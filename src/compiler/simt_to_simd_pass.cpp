@@ -1938,7 +1938,7 @@ private:
             SimdVal outSt;
             outSt.kind = SimdVal::Kind::Struct;
             outSt.origType = st;
-            for (unsigned f = 0; f < 4 && f < st.getBody().size(); ++f) {
+            for (unsigned f = 0; f < st.getBody().size(); ++f) {
                 mlir::Value val = mlir::scf::IfOp::create(
                                       b_, loc, isNull,
                                       [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -1964,7 +1964,8 @@ private:
         SimdVal outSt;
         outSt.kind = SimdVal::Kind::Struct;
         outSt.origType = st;
-        llvm::SmallVector<mlir::Value, 4> fieldVecs(4, mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
+        const unsigned numFields = static_cast<unsigned>(st.getBody().size());
+        llvm::SmallVector<mlir::Value, 8> fieldVecs(numFields, mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value ptr = laneValue(loc, h, l);
             mlir::Value dataBase = h.isRootConstants ? ptr : loadDescBasePtr(loc, ptr);
@@ -1973,7 +1974,7 @@ private:
             mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
             mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), idxL);
             mlir::Value off64 = isLegacy ? mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16)) : idx64;
-            for (unsigned f = 0; f < 4 && f < st.getBody().size(); ++f) {
+            for (unsigned f = 0; f < st.getBody().size(); ++f) {
                 mlir::Value val = mlir::scf::IfOp::create(
                                       b_, loc, ok,
                                       [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -1991,7 +1992,7 @@ private:
                 fieldVecs[f] = mlir::vector::InsertOp::create(b_, loc, val, fieldVecs[f], static_cast<int64_t>(l));
             }
         }
-        for (unsigned f = 0; f < 4 && f < st.getBody().size(); ++f) {
+        for (unsigned f = 0; f < numFields; ++f) {
             outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, fieldVecs[f], {}, {}});
         }
         setMapped(call.getResult(), outSt);
@@ -2842,7 +2843,9 @@ private:
                     identity = splatInt(loc, et, ~uint64_t(0));
                 } else {
                     ck = mlir::vector::CombiningKind::MINSI;
-                    identity = splatInt(loc, et, et.getIntOrFloatBitWidth() == 64 ? uint64_t(INT64_MAX) : uint64_t(INT32_MAX));
+                    unsigned bw = et.getIntOrFloatBitWidth();
+                    uint64_t sMax = (bw >= 64) ? uint64_t(INT64_MAX) : ((uint64_t(1) << (bw - 1)) - 1);
+                    identity = splatInt(loc, et, sMax);
                 }
             } else { // MAX
                 if (isFloat) {
@@ -2853,7 +2856,9 @@ private:
                     identity = splatInt(loc, et, 0);
                 } else {
                     ck = mlir::vector::CombiningKind::MAXSI;
-                    identity = splatInt(loc, et, et.getIntOrFloatBitWidth() == 64 ? uint64_t(INT64_MIN) : uint64_t(uint32_t(INT32_MIN)));
+                    unsigned bw = et.getIntOrFloatBitWidth();
+                    uint64_t sMin = (bw >= 64) ? uint64_t(INT64_MIN) : (uint64_t(1) << (bw - 1));
+                    identity = splatInt(loc, et, sMin);
                 }
             }
             mlir::Value masked = mlir::arith::SelectOp::create(b_, loc, activeMask, valVec, identity);
@@ -3008,8 +3013,8 @@ private:
         switch (op) {
         case 6: return store(mlir::math::AbsFOp::create(b_, loc, vT, argV(1)));
         case 7: { // Saturate
-            mlir::Value lo = mlir::arith::MaximumFOp::create(b_, loc, vT, argV(1), splatFlt(loc, resTy, 0.0));
-            return store(mlir::arith::MinimumFOp::create(b_, loc, vT, lo, splatFlt(loc, resTy, 1.0)));
+            mlir::Value lo = mlir::arith::MaxNumFOp::create(b_, loc, vT, argV(1), splatFlt(loc, resTy, 0.0));
+            return store(mlir::arith::MinNumFOp::create(b_, loc, vT, lo, splatFlt(loc, resTy, 1.0)));
         }
         case 8: return store(mlir::math::IsNaNOp::create(b_, loc, vT, argV(1)));
         case 9: return store(mlir::math::IsInfOp::create(b_, loc, vT, argV(1)));
@@ -3081,8 +3086,8 @@ private:
             mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, argTy, 0));
             return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), lz));
         }
-        case 35: return store(mlir::arith::MaximumFOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 36: return store(mlir::arith::MinimumFOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 35: return store(mlir::arith::MaxNumFOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 36: return store(mlir::arith::MinNumFOp::create(b_, loc, vT, argV(1), argV(2)));
         case 37: return store(mlir::arith::MaxSIOp::create(b_, loc, vT, argV(1), argV(2)));
         case 38: return store(mlir::arith::MinSIOp::create(b_, loc, vT, argV(1), argV(2)));
         case 39: return store(mlir::arith::MaxUIOp::create(b_, loc, vT, argV(1), argV(2)));
@@ -3168,6 +3173,17 @@ private:
             mlir::Value i16v = mlir::arith::TruncIOp::create(b_, loc, vecTy(b_.getI16Type()), argV(1));
             mlir::Value f16v = mlir::arith::BitcastOp::create(b_, loc, vecTy(b_.getF16Type()), i16v);
             return store(mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), f16v));
+        }
+        case 162: { // Dot2AddHalf(acc, ax, ay, bx, by) -> f32
+            mlir::Value acc = argV(1);
+            mlir::Value ax = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(2));
+            mlir::Value ay = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(3));
+            mlir::Value bx = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(4));
+            mlir::Value by = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(5));
+            mlir::Value px = mlir::arith::MulFOp::create(b_, loc, ax, bx);
+            mlir::Value py = mlir::arith::MulFOp::create(b_, loc, ay, by);
+            mlir::Value sum = mlir::arith::AddFOp::create(b_, loc, acc, mlir::arith::AddFOp::create(b_, loc, px, py));
+            return store(sum);
         }
         case 163: // Dot4AddI8Packed(acc, a, b)
         case 164: { // Dot4AddU8Packed(acc, a, b)

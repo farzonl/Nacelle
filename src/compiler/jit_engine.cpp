@@ -115,7 +115,7 @@ std::string hashToHex128(uint64_t lo, uint64_t hi) {
 
 namespace {
 
-constexpr uint32_t kCompilerMagicVersion = 0x4E434A34; // 'NCJ4'
+constexpr uint32_t kCompilerMagicVersion = 0x4E434A35; // 'NCJ5'
 
 struct HashFeed {
     std::vector<uint8_t> buf;
