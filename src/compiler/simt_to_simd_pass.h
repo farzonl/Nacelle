@@ -36,7 +36,7 @@ struct SimdVal {
     uint32_t resourceKind = 0;  // DXIL ResourceKind
     uint32_t stride = 0;
     bool isRootConstants = false;
-    bool isUniform() const { return kind == Kind::Lanes && lanes.size() == 1; }
+    bool isUniform() const { return (kind == Kind::Lanes || kind == Kind::Handle) && lanes.size() == 1; }
     bool valid() const { return kind != Kind::Invalid; }
 };
 
