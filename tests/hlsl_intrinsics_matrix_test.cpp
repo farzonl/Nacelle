@@ -103,8 +103,10 @@ bool testMatrixSwizzle(testutil::TestRuntime& rt) {
     return ok;
 }
 
-bool testQuadDerivatives(testutil::TestRuntime& rt) {
-    std::cout << "=== Test: quad_derivatives ===\n";
+bool testQuadDerivatives(testutil::TestRuntime& rt, bool useD32S8DepthStencil) {
+    std::cout << "=== Test: quad_derivatives"
+              << (useD32S8DepthStencil ? " (D32_FLOAT_S8X24_UINT DSV)" : "")
+              << " ===\n";
     auto vsBytes = testutil::loadShaderBytes("quad_derivatives_vs.dxil");
     auto psBytes = testutil::loadShaderBytes("quad_derivatives_ps.dxil");
 
@@ -128,6 +130,12 @@ bool testQuadDerivatives(testutil::TestRuntime& rt) {
     psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if (useD32S8DepthStencil) {
+        psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        psoDesc.DepthStencilState.DepthEnable = TRUE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    }
 
     ComPtr<ID3D12PipelineState> pso;
     testutil::checkHR(rt.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "CreateGraphicsPSO");
@@ -141,6 +149,18 @@ bool testQuadDerivatives(testutil::TestRuntime& rt) {
     ComPtr<ID3D12DescriptorHeap> rtvHeap;
     testutil::checkHR(rt.device->CreateDescriptorHeap(&rtvHD, IID_PPV_ARGS(&rtvHeap)), "RTVHeap");
     rt.device->CreateRenderTargetView(rtvTex.Get(), nullptr, rtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    ComPtr<ID3D12Resource> dsvTex;
+    ComPtr<ID3D12DescriptorHeap> dsvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvH{};
+    if (useD32S8DepthStencil) {
+        D3D12_RESOURCE_DESC dsd = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 4, 4, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        testutil::checkHR(rt.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dsd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&dsvTex)), "DSVTex");
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHD{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        testutil::checkHR(rt.device->CreateDescriptorHeap(&dsvHD, IID_PPV_ARGS(&dsvHeap)), "DSVHeap");
+        dsvH = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        rt.device->CreateDepthStencilView(dsvTex.Get(), nullptr, dsvH);
+    }
 
     const float verts[12] = {
         -1.f, -1.f, -1.f, 1.f, 1.f, 1.f,
@@ -159,9 +179,12 @@ bool testQuadDerivatives(testutil::TestRuntime& rt) {
     rt.cmdList->RSSetViewports(1, &vp);
     rt.cmdList->RSSetScissorRects(1, &sc);
     D3D12_CPU_DESCRIPTOR_HANDLE rtvH = rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rt.cmdList->OMSetRenderTargets(1, &rtvH, FALSE, nullptr);
+    rt.cmdList->OMSetRenderTargets(1, &rtvH, FALSE, useD32S8DepthStencil ? &dsvH : nullptr);
     const float clearCol[4] = {0, 0, 0, 0};
     rt.cmdList->ClearRenderTargetView(rtvH, clearCol, 0, nullptr);
+    if (useD32S8DepthStencil) {
+        rt.cmdList->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+    }
     rt.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     rt.cmdList->IASetVertexBuffers(0, 1, &vbv);
     rt.cmdList->DrawInstanced(6, 1, 0, 0);
@@ -333,7 +356,8 @@ int main() {
     rt.init();
 
     bool ok1 = testMatrixSwizzle(rt);
-    bool ok2 = testQuadDerivatives(rt);
+    bool ok2 = testQuadDerivatives(rt, false);
+    bool ok2d = testQuadDerivatives(rt, true);
     bool ok3 = testMathDenormsBits(rt);
-    return (ok1 && ok2 && ok3) ? 0 : 1;
+    return (ok1 && ok2 && ok2d && ok3) ? 0 : 1;
 }

@@ -177,6 +177,9 @@ void loadTileDSV(
                 std::memcpy(&v, p, 4);
                 depthSOA[pixIdx] = static_cast<float>(v & 0x00FFFFFFu) / 16777215.0f;
                 stencilSOA[pixIdx] = static_cast<uint8_t>(v >> 24);
+            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                std::memcpy(&depthSOA[pixIdx], p, 4);
+                stencilSOA[pixIdx] = p[4];
             } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
                 uint16_t v = 0;
                 std::memcpy(&v, p, 2);
@@ -223,6 +226,9 @@ void storeTileDSV(
                 uint32_t d24 = static_cast<uint32_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 16777215.0f + 0.5f);
                 uint32_t v = (d24 & 0x00FFFFFFu) | (static_cast<uint32_t>(stencilSOA[pixIdx]) << 24);
                 std::memcpy(p, &v, 4);
+            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                std::memcpy(p, &depthSOA[pixIdx], 4);
+                p[4] = stencilSOA[pixIdx];
             } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
                 uint16_t d16 = static_cast<uint16_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 65535.0f + 0.5f);
                 std::memcpy(p, &d16, 2);
