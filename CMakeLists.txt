@@ -81,7 +81,7 @@ add_custom_command(
     OUTPUT "${TEX_SAMPLER_BC}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
     COMMAND "${NACELLE_CLANGXX}" -std=c++20 -O3 -emit-llvm -c
-            -fno-exceptions -fno-rtti -ffreestanding
+            -fno-exceptions -fno-rtti -ffreestanding -fno-math-errno
             "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/texture_sampler.cpp"
             -o "${TEX_SAMPLER_BC}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/texture_sampler.cpp"

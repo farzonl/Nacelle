@@ -1,0 +1,25 @@
+// RUN: %dxc -T cs_6_6 -E CSMain -Fo %t.dxil %S/../shaders/interlocked_barrier.hlsl
+// RUN: %nacelle_compile --simd-width=4 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W4
+// RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W8
+// RUN: %nacelle_compile --simd-width=16 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM16
+
+// W4: func.func @nacelle_cs_test
+// W4-DAG: vector<4x
+// W4-DAG: scf.while
+// W4-DAG: llvm.atomicrmw
+// W4-DAG: llvm.cmpxchg
+// W4-NOT: dx.op.barrier
+// W4-NOT: dx.op.atomicBinOp
+// W4-NOT: dx.op.atomicCompareExchange
+
+// W8: func.func @nacelle_cs_test
+// W8-DAG: vector<8x
+// W8-DAG: scf.while
+// W8-DAG: llvm.atomicrmw
+// W8-DAG: llvm.cmpxchg
+// W8-NOT: dx.op.barrier
+
+// LLVM16: define void @nacelle_cs_test
+// LLVM16-DAG: atomicrmw
+// LLVM16-DAG: cmpxchg
+// LLVM16-NOT: dx.op.

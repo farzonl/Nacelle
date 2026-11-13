@@ -291,6 +291,17 @@ uint32_t lowerGroupSharedGlobals(llvm::Module& mod, llvm::Function* entryFn) {
                             changed = true;
                         }
                     }
+                } else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(&inst)) {
+                    if (sel->getType()->isPointerTy() && sel->getType()->getPointerAddressSpace() == 3 && !rewrittenPtrs.count(sel)) {
+                        llvm::Value* tv = mapVal(sel->getTrueValue());
+                        llvm::Value* fv = mapVal(sel->getFalseValue());
+                        if (tv->getType() == ptrTy && fv->getType() == ptrTy) {
+                            llvm::IRBuilder<> b(sel);
+                            rewrittenPtrs[sel] = b.CreateSelect(sel->getCondition(), tv, fv, sel->getName() + ".gs");
+                            toErase.push_back(sel);
+                            changed = true;
+                        }
+                    }
                 } else if (auto* bc = llvm::dyn_cast<llvm::BitCastInst>(&inst)) {
                     if (bc->getType()->isPointerTy() && bc->getType()->getPointerAddressSpace() == 3 && !rewrittenPtrs.count(bc)) {
                         llvm::Value* base = mapVal(bc->getOperand(0));

@@ -123,6 +123,8 @@ static inline __attribute__((always_inline)) void read_texel_ptr(
         return;
     }
     case 16: // R32G32_FLOAT
+    case 17: // R32G32_UINT
+    case 18: // R32G32_SINT
         __builtin_memcpy(out, ptr, 8);
         out[2] = 0.0f;
         out[3] = 1.0f;
@@ -163,6 +165,8 @@ static inline __attribute__((always_inline)) void read_texel_ptr(
     case 40: // D32_FLOAT
     case 41: // R32_FLOAT
     case 39: // R32_TYPELESS
+    case 42: // R32_UINT
+    case 43: // R32_SINT
         __builtin_memcpy(out, ptr, 4);
         out[1] = out[2] = 0.0f;
         out[3] = 1.0f;
@@ -231,6 +235,8 @@ static inline __attribute__((always_inline)) void write_texel_ptr(
         return;
     }
     case 16: // R32G32_FLOAT
+    case 17: // R32G32_UINT
+    case 18: // R32G32_SINT
         __builtin_memcpy(ptr, in, 8);
         return;
     case 28:
@@ -257,7 +263,11 @@ static inline __attribute__((always_inline)) void write_texel_ptr(
         ptr[3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
         return;
     }
+    case 39:
+    case 40:
     case 41:
+    case 42:
+    case 43:
         __builtin_memcpy(ptr, in, 4);
         return;
     case 61:
