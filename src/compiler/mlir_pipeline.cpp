@@ -182,15 +182,10 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
         }
     }
 
-    thread_local mlir::MLIRContext* cachedCtx = nullptr;
-    thread_local std::unique_ptr<mlir::PassManager> cachedPM;
-    if (cachedCtx != &mlirCtx || !cachedPM) {
-        cachedCtx = &mlirCtx;
-        cachedPM = std::make_unique<mlir::PassManager>(&mlirCtx);
-        cachedPM->addPass(mlir::createLiftControlFlowToSCFPass());
-        cachedPM->addPass(mlir::createCanonicalizerPass());
-    }
-    if (mlir::failed(cachedPM->run(*mlirMod))) {
+    mlir::PassManager pm(&mlirCtx);
+    pm.addPass(mlir::createLiftControlFlowToSCFPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    if (mlir::failed(pm.run(*mlirMod))) {
         outError = "MLIR ControlFlowToSCF pass failed";
         return nullptr;
     }

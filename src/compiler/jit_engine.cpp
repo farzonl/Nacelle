@@ -221,7 +221,7 @@ llvm::Expected<llvm::orc::JITTargetMachineBuilder> createHostJTMB(llvm::CodeGenO
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::None);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
@@ -370,6 +370,9 @@ void runTier1Optimize(llvm::Module& mod) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::FunctionPassManager fpm;
+    fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    fpm.addPass(llvm::EarlyCSEPass(true));
+    fpm.addPass(llvm::InstCombinePass());
     fpm.addPass(llvm::SimplifyCFGPass());
 
     for (llvm::Function& fn : mod) {
@@ -654,23 +657,18 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     });
 
-    thread_local mlir::MLIRContext* cachedCtx = nullptr;
-    thread_local std::unique_ptr<mlir::PassManager> cachedPM;
-    if (cachedCtx != mlirMod.getContext() || !cachedPM) {
-        cachedCtx = mlirMod.getContext();
-        cachedPM = std::make_unique<mlir::PassManager>(cachedCtx);
-        cachedPM->addPass(mlir::createSCFToControlFlowPass());
-        cachedPM->addPass(mlir::createConvertVectorToLLVMPass());
-        cachedPM->addPass(mlir::createConvertMathToLLVMPass());
-        cachedPM->addPass(mlir::createConvertMathToLibmPass());
-        cachedPM->addPass(mlir::createArithToLLVMConversionPass());
-        cachedPM->addPass(mlir::createConvertControlFlowToLLVMPass());
-        cachedPM->addPass(mlir::createConvertFuncToLLVMPass());
-        cachedPM->addPass(mlir::createUBToLLVMConversionPass());
-        cachedPM->addPass(mlir::createReconcileUnrealizedCastsPass());
-    }
+    mlir::PassManager pm(mlirMod.getContext());
+    pm.addPass(mlir::createSCFToControlFlowPass());
+    pm.addPass(mlir::createConvertVectorToLLVMPass());
+    pm.addPass(mlir::createConvertMathToLLVMPass());
+    pm.addPass(mlir::createConvertMathToLibmPass());
+    pm.addPass(mlir::createArithToLLVMConversionPass());
+    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+    pm.addPass(mlir::createConvertFuncToLLVMPass());
+    pm.addPass(mlir::createUBToLLVMConversionPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
-    if (mlir::failed(cachedPM->run(mlirMod))) {
+    if (mlir::failed(pm.run(mlirMod))) {
         outError = "MLIR LLVM lowering pipeline failed";
         return nullptr;
     }
