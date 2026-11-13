@@ -39,6 +39,10 @@
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
 #include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
@@ -166,25 +170,53 @@ JitRuntime& getJitRuntime() {
     return runtime;
 }
 
+struct CachedHostTargetInfo {
+    std::string cpu;
+    std::vector<std::pair<std::string, bool>> features;
+};
+
+const CachedHostTargetInfo& getCachedHostTargetInfo() {
+    static const CachedHostTargetInfo info = []() {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        llvm::InitializeNativeTargetAsmParser();
+
+        CachedHostTargetInfo res;
+        llvm::StringRef cpu = llvm::sys::getHostCPUName();
+        if (!cpu.empty()) {
+            res.cpu = cpu.str();
+        }
+        auto hostFeatures = llvm::sys::getHostCPUFeatures();
+        res.features.reserve(hostFeatures.size());
+        for (const auto& kv : hostFeatures) {
+            res.features.emplace_back(kv.first().str(), kv.second);
+        }
+        return res;
+    }();
+    return info;
+}
+
+llvm::Expected<llvm::orc::JITTargetMachineBuilder> createHostJTMB(llvm::CodeGenOptLevel optLevel) {
+    const CachedHostTargetInfo& info = getCachedHostTargetInfo();
+    auto jtmbOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jtmbOrErr) return jtmbOrErr;
+    jtmbOrErr->setCodeGenOptLevel(optLevel);
+    if (!info.cpu.empty()) {
+        jtmbOrErr->setCPU(info.cpu);
+    }
+    for (const auto& kv : info.features) {
+        jtmbOrErr->getFeatures().AddFeature(kv.first, kv.second);
+    }
+    return jtmbOrErr;
+}
+
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-    llvm::InitializeNativeTargetAsmParser();
 
-    auto jtmbOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
-    }
-    jtmbOrErr->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
-    llvm::StringMap<bool, llvm::MallocAllocator> hostFeatures = llvm::sys::getHostCPUFeatures();
-    for (const auto& kv : hostFeatures) {
-        jtmbOrErr->getFeatures().AddFeature(kv.first(), kv.second);
-    }
-    llvm::StringRef cpu = llvm::sys::getHostCPUName();
-    if (!cpu.empty()) {
-        jtmbOrErr->setCPU(cpu.str());
     }
 
     auto jitOrErr = llvm::orc::LLJITBuilder()
@@ -238,18 +270,11 @@ bool emitObjectBytesO3(
     llvm::Module& mod,
     llvm::SmallVectorImpl<char>& outObjBytes,
     std::string& outError) {
-    auto jtmbOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Default);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return false;
     }
-    jtmbOrErr->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
-    llvm::StringMap<bool, llvm::MallocAllocator> hostFeatures = llvm::sys::getHostCPUFeatures();
-    for (const auto& kv : hostFeatures) {
-        jtmbOrErr->getFeatures().AddFeature(kv.first(), kv.second);
-    }
-    llvm::StringRef cpu = llvm::sys::getHostCPUName();
-    if (!cpu.empty()) jtmbOrErr->setCPU(cpu.str());
 
     auto tmOrErr = jtmbOrErr->createTargetMachine();
     if (!tmOrErr) {
@@ -261,8 +286,8 @@ bool emitObjectBytesO3(
     mod.setDataLayout(tm->createDataLayout());
 
     llvm::PipelineTuningOptions pto;
-    pto.LoopVectorization = true;
-    pto.SLPVectorization = true;
+    pto.LoopVectorization = false;
+    pto.SLPVectorization = false;
     pto.LoopInterleaving = true;
     pto.LoopUnrolling = true;
 
@@ -282,7 +307,7 @@ bool emitObjectBytesO3(
     pb.registerLoopAnalyses(lam);
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
-    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
     mpm.run(mod, mam);
 
     llvm::legacy::PassManager codegenPM;
@@ -312,8 +337,17 @@ void runTier1Optimize(llvm::Module& mod) {
     pb.registerLoopAnalyses(lam);
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
-    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
-    mpm.run(mod, mam);
+    llvm::FunctionPassManager fpm;
+    fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    fpm.addPass(llvm::EarlyCSEPass(true));
+    fpm.addPass(llvm::InstCombinePass());
+    fpm.addPass(llvm::SimplifyCFGPass());
+
+    for (llvm::Function& fn : mod) {
+        if (!fn.isDeclaration()) {
+            fpm.run(fn, fam);
+        }
+    }
 }
 
 bool writeFileAtomic(const std::filesystem::path& dst, const void* data, size_t size, uint64_t tmpId) {
@@ -566,15 +600,6 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
     std::string& outError) {
-    {
-        mlir::PassManager canonPm(mlirMod.getContext());
-        canonPm.addPass(mlir::createCanonicalizerPass());
-        if (mlir::failed(canonPm.run(mlirMod))) {
-            outError = "MLIR canonicalization pass failed";
-            return nullptr;
-        }
-    }
-
     // Upstream MLIR's ConvertMathToLLVMPass lowers math.isnan and math.isfinite
     // to LLVM::IsFPClass, but omits math.isinf and math.isnormal, which would
     // otherwise be rejected as illegal by ConvertMathToLibmPass.
@@ -1041,7 +1066,7 @@ bool compileComputePSO(
             ? shader.embeddedRootSig
             : rootLayout;
 
-    mlir::MLIRContext mlirCtx;
+    thread_local mlir::MLIRContext mlirCtx;
     auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
     if (!mlirMod) return false;
 

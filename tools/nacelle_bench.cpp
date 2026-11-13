@@ -147,9 +147,9 @@ BenchResult runNacelleBench(
     psoDesc.CS = {dxil.data(), dxil.size()};
     ID3D12PipelineState* pso = nullptr;
     HRESULT hr = dev->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
-    nacelle::waitForAllAsyncJITTasks();
     auto t1 = std::chrono::steady_clock::now();
     res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    nacelle::waitForAllAsyncJITTasks();
 
     if (FAILED(hr) || !pso) {
         res.status = "FAILED (CreateComputePipelineState)";

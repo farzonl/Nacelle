@@ -23,20 +23,26 @@
 namespace nacelle {
 
 void configureNacelleMLIRContext(mlir::MLIRContext& ctx) {
-    mlir::DialectRegistry registry;
-    mlir::registerBuiltinDialectTranslation(registry);
-    mlir::registerLLVMDialectImport(registry);
-    mlir::registerLLVMDialectTranslation(registry);
-    registry.insert<
-        mlir::DLTIDialect,
-        mlir::func::FuncDialect,
-        mlir::cf::ControlFlowDialect,
-        mlir::scf::SCFDialect,
-        mlir::arith::ArithDialect,
-        mlir::math::MathDialect,
-        mlir::vector::VectorDialect,
-        mlir::ub::UBDialect,
-        mlir::LLVM::LLVMDialect>();
+    if (ctx.getLoadedDialect<mlir::scf::SCFDialect>()) {
+        return;
+    }
+    static const mlir::DialectRegistry registry = []() {
+        mlir::DialectRegistry reg;
+        mlir::registerBuiltinDialectTranslation(reg);
+        mlir::registerLLVMDialectImport(reg);
+        mlir::registerLLVMDialectTranslation(reg);
+        reg.insert<
+            mlir::DLTIDialect,
+            mlir::func::FuncDialect,
+            mlir::cf::ControlFlowDialect,
+            mlir::scf::SCFDialect,
+            mlir::arith::ArithDialect,
+            mlir::math::MathDialect,
+            mlir::vector::VectorDialect,
+            mlir::ub::UBDialect,
+            mlir::LLVM::LLVMDialect>();
+        return reg;
+    }();
     ctx.appendDialectRegistry(registry);
     ctx.loadAllAvailableDialects();
 }
@@ -184,10 +190,12 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
         return nullptr;
     }
 
+#ifndef NDEBUG
     if (mlir::failed(mlir::verify(*mlirMod))) {
         outError = "MLIR module verification failed after ControlFlowToSCF";
         return nullptr;
     }
+#endif
     return mlirMod;
 }
 
