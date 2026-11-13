@@ -254,9 +254,15 @@ add_executable(nacelle_viewer apps/nacelle_viewer.cpp)
 add_dependencies(nacelle_viewer nacelle_test_shaders)
 target_include_directories(nacelle_viewer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
 )
+if(NOT WIN32)
+    target_include_directories(nacelle_viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/common/posix_sal")
+endif()
+target_include_directories(nacelle_viewer SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 target_compile_definitions(nacelle_viewer PRIVATE
+    ${LLVM_DEFS_LIST}
     NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
 )
 target_link_libraries(nacelle_viewer PRIVATE nacelle)
