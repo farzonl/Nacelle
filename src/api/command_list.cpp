@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "../common/format_utils.h"
+#include "../common/fp_env.h"
 
 namespace nacelle {
 
@@ -689,6 +690,7 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     const DriverRootContext ctxSnapshot = state.computeCtx;
 
     auto runRange = [&](uint64_t begin, uint64_t end) {
+        ScopedFlushDenormals flushDenorms;
         thread_local std::vector<uint8_t> tlScratch;
         if (tlScratch.size() < scratchSize) tlScratch.resize(scratchSize);
         for (uint64_t idx = begin; idx < end; ++idx) {

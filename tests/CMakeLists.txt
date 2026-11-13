@@ -44,6 +44,10 @@ add_hlsl_dxil(divergent_cf_atomics.hlsl cs_6_0 CSMain divergent_cf_atomics.dxil)
 add_hlsl_dxil(wave_intrinsics.hlsl cs_6_0 CSMain wave_intrinsics.dxil)
 add_hlsl_dxil(prefix_sum_groupshared.hlsl cs_6_0 CSMain prefix_sum_groupshared.dxil)
 add_hlsl_dxil(interlocked_barrier.hlsl cs_6_6 CSMain interlocked_barrier.dxil)
+add_hlsl_dxil(matrix_swizzle.hlsl cs_6_0 CSMain matrix_swizzle.dxil)
+add_hlsl_dxil(math_denorms_bits.hlsl cs_6_5 CSMain math_denorms_bits.dxil)
+add_hlsl_dxil(quad_derivatives.hlsl vs_6_0 VSMain quad_derivatives_vs.dxil)
+add_hlsl_dxil(quad_derivatives.hlsl ps_6_0 PSMain quad_derivatives_ps.dxil)
 
 # Cross-backend benchmark shader (DXIL + SPIR-V)
 add_hlsl_dxil(bench_raymarch.hlsl cs_6_0 main bench_raymarch.dxil)
@@ -108,6 +112,7 @@ add_nacelle_test(rasterizer_pipeline_test rasterizer_pipeline_test.cpp)
 add_nacelle_test(pbr_render_test pbr_render_test.cpp)
 add_nacelle_test(pso_cache_bcn_test pso_cache_bcn_test.cpp)
 add_nacelle_test(interlocked_barrier_test interlocked_barrier_test.cpp)
+add_nacelle_test(hlsl_intrinsics_matrix_test hlsl_intrinsics_matrix_test.cpp)
 
 # lit / FileCheck compiler IR tests
 file(GLOB NACELLE_LIT_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/lit/*.test")

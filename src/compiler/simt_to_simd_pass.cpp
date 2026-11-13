@@ -2043,6 +2043,9 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
+            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
+                                         : mlir::Value();
             mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
             mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
             mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
@@ -2060,6 +2063,13 @@ private:
                 mlir::Value inBounds = mlir::arith::AndIOp::create(
                     b_, loc, okPtr,
                     mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
+                if (elemStride) {
+                    mlir::Value elemEnd = cInt(loc, i32Ty(), (c + 1) * elemBytes);
+                    mlir::Value strideZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, elemStride, cInt(loc, i32Ty(), 0));
+                    mlir::Value inElem = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
+                    inBounds = mlir::arith::AndIOp::create(
+                        b_, loc, inBounds, mlir::arith::OrIOp::create(b_, loc, strideZero, inElem));
+                }
                 mlir::Value val = mlir::scf::IfOp::create(
                                       b_, loc, inBounds,
                                       [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -2111,6 +2121,9 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
+            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
+                                         : mlir::Value();
             mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
             mlir::Value okPtr = mlir::arith::AndIOp::create(
                 b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
@@ -2126,6 +2139,13 @@ private:
                 mlir::Value doStore = mlir::arith::AndIOp::create(
                     b_, loc, okPtr,
                     mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
+                if (elemStride) {
+                    mlir::Value elemEnd = cInt(loc, i32Ty(), (c + 1) * elemBytes);
+                    mlir::Value strideZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, elemStride, cInt(loc, i32Ty(), 0));
+                    mlir::Value inElem = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
+                    doStore = mlir::arith::AndIOp::create(
+                        b_, loc, doStore, mlir::arith::OrIOp::create(b_, loc, strideZero, inElem));
+                }
                 mlir::scf::IfOp::create(b_, loc, doStore, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::Value ep = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{cOff});
                     mlir::LLVM::StoreOp::create(nb, nloc, vL, ep);
@@ -2944,6 +2964,17 @@ private:
             return true;
         };
 
+        auto flushDenormF = [&](mlir::Value v) -> mlir::Value {
+            if (!resTy.isF32()) return v;
+            mlir::Value bits = mlir::arith::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
+            mlir::Value absBits = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
+            mlir::Value isDenorm = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::ult, absBits, splatInt(loc, i32Ty(), 0x00800000u));
+            mlir::Value signZero = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x80000000u));
+            mlir::Value flushed = mlir::arith::SelectOp::create(b_, loc, isDenorm, signZero, bits);
+            return mlir::arith::BitcastOp::create(b_, loc, vT, flushed);
+        };
+
         switch (op) {
         case 6: return store(mlir::math::AbsFOp::create(b_, loc, vT, argV(1)));
         case 7: { // Saturate
@@ -2954,21 +2985,21 @@ private:
         case 9: return store(mlir::math::IsInfOp::create(b_, loc, vT, argV(1)));
         case 10: return store(mlir::math::IsFiniteOp::create(b_, loc, vT, argV(1)));
         case 11: return store(mlir::math::IsNormalOp::create(b_, loc, vT, argV(1)));
-        case 12: return store(mlir::math::CosOp::create(b_, loc, vT, argV(1)));
-        case 13: return store(mlir::math::SinOp::create(b_, loc, vT, argV(1)));
-        case 14: return store(mlir::math::TanOp::create(b_, loc, vT, argV(1)));
-        case 15: return store(mlir::math::AcosOp::create(b_, loc, vT, argV(1)));
-        case 16: return store(mlir::math::AsinOp::create(b_, loc, vT, argV(1)));
-        case 17: return store(mlir::math::AtanOp::create(b_, loc, vT, argV(1)));
-        case 18: return store(mlir::math::CoshOp::create(b_, loc, vT, argV(1)));
-        case 19: return store(mlir::math::SinhOp::create(b_, loc, vT, argV(1)));
-        case 20: return store(mlir::math::TanhOp::create(b_, loc, vT, argV(1)));
-        case 21: return store(mlir::math::Exp2Op::create(b_, loc, vT, argV(1))); // DXIL Exp is base-2!
+        case 12: return store(mlir::math::CosOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 13: return store(mlir::math::SinOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 14: return store(mlir::math::TanOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 15: return store(mlir::math::AcosOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 16: return store(mlir::math::AsinOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 17: return store(mlir::math::AtanOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 18: return store(mlir::math::CoshOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 19: return store(mlir::math::SinhOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 20: return store(mlir::math::TanhOp::create(b_, loc, vT, flushDenormF(argV(1))));
+        case 21: return store(mlir::math::Exp2Op::create(b_, loc, vT, flushDenormF(argV(1)))); // DXIL Exp is base-2!
         case 22: { // Frc = x - floor(x)
             mlir::Value x = argV(1);
             return store(mlir::arith::SubFOp::create(b_, loc, vT, x, mlir::math::FloorOp::create(b_, loc, vT, x)));
         }
-        case 23: return store(mlir::math::Log2Op::create(b_, loc, vT, argV(1))); // DXIL Log is base-2!
+        case 23: return store(mlir::math::Log2Op::create(b_, loc, vT, flushDenormF(argV(1)))); // DXIL Log is base-2!
         case 24: return store(mlir::math::SqrtOp::create(b_, loc, vT, argV(1)));
         case 25: { // Rsqrt = 1.0 / sqrt(x)
             mlir::Value sq = mlir::math::SqrtOp::create(b_, loc, vT, argV(1));
@@ -2982,23 +3013,33 @@ private:
         case 31: return store(mlir::math::CtPopOp::create(b_, loc, vT, argV(1)));
         case 32: { // FirstbitLo: index of lowest set bit, or -1 if 0
             mlir::Value x = argV(1);
-            mlir::Value tz = mlir::math::CountTrailingZerosOp::create(b_, loc, vT, x);
-            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, resTy, 0));
+            mlir::Type argTy = call.getOperand(1).getType();
+            mlir::Value tz = mlir::math::CountTrailingZerosOp::create(b_, loc, vecTy(argTy), x);
+            if (argTy != resTy) {
+                tz = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
+                         ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, tz))
+                         : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, tz));
+            }
+            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, argTy, 0));
             return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), tz));
         }
-        case 33: // FirstbitHi: 31 - clz(x), or -1 if 0
-        case 34: { // FirstbitSHi
+        case 33: // FirstbitHi: clz(x), or -1 if 0 (DXIL returns leading-zero count from MSB; DXC emits bitWidth-1 - res)
+        case 34: { // FirstbitSHi: clz(x < 0 ? ~x : x), or -1 if 0 or -1
             mlir::Value x = argV(1);
+            mlir::Type argTy = call.getOperand(1).getType();
             if (op == 34) {
-                mlir::Value isNeg = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::slt, x, splatInt(loc, resTy, 0));
-                mlir::Value inv = mlir::arith::XOrIOp::create(b_, loc, x, splatInt(loc, resTy, ~uint64_t(0)));
+                mlir::Value isNeg = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::slt, x, splatInt(loc, argTy, 0));
+                mlir::Value inv = mlir::arith::XOrIOp::create(b_, loc, x, splatInt(loc, argTy, ~uint64_t(0)));
                 x = mlir::arith::SelectOp::create(b_, loc, isNeg, inv, x);
             }
-            mlir::Value lz = mlir::math::CountLeadingZerosOp::create(b_, loc, vT, x);
-            mlir::Value bitIdx = mlir::arith::SubIOp::create(
-                b_, loc, splatInt(loc, resTy, resTy.getIntOrFloatBitWidth() - 1), lz);
-            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, resTy, 0));
-            return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), bitIdx));
+            mlir::Value lz = mlir::math::CountLeadingZerosOp::create(b_, loc, vecTy(argTy), x);
+            if (argTy != resTy) {
+                lz = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
+                         ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, lz))
+                         : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, lz));
+            }
+            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, argTy, 0));
+            return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), lz));
         }
         case 35: return store(mlir::arith::MaximumFOp::create(b_, loc, vT, argV(1), argV(2)));
         case 36: return store(mlir::arith::MinimumFOp::create(b_, loc, vT, argV(1), argV(2)));
