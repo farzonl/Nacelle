@@ -605,18 +605,22 @@ bool loadAndUpgradeDXIL(
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     // Force internal helper functions inline into entry (keep hull patch-constant entry intact)
+    bool hasHelpersToInline = false;
     for (auto& fn : *mod) {
         if (!fn.isDeclaration() && fn.getName() != outShader.entryName &&
             (outShader.hsPatchConstFnName.empty() || fn.getName() != outShader.hsPatchConstFnName)) {
             fn.setLinkage(llvm::GlobalValue::InternalLinkage);
             fn.addFnAttr(llvm::Attribute::AlwaysInline);
+            hasHelpersToInline = true;
         }
     }
 
     {
         llvm::ModulePassManager mpm;
         mpm.addPass(llvm::DXILUpgradePass());
-        mpm.addPass(llvm::AlwaysInlinerPass());
+        if (hasHelpersToInline) {
+            mpm.addPass(llvm::AlwaysInlinerPass());
+        }
         mpm.run(*mod, mam);
     }
 
@@ -647,12 +651,21 @@ bool loadAndUpgradeDXIL(
     }
 
     // Promote allocas and clean CFG (removing switch ops) before MLIR import
+    auto fnHasSwitch = [](const llvm::Function& fn) {
+        for (const llvm::BasicBlock& bb : fn) {
+            if (llvm::isa<llvm::SwitchInst>(bb.getTerminator())) return true;
+        }
+        return false;
+    };
+    bool hasSwitch = fnHasSwitch(*entryFn) || (pcFn && !pcFn->isDeclaration() && fnHasSwitch(*pcFn));
     fam.clear();
     {
         llvm::FunctionPassManager fpm;
         fpm.addPass(llvm::PromotePass());
         fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-        fpm.addPass(llvm::LowerSwitchPass());
+        if (hasSwitch) {
+            fpm.addPass(llvm::LowerSwitchPass());
+        }
         fpm.addPass(llvm::SimplifyCFGPass());
         fpm.run(*entryFn, fam);
         if (pcFn && !pcFn->isDeclaration()) {
