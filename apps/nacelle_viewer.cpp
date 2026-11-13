@@ -201,22 +201,32 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--headless") {
+        if (arg == "--headless" || arg == "-headless") {
             headless = true;
-        } else if (arg == "--frames" && i + 1 < argc) {
+        } else if ((arg == "--frames" || arg == "-frames") && i + 1 < argc) {
             maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--dump" && i + 1 < argc) {
+        } else if ((arg == "--dump" || arg == "-dump") && i + 1 < argc) {
             dumpPath = argv[++i];
-        } else if (arg == "--ps" && i + 1 < argc) {
+        } else if ((arg == "--ps" || arg == "-ps") && i + 1 < argc) {
             psPath = argv[++i];
-        } else if (arg == "--vs" && i + 1 < argc) {
+        } else if ((arg == "--vs" || arg == "-vs") && i + 1 < argc) {
             vsPath = argv[++i];
-        } else if (arg == "--width" && i + 1 < argc) {
+        } else if ((arg == "--width" || arg == "-width") && i + 1 < argc) {
             kW = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--height" && i + 1 < argc) {
+        } else if ((arg == "--height" || arg == "-height") && i + 1 < argc) {
             kH = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else {
+            std::fprintf(stderr, "Unknown or incomplete option: %s\n", arg.c_str());
+            return 1;
         }
     }
+
+#if !defined(NACELLE_HAS_SDL3)
+    if (!headless) {
+        std::fprintf(stderr, "nacelle_viewer was built without SDL3; pass --headless (and optionally --dump <file.ppm>)\n");
+        return 1;
+    }
+#endif
 
     const bool customPsMode = !psPath.empty();
 
@@ -344,12 +354,25 @@ int main(int argc, char** argv) {
     SDL_Renderer* renderer = nullptr;
     SDL_Texture* tex = nullptr;
     if (!headless) {
-        if (SDL_Init(SDL_INIT_VIDEO)) {
-            win = SDL_CreateWindow("Nacelle D3D12 Viewer", static_cast<int>(kW), static_cast<int>(kH), 0);
-            renderer = SDL_CreateRenderer(win, nullptr);
-            if (renderer) SDL_SetRenderVSync(renderer, 1);
-            tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(kW), static_cast<int>(kH));
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            std::fprintf(stderr, "SDL_Init(SDL_INIT_VIDEO) failed: %s\n", SDL_GetError());
+            return 1;
         }
+        win = SDL_CreateWindow("Nacelle D3D12 Viewer", static_cast<int>(kW), static_cast<int>(kH), 0);
+        if (!win) {
+            std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+            SDL_Quit();
+            return 1;
+        }
+        renderer = SDL_CreateRenderer(win, nullptr);
+        if (!renderer) {
+            std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
+        SDL_SetRenderVSync(renderer, 1);
+        tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(kW), static_cast<int>(kH));
     }
 #endif
 
