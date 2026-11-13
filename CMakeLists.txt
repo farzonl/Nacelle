@@ -249,7 +249,19 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # 6. SDL3 Interactive + Headless Viewer
+option(NACELLE_FETCH_SDL3 "Automatically fetch prebuilt SDL3 VC SDK on Windows when SDL3 is not installed" ON)
 find_package(SDL3 QUIET HINTS /opt/homebrew /usr/local)
+if(WIN32 AND NOT SDL3_FOUND AND NACELLE_FETCH_SDL3)
+    include(FetchContent)
+    FetchContent_Declare(
+        nacelle_sdl3_vc
+        URL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-devel-3.4.20-VC.zip"
+        URL_HASH SHA256=1ec3009655ee37b1f73e52b3b120acc5afd8abaf9532f3303b1bf1dfe91b5969
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(nacelle_sdl3_vc)
+    find_package(SDL3 QUIET CONFIG PATHS "${nacelle_sdl3_vc_SOURCE_DIR}/cmake" NO_DEFAULT_PATH)
+endif()
 add_executable(nacelle_viewer apps/nacelle_viewer.cpp)
 add_dependencies(nacelle_viewer nacelle_test_shaders)
 target_include_directories(nacelle_viewer PRIVATE
@@ -270,6 +282,13 @@ if(SDL3_FOUND)
     message(STATUS "Found SDL3; enabling windowed mode in nacelle_viewer")
     target_compile_definitions(nacelle_viewer PRIVATE NACELLE_HAS_SDL3=1)
     target_link_libraries(nacelle_viewer PRIVATE SDL3::SDL3)
+    if(WIN32 AND TARGET SDL3::SDL3-shared)
+        add_custom_command(TARGET nacelle_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:SDL3::SDL3-shared>"
+                "$<TARGET_FILE_DIR:nacelle_viewer>"
+        )
+    endif()
 else()
     message(STATUS "SDL3 not found; nacelle_viewer will build in headless-only mode")
 endif()
