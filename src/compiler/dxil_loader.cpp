@@ -18,6 +18,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/ReplaceConstant.h>
 #include <llvm/Object/DXContainer.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -529,7 +530,11 @@ bool loadAndUpgradeDXIL(
 
     // Strip target-specific DXIL metadata/attributes that interfere with LLVM/MLIR import, while
     // running DXILUpgradePass first to convert legacy DXIL constructs and typed pointers.
+#if LLVM_VERSION_MAJOR >= 24
+    llvm::PassBuilder pb(llvmCtx);
+#else
     llvm::PassBuilder pb;
+#endif
     llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
     llvm::CGSCCAnalysisManager cgam;

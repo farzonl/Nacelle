@@ -27,6 +27,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Linker/Linker.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
@@ -191,10 +192,16 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         if (prof[0] == '1') {
             if (auto* oll = llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&rt.jit->getObjLinkingLayer())) {
                 if (rt.jit->getTargetTriple().isOSBinFormatMachO()) {
+#if LLVM_VERSION_MAJOR >= 24
+                    auto pluginOrErr = llvm::orc::GDBJITDebugInfoRegistrationPlugin::Create(
+                        rt.jit->getExecutionSession(),
+                        rt.jit->getTargetTriple());
+#else
                     auto pluginOrErr = llvm::orc::GDBJITDebugInfoRegistrationPlugin::Create(
                         rt.jit->getExecutionSession(),
                         *rt.jit->getProcessSymbolsJITDylib(),
                         rt.jit->getTargetTriple());
+#endif
                     if (pluginOrErr) {
                         oll->addPlugin(std::move(*pluginOrErr));
                     } else {
@@ -248,7 +255,11 @@ bool emitObjectBytesO3(
     llvm::CGSCCAnalysisManager cgam;
     llvm::ModuleAnalysisManager mam;
 
+#if LLVM_VERSION_MAJOR >= 24
+    llvm::PassBuilder pb(mod.getContext(), tm.get(), pto);
+#else
     llvm::PassBuilder pb(tm.get(), pto);
+#endif
     pb.registerModuleAnalyses(mam);
     pb.registerCGSCCAnalyses(cgam);
     pb.registerFunctionAnalyses(fam);
@@ -274,7 +285,11 @@ void runTier1Optimize(llvm::Module& mod) {
     llvm::CGSCCAnalysisManager cgam;
     llvm::ModuleAnalysisManager mam;
 
+#if LLVM_VERSION_MAJOR >= 24
+    llvm::PassBuilder pb(mod.getContext());
+#else
     llvm::PassBuilder pb;
+#endif
     pb.registerModuleAnalyses(mam);
     pb.registerCGSCCAnalyses(cgam);
     pb.registerFunctionAnalyses(fam);
@@ -538,7 +553,11 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         llvm::FunctionAnalysisManager fam;
         llvm::CGSCCAnalysisManager cgam;
         llvm::ModuleAnalysisManager mam;
+#if LLVM_VERSION_MAJOR >= 24
+        llvm::PassBuilder pb(llvmMod->getContext());
+#else
         llvm::PassBuilder pb;
+#endif
         pb.registerModuleAnalyses(mam);
         pb.registerCGSCCAnalyses(cgam);
         pb.registerFunctionAnalyses(fam);

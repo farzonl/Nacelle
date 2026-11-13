@@ -401,7 +401,7 @@ NacelleSwapChain::~NacelleSwapChain() {
 HRESULT STDMETHODCALLTYPE NacelleSwapChain::QueryInterface(REFIID riid, void** ppvObject) {
     if (!ppvObject) return E_POINTER;
     if (InlineIsEqualGUID(riid, __uuidof(IUnknown)) ||
-        InlineIsEqualGUID(riid, __uuidof(INacelleSwapChain))) {
+        InlineIsEqualGUID(riid, IID_INacelleSwapChain)) {
         *ppvObject = static_cast<INacelleSwapChain*>(this);
         AddRef();
         return S_OK;
