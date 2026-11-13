@@ -80,6 +80,7 @@ void setupClippedTriangle(
     const ShadedVertex& v1,
     const ShadedVertex& v2,
     const float* flatAttrsV0,
+    uint32_t primitiveId,
     const D3D12_VIEWPORT& vp,
     const D3D12_RASTERIZER_DESC& rast,
     RasterScene& scene) {
@@ -149,6 +150,7 @@ void setupClippedTriangle(
     tri.minY = minY;
     tri.maxY = maxY;
     tri.isFrontFace = isFront ? 1u : 0u;
+    tri.primitiveId = primitiveId;
 
     int64_t signFlip = isCW ? 1 : -1;
     int64_t posArea256 = signedArea256 * signFlip;
@@ -225,12 +227,24 @@ void processTriangle(
     const ShadedVertex& v0,
     const ShadedVertex& v1,
     const ShadedVertex& v2,
+    uint32_t primitiveId,
     const D3D12_VIEWPORT& vp,
     const D3D12_RASTERIZER_DESC& rast,
     RasterScene& scene,
     std::vector<ShadedVertex>& polyA,
     std::vector<ShadedVertex>& polyB) {
     uint32_t numScalars = scene.numPSInputScalars;
+
+    // SV_CullDistance: cull entire primitive if all vertices have < 0 for any active cull component
+    if (scene.cullDistMask != 0) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (!(scene.cullDistMask & (1u << k))) continue;
+            uint32_t s = scene.cullAttrOffset + k;
+            if (s < kMaxPSInputScalars && v0.attrs[s] < 0.0f && v1.attrs[s] < 0.0f && v2.attrs[s] < 0.0f) {
+                return;
+            }
+        }
+    }
 
     // Fast trivial reject against frustum planes
     auto allOut = [&](auto&& pred) {
@@ -246,19 +260,29 @@ void processTriangle(
         return;
     }
 
-    // Fast trivial accept
-    auto inside = [](const ShadedVertex& v) {
-        return v.clipW > 1e-6f &&
-               v.clipX >= -v.clipW && v.clipX <= v.clipW &&
-               v.clipY >= -v.clipW && v.clipY <= v.clipW &&
-               v.clipZ >= 0.0f && v.clipZ <= v.clipW;
+    // Fast trivial accept (only if no user clip planes are negative)
+    auto inside = [&](const ShadedVertex& v) {
+        if (!(v.clipW > 1e-6f &&
+              v.clipX >= -v.clipW && v.clipX <= v.clipW &&
+              v.clipY >= -v.clipW && v.clipY <= v.clipW &&
+              v.clipZ >= 0.0f && v.clipZ <= v.clipW)) {
+            return false;
+        }
+        if (scene.clipDistMask != 0) {
+            for (uint32_t k = 0; k < 8; ++k) {
+                if (!(scene.clipDistMask & (1u << k))) continue;
+                uint32_t s = scene.clipAttrOffset + k;
+                if (s < kMaxPSInputScalars && v.attrs[s] < 0.0f) return false;
+            }
+        }
+        return true;
     };
     if (inside(v0) && inside(v1) && inside(v2)) {
-        setupClippedTriangle(v0, v1, v2, v0.attrs, vp, rast, scene);
+        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vp, rast, scene);
         return;
     }
 
-    // Homogeneous 6-plane Sutherland-Hodgman clipping
+    // Homogeneous 6-plane + user clip-distance Sutherland-Hodgman clipping
     polyA.clear();
     polyA.push_back(v0);
     polyA.push_back(v1);
@@ -279,8 +303,19 @@ void processTriangle(
     clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - v.clipZ; });
     if (polyB.size() < 3) return;
 
+    if (scene.clipDistMask != 0) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (!(scene.clipDistMask & (1u << k))) continue;
+            uint32_t s = scene.clipAttrOffset + k;
+            if (s >= kMaxPSInputScalars) continue;
+            clipPolygonPlane(polyB, polyA, numScalars, [s](const ShadedVertex& v) { return v.attrs[s]; });
+            std::swap(polyA, polyB);
+            if (polyB.size() < 3) return;
+        }
+    }
+
     for (size_t k = 1; k + 1 < polyB.size(); ++k) {
-        setupClippedTriangle(polyB[0], polyB[k], polyB[k + 1], v0.attrs, vp, rast, scene);
+        setupClippedTriangle(polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vp, rast, scene);
     }
 }
 
@@ -344,7 +379,12 @@ bool buildRasterScene(
     outScene.fbHeight = fbH;
     outScene.numTilesX = (fbW + kTileSize - 1) / kTileSize;
     outScene.numTilesY = (fbH + kTileSize - 1) / kTileSize;
-    outScene.numPSInputScalars = std::min<uint32_t>(compiled->numPSInputRegs * 4, kMaxPSInputScalars);
+    outScene.numPSInputScalars = std::min<uint32_t>(
+        std::max(compiled->totalVSScalarAttrs, compiled->numPSInputRegs * 4), kMaxPSInputScalars);
+    outScene.clipDistMask = compiled->clipDistMask;
+    outScene.cullDistMask = compiled->cullDistMask;
+    outScene.clipAttrOffset = compiled->clipAttrOffset;
+    outScene.cullAttrOffset = compiled->cullAttrOffset;
     outScene.scissorRect = scissor;
     outScene.triangles.clear();
     outScene.attrBaseArena.clear();
@@ -352,10 +392,52 @@ bool buildRasterScene(
 
     const uint32_t W = std::max<uint32_t>(1, compiled->simdWidth);
     const uint32_t numScalars = outScene.numPSInputScalars;
-    const bool isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
-                          state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+    const bool hasTess = compiled->hasTess;
+    const bool hasGS = compiled->hasGS;
+    CompiledHullCPFn hsFn = hasTess ? compiled->hsFn.load(std::memory_order_acquire) : nullptr;
+    CompiledHullPCFn hsPcFn = hasTess ? compiled->hsPcFn.load(std::memory_order_acquire) : nullptr;
+    CompiledDomainFn dsFn = hasTess ? compiled->dsFn.load(std::memory_order_acquire) : nullptr;
+    CompiledGeometryFn gsFn = hasGS ? compiled->gsFn.load(std::memory_order_acquire) : nullptr;
+    const uint32_t vsOutScalars =
+        hasTess ? std::min<uint32_t>(compiled->numHSInputScalars, kMaxPSInputScalars)
+                : (hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars) : numScalars);
 
-    // Build triangle index triplets (referencing unique vertex indices)
+    uint32_t vertsPerPrim = 3;
+    bool isStrip = false;
+    if (hasTess) {
+        if (state.topology >= D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
+            state.topology <= D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST) {
+            vertsPerPrim = static_cast<uint32_t>(state.topology - D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1);
+        } else {
+            vertsPerPrim = std::max<uint32_t>(1, compiled->hsInputCPCount);
+        }
+    } else if (hasGS) {
+        switch (state.topology) {
+        case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+            vertsPerPrim = 1;
+            break;
+        case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+            vertsPerPrim = 2;
+            break;
+        case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+            vertsPerPrim = 2;
+            isStrip = true;
+            break;
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+            vertsPerPrim = 3;
+            isStrip = true;
+            break;
+        default:
+            vertsPerPrim = 3;
+            break;
+        }
+    } else {
+        isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+                   state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+    }
+
+    // Build primitive vertex index list (referencing unique vertex indices)
     std::vector<uint32_t> triVerts;
     std::vector<uint32_t> uniqueVIds;
     std::unordered_map<uint32_t, uint32_t> vIdToUnique;
@@ -369,11 +451,16 @@ bool buildRasterScene(
     if (!draw.indexed) {
         uint32_t n = draw.countPerInstance;
         if (!isStrip) {
-            triVerts.reserve((n / 3) * 3);
-            for (uint32_t i = 0; i + 2 < n; i += 3) {
-                triVerts.push_back(internVertex(draw.startIndexOrVertex + i + 0));
+            triVerts.reserve((n / vertsPerPrim) * vertsPerPrim);
+            for (uint32_t i = 0; i + vertsPerPrim - 1 < n; i += vertsPerPrim) {
+                for (uint32_t k = 0; k < vertsPerPrim; ++k) {
+                    triVerts.push_back(internVertex(draw.startIndexOrVertex + i + k));
+                }
+            }
+        } else if (vertsPerPrim == 2) {
+            for (uint32_t i = 0; i + 1 < n; ++i) {
+                triVerts.push_back(internVertex(draw.startIndexOrVertex + i));
                 triVerts.push_back(internVertex(draw.startIndexOrVertex + i + 1));
-                triVerts.push_back(internVertex(draw.startIndexOrVertex + i + 2));
             }
         } else {
             for (uint32_t i = 0; i + 2 < n; ++i) {
@@ -388,15 +475,13 @@ bool buildRasterScene(
     } else {
         uint32_t n = draw.countPerInstance;
         if (!isStrip) {
-            triVerts.reserve((n / 3) * 3);
-            for (uint32_t i = 0; i + 2 < n; i += 3) {
-                bool cut = false;
-                uint32_t r0 = readIndex(state.indexBuffer, draw.startIndexOrVertex + i + 0, cut);
-                uint32_t r1 = readIndex(state.indexBuffer, draw.startIndexOrVertex + i + 1, cut);
-                uint32_t r2 = readIndex(state.indexBuffer, draw.startIndexOrVertex + i + 2, cut);
-                triVerts.push_back(internVertex(static_cast<uint32_t>(static_cast<int32_t>(r0) + draw.baseVertexLocation)));
-                triVerts.push_back(internVertex(static_cast<uint32_t>(static_cast<int32_t>(r1) + draw.baseVertexLocation)));
-                triVerts.push_back(internVertex(static_cast<uint32_t>(static_cast<int32_t>(r2) + draw.baseVertexLocation)));
+            triVerts.reserve((n / vertsPerPrim) * vertsPerPrim);
+            for (uint32_t i = 0; i + vertsPerPrim - 1 < n; i += vertsPerPrim) {
+                for (uint32_t k = 0; k < vertsPerPrim; ++k) {
+                    bool cut = false;
+                    uint32_t r = readIndex(state.indexBuffer, draw.startIndexOrVertex + i + k, cut);
+                    triVerts.push_back(internVertex(static_cast<uint32_t>(static_cast<int32_t>(r) + draw.baseVertexLocation)));
+                }
             }
         } else {
             std::vector<uint32_t> stripRun;
@@ -408,7 +493,11 @@ bool buildRasterScene(
                     continue;
                 }
                 stripRun.push_back(static_cast<uint32_t>(static_cast<int32_t>(r) + draw.baseVertexLocation));
-                if (stripRun.size() >= 3) {
+                if (vertsPerPrim == 2 && stripRun.size() >= 2) {
+                    size_t m = stripRun.size();
+                    triVerts.push_back(internVertex(stripRun[m - 2]));
+                    triVerts.push_back(internVertex(stripRun[m - 1]));
+                } else if (vertsPerPrim == 3 && stripRun.size() >= 3) {
                     size_t m = stripRun.size();
                     bool odd = ((m - 3) & 1u) != 0;
                     uint32_t a = internVertex(stripRun[m - 3]);
@@ -429,10 +518,10 @@ bool buildRasterScene(
     std::vector<uint32_t> batchVIds(W, 0);
     std::vector<uint32_t> batchIIds(W, 0);
     std::vector<float> outPosXYZW(4 * W, 0.0f);
-    std::vector<float> outAttrs(std::max<uint32_t>(1, numScalars) * W, 0.0f);
+    std::vector<float> outAttrs(std::max<uint32_t>(1, vsOutScalars) * W, 0.0f);
     std::vector<ShadedVertex> polyA, polyB;
 
-    outScene.triangles.reserve((triVerts.size() / 3) * draw.instanceCount);
+    outScene.triangles.reserve((triVerts.size() / vertsPerPrim) * draw.instanceCount);
 
     for (uint32_t inst = 0; inst < draw.instanceCount; ++inst) {
         uint32_t instId = draw.startInstanceLocation + inst;
@@ -455,22 +544,240 @@ bool buildRasterScene(
                 sv.clipY = outPosXYZW[1 * W + l];
                 sv.clipZ = outPosXYZW[2 * W + l];
                 sv.clipW = outPosXYZW[3 * W + l];
-                for (uint32_t s = 0; s < numScalars; ++s) {
+                for (uint32_t s = 0; s < vsOutScalars; ++s) {
                     sv.attrs[s] = outAttrs[s * W + l];
                 }
             }
         }
 
-        for (size_t t = 0; t + 2 < triVerts.size(); t += 3) {
-            processTriangle(
-                shadedVerts[triVerts[t + 0]],
-                shadedVerts[triVerts[t + 1]],
-                shadedVerts[triVerts[t + 2]],
-                vp,
-                rast,
-                outScene,
-                polyA,
-                polyB);
+        auto runGSOnPrim = [&](const ShadedVertex* primVerts, uint32_t primVertCount, uint32_t primId,
+                               uint32_t inAttrScalars) {
+            uint32_t maxVerts = std::max<uint32_t>(1, compiled->gsMaxVertexCount);
+            std::vector<float> gsInPos(primVertCount * 4, 0.0f);
+            std::vector<float> gsInAttrs(std::max<uint32_t>(1, primVertCount * inAttrScalars), 0.0f);
+            std::vector<float> gsOutPos(maxVerts * 4, 0.0f);
+            std::vector<float> gsOutAttrs(std::max<uint32_t>(1, maxVerts * numScalars), 0.0f);
+            std::vector<uint32_t> gsStripCounts(maxVerts, 0);
+
+            auto makeGsVert = [&](uint32_t vIdx) {
+                ShadedVertex sv;
+                sv.clipX = gsOutPos[vIdx * 4 + 0];
+                sv.clipY = gsOutPos[vIdx * 4 + 1];
+                sv.clipZ = gsOutPos[vIdx * 4 + 2];
+                sv.clipW = gsOutPos[vIdx * 4 + 3];
+                for (uint32_t s = 0; s < numScalars; ++s) {
+                    sv.attrs[s] = gsOutAttrs[vIdx * numScalars + s];
+                }
+                return sv;
+            };
+
+            for (uint32_t k = 0; k < primVertCount; ++k) {
+                const ShadedVertex& sv = primVerts[k];
+                gsInPos[k * 4 + 0] = sv.clipX;
+                gsInPos[k * 4 + 1] = sv.clipY;
+                gsInPos[k * 4 + 2] = sv.clipZ;
+                gsInPos[k * 4 + 3] = sv.clipW;
+                for (uint32_t s = 0; s < inAttrScalars; ++s) {
+                    gsInAttrs[k * inAttrScalars + s] = sv.attrs[s];
+                }
+            }
+            for (uint32_t gInst = 0; gInst < std::max<uint32_t>(1, compiled->gsInstanceCount); ++gInst) {
+                uint32_t totalVerts = 0;
+                uint32_t numStrips = 0;
+                gsFn(&state.rootCtx, gsInPos.data(), gsInAttrs.data(), primId, gInst,
+                     gsOutPos.data(), gsOutAttrs.data(), gsStripCounts.data(), &totalVerts, &numStrips);
+                uint32_t baseV = 0;
+                for (uint32_t s = 0; s < numStrips; ++s) {
+                    uint32_t sc = gsStripCounts[s];
+                    if (compiled->gsOutputTopology == 5 && sc >= 3) { // TriangleStrip
+                        for (uint32_t k = 0; k + 2 < sc; ++k) {
+                            uint32_t i0 = baseV + k;
+                            uint32_t i1 = baseV + k + ((k & 1u) ? 2u : 1u);
+                            uint32_t i2 = baseV + k + ((k & 1u) ? 1u : 2u);
+                            processTriangle(makeGsVert(i0), makeGsVert(i1), makeGsVert(i2), primId, vp, rast, outScene, polyA, polyB);
+                        }
+                    }
+                    baseV += sc;
+                }
+            }
+        };
+
+        if (hasTess && hsFn && hsPcFn && dsFn) {
+            uint32_t inCPCount = vertsPerPrim;
+            uint32_t outCPCount = std::max<uint32_t>(1, compiled->hsOutputCPCount);
+            uint32_t inAttrScalars = std::max<uint32_t>(1, compiled->numHSInputScalars);
+            uint32_t outAttrScalars = std::max<uint32_t>(1, compiled->numHSOutputScalars);
+            uint32_t pcScalars = std::max<uint32_t>(1, compiled->numPatchConstScalars);
+            uint32_t dsOutScalars =
+                hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars) : numScalars;
+
+            std::vector<float> inCPAttrs(inCPCount * inAttrScalars, 0.0f);
+            std::vector<float> outCPAttrs(outCPCount * outAttrScalars, 0.0f);
+            std::vector<float> patchConsts(pcScalars, 0.0f);
+            float tessFactors[6]{};
+            std::vector<float> dsPos(4, 0.0f);
+            std::vector<float> dsAttrs(std::max<uint32_t>(1, dsOutScalars), 0.0f);
+
+            auto partitionTF = [&](float tf) -> uint32_t {
+                float clamped = std::clamp(tf, 1.0f, std::max(1.0f, compiled->hsMaxTessFactor));
+                switch (compiled->tessPartitioning) {
+                case 2: { // pow2
+                    float p2 = std::pow(2.0f, std::ceil(std::log2(clamped)));
+                    return static_cast<uint32_t>(std::max(1.0f, p2));
+                }
+                case 3: { // fractional_odd
+                    uint32_t c = static_cast<uint32_t>(std::ceil(clamped));
+                    return (c > 1 && (c % 2u) == 0u) ? (c + 1u) : std::max<uint32_t>(1, c);
+                }
+                case 4: { // fractional_even
+                    uint32_t c = static_cast<uint32_t>(std::ceil(clamped));
+                    return ((c % 2u) != 0u) ? (c + 1u) : std::max<uint32_t>(2, c);
+                }
+                default: // integer / undefined
+                    return static_cast<uint32_t>(std::max(1.0f, std::ceil(clamped)));
+                }
+            };
+
+            uint32_t numPatches = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
+            for (uint32_t p = 0; p < numPatches; ++p) {
+                std::fill(inCPAttrs.begin(), inCPAttrs.end(), 0.0f);
+                for (uint32_t k = 0; k < inCPCount; ++k) {
+                    const ShadedVertex& sv = shadedVerts[triVerts[p * vertsPerPrim + k]];
+                    uint32_t copyCount = std::min<uint32_t>(vsOutScalars, inAttrScalars);
+                    for (uint32_t s = 0; s < copyCount; ++s) {
+                        inCPAttrs[k * inAttrScalars + s] = sv.attrs[s];
+                    }
+                }
+                std::fill(outCPAttrs.begin(), outCPAttrs.end(), 0.0f);
+                for (uint32_t outCp = 0; outCp < outCPCount; ++outCp) {
+                    hsFn(&state.rootCtx, inCPAttrs.data(), p, outCp, &outCPAttrs[outCp * outAttrScalars]);
+                }
+                std::fill(patchConsts.begin(), patchConsts.end(), 0.0f);
+                std::fill(std::begin(tessFactors), std::end(tessFactors), 0.0f);
+                hsPcFn(&state.rootCtx, inCPAttrs.data(), outCPAttrs.data(), p, patchConsts.data(), tessFactors);
+
+                auto evalDS = [&](float u, float v, float w) -> ShadedVertex {
+                    std::fill(dsPos.begin(), dsPos.end(), 0.0f);
+                    std::fill(dsAttrs.begin(), dsAttrs.end(), 0.0f);
+                    dsFn(&state.rootCtx, outCPAttrs.data(), patchConsts.data(), tessFactors,
+                         p, u, v, w, dsPos.data(), dsAttrs.data());
+                    ShadedVertex sv;
+                    sv.clipX = dsPos[0];
+                    sv.clipY = dsPos[1];
+                    sv.clipZ = dsPos[2];
+                    sv.clipW = dsPos[3];
+                    for (uint32_t s = 0; s < dsOutScalars; ++s) {
+                        sv.attrs[s] = dsAttrs[s];
+                    }
+                    return sv;
+                };
+
+                auto emitTri = [&](const ShadedVertex& a, const ShadedVertex& b, const ShadedVertex& c) {
+                    if (hasGS && gsFn) {
+                        ShadedVertex tri[3] = {a, b, c};
+                        runGSOnPrim(tri, 3, p, dsOutScalars);
+                    } else {
+                        processTriangle(a, b, c, p, vp, rast, outScene, polyA, polyB);
+                    }
+                };
+
+                if (compiled->tessDomain == 1) { // Isoline
+                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f)) continue;
+                    uint32_t numLines = partitionTF(tessFactors[0]);
+                    uint32_t numSegs = partitionTF(tessFactors[1]);
+                    for (uint32_t li = 0; li < numLines; ++li) {
+                        float v = static_cast<float>(li) / static_cast<float>(numLines);
+                        for (uint32_t si = 0; si <= numSegs; ++si) {
+                            float u = static_cast<float>(si) / static_cast<float>(numSegs);
+                            (void)evalDS(u, v, 0.0f);
+                        }
+                    }
+                } else if (compiled->tessDomain == 2) { // Tri
+                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) || !(tessFactors[2] > 0.0f)) continue;
+                    uint32_t n = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[1]),
+                                           partitionTF(tessFactors[2]), partitionTF(tessFactors[4])});
+                    std::vector<std::vector<ShadedVertex>> rows(n + 1);
+                    for (uint32_t i = 0; i <= n; ++i) {
+                        rows[i].resize(n - i + 1);
+                        for (uint32_t j = 0; j <= n - i; ++j) {
+                            float u = static_cast<float>(i) / static_cast<float>(n);
+                            float v = static_cast<float>(j) / static_cast<float>(n);
+                            float w = std::max(0.0f, 1.0f - u - v);
+                            rows[i][j] = evalDS(u, v, w);
+                        }
+                    }
+                    bool cw = (compiled->tessOutputPrimitive == 3);
+                    for (uint32_t i = 0; i < n; ++i) {
+                        for (uint32_t j = 0; j < n - i; ++j) {
+                            if (cw) {
+                                emitTri(rows[i][j], rows[i][j + 1], rows[i + 1][j]);
+                            } else {
+                                emitTri(rows[i][j], rows[i + 1][j], rows[i][j + 1]);
+                            }
+                            if (i + j + 1 < n) {
+                                if (cw) {
+                                    emitTri(rows[i + 1][j], rows[i][j + 1], rows[i + 1][j + 1]);
+                                } else {
+                                    emitTri(rows[i + 1][j], rows[i + 1][j + 1], rows[i][j + 1]);
+                                }
+                            }
+                        }
+                    }
+                } else if (compiled->tessDomain == 3) { // Quad
+                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) ||
+                        !(tessFactors[2] > 0.0f) || !(tessFactors[3] > 0.0f)) {
+                        continue;
+                    }
+                    uint32_t nu = std::max({partitionTF(tessFactors[1]), partitionTF(tessFactors[3]), partitionTF(tessFactors[4])});
+                    uint32_t nv = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[2]), partitionTF(tessFactors[5])});
+                    std::vector<ShadedVertex> grid((nv + 1) * (nu + 1));
+                    for (uint32_t j = 0; j <= nv; ++j) {
+                        float v = static_cast<float>(j) / static_cast<float>(nv);
+                        for (uint32_t i = 0; i <= nu; ++i) {
+                            float u = static_cast<float>(i) / static_cast<float>(nu);
+                            grid[j * (nu + 1) + i] = evalDS(u, v, 0.0f);
+                        }
+                    }
+                    bool cw = (compiled->tessOutputPrimitive == 3);
+                    for (uint32_t j = 0; j < nv; ++j) {
+                        for (uint32_t i = 0; i < nu; ++i) {
+                            const ShadedVertex& v00 = grid[j * (nu + 1) + i];
+                            const ShadedVertex& v10 = grid[j * (nu + 1) + (i + 1)];
+                            const ShadedVertex& v01 = grid[(j + 1) * (nu + 1) + i];
+                            const ShadedVertex& v11 = grid[(j + 1) * (nu + 1) + (i + 1)];
+                            if (cw) {
+                                emitTri(v00, v11, v10);
+                                emitTri(v00, v01, v11);
+                            } else {
+                                emitTri(v00, v10, v11);
+                                emitTri(v00, v11, v01);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (hasGS && gsFn) {
+            uint32_t numPrims = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
+            std::vector<ShadedVertex> primVerts(vertsPerPrim);
+            for (uint32_t p = 0; p < numPrims; ++p) {
+                for (uint32_t k = 0; k < vertsPerPrim; ++k) {
+                    primVerts[k] = shadedVerts[triVerts[p * vertsPerPrim + k]];
+                }
+                runGSOnPrim(primVerts.data(), vertsPerPrim, p, vsOutScalars);
+            }
+        } else {
+            for (size_t t = 0; t + 2 < triVerts.size(); t += 3) {
+                processTriangle(
+                    shadedVerts[triVerts[t + 0]],
+                    shadedVerts[triVerts[t + 1]],
+                    shadedVerts[triVerts[t + 2]],
+                    static_cast<uint32_t>(t / 3),
+                    vp,
+                    rast,
+                    outScene,
+                    polyA,
+                    polyB);
+            }
         }
     }
 

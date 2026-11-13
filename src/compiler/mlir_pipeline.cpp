@@ -157,7 +157,8 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
     std::unique_ptr<llvm::Module> llvmModule,
     const std::string& entryName,
     mlir::MLIRContext& mlirCtx,
-    std::string& outError) {
+    std::string& outError,
+    const std::string& extraEntryName) {
     configureNacelleMLIRContext(mlirCtx);
 
     auto mlirMod = mlir::translateLLVMIRToModule(std::move(llvmModule), &mlirCtx);
@@ -168,6 +169,11 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
 
     if (!convertLLVMFuncShellToCF(*mlirMod, entryName, outError)) {
         return nullptr;
+    }
+    if (!extraEntryName.empty() && extraEntryName != entryName) {
+        if (!convertLLVMFuncShellToCF(*mlirMod, extraEntryName, outError)) {
+            return nullptr;
+        }
     }
 
     mlir::PassManager pm(&mlirCtx);

@@ -1297,7 +1297,7 @@ private:
                         for (mlir::Value r : ifOp.getResults()) {
                             sub.packSimdToValues(nloc, sub.makeZeroSimd(nloc, r.getType()), zeros);
                         }
-                        if (hasRealMaskOut) zeros.push_back(curReal);
+                        if (hasRealMaskOut) zeros.push_back(bReal);
                         mlir::scf::YieldOp::create(nb, nloc, zeros);
                     });
                 for (mlir::Value r : guard.getResults()) outPacked.push_back(r);
@@ -1873,15 +1873,20 @@ private:
             return packetizeTextureOp(call, op, execMask, realMask, outError);
         }
 
-        // 7. VS / PS Input/Output & Discard
-        if (op == 4) { // loadInput
+        // 7. VS / GS / HS / DS / PS Input/Output, Stream, & Discard
+        if (op == 4) { // loadInput(sigId, row, col, gsVertexAxis)
             uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
             SimdVal row = getMapped(loc, arg(2));
             uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
             SimdVal res;
-            if (!hooks_.loadInput || !hooks_.loadInput(b_, loc, sigId, row, col, resTy(), res)) {
-                res = makeZeroSimd(loc, resTy());
+            bool ok = false;
+            if (hooks_.loadInputWithVertex) {
+                SimdVal vAxis = (call.getNumOperands() > 4) ? getMapped(loc, arg(4)) : makeZeroSimd(loc, i32Ty());
+                ok = hooks_.loadInputWithVertex(b_, loc, sigId, row, col, vAxis, resTy(), res);
+            } else if (hooks_.loadInput) {
+                ok = hooks_.loadInput(b_, loc, sigId, row, col, resTy(), res);
             }
+            if (!ok) res = makeZeroSimd(loc, resTy());
             setMapped(call.getResult(), res);
             return true;
         }
@@ -1893,6 +1898,84 @@ private:
             if (hooks_.storeOutput) {
                 if (!hooks_.storeOutput(b_, loc, sigId, row, col, val, realMask)) return false;
             }
+            return true;
+        }
+        if (op == 97 || op == 98 || op == 99) { // emitStream / cutStream / emitThenCutStream
+            uint32_t streamId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            if ((op == 97 || op == 99) && hooks_.emitStream) {
+                if (!hooks_.emitStream(b_, loc, streamId, realMask)) return false;
+            }
+            if ((op == 98 || op == 99) && hooks_.cutStream) {
+                if (!hooks_.cutStream(b_, loc, streamId, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 100) { // gsInstanceID
+            SimdVal res;
+            if (!hooks_.loadGSInstanceId || !hooks_.loadGSInstanceId(b_, loc, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
+            return true;
+        }
+        if (op == 103) { // loadOutputControlPoint(sigId, row, col, cpId)
+            uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal row = getMapped(loc, arg(2));
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
+            SimdVal cpId = getMapped(loc, arg(4));
+            SimdVal res;
+            if (!hooks_.loadOutputControlPoint ||
+                !hooks_.loadOutputControlPoint(b_, loc, sigId, row, col, cpId, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
+            return true;
+        }
+        if (op == 104) { // loadPatchConstant(sigId, row, col)
+            uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal row = getMapped(loc, arg(2));
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
+            SimdVal res;
+            if (!hooks_.loadPatchConstant ||
+                !hooks_.loadPatchConstant(b_, loc, sigId, row, col, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
+            return true;
+        }
+        if (op == 105) { // domainLocation(col)
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal res;
+            if (!hooks_.loadDomainLocation || !hooks_.loadDomainLocation(b_, loc, col, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
+            return true;
+        }
+        if (op == 106) { // storePatchConstant(sigId, row, col, val)
+            uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal row = getMapped(loc, arg(2));
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
+            SimdVal val = getMapped(loc, arg(4));
+            if (hooks_.storePatchConstant) {
+                if (!hooks_.storePatchConstant(b_, loc, sigId, row, col, val, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 107) { // outputControlPointID
+            SimdVal res;
+            if (!hooks_.loadOutputControlPointId || !hooks_.loadOutputControlPointId(b_, loc, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
+            return true;
+        }
+        if (op == 108) { // primitiveID
+            SimdVal res;
+            if (!hooks_.loadPrimitiveId || !hooks_.loadPrimitiveId(b_, loc, resTy(), res)) {
+                res = makeZeroSimd(loc, resTy());
+            }
+            setMapped(call.getResult(), res);
             return true;
         }
         if (op == 82) { // discard(cond)

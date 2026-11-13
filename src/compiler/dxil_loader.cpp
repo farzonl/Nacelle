@@ -174,6 +174,9 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
                 if (sigTuple->getNumOperands() >= 2) {
                     parseSignatureList(llvm::dyn_cast_or_null<llvm::MDNode>(sigTuple->getOperand(1).get()), out.outputSigs);
                 }
+                if (sigTuple->getNumOperands() >= 3) {
+                    parseSignatureList(llvm::dyn_cast_or_null<llvm::MDNode>(sigTuple->getOperand(2).get()), out.patchConstSigs);
+                }
             }
             if (out.resources.empty()) {
                 if (auto* epRes = llvm::dyn_cast_or_null<llvm::MDNode>(ep->getOperand(3).get())) {
@@ -183,7 +186,44 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
             if (auto* props = llvm::dyn_cast_or_null<llvm::MDNode>(ep->getOperand(4).get())) {
                 for (unsigned p = 0; p + 1 < props->getNumOperands(); p += 2) {
                     uint32_t tag = mdAsUInt(props->getOperand(p).get());
-                    if (tag == 4) {
+                    if (tag == 1) { // kDxilGSStateTag
+                        if (auto* gs = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (gs->getNumOperands() >= 5) {
+                                out.gsInputPrimitive = mdAsUInt(gs->getOperand(0).get(), 0);
+                                out.gsMaxVertexCount = mdAsUInt(gs->getOperand(1).get(), 0);
+                                out.gsActiveStreamMask = mdAsUInt(gs->getOperand(2).get(), 1);
+                                out.gsOutputTopology = mdAsUInt(gs->getOperand(3).get(), 5);
+                                out.gsInstanceCount = std::max(1u, mdAsUInt(gs->getOperand(4).get(), 1));
+                            }
+                        }
+                    } else if (tag == 2) { // kDxilDSStateTag
+                        if (auto* ds = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (ds->getNumOperands() >= 2) {
+                                out.tessDomain = mdAsUInt(ds->getOperand(0).get(), 0);
+                                out.dsInputControlPointCount = mdAsUInt(ds->getOperand(1).get(), 0);
+                            }
+                        }
+                    } else if (tag == 3) { // kDxilHSStateTag
+                        if (auto* hs = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (hs->getNumOperands() >= 7) {
+                                if (auto* pcFnVal = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(hs->getOperand(0).get())) {
+                                    if (auto* pcFn = llvm::dyn_cast<llvm::Function>(pcFnVal->getValue())) {
+                                        out.hsPatchConstFnName = pcFn->getName().str();
+                                    }
+                                }
+                                out.hsInputControlPointCount = mdAsUInt(hs->getOperand(1).get(), 0);
+                                out.hsOutputControlPointCount = mdAsUInt(hs->getOperand(2).get(), 0);
+                                out.tessDomain = mdAsUInt(hs->getOperand(3).get(), 0);
+                                out.tessPartitioning = mdAsUInt(hs->getOperand(4).get(), 0);
+                                out.tessOutputPrimitive = mdAsUInt(hs->getOperand(5).get(), 0);
+                                if (auto* c = llvm::dyn_cast_or_null<llvm::ConstantAsMetadata>(hs->getOperand(6).get())) {
+                                    if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c->getValue())) {
+                                        out.hsMaxTessFactor = cf->getValueAPF().convertToFloat();
+                                    }
+                                }
+                            }
+                        }
+                    } else if (tag == 4) { // kDxilNumThreadsTag
                         if (auto* tgs = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
                             for (unsigned k = 0; k < 3 && k < tgs->getNumOperands(); ++k) {
                                 out.threadGroupSize[k] = std::max(1u, mdAsUInt(tgs->getOperand(k).get(), 1));
@@ -474,6 +514,13 @@ const DxilSigRecord* DxilLoadedShader::findOutputSig(uint32_t sigId) const {
     return nullptr;
 }
 
+const DxilSigRecord* DxilLoadedShader::findPatchConstSig(uint32_t sigId) const {
+    for (const auto& s : patchConstSigs) {
+        if (s.sigId == sigId) return &s;
+    }
+    return nullptr;
+}
+
 const std::string& getHostDataLayoutString() {
     std::call_once(gHostInfoOnce, initHostInfo);
     return gHostDataLayoutStr;
@@ -557,9 +604,10 @@ bool loadAndUpgradeDXIL(
     pb.registerLoopAnalyses(lam);
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
-    // Force internal helper functions inline into entry
+    // Force internal helper functions inline into entry (keep hull patch-constant entry intact)
     for (auto& fn : *mod) {
-        if (!fn.isDeclaration() && fn.getName() != outShader.entryName) {
+        if (!fn.isDeclaration() && fn.getName() != outShader.entryName &&
+            (outShader.hsPatchConstFnName.empty() || fn.getName() != outShader.hsPatchConstFnName)) {
             fn.setLinkage(llvm::GlobalValue::InternalLinkage);
             fn.addFnAttr(llvm::Attribute::AlwaysInline);
         }
@@ -577,11 +625,14 @@ bool loadAndUpgradeDXIL(
         outError = "Entry function not found in DXIL module: " + outShader.entryName;
         return false;
     }
+    llvm::Function* pcFn = outShader.hsPatchConstFnName.empty()
+                               ? nullptr
+                               : mod->getFunction(outShader.hsPatchConstFnName);
 
     // Erase non-entry helper definitions after inlining
     llvm::SmallVector<llvm::Function*, 8> deadFns;
     for (auto& fn : *mod) {
-        if (!fn.isDeclaration() && &fn != entryFn && fn.use_empty()) {
+        if (!fn.isDeclaration() && &fn != entryFn && &fn != pcFn && fn.use_empty()) {
             deadFns.push_back(&fn);
         }
     }
@@ -590,6 +641,10 @@ bool loadAndUpgradeDXIL(
     outShader.groupSharedBytes = lowerGroupSharedGlobals(*mod, entryFn);
     unifyExitBlocks(*entryFn);
     scanDxilFlags(*entryFn, outShader);
+    if (pcFn && !pcFn->isDeclaration()) {
+        unifyExitBlocks(*pcFn);
+        scanDxilFlags(*pcFn, outShader);
+    }
 
     // Promote allocas and clean CFG (removing switch ops) before MLIR import
     fam.clear();
@@ -600,8 +655,14 @@ bool loadAndUpgradeDXIL(
         fpm.addPass(llvm::LowerSwitchPass());
         fpm.addPass(llvm::SimplifyCFGPass());
         fpm.run(*entryFn, fam);
+        if (pcFn && !pcFn->isDeclaration()) {
+            fpm.run(*pcFn, fam);
+        }
     }
     unifyExitBlocks(*entryFn);
+    if (pcFn && !pcFn->isDeclaration()) {
+        unifyExitBlocks(*pcFn);
+    }
 
     // Remove DXIL-specific named metadata (already extracted into DxilLoadedShader)
     llvm::SmallVector<llvm::NamedMDNode*, 8> mdToDrop;
