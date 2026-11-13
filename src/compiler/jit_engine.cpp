@@ -13,6 +13,7 @@
 
 #include <BS_thread_pool.hpp>
 
+#include <llvm/ADT/FloatingPointMode.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -48,6 +49,9 @@
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Conversion/UBToLLVM/UBToLLVM.h>
 #include <mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/Math/IR/Math.h>
+#include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Target/LLVMIR/Export.h>
@@ -111,7 +115,7 @@ std::string hashToHex128(uint64_t lo, uint64_t hi) {
 
 namespace {
 
-constexpr uint32_t kCompilerMagicVersion = 0x4E434A33; // 'NCJ3'
+constexpr uint32_t kCompilerMagicVersion = 0x4E434A34; // 'NCJ4'
 
 struct HashFeed {
     std::vector<uint8_t> buf;
@@ -497,8 +501,37 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
     std::string& outError) {
+    {
+        mlir::PassManager canonPm(mlirMod.getContext());
+        canonPm.addPass(mlir::createCanonicalizerPass());
+        if (mlir::failed(canonPm.run(mlirMod))) {
+            outError = "MLIR canonicalization pass failed";
+            return nullptr;
+        }
+    }
+
+    // Upstream MLIR's ConvertMathToLLVMPass lowers math.isnan and math.isfinite
+    // to LLVM::IsFPClass, but omits math.isinf and math.isnormal, which would
+    // otherwise be rejected as illegal by ConvertMathToLibmPass.
+    mlirMod.walk([](mlir::Operation* op) {
+        if (auto isInf = llvm::dyn_cast<mlir::math::IsInfOp>(op)) {
+            mlir::OpBuilder b(isInf);
+            auto repl = mlir::LLVM::IsFPClass::create(
+                b, isInf.getLoc(), isInf.getResult().getType(),
+                isInf.getOperand(), static_cast<uint32_t>(llvm::fcInf));
+            isInf.replaceAllUsesWith(repl.getRes());
+            isInf.erase();
+        } else if (auto isNorm = llvm::dyn_cast<mlir::math::IsNormalOp>(op)) {
+            mlir::OpBuilder b(isNorm);
+            auto repl = mlir::LLVM::IsFPClass::create(
+                b, isNorm.getLoc(), isNorm.getResult().getType(),
+                isNorm.getOperand(), static_cast<uint32_t>(llvm::fcNormal));
+            isNorm.replaceAllUsesWith(repl.getRes());
+            isNorm.erase();
+        }
+    });
+
     mlir::PassManager pm(mlirMod.getContext());
-    pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createSCFToControlFlowPass());
     pm.addPass(mlir::createConvertVectorToLLVMPass());
     pm.addPass(mlir::createConvertMathToLLVMPass());

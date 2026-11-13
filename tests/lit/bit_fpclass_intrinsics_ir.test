@@ -1,0 +1,54 @@
+// RUN: %split_file %s %t
+// RUN: %dxc -enable-16bit-types -T cs_6_5 -E CSMain -Fo %t/shader.dxil %t/shader.hlsl
+// RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t/shader.dxil | %FileCheck %s --check-prefix=SIMD8
+// RUN: %nacelle_compile --simd-width=4 --emit-llvm %t/shader.dxil | %FileCheck %s --check-prefix=LLVM4
+// RUN: %nacelle_compile --simd-width=16 --emit-llvm %t/shader.dxil | %FileCheck %s --check-prefix=LLVM16
+
+//--- shader.hlsl
+StructuredBuffer<int64_t4>  InI64 : register(t0);
+StructuredBuffer<uint16_t4> InU16 : register(t1);
+StructuredBuffer<float4>    InF32 : register(t2);
+StructuredBuffer<half4>     InF16 : register(t3);
+
+RWStructuredBuffer<uint4>   OutU32 : register(u0);
+
+[RootSignature("DescriptorTable(SRV(t0, numDescriptors = 4), UAV(u0, numDescriptors = 1))")]
+[numthreads(8, 1, 1)]
+void CSMain(uint3 tid : SV_DispatchThreadID) {
+    uint i = tid.x;
+    uint4 pop64 = countbits(InI64[i]);
+    uint4 pop16 = countbits(InU16[i]);
+    uint4 fblo64 = firstbitlow(InI64[i]);
+    uint4 fbhi64 = firstbithigh(InI64[i]);
+    bool4 inf32 = isinf(InF32[i]);
+    bool4 inf16 = isinf(InF16[i]);
+    bool2x2 infMat = isinf(float2x2(InF32[i].xy, InF32[i].zw));
+
+    OutU32[i * 4u + 0u] = pop64 + pop16;
+    OutU32[i * 4u + 1u] = fblo64 ^ fbhi64;
+    OutU32[i * 4u + 2u] = uint4(inf32) + uint4(inf16);
+    OutU32[i * 4u + 3u] = uint4(infMat[0], infMat[1]);
+}
+
+// SIMD8: func.func @nacelle_cs_test
+// SIMD8-DAG: math.ctpop {{.*}} : vector<8xi64>
+// SIMD8-DAG: arith.trunci {{.*}} : vector<8xi64> to vector<8xi32>
+// SIMD8-DAG: math.ctpop {{.*}} : vector<8xi16>
+// SIMD8-DAG: arith.extui {{.*}} : vector<8xi16> to vector<8xi32>
+// SIMD8-DAG: math.cttz {{.*}} : vector<8xi64>
+// SIMD8-DAG: math.ctlz {{.*}} : vector<8xi64>
+// SIMD8-DAG: math.isinf {{.*}} : vector<8xf32>
+// SIMD8-NOT: dx.op.unaryBits
+// SIMD8-NOT: dx.op.isSpecialFloat
+
+// LLVM4: define void @nacelle_cs_test
+// LLVM4-DAG: call <4 x i64> @llvm.ctpop.v4i64(<4 x i64>
+// LLVM4-DAG: call <4 x i16> @llvm.ctpop.v4i16(<4 x i16>
+// LLVM4-DAG: call <4 x i1> @llvm.is.fpclass.v4f32(<4 x float> {{.*}}, {{.*}}i32 516)
+// LLVM4-NOT: dx.op.
+
+// LLVM16: define void @nacelle_cs_test
+// LLVM16-DAG: call <16 x i64> @llvm.ctpop.v16i64(<16 x i64>
+// LLVM16-DAG: call <16 x i16> @llvm.ctpop.v16i16(<16 x i16>
+// LLVM16-DAG: call <16 x i1> @llvm.is.fpclass.v16f32(<16 x float> {{.*}}, {{.*}}i32 516)
+// LLVM16-NOT: dx.op.

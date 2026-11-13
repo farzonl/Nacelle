@@ -6,6 +6,7 @@ RWStructuredBuffer<uint64_t> gOut64    : register(u0);
 RWByteAddressBuffer          gRaw      : register(u1);
 RWBuffer<float>              gFloatBuf : register(u2);
 RWTexture2D<uint>            gTex      : register(u3);
+RWStructuredBuffer<int64_t>  gOutS64   : register(u4);
 
 groupshared uint     gsSum32;
 groupshared uint64_t gsSum64;
@@ -25,9 +26,25 @@ void CSMain(uint3 gtid : SV_GroupThreadID) {
         gOut64[0] = 0ull;
         gOut64[1] = 0x1122334455667788ull;
         gOut64[2] = 0xCAFEBABE00000001ull;
+        gOut64[24] = 0xFFFFFFFFFFFFFFFFull;
+        gOut64[25] = 0ull;
+        gOut64[26] = 0xAAAAAAAAAAAAAAAAull;
+        gOut64[27] = 0xFFFFFFFFFFFFFFFFull;
+        gOut64[28] = 0ull;
+
+        gOutS64[0] = -1ll;
+        gOutS64[1] = 0ll;
+        gOutS64[2] = 0x5555555555555555ll;
+        gOutS64[3] = 1000ll;
+        gOutS64[4] = -1000ll;
 
         gRaw.Store(0, 0u);
         gRaw.Store<uint64_t>(8, 0ull);
+        gRaw.Store<uint64_t>(16, 0xFFFFFFFFFFFFFFFFull);
+        gRaw.Store<uint64_t>(24, 0ull);
+        gRaw.Store<uint64_t>(32, 0xFFFF0000FFFF0000ull);
+        gRaw.Store<uint64_t>(40, 0xFFFFFFFFFFFFFFFFull);
+        gRaw.Store<uint64_t>(48, 0ull);
 
         gFloatBuf[0] = -5.0f;
         gFloatBuf[1] = 9.0f;
@@ -88,6 +105,28 @@ void CSMain(uint3 gtid : SV_GroupThreadID) {
 
     uint64_t prevRaw64;
     gRaw.InterlockedAdd64(8, 0x100000002ull, prevRaw64);
+
+    // 64-bit resource InterlockedAnd / Or / Xor / Min / Max (unsigned, signed, and raw buffer).
+    uint64_t nibBit = 1ull << (tid * 4u);
+    InterlockedAnd(gOut64[24], ~nibBit);
+    InterlockedOr(gOut64[25], nibBit);
+    InterlockedXor(gOut64[26], nibBit);
+    InterlockedMin(gOut64[27], uint64_t(tid + 5u) * 0x100000001ull);
+    InterlockedMax(gOut64[28], uint64_t(tid + 5u) * 0x100000001ull);
+
+    int64_t prevS64;
+    InterlockedAnd(gOutS64[0], ~int64_t(1ull << tid), prevS64);
+    InterlockedOr(gOutS64[1], int64_t(1ull << (tid + 32u)), prevS64);
+    InterlockedXor(gOutS64[2], int64_t(nibBit), prevS64);
+    InterlockedMin(gOutS64[3], int64_t(tid) - 50ll, prevS64);
+    InterlockedMax(gOutS64[4], int64_t(tid) - 5ll, prevS64);
+
+    uint64_t prevRawBit64;
+    gRaw.InterlockedAnd64(16, ~(1ull << tid));
+    gRaw.InterlockedOr64(24, 1ull << (tid + 32u), prevRawBit64);
+    gRaw.InterlockedXor64(32, 1ull << tid, prevRawBit64);
+    gRaw.InterlockedMin64(40, uint64_t(tid + 7u) * 0x100000001ull);
+    gRaw.InterlockedMax64(48, uint64_t(tid + 7u) * 0x100000001ull, prevRawBit64);
 
     // RWTexture2D<uint> lossless 0xFFFFFFFFu load/store + InterlockedCompareStore.
     uint texBefore = gTex[uint2(tid, 0u)];

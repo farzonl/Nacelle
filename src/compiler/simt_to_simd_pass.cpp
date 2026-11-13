@@ -1087,8 +1087,20 @@ private:
             return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MinSIOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::SMaxOp>(&op))
             return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MaxSIOp::create(b_, loc, rt, a, c); });
-        if (llvm::isa<mlir::LLVM::CtPopOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::CtPopOp::create(b_, loc, rt, a); });
+        auto castIntVec = [&](mlir::Value v, mlir::Type dstElem) -> mlir::Value {
+            mlir::Type srcElem = llvm::cast<mlir::VectorType>(v.getType()).getElementType();
+            if (srcElem == dstElem) return v;
+            return (srcElem.getIntOrFloatBitWidth() > dstElem.getIntOrFloatBitWidth())
+                       ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vecTy(dstElem), v))
+                       : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vecTy(dstElem), v));
+        };
+        if (llvm::isa<mlir::LLVM::CtPopOp>(&op)) {
+            mlir::Type resElem = op.getResult(0).getType();
+            mlir::Value a = asVec(loc, getMapped(loc, op.getOperand(0)));
+            mlir::Value r = castIntVec(mlir::math::CtPopOp::create(b_, loc, a.getType(), a), resElem);
+            setMapped(op.getResult(0), {SimdVal::Kind::Vector, resElem, r, {}, {}});
+            return true;
+        }
         if (llvm::isa<mlir::LLVM::BitReverseOp>(&op))
             return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::BitReverseOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FMAOp, mlir::LLVM::FMulAddOp>(&op)) {
@@ -1103,13 +1115,21 @@ private:
         if (auto ctlz = llvm::dyn_cast<mlir::LLVM::CountLeadingZerosOp>(&op)) {
             mlir::Type resElem = ctlz.getType();
             mlir::Value a = asVec(loc, getMapped(loc, ctlz.getIn()));
-            setMapped(ctlz.getRes(), {SimdVal::Kind::Vector, resElem, mlir::math::CountLeadingZerosOp::create(b_, loc, vecTy(resElem), a), {}, {}});
+            mlir::Value r = castIntVec(mlir::math::CountLeadingZerosOp::create(b_, loc, a.getType(), a), resElem);
+            setMapped(ctlz.getRes(), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
         if (auto cttz = llvm::dyn_cast<mlir::LLVM::CountTrailingZerosOp>(&op)) {
             mlir::Type resElem = cttz.getType();
             mlir::Value a = asVec(loc, getMapped(loc, cttz.getIn()));
-            setMapped(cttz.getRes(), {SimdVal::Kind::Vector, resElem, mlir::math::CountTrailingZerosOp::create(b_, loc, vecTy(resElem), a), {}, {}});
+            mlir::Value r = castIntVec(mlir::math::CountTrailingZerosOp::create(b_, loc, a.getType(), a), resElem);
+            setMapped(cttz.getRes(), {SimdVal::Kind::Vector, resElem, r, {}, {}});
+            return true;
+        }
+        if (auto fpc = llvm::dyn_cast<mlir::LLVM::IsFPClass>(&op)) {
+            mlir::Value a = asVec(loc, getMapped(loc, fpc.getIn()));
+            auto r = mlir::LLVM::IsFPClass::create(b_, loc, vecTy(i1Ty()), a, fpc.getBit());
+            setMapped(fpc.getRes(), {SimdVal::Kind::Vector, i1Ty(), r.getRes(), {}, {}});
             return true;
         }
         return false;
@@ -3015,7 +3035,17 @@ private:
         case 28: return store(mlir::math::CeilOp::create(b_, loc, vT, argV(1)));
         case 29: return store(mlir::math::TruncOp::create(b_, loc, vT, argV(1)));
         case 30: return store(mlir::LLVM::BitReverseOp::create(b_, loc, vT, argV(1)));
-        case 31: return store(mlir::math::CtPopOp::create(b_, loc, vT, argV(1)));
+        case 31: { // Countbits: population count, result is always i32 in DXIL
+            mlir::Value x = argV(1);
+            mlir::Type argTy = call.getOperand(1).getType();
+            mlir::Value pop = mlir::math::CtPopOp::create(b_, loc, vecTy(argTy), x);
+            if (argTy != resTy) {
+                pop = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
+                          ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, pop))
+                          : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, pop));
+            }
+            return store(pop);
+        }
         case 32: { // FirstbitLo: index of lowest set bit, or -1 if 0
             mlir::Value x = argV(1);
             mlir::Type argTy = call.getOperand(1).getType();

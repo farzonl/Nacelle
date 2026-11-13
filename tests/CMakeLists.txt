@@ -48,6 +48,7 @@ add_hlsl_dxil(matrix_swizzle.hlsl cs_6_0 CSMain matrix_swizzle.dxil)
 add_hlsl_dxil(math_denorms_bits.hlsl cs_6_5 CSMain math_denorms_bits.dxil)
 add_hlsl_dxil(byte_address_get_dims.hlsl cs_6_5 CSMain byte_address_get_dims.dxil)
 add_hlsl_dxil(uav_counter_dec.hlsl cs_6_0 CSMain uav_counter_dec.dxil)
+add_hlsl_dxil(bit_fpclass_intrinsics.hlsl cs_6_5 CSMain bit_fpclass_intrinsics.dxil)
 add_hlsl_dxil(quad_derivatives.hlsl vs_6_0 VSMain quad_derivatives_vs.dxil)
 add_hlsl_dxil(quad_derivatives.hlsl ps_6_0 PSMain quad_derivatives_ps.dxil)
 
