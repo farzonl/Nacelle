@@ -803,7 +803,7 @@ BenchResult runWarpBench(
     for (size_t i = 0; i < pixelCount; ++i) sum += outPtr[i * 4];
     rb->Unmap(0, nullptr);
 
-    res.medianMs = medianOf(samples);
+    res.medianMs = computeMedian(samples);
     res.minMs = *std::min_element(samples.begin(), samples.end());
     res.checksum = sum;
     res.ran = true;
