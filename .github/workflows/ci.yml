@@ -1,0 +1,270 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build-and-test-unix:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3 \
+            zlib1g-dev \
+            libzstd-dev
+
+      - name: Ensure build tools are installed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/DirectX-Headers \
+            third_party/DirectXMath \
+            third_party/bcdec \
+            third_party/thread-pool \
+            third_party/xxHash
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
+          echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DXC / GPU SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Install DirectXShaderCompiler (Linux)
+        if: runner.os == 'Linux' && steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk
+          curl -fsSL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz \
+            | tar -xzf - -C .sdk ./bin ./include ./lib
+
+      - name: Install DirectXShaderCompiler via Vulkan SDK (macOS)
+        if: runner.os == 'macOS' && steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/include .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/include/dxc .sdk/include/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+      - name: Save DXC / GPU SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Restore third_party LLVM/MLIR binaries cache
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build and install third_party LLVM/MLIR/Clang
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.toolchains/llvm" \
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          rm -rf build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure Nacelle
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+
+      - name: Build Nacelle
+        run: cmake --build build --parallel
+
+      - name: Run CTest
+        env:
+          LD_LIBRARY_PATH: "${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+          DYLD_LIBRARY_PATH: "${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+        run: ctest --test-dir build --output-on-failure
+
+  build-and-test-windows:
+    name: Build & Test (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 `
+            third_party/DirectX-Headers `
+            third_party/DirectXMath `
+            third_party/bcdec `
+            third_party/thread-pool `
+            third_party/xxHash
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          $llvmRev = ((git ls-tree HEAD third_party/llvm-project) -split '\s+')[2]
+          "llvm=$llvmRev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Install DirectXShaderCompiler (Windows)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path .sdk
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -OutFile dxc.zip
+          Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
+          Remove-Item dxc.zip
+
+      - name: Save DXC SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Restore third_party LLVM/MLIR binaries cache
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-Windows-x64-
+
+      - name: Build and install third_party LLVM/MLIR/Clang
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/.toolchains/llvm" `
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" `
+            -DLLVM_TARGETS_TO_BUILD="host" `
+            -DLLVM_BUILD_UTILS=ON `
+            -DLLVM_INSTALL_UTILS=ON `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_USE_CRT_RELEASE=MD `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DMLIR_INCLUDE_TESTS=OFF `
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          Remove-Item -Recurse -Force build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure Nacelle
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
+            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
+            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
+            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
+
+      - name: Build Nacelle
+        run: cmake --build build --parallel
+
+      - name: Run CTest
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
+          ctest --test-dir build --output-on-failure
