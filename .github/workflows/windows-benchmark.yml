@@ -174,19 +174,33 @@ jobs:
             "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
+      - name: Resolve latest Mesa llvmpipe release
+        if: steps.check-lavapipe.outputs.found != 'true'
+        id: mesa-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{ "User-Agent" = "Nacelle-CI" }
+          if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $headers
+          $asset = $rel.assets | Where-Object { $_.name -match "^mesa3d-.*-release-msvc\.7z$" } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find release-msvc.7z asset in pal1000/mesa-dist-win latest release ($($rel.tag_name))" }
+          "tag=$($rel.tag_name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "url=$($asset.browser_download_url)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Restore Mesa llvmpipe cache
         if: steps.check-lavapipe.outputs.found != 'true'
         id: cache-llvmpipe
         uses: actions/cache/restore@v4
         with:
           path: .toolchains/llvmpipe
-          key: nacelle-llvmpipe-Windows-x64-26.2.6
+          key: nacelle-llvmpipe-Windows-x64-${{ steps.mesa-release.outputs.tag }}
 
       - name: Download prebuilt Mesa llvmpipe (Windows)
         if: steps.check-lavapipe.outputs.found != 'true' && steps.cache-llvmpipe.outputs.cache-hit != 'true'
         run: |
           New-Item -ItemType Directory -Force -Path .toolchains/llvmpipe
-          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.6/mesa3d-26.2.6-release-msvc.7z" -OutFile mesa.7z
+          Invoke-WebRequest -Uri "${{ steps.mesa-release.outputs.url }}" -OutFile mesa.7z
           7z x mesa.7z -o.toolchains/llvmpipe -y
           Remove-Item mesa.7z
 
@@ -196,7 +210,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .toolchains/llvmpipe
-          key: nacelle-llvmpipe-Windows-x64-26.2.6
+          key: nacelle-llvmpipe-Windows-x64-${{ steps.mesa-release.outputs.tag }}
 
       - name: Ensure Vulkan Loader (vulkan-1.dll) is installed
         run: |
