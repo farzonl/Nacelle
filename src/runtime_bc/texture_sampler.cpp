@@ -435,6 +435,29 @@ static inline __attribute__((always_inline)) void map_cube_coords(
     outV = tc * invMa + 0.5f;
 }
 
+static inline __attribute__((always_inline)) void resolve_sample_coords(
+    const BC_Descriptor* tex, float u, float v, float w,
+    float& su, float& sv, int32_t& slice, uint32_t& addrU, uint32_t& addrV) {
+    uint32_t dim = tex->view_flags & 0xFFu;
+    uint32_t firstArraySlice = (tex->view_flags >> 16) & 0xFFFFu;
+    slice = static_cast<int32_t>(firstArraySlice);
+    su = u;
+    sv = v;
+    if (dim == 2) { // TEXTURE1D
+        sv = 0.5f;
+    } else if (dim == 3) { // TEXTURE1DARRAY
+        sv = 0.5f;
+        slice += static_cast<int32_t>(v + 0.5f);
+    } else if (dim == 5 || dim == 7) { // TEXTURE2DARRAY / TEXTURE2DMSARRAY
+        slice += static_cast<int32_t>(w + 0.5f);
+    } else if (dim == 9 || dim == 10) { // TEXTURECUBE / TEXTURECUBEARRAY
+        int32_t face = 0;
+        map_cube_coords(u, v, w, su, sv, face);
+        slice += face;
+        addrU = addrV = 2; // CLAMP on cube faces
+    }
+}
+
 void nacelle_tex_sample(
     const BC_Descriptor* tex,
     const BC_Descriptor* samp,
@@ -463,28 +486,9 @@ void nacelle_tex_sample(
     float minLod = samp ? float(samp->view_flags & 0xFFFFu) / 256.0f : 0.0f;
     float maxLod = samp ? float((samp->view_flags >> 16) & 0xFFFFu) / 256.0f : 16.0f;
 
-    uint32_t dim = tex->view_flags & 0xFFu;
-    uint32_t firstArraySlice = (tex->view_flags >> 16) & 0xFFFFu;
-    int32_t slice = static_cast<int32_t>(firstArraySlice);
+    int32_t slice = 0;
     float su = u, sv = v;
-    if (dim == 3) { // TEXTURE1D
-        sv = 0.5f;
-    } else if (dim == 4) { // TEXTURE1DARRAY
-        sv = 0.5f;
-        slice += static_cast<int32_t>(v + 0.5f);
-    } else if (dim == 7) { // TEXTURE2DARRAY
-        slice += static_cast<int32_t>(w + 0.5f);
-    } else if (dim == 9) { // TEXTURECUBE
-        int32_t face = 0;
-        map_cube_coords(u, v, w, su, sv, face);
-        slice += face;
-        addrU = addrV = 2; // CLAMP on cube faces
-    } else if (dim == 10) { // TEXTURECUBEARRAY
-        int32_t face = 0;
-        map_cube_coords(u, v, w, su, sv, face);
-        slice += face;
-        addrU = addrV = 2;
-    }
+    resolve_sample_coords(tex, u, v, w, su, sv, slice, addrU, addrV);
 
     bool linearMag = (filter & 0x04u) != 0;
     bool linearMin = (filter & 0x10u) != 0;
@@ -639,6 +643,45 @@ void nacelle_tex_store(
     write_texel_ptr(ptr, tex->format, in);
 }
 
+static inline __attribute__((always_inline)) void gather_four_texels(
+    const BC_Descriptor* tex,
+    const BC_Descriptor* samp,
+    float u, float v, float w,
+    int32_t offX, int32_t offY,
+    uint32_t component,
+    bool doCmp, float cmpVal,
+    float* outRGBA) {
+    if (!tex || !tex->base_ptr) {
+        outRGBA[0] = outRGBA[1] = outRGBA[2] = outRGBA[3] = 0.0f;
+        return;
+    }
+    uint32_t sflags = samp ? samp->sampler_flags : (doCmp ? 0x95u : 0x15u);
+    uint32_t addrU = (sflags >> 8) & 0x7u;
+    uint32_t addrV = (sflags >> 11) & 0x7u;
+    uint32_t addrW = (sflags >> 14) & 0x7u;
+    uint32_t cmpFunc = (sflags >> 17) & 0xFu;
+    uint32_t borderKind = (sflags >> 26) & 0x3u;
+
+    int32_t slice = 0;
+    float su = u, sv = v;
+    resolve_sample_coords(tex, u, v, w, su, sv, slice, addrU, addrV);
+
+    float fx = su * float(tex->width) - 0.5f + float(offX);
+    float fy = sv * float(tex->height) - 0.5f + float(offY);
+    int32_t x0 = static_cast<int32_t>(f_floor(fx));
+    int32_t y0 = static_cast<int32_t>(f_floor(fy));
+    uint32_t c = component & 3u;
+
+    const int32_t dx[4] = {0, 1, 1, 0};
+    const int32_t dy[4] = {1, 1, 0, 0};
+    float t[4];
+    // D3D12 Gather ordering: x = (-,+), y = (+,+), z = (+,-), w = (-,-)
+    for (int i = 0; i < 4; ++i) {
+        fetch_texel_mip(tex, 0, x0 + dx[i], y0 + dy[i], slice, addrU, addrV, addrW, borderKind, t);
+        outRGBA[i] = doCmp ? eval_cmp(cmpFunc, cmpVal, t[c]) : t[c];
+    }
+}
+
 void nacelle_tex_gather(
     const BC_Descriptor* tex,
     const BC_Descriptor* samp,
@@ -646,29 +689,86 @@ void nacelle_tex_gather(
     int32_t offX, int32_t offY,
     uint32_t component,
     float* outRGBA) {
-    if (!tex || !tex->base_ptr) {
-        outRGBA[0] = outRGBA[1] = outRGBA[2] = outRGBA[3] = 0.0f;
+    gather_four_texels(tex, samp, u, v, w, offX, offY, component, false, 0.0f, outRGBA);
+}
+
+void nacelle_tex_gather_cmp(
+    const BC_Descriptor* tex,
+    const BC_Descriptor* samp,
+    float u, float v, float w,
+    int32_t offX, int32_t offY,
+    uint32_t component,
+    float cmpVal,
+    float* outRGBA) {
+    gather_four_texels(tex, samp, u, v, w, offX, offY, component, true, cmpVal, outRGBA);
+}
+
+void nacelle_tex_project_lod_coords(
+    const BC_Descriptor* tex,
+    float u, float v, float w,
+    float* outUVW) {
+    if (!tex) {
+        outUVW[0] = u;
+        outUVW[1] = v;
+        outUVW[2] = 0.0f;
         return;
     }
+    uint32_t dim = tex->view_flags & 0xFFu;
+    if (dim == 2 || dim == 3) { // TEXTURE1D / TEXTURE1DARRAY
+        outUVW[0] = u;
+        outUVW[1] = 0.0f;
+        outUVW[2] = 0.0f;
+    } else if (dim == 8) { // TEXTURE3D
+        outUVW[0] = u;
+        outUVW[1] = v;
+        outUVW[2] = w;
+    } else if (dim == 9 || dim == 10) { // TEXTURECUBE / TEXTURECUBEARRAY
+        int32_t face = 0;
+        map_cube_coords(u, v, w, outUVW[0], outUVW[1], face);
+        outUVW[2] = 0.0f;
+    } else { // TEXTURE2D / TEXTURE2DARRAY
+        outUVW[0] = u;
+        outUVW[1] = v;
+        outUVW[2] = 0.0f;
+    }
+}
+
+float nacelle_tex_calc_lod(
+    const BC_Descriptor* tex,
+    const BC_Descriptor* samp,
+    float ddx_u, float ddx_v, float ddx_w,
+    float ddy_u, float ddy_v, float ddy_w,
+    uint32_t clamped) {
+    if (!tex) return 0.0f;
+    uint32_t dim = tex->view_flags & 0xFFu;
     uint32_t sflags = samp ? samp->sampler_flags : 0x15u;
-    uint32_t addrU = (sflags >> 8) & 0x7u;
-    uint32_t addrV = (sflags >> 11) & 0x7u;
-    uint32_t addrW = (sflags >> 14) & 0x7u;
-    uint32_t borderKind = (sflags >> 26) & 0x3u;
-    (void)w;
+    uint32_t filter = sflags & 0xFFu;
+    bool isAniso = (filter == 0x55u || filter == 0xD5u);
+    float sampBias = samp ? samp->mip_lod_bias : 0.0f;
+    float minLod = samp ? float(samp->view_flags & 0xFFFFu) / 256.0f : 0.0f;
+    float maxLod = samp ? float((samp->view_flags >> 16) & 0xFFFFu) / 256.0f : 16.0f;
 
-    float fx = u * float(tex->width) - 0.5f + float(offX);
-    float fy = v * float(tex->height) - 0.5f + float(offY);
-    int32_t x0 = static_cast<int32_t>(f_floor(fx));
-    int32_t y0 = static_cast<int32_t>(f_floor(fy));
-    uint32_t c = component & 3u;
+    float fw = float(tex->width);
+    float fh = (dim == 3 || dim == 4) ? 0.0f : float(tex->height);
+    float fd = (dim == 8) ? float(tex->depth_or_array) : 0.0f;
 
-    float t[4];
-    // D3D12 Gather ordering: x = (-,+)=TL?(0,1), y = (+,+)=TR?(1,1), z = (+,-)=BR?(1,0), w = (-,-)=BL?(0,0)
-    fetch_texel_mip(tex, 0, x0, y0 + 1, 0, addrU, addrV, addrW, borderKind, t); outRGBA[0] = t[c];
-    fetch_texel_mip(tex, 0, x0 + 1, y0 + 1, 0, addrU, addrV, addrW, borderKind, t); outRGBA[1] = t[c];
-    fetch_texel_mip(tex, 0, x0 + 1, y0, 0, addrU, addrV, addrW, borderKind, t); outRGBA[2] = t[c];
-    fetch_texel_mip(tex, 0, x0, y0, 0, addrU, addrV, addrW, borderKind, t); outRGBA[3] = t[c];
+    float dx2 = ddx_u * ddx_u * fw * fw + ddx_v * ddx_v * fh * fh + ddx_w * ddx_w * fd * fd;
+    float dy2 = ddy_u * ddy_u * fw * fw + ddy_v * ddy_v * fh * fh + ddy_w * ddy_w * fd * fd;
+    float rho2 = f_max(dx2, dy2);
+    if (isAniso) {
+        float min2 = f_min(dx2, dy2);
+        float maxAniso = samp ? float((sflags >> 21) & 0x1Fu) : 1.0f;
+        float ratio = f_sqrt(rho2 / f_max(min2, 1e-24f));
+        ratio = f_min(ratio, f_max(1.0f, maxAniso));
+        rho2 = rho2 / (ratio * ratio);
+    }
+
+    float lod = 0.5f * f_log2(f_max(rho2, 1e-24f)) + sampBias;
+    if (clamped) {
+        float maxMipF = float(tex->mip_levels > 0 ? tex->mip_levels - 1 : 0);
+        lod = f_clamp(lod, minLod, f_min(maxLod, maxMipF));
+    }
+    return lod;
 }
 
 void nacelle_tex_get_dims(const BC_Descriptor* tex, uint32_t mip, uint32_t* outDims4) {

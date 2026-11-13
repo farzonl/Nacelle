@@ -188,6 +188,7 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     }
     rt.jit = std::move(*jitOrErr);
 
+#if defined(__APPLE__)
     if (const char* prof = std::getenv("NACELLE_JIT_PROFILING")) {
         if (prof[0] == '1') {
             if (auto* oll = llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&rt.jit->getObjLinkingLayer())) {
@@ -211,6 +212,7 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
             }
         }
     }
+#endif
 }
 
 llvm::Expected<llvm::orc::JITDylib&> createIsolatedDylibLocked(JitRuntime& rt) {
@@ -568,6 +570,17 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         inlinerPM.addPass(llvm::AlwaysInlinerPass());
         inlinerPM.run(*llvmMod, mam);
     }
+
+#if defined(_WIN32)
+    // Win64 guarantees only 16-byte stack alignment; mark JIT functions nounwind
+    // with stackrealign so AVX2/AVX-512 spills and allocas receive 32/64-byte alignment.
+    for (llvm::Function& f : *llvmMod) {
+        if (!f.isDeclaration()) {
+            f.setDoesNotThrow();
+            f.addFnAttr("stackrealign");
+        }
+    }
+#endif
 
     return llvmMod;
 }
