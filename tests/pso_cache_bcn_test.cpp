@@ -8,6 +8,17 @@
 #include <vector>
 
 int main() {
+    // 0. Verify build-time compiler SHA-256 stamp
+    {
+        const char* buildHash = nacelle::getCompilerBuildHash();
+        assert(buildHash != nullptr);
+        assert(std::strlen(buildHash) == 64);
+        for (size_t i = 0; i < 64; ++i) {
+            char c = buildHash[i];
+            assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+        }
+    }
+
     // 1. Verify BC1 decompression
     {
         // Solid red 4x4 BC1 block: color0 = 0xF800 (red), color1 = 0x0000, indices = 0

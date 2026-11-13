@@ -99,7 +99,49 @@ add_custom_command(
     COMMENT "Embedding texture_sampler.bc into generated header"
 )
 
-add_custom_target(nacelle_embedded_bc DEPENDS "${TEX_SAMPLER_BC_HDR}")
+# Compute deterministic build-time SHA-256 stamp across all compiler, ABI, and runtime bitcode inputs
+set(COMPILER_VERSION_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_version.h")
+set(COMPILER_HASH_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_hash_inputs.txt")
+set(NACELLE_COMPILER_HASH_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/api/d3d12_types.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/api/pipeline.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/format_utils.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/dxil_loader.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/dxil_loader.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/pso_synthesizer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/pso_synthesizer.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/shader_compiler.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/simt_to_simd_pass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/simt_to_simd_pass.h"
+    "${TEX_SAMPLER_BC}"
+)
+string(JOIN "\n" COMPILER_HASH_MANIFEST_CONTENT
+    "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}"
+    ${NACELLE_COMPILER_HASH_INPUTS}
+)
+file(GENERATE
+    OUTPUT "${COMPILER_HASH_MANIFEST}"
+    CONTENT "${COMPILER_HASH_MANIFEST_CONTENT}\n"
+)
+
+add_custom_command(
+    OUTPUT "${COMPILER_VERSION_HDR}"
+    COMMAND ${CMAKE_COMMAND}
+            "-DMANIFEST_FILE=${COMPILER_HASH_MANIFEST}"
+            "-DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DOUTPUT_FILE=${COMPILER_VERSION_HDR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateCompilerVersion.cmake"
+    DEPENDS ${NACELLE_COMPILER_HASH_INPUTS}
+            "${COMPILER_HASH_MANIFEST}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateCompilerVersion.cmake"
+    COMMENT "Generating compiler build hash header"
+)
+
+add_custom_target(nacelle_embedded_bc DEPENDS "${TEX_SAMPLER_BC_HDR}" "${COMPILER_VERSION_HDR}")
 
 # 4. Core Nacelle Object Library (shared between static libnacelle and shared libnacelle_d3d12)
 set(NACELLE_SOURCES
