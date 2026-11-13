@@ -170,10 +170,12 @@ struct IRHelpers {
             b, loc, ptrTy(), elemTy, basePtr, mlir::ValueRange{idx});
     }
     mlir::Value loadScalar(mlir::Type ty, mlir::Value ptr) const {
-        return mlir::LLVM::LoadOp::create(b, loc, ty, ptr);
+        unsigned align = llvm::isa<mlir::VectorType>(ty) ? 4u : 0u;
+        return mlir::LLVM::LoadOp::create(b, loc, ty, ptr, align);
     }
     void storeScalar(mlir::Value val, mlir::Value ptr) const {
-        mlir::LLVM::StoreOp::create(b, loc, val, ptr);
+        unsigned align = llvm::isa<mlir::VectorType>(val.getType()) ? 4u : 0u;
+        mlir::LLVM::StoreOp::create(b, loc, val, ptr, align);
     }
 
     mlir::Value orReduce(mlir::Value maskVec) const {
@@ -1086,13 +1088,13 @@ bool synthesizeGraphicsPSOMLIR(
                     if (rt < desc.NumRenderTargets && desc.RTVFormats[rt] != DXGI_FORMAT_UNKNOWN) {
                         for (uint32_t c = 0; c < 4; ++c) {
                             rtOutPtrs[rt][c] = mlir::LLVM::AllocaOp::create(
-                                pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), 16);
+                                pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                             ph.storeScalar(ph.splatFlt(c == 3 ? 1.0 : 0.0), rtOutPtrs[rt][c]);
                         }
                     }
                 }
                 mlir::Value outDepthPtr = mlir::LLVM::AllocaOp::create(
-                    pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), 16);
+                    pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                 ph.storeScalar(interpZ, outDepthPtr);
 
                 StageHooks psHooks;
