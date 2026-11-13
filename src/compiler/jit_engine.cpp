@@ -27,6 +27,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -274,10 +275,32 @@ bool emitObjectBytesO3(
     llvm::Module& mod,
     llvm::SmallVectorImpl<char>& outObjBytes,
     std::string& outError) {
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Default);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Aggressive);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return false;
+    }
+
+    const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
+    const bool strictFp = strictFpEnv && strictFpEnv[0] == '1';
+    if (!strictFp) {
+        jtmbOrErr->getOptions().AllowFPOpFusion = llvm::FPOpFusion::Fast;
+        llvm::FastMathFlags fmf;
+        fmf.setAllowContract(true);
+        fmf.setAllowReassoc(true);
+        fmf.setNoSignedZeros(true);
+        fmf.setAllowReciprocal(true);
+        fmf.setApproxFunc(true);
+        for (llvm::Function& fn : mod) {
+            if (fn.isDeclaration()) continue;
+            for (llvm::BasicBlock& bb : fn) {
+                for (llvm::Instruction& inst : bb) {
+                    if (llvm::isa<llvm::FPMathOperator>(&inst)) {
+                        inst.setFastMathFlags(fmf);
+                    }
+                }
+            }
+        }
     }
 
     auto tmOrErr = jtmbOrErr->createTargetMachine();
@@ -311,7 +334,7 @@ bool emitObjectBytesO3(
     pb.registerLoopAnalyses(lam);
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
-    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+    llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     mpm.run(mod, mam);
 
     llvm::legacy::PassManager codegenPM;
