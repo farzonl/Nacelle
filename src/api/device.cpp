@@ -171,7 +171,7 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
     case D3D12_FEATURE_SHADER_MODEL: {
         if (size < sizeof(D3D12_FEATURE_DATA_SHADER_MODEL)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL*>(pData);
-        o->HighestShaderModel = std::min(o->HighestShaderModel, D3D_SHADER_MODEL_6_6);
+        o->HighestShaderModel = std::min(o->HighestShaderModel, D3D_SHADER_MODEL_6_9);
         return S_OK;
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
