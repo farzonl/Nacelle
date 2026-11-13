@@ -168,7 +168,7 @@ jobs:
           mv build-offload/bin/offloader build-offload/bin/offloader.bin
           printf '#!/bin/sh\nexec "%s/build-offload/bin/offloader.bin" --api=dx "$@"\n' "${{ github.workspace }}" > build-offload/bin/offloader
           chmod +x build-offload/bin/offloader
-          lit -v --timeout=60 --output="${{ github.workspace }}/offload-results.json" "${{ github.workspace }}/build-offload/test/d3d12" || true
+          lit -j 2 -v --timeout=60 --output="${{ github.workspace }}/offload-results.json" "${{ github.workspace }}/build-offload/test/d3d12" || true
           mv build-offload/bin/offloader.bin build-offload/bin/offloader
 
       - name: Restore historical compliance data cache
