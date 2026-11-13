@@ -297,10 +297,15 @@ std::vector<BenchResult> runVulkanBenchmarks(
         instRes = vk.vkCreateInstance(&ici, nullptr, &inst);
     }
     if (instRes != vkmin::VK_SUCCESS || !vk.loadInstanceSyms(inst)) {
+        if (inst && vk.vkDestroyInstance) {
+            vk.vkDestroyInstance(inst, nullptr);
+        }
         BenchResult r;
         r.backend = "Vulkan (Lavapipe/SwiftShader)";
         r.shaderFormat = "SPIR-V";
-        r.status = "SKIPPED (vkCreateInstance failed)";
+        r.status = instRes != vkmin::VK_SUCCESS
+            ? ("SKIPPED (vkCreateInstance failed: " + std::to_string(instRes) + ")")
+            : "SKIPPED (Vulkan instance symbols missing)";
         results.push_back(r);
         return results;
     }
