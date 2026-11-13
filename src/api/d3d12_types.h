@@ -45,6 +45,7 @@ constexpr uint32_t kAddrWShift = 14;     // 3 bits
 constexpr uint32_t kCmpFuncShift = 17;   // 4 bits (D3D12_COMPARISON_FUNC)
 constexpr uint32_t kMaxAnisoShift = 21;  // 5 bits (1..16)
 constexpr uint32_t kBorderShift = 26;    // 2 bits (0=trans black, 1=opaque black, 2=opaque white, 3=custom)
+constexpr uint32_t kReductionShift = 28; // 2 bits (0=standard, 1=comparison, 2=minimum, 3=maximum)
 } // namespace SamplerFlags
 
 /// View / resource descriptor (64 bytes, 64-byte aligned) matching SM 6.6 heap layout.

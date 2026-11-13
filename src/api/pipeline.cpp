@@ -571,7 +571,7 @@ static HRESULT serializeVersionedInternal(
     }
     for (UINT i = 0; i < numSamplers; ++i) {
         const auto& ss = samplers[i];
-        RootSignatureLayout::StaticSampler out;
+        RootSignatureLayout::StaticSampler out{};
         out.shaderRegister = ss.ShaderRegister;
         out.registerSpace = ss.RegisterSpace;
         out.visibility = ss.ShaderVisibility;

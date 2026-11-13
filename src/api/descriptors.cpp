@@ -96,6 +96,7 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
         uint32_t mostDetailedMip = 0;
         uint32_t mipLevels = rdesc.MipLevels;
         uint32_t firstArraySlice = 0;
+        uint32_t arraySliceCount = rdesc.DepthOrArraySize;
         D3D12_SRV_DIMENSION dim = D3D12_SRV_DIMENSION_TEXTURE2D;
         if (pDesc) {
             dim = pDesc->ViewDimension;
@@ -108,6 +109,11 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
                 mostDetailedMip = pDesc->Texture1DArray.MostDetailedMip;
                 mipLevels = pDesc->Texture1DArray.MipLevels;
                 firstArraySlice = pDesc->Texture1DArray.FirstArraySlice;
+                if (pDesc->Texture1DArray.ArraySize != UINT32_MAX && pDesc->Texture1DArray.ArraySize > 0) {
+                    arraySliceCount = pDesc->Texture1DArray.ArraySize;
+                } else if (rdesc.DepthOrArraySize > firstArraySlice) {
+                    arraySliceCount = rdesc.DepthOrArraySize - firstArraySlice;
+                }
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE2D:
                 mostDetailedMip = pDesc->Texture2D.MostDetailedMip;
@@ -117,6 +123,11 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
                 mostDetailedMip = pDesc->Texture2DArray.MostDetailedMip;
                 mipLevels = pDesc->Texture2DArray.MipLevels;
                 firstArraySlice = pDesc->Texture2DArray.FirstArraySlice;
+                if (pDesc->Texture2DArray.ArraySize != UINT32_MAX && pDesc->Texture2DArray.ArraySize > 0) {
+                    arraySliceCount = pDesc->Texture2DArray.ArraySize;
+                } else if (rdesc.DepthOrArraySize > firstArraySlice) {
+                    arraySliceCount = rdesc.DepthOrArraySize - firstArraySlice;
+                }
                 break;
             case D3D12_SRV_DIMENSION_TEXTURE3D:
                 mostDetailedMip = pDesc->Texture3D.MostDetailedMip;
@@ -130,13 +141,23 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
                 mostDetailedMip = pDesc->TextureCubeArray.MostDetailedMip;
                 mipLevels = pDesc->TextureCubeArray.MipLevels;
                 firstArraySlice = pDesc->TextureCubeArray.First2DArrayFace;
+                if (pDesc->TextureCubeArray.NumCubes != UINT32_MAX && pDesc->TextureCubeArray.NumCubes > 0) {
+                    arraySliceCount = pDesc->TextureCubeArray.NumCubes * 6u;
+                } else if (rdesc.DepthOrArraySize > firstArraySlice) {
+                    arraySliceCount = rdesc.DepthOrArraySize - firstArraySlice;
+                }
                 break;
             default:
                 break;
             }
         } else {
-            if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) dim = D3D12_SRV_DIMENSION_TEXTURE1D;
-            else if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) dim = D3D12_SRV_DIMENSION_TEXTURE3D;
+            if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+                dim = (rdesc.DepthOrArraySize > 1) ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
+            } else if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                dim = (rdesc.DepthOrArraySize > 1) ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY : D3D12_SRV_DIMENSION_TEXTURE2D;
+            } else if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                dim = D3D12_SRV_DIMENSION_TEXTURE3D;
+            }
         }
         if (mipLevels == UINT32_MAX || mipLevels == 0) {
             mipLevels = rdesc.MipLevels - mostDetailedMip;
@@ -147,7 +168,7 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
         sd->height = mip0.height;
         sd->depth_or_array = (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
                                  ? mip0.depth
-                                 : rdesc.DepthOrArraySize;
+                                 : arraySliceCount;
         sd->row_pitch = mip0.row_pitch;
         sd->mip_levels = mipLevels;
         sd->byte_size = res->totalBytes();
@@ -196,20 +217,75 @@ void DescriptorOps::createUAV(ID3D12Resource* pResource,
             sd->extra_ptr = counterRes->basePtr() + pDesc->Buffer.CounterOffsetInBytes;
         }
     } else {
-        uint32_t mipSlice = pDesc ? pDesc->Texture2D.MipSlice : 0;
+        uint32_t mipSlice = 0;
+        uint32_t firstSlice = 0;
+        uint32_t sliceCount = rdesc.DepthOrArraySize;
+        D3D12_UAV_DIMENSION dim = D3D12_UAV_DIMENSION_TEXTURE2D;
+        if (pDesc) {
+            dim = pDesc->ViewDimension;
+            switch (dim) {
+            case D3D12_UAV_DIMENSION_TEXTURE1D:
+                mipSlice = pDesc->Texture1D.MipSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+                mipSlice = pDesc->Texture1DArray.MipSlice;
+                firstSlice = pDesc->Texture1DArray.FirstArraySlice;
+                if (pDesc->Texture1DArray.ArraySize != UINT32_MAX && pDesc->Texture1DArray.ArraySize > 0) {
+                    sliceCount = pDesc->Texture1DArray.ArraySize;
+                } else if (rdesc.DepthOrArraySize > firstSlice) {
+                    sliceCount = rdesc.DepthOrArraySize - firstSlice;
+                }
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE2D:
+                mipSlice = pDesc->Texture2D.MipSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+                mipSlice = pDesc->Texture2DArray.MipSlice;
+                firstSlice = pDesc->Texture2DArray.FirstArraySlice;
+                if (pDesc->Texture2DArray.ArraySize != UINT32_MAX && pDesc->Texture2DArray.ArraySize > 0) {
+                    sliceCount = pDesc->Texture2DArray.ArraySize;
+                } else if (rdesc.DepthOrArraySize > firstSlice) {
+                    sliceCount = rdesc.DepthOrArraySize - firstSlice;
+                }
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                mipSlice = pDesc->Texture3D.MipSlice;
+                firstSlice = pDesc->Texture3D.FirstWSlice;
+                if (pDesc->Texture3D.WSize != UINT32_MAX && pDesc->Texture3D.WSize > 0) {
+                    sliceCount = pDesc->Texture3D.WSize;
+                } else {
+                    const auto& mipLayout = res->subresourceLayout(mipSlice);
+                    sliceCount = (mipLayout.depth > firstSlice) ? (mipLayout.depth - firstSlice) : 1;
+                }
+                break;
+            default:
+                break;
+            }
+        } else {
+            if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+                dim = (rdesc.DepthOrArraySize > 1) ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY : D3D12_UAV_DIMENSION_TEXTURE1D;
+            } else if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+                dim = (rdesc.DepthOrArraySize > 1) ? D3D12_UAV_DIMENSION_TEXTURE2DARRAY : D3D12_UAV_DIMENSION_TEXTURE2D;
+            } else if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                dim = D3D12_UAV_DIMENSION_TEXTURE3D;
+            }
+        }
         const auto& mip = res->subresourceLayout(mipSlice);
-        sd->base_ptr = res->basePtr() + mip.offset;
+        if (dim == D3D12_UAV_DIMENSION_TEXTURE3D && (!pDesc || pDesc->Texture3D.WSize == UINT32_MAX || pDesc->Texture3D.WSize == 0)) {
+            sliceCount = (mip.depth > firstSlice) ? (mip.depth - firstSlice) : 1;
+        }
+        sd->base_ptr = res->basePtr();
         sd->width = mip.width;
         sd->height = mip.height;
-        sd->depth_or_array = (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-                                 ? mip.depth
-                                 : rdesc.DepthOrArraySize;
+        sd->depth_or_array = sliceCount;
         sd->row_pitch = mip.row_pitch;
         sd->mip_levels = 1;
         sd->byte_size = res->totalBytes() - mip.offset;
         sd->elem_stride = getFormatInfo(fmt).bytesPerBlock;
         sd->extra_ptr = res->textureMetadata();
-        sd->view_flags = pDesc ? static_cast<uint32_t>(pDesc->ViewDimension) : D3D12_UAV_DIMENSION_TEXTURE2D;
+        sd->view_flags = (static_cast<uint32_t>(dim) & 0xFFu) |
+                         ((mipSlice & 0xFFu) << 8) |
+                         ((firstSlice & 0xFFFFu) << 16);
     }
 }
 
@@ -268,13 +344,15 @@ void DescriptorOps::populateSamplerDesc(const D3D12_SAMPLER_DESC& desc, NacelleD
         border = (desc.BorderColor[0] > 0.5f) ? 2u : 1u;
     }
 
+    uint32_t reduction = (static_cast<uint32_t>(desc.Filter) >> 7) & 0x3u;
     out.sampler_flags = (static_cast<uint32_t>(desc.Filter) & 0xFFu) |
                         (u << SamplerFlags::kAddrUShift) |
                         (v << SamplerFlags::kAddrVShift) |
                         (w << SamplerFlags::kAddrWShift) |
                         (cmp << SamplerFlags::kCmpFuncShift) |
                         (aniso << SamplerFlags::kMaxAnisoShift) |
-                        (border << SamplerFlags::kBorderShift);
+                        (border << SamplerFlags::kBorderShift) |
+                        (reduction << SamplerFlags::kReductionShift);
     out.mip_lod_bias = desc.MipLODBias;
     // Pack min_lod (clamped 0..15.99 in 8.8) & max_lod (in 8.8) into view_flags
     uint16_t minLodQ8 = static_cast<uint16_t>(std::clamp(desc.MinLOD, 0.0f, 255.0f) * 256.0f);
