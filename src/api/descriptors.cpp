@@ -79,14 +79,16 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
         uint32_t stride = (pDesc && pDesc->Buffer.StructureByteStride > 0)
                               ? pDesc->Buffer.StructureByteStride
                               : (fmt != DXGI_FORMAT_UNKNOWN ? getFormatInfo(fmt).bytesPerBlock : 4);
+        uint32_t isRaw = 0;
         if (pDesc && (pDesc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) {
             stride = 4;
+            isRaw = 1;
         }
         sd->base_ptr = res->basePtr() + firstElem * stride;
         sd->width = numElems;
         sd->elem_stride = stride;
         sd->byte_size = uint64_t(numElems) * stride;
-        sd->view_flags = D3D12_SRV_DIMENSION_BUFFER;
+        sd->view_flags = D3D12_SRV_DIMENSION_BUFFER | (isRaw << 8);
     } else {
         if (res->textureMetadata()->is_compressed) {
             res->ensureDecodedBC();
@@ -179,14 +181,16 @@ void DescriptorOps::createUAV(ID3D12Resource* pResource,
         uint32_t stride = (pDesc && pDesc->Buffer.StructureByteStride > 0)
                               ? pDesc->Buffer.StructureByteStride
                               : (fmt != DXGI_FORMAT_UNKNOWN ? getFormatInfo(fmt).bytesPerBlock : 4);
+        uint32_t isRaw = 0;
         if (pDesc && (pDesc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
             stride = 4;
+            isRaw = 1;
         }
         sd->base_ptr = res->basePtr() + firstElem * stride;
         sd->width = numElems;
         sd->elem_stride = stride;
         sd->byte_size = uint64_t(numElems) * stride;
-        sd->view_flags = D3D12_UAV_DIMENSION_BUFFER;
+        sd->view_flags = D3D12_UAV_DIMENSION_BUFFER | (isRaw << 8);
         if (pCounterResource) {
             auto* counterRes = static_cast<NacelleResource*>(pCounterResource);
             sd->extra_ptr = counterRes->basePtr() + pDesc->Buffer.CounterOffsetInBytes;

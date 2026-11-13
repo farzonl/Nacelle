@@ -786,6 +786,14 @@ void nacelle_tex_get_dims(const BC_Descriptor* tex, uint32_t mip, uint32_t* outD
         outDims4[0] = outDims4[1] = outDims4[2] = outDims4[3] = 0;
         return;
     }
+    // Raw buffers (ByteAddressBuffer / RWByteAddressBuffer) report total byte size.
+    if ((tex->view_flags & 0xFFu) == 1u && (tex->view_flags & 0x100u) != 0u) {
+        outDims4[0] = static_cast<uint32_t>(tex->byte_size);
+        outDims4[1] = 0;
+        outDims4[2] = 0;
+        outDims4[3] = 0;
+        return;
+    }
     uint32_t w = tex->width >> mip;
     uint32_t h = tex->height >> mip;
     if (w == 0 && tex->width > 0) w = 1;

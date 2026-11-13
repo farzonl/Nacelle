@@ -1794,9 +1794,11 @@ private:
         if (op == 68 || op == 139) return packetizeBufferLoad(call, op == 139, outError);
         if (op == 69 || op == 140) return packetizeBufferStore(call, op == 140, realMask, outError);
         if (op == 70) {
-            // bufferUpdateCounter: extra_ptr holds atomic counter ptr if bound
+            // bufferUpdateCounter: extra_ptr holds atomic counter ptr if bound.
+            // DXIL passes inc as i8 (+1 for IncrementCounter, -1 for DecrementCounter);
+            // sign-extend from i8 and return pre-op value for increment, post-op value for decrement.
             SimdVal h = getMapped(loc, arg(1));
-            int32_t inc = static_cast<int32_t>(getConstIntValue(arg(2)).value_or(1));
+            int32_t inc = static_cast<int32_t>(static_cast<int8_t>(getConstIntValue(arg(2)).value_or(1)));
             mlir::Value outVec = splatInt(loc, i32Ty(), 0);
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
@@ -1816,11 +1818,14 @@ private:
                         auto cr = mlir::scf::IfOp::create(
                             nb, nloc, cValid,
                             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+                                mlir::Value incVal = mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), inc);
                                 mlir::Value old = mlir::LLVM::AtomicRMWOp::create(
-                                    ib, iloc, mlir::LLVM::AtomicBinOp::add, cptr,
-                                    mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), inc),
+                                    ib, iloc, mlir::LLVM::AtomicBinOp::add, cptr, incVal,
                                     mlir::LLVM::AtomicOrdering::acq_rel);
-                                mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{old});
+                                mlir::Value retVal = (inc < 0)
+                                    ? mlir::arith::AddIOp::create(ib, iloc, old, incVal).getResult()
+                                    : old;
+                                mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{retVal});
                             },
                             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
                                 mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)});
