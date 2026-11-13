@@ -195,7 +195,7 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
 #if LLVM_VERSION_MAJOR >= 24
                     auto pluginOrErr = llvm::orc::GDBJITDebugInfoRegistrationPlugin::Create(
                         rt.jit->getExecutionSession(),
-                        rt.jit->getTargetTriple());
+                        *rt.jit->getProcessSymbolsJITDylib());
 #else
                     auto pluginOrErr = llvm::orc::GDBJITDebugInfoRegistrationPlugin::Create(
                         rt.jit->getExecutionSession(),

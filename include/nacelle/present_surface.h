@@ -24,7 +24,11 @@ static const GUID IID_INacelleSwapChain = {
     0x8f7c4a12, 0x51e9, 0x4d30, {0x9b, 0x6a, 0x2c, 0x18, 0xe0, 0xd5, 0x90, 0x01}
 };
 
+#if defined(_WIN32)
+struct __declspec(uuid("8F7C4A12-51E9-4D30-9B6A-2C18E0D59001")) INacelleSwapChain : public IUnknown {
+#else
 struct INacelleSwapChain : public IUnknown {
+#endif
     virtual HRESULT STDMETHODCALLTYPE GetBuffer(uint32_t Buffer, REFIID riid, void** ppSurface) = 0;
     virtual uint32_t STDMETHODCALLTYPE GetCurrentBackBufferIndex() = 0;
     virtual HRESULT STDMETHODCALLTYPE Present(uint32_t SyncInterval, uint32_t Flags) = 0;
