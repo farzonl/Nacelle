@@ -11,6 +11,17 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#endif
+
 #include <nacelle/nacelle.h>
 #include "../src/compiler/jit_engine.h"
 #include "../src/compiler/shader_compiler.h"
@@ -18,11 +29,6 @@
 
 #if defined(__APPLE__)
 #include "metal_bench.h"
-#endif
-
-#if defined(_WIN32)
-#include <directx/d3d12.h>
-#include <dxgi1_4.h>
 #endif
 
 namespace {
