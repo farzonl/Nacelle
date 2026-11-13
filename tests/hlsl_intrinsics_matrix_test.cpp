@@ -349,6 +349,168 @@ bool testMathDenormsBits(testutil::TestRuntime& rt) {
     return ok;
 }
 
+bool testBitAndFPClassIntrinsics(testutil::TestRuntime& rt) {
+    std::cout << "=== Test: bit_fpclass_intrinsics ===\n";
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 3;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 3;
+    ranges[1].BaseShaderRegister = 0;
+    ranges[1].OffsetInDescriptorsFromTableStart = 3;
+
+    D3D12_ROOT_PARAMETER rp{};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable.NumDescriptorRanges = 2;
+    rp.DescriptorTable.pDescriptorRanges = ranges;
+
+    auto rs = createRS(rt.device.Get(), 1, &rp);
+    auto pso = createCS(rt.device.Get(), rs.Get(), "bit_fpclass_intrinsics.dxil");
+
+    auto bufInI64 = rt.createBuffer(2 * 32, D3D12_HEAP_TYPE_DEFAULT);
+    auto bufInU64 = rt.createBuffer(2 * 32, D3D12_HEAP_TYPE_DEFAULT);
+    auto bufInFlt = rt.createBuffer(3 * 16, D3D12_HEAP_TYPE_DEFAULT);
+    auto bufOutBits = rt.createBuffer(5 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto bufOutAdj = rt.createBuffer(3 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto bufOutFPC = rt.createBuffer(9 * 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    const int64_t inI64[2][4] = {
+        {0x2All, 0ll, 0x0f0f0f0f0f0f0f0fll, -1ll},
+        {0ll, -1ll, -9ll, 0x0000010000000000ll},
+    };
+    const uint64_t inU64[2][4] = {
+        {0x2Aull, 0ull, 0x0f0f0f0f0f0f0f0full, 0xffffffffffffffffull},
+        {0ull, 1ull, 0x8000000000000000ull, 0x0000010000000000ull},
+    };
+    const float posInf = std::numeric_limits<float>::infinity();
+    const float negInf = -std::numeric_limits<float>::infinity();
+    const float qNan = std::numeric_limits<float>::quiet_NaN();
+    const float inFlt[3][4] = {
+        {posInf, negInf, 1.0f, qNan},
+        {negInf, 0.0f, qNan, posInf},
+        {0.0f, qNan, posInf, negInf},
+    };
+    const uint32_t initAdj[3][4] = {
+        {101u, 102u, 103u, 104u},
+        {105u, 106u, 107u, 108u},
+        {109u, 110u, 111u, 112u},
+    };
+    const uint32_t zeroFPC[9][4]{};
+
+    rt.uploadBuffer(bufInI64.Get(), inI64, sizeof(inI64));
+    rt.uploadBuffer(bufInU64.Get(), inU64, sizeof(inU64));
+    rt.uploadBuffer(bufInFlt.Get(), inFlt, sizeof(inFlt));
+    rt.uploadBuffer(bufOutAdj.Get(), initAdj, sizeof(initAdj));
+    rt.uploadBuffer(bufOutFPC.Get(), zeroFPC, sizeof(zeroFPC));
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 6, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    testutil::checkHR(rt.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "Heap");
+    const UINT inc = rt.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+
+    auto makeSrv = [&](ID3D12Resource* r, UINT num, UINT stride, UINT idx) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = DXGI_FORMAT_UNKNOWN;
+        d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.NumElements = num;
+        d.Buffer.StructureByteStride = stride;
+        rt.device->CreateShaderResourceView(r, &d, {cpu.ptr + idx * inc});
+    };
+    auto makeUav = [&](ID3D12Resource* r, UINT num, UINT stride, UINT idx) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+        d.Format = DXGI_FORMAT_UNKNOWN;
+        d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        d.Buffer.NumElements = num;
+        d.Buffer.StructureByteStride = stride;
+        rt.device->CreateUnorderedAccessView(r, nullptr, &d, {cpu.ptr + idx * inc});
+    };
+
+    makeSrv(bufInI64.Get(), 2, 32, 0);
+    makeSrv(bufInU64.Get(), 2, 32, 1);
+    makeSrv(bufInFlt.Get(), 3, 16, 2);
+    makeUav(bufOutBits.Get(), 5, 16, 3);
+    makeUav(bufOutAdj.Get(), 3, 16, 4);
+    makeUav(bufOutFPC.Get(), 9, 16, 5);
+
+    rt.resetCmd();
+    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+    rt.cmdList->SetDescriptorHeaps(1, heaps);
+    rt.cmdList->SetComputeRootSignature(rs.Get());
+    rt.cmdList->SetPipelineState(pso.Get());
+    rt.cmdList->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    rt.cmdList->Dispatch(1, 1, 1);
+    rt.executeAndWait();
+
+    auto bitsRaw = rt.readbackBuffer(bufOutBits.Get(), 5 * 16);
+    auto adjRaw = rt.readbackBuffer(bufOutAdj.Get(), 3 * 16);
+    auto fpcRaw = rt.readbackBuffer(bufOutFPC.Get(), 9 * 16);
+
+    uint32_t outBits[5][4];
+    uint32_t outAdj[3][4];
+    uint32_t outFPC[9][4];
+    std::memcpy(outBits, bitsRaw.data(), sizeof(outBits));
+    std::memcpy(outAdj, adjRaw.data(), sizeof(outAdj));
+    std::memcpy(outFPC, fpcRaw.data(), sizeof(outFPC));
+
+    const uint32_t expBits[5][4] = {
+        {3u, 0u, 32u, 64u},
+        {3u, 0u, 32u, 64u},
+        {0xFFFFFFFFu, 0u, 63u, 40u},
+        {0xFFFFFFFFu, 0u, 63u, 40u},
+        {0xFFFFFFFFu, 0xFFFFFFFFu, 3u, 40u},
+    };
+    const uint32_t expAdj[3][4] = {
+        {3u, 0u, 32u, 64u},
+        {3u, 0u, 32u, 64u},
+        {3u, 0u, 111u, 112u},
+    };
+    const uint32_t expFPC[9][4] = {
+        {1u, 1u, 0u, 0u},
+        {1u, 1u, 0u, 0u},
+        {1u, 1u, 0u, 0u},
+        {1u, 0u, 0u, 1u},
+        {0u, 0u, 1u, 1u},
+        {1u, 0u, 0u, 0u},
+        {0u, 1u, 0u, 0u},
+        {0u, 0u, 0u, 1u},
+        {0u, 0u, 1u, 0u},
+    };
+
+    bool ok = true;
+    for (int r = 0; r < 5; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (outBits[r][c] != expBits[r][c]) {
+                ok = false;
+                std::cout << "outBits[" << r << "][" << c << "] = " << outBits[r][c]
+                          << " (expected " << expBits[r][c] << ")\n";
+            }
+        }
+    }
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (outAdj[r][c] != expAdj[r][c]) {
+                ok = false;
+                std::cout << "outAdj[" << r << "][" << c << "] = " << outAdj[r][c]
+                          << " (expected " << expAdj[r][c] << ")\n";
+            }
+        }
+    }
+    for (int r = 0; r < 9; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (outFPC[r][c] != expFPC[r][c]) {
+                ok = false;
+                std::cout << "outFPC[" << r << "][" << c << "] = " << outFPC[r][c]
+                          << " (expected " << expFPC[r][c] << ")\n";
+            }
+        }
+    }
+    if (ok) std::cout << "PASS\n";
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -359,5 +521,6 @@ int main() {
     bool ok2 = testQuadDerivatives(rt, false);
     bool ok2d = testQuadDerivatives(rt, true);
     bool ok3 = testMathDenormsBits(rt);
-    return (ok1 && ok2 && ok2d && ok3) ? 0 : 1;
+    bool ok4 = testBitAndFPClassIntrinsics(rt);
+    return (ok1 && ok2 && ok2d && ok3 && ok4) ? 0 : 1;
 }
