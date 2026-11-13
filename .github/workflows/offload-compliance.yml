@@ -56,6 +56,7 @@ jobs:
             third_party/bcdec \
             third_party/thread-pool \
             third_party/xxHash \
+            third_party/llvm-project \
             third_party/offload-test-suite
 
       - name: Compute third_party LLVM revision
@@ -139,6 +140,7 @@ jobs:
           cmake -S third_party/offload-test-suite -B build-offload -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DLLVM_MAIN_SRC_DIR="${{ github.workspace }}/third_party/llvm-project/llvm" \
             -DOFFLOADTEST_ENABLE_D3D12=ON \
             -DOFFLOADTEST_ENABLE_VULKAN=OFF \
             -DOFFLOADTEST_ENABLE_METAL=OFF \
