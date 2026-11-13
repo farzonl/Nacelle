@@ -60,6 +60,7 @@
 #include "dxil_loader.h"
 #include "mlir_pipeline.h"
 #include "simt_to_simd_pass.h"
+#include "compiler_version.h"
 #include "texture_sampler_bc.h"
 
 namespace nacelle {
@@ -103,6 +104,10 @@ uint32_t getTargetSimdWidth() {
 #endif
 }
 
+const char* getCompilerBuildHash() {
+    return kCompilerBuildHash;
+}
+
 std::string hashToHex128(uint64_t lo, uint64_t hi) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out(32, '0');
@@ -115,7 +120,6 @@ std::string hashToHex128(uint64_t lo, uint64_t hi) {
 
 namespace {
 
-constexpr uint32_t kCompilerMagicVersion = 0x4E434A35; // 'NCJ5'
 
 struct HashFeed {
     std::vector<uint8_t> buf;
@@ -497,7 +501,7 @@ void computeComputePSOHash(
     uint64_t& outLo,
     uint64_t& outHi) {
     HashFeed feed;
-    feed.add(kCompilerMagicVersion);
+    feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
     feed.add(simdWidth);
     feed.add(rootLayout.hashLo);
@@ -517,7 +521,7 @@ void computeGraphicsPSOHash(
     uint64_t& outLo,
     uint64_t& outHi) {
     HashFeed feed;
-    feed.add(kCompilerMagicVersion);
+    feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
     feed.add(simdWidth);
     feed.add(rootLayout.hashLo);
