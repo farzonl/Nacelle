@@ -28,6 +28,11 @@ struct GraphicsExecutionState {
     uint32_t numRTVs = 0;
     NacelleRenderTargetDescriptor dsv{};
     bool hasDSV = false;
+    D3D12_SHADING_RATE shadingRate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER shadingRateCombiners[2]{
+        D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+    };
 };
 
 struct DrawCallParams {

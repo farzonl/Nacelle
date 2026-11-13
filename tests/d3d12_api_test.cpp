@@ -63,6 +63,21 @@ int main() {
     assert(heap->GetCPUDescriptorHandleForHeapStart().ptr != 0);
     assert(heap->GetGPUDescriptorHandleForHeapStart().ptr != 0);
 
+    // 5. Graphics & texture feature capability flags
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts0{};
+    testutil::checkHR(rt.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts0, sizeof(opts0)), "OPTIONS");
+    assert(opts0.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2);
+    assert(opts0.PSSpecifiedStencilRefSupported == TRUE);
+    assert(opts0.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation == TRUE);
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 opts3{};
+    testutil::checkHR(rt.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &opts3, sizeof(opts3)), "OPTIONS3");
+    assert(opts3.BarycentricsSupported == TRUE);
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+    testutil::checkHR(rt.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6)), "OPTIONS6");
+    assert(opts6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_1);
+
     std::printf("d3d12_api_test PASSED (adapter=\"%s\")\n", descBuf);
     return 0;
 }

@@ -407,15 +407,16 @@ void rasterizeTiles(
         emitter.args.tileDepthSOA = state.hasDSV ? scratch.depthSOA : nullptr;
         emitter.args.tileStencilSOA = state.hasDSV ? scratch.stencilSOA : nullptr;
 
-        const D3D12_RECT tileScissor{
-            std::max<LONG>(scene.scissorRect.left, static_cast<LONG>(tileOriginX)),
-            std::max<LONG>(scene.scissorRect.top, static_cast<LONG>(tileOriginY)),
-            std::min<LONG>(scene.scissorRect.right, static_cast<LONG>(tileOriginX + tileW)),
-            std::min<LONG>(scene.scissorRect.bottom, static_cast<LONG>(tileOriginY + tileH)),
-        };
-
         for (uint32_t triIdx : bins[tileIdx].triIndices) {
             const SetupTriangle& tri = scene.triangles[triIdx];
+            const uint32_t scIdx = (tri.viewportIndex < scene.numScissors) ? tri.viewportIndex : 0u;
+            const D3D12_RECT& vpScissor = scene.scissors[scIdx];
+            const D3D12_RECT tileScissor{
+                std::max<LONG>(vpScissor.left, static_cast<LONG>(tileOriginX)),
+                std::max<LONG>(vpScissor.top, static_cast<LONG>(tileOriginY)),
+                std::min<LONG>(vpScissor.right, static_cast<LONG>(tileOriginX + tileW)),
+                std::min<LONG>(vpScissor.bottom, static_cast<LONG>(tileOriginY + tileH)),
+            };
             int32_t minX = std::max<int32_t>(tri.minX, tileScissor.left);
             int32_t maxX = std::min<int32_t>(tri.maxX, tileScissor.right);
             int32_t minY = std::max<int32_t>(tri.minY, tileScissor.top);
@@ -428,6 +429,8 @@ void rasterizeTiles(
             emitter.args.triDepth = tri.depth;
             emitter.args.isFrontFace = tri.isFrontFace;
             emitter.args.primitiveId = tri.primitiveId;
+            emitter.args.viewportArrayIndex = tri.viewportIndex;
+            emitter.args.shadingRate = tri.shadingRate;
 
             int32_t qMinX = minX & ~1;
             int32_t qMaxX = (maxX + 1) & ~1;

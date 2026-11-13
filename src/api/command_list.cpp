@@ -289,6 +289,18 @@ void STDMETHODCALLTYPE NacelleCommandList::OMSetStencilRef(UINT ref) {
     commands_.push_back(CmdOMSetStencilRef{ref});
 }
 
+void STDMETHODCALLTYPE NacelleCommandList::RSSetShadingRate(
+    D3D12_SHADING_RATE baseShadingRate,
+    const D3D12_SHADING_RATE_COMBINER* combiners) {
+    CmdRSSetShadingRate cmd;
+    cmd.rate = baseShadingRate;
+    if (combiners) {
+        cmd.combiners[0] = combiners[0];
+        cmd.combiners[1] = combiners[1];
+    }
+    commands_.push_back(cmd);
+}
+
 void STDMETHODCALLTYPE NacelleCommandList::SetPipelineState(ID3D12PipelineState* pPSO) {
     if (pPSO) { pPSO->AddRef(); heldRefs_.push_back(pPSO); }
     commands_.push_back(CmdSetPipelineState{static_cast<NacellePipelineState*>(pPSO)});
@@ -817,6 +829,10 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 std::memcpy(state.gfx.rootCtx.blend_factor, c.factor, 16);
             } else if constexpr (std::is_same_v<T, CmdOMSetStencilRef>) {
                 state.gfx.rootCtx.stencil_ref = c.ref;
+            } else if constexpr (std::is_same_v<T, CmdRSSetShadingRate>) {
+                state.gfx.shadingRate = c.rate;
+                state.gfx.shadingRateCombiners[0] = c.combiners[0];
+                state.gfx.shadingRateCombiners[1] = c.combiners[1];
             } else if constexpr (std::is_same_v<T, CmdOMSetRenderTargets>) {
                 state.gfx.numRTVs = static_cast<uint32_t>(std::min<size_t>(c.rtvs.size(), 8));
                 for (uint32_t i = 0; i < state.gfx.numRTVs; ++i) state.gfx.rtvs[i] = c.rtvs[i];

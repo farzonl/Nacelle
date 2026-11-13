@@ -26,7 +26,7 @@ struct PsoUpdateBox {
 };
 
 struct CachedPSOMeta {
-    uint32_t magic = 0x4E434C31; // 'NCL1'
+    uint32_t magic = 0x4E434C32; // 'NCL2'
     uint32_t simdWidth = 4;
     // Compute
     uint32_t threadGroupSize[3]{1, 1, 1};
@@ -40,6 +40,10 @@ struct CachedPSOMeta {
     uint32_t cullDistMask = 0;
     uint32_t clipAttrOffset = 0;
     uint32_t cullAttrOffset = 0;
+    uint8_t hasViewportArrayIndex = 0;
+    uint32_t vpIndexAttrOffset = 0;
+    uint8_t hasPerPrimShadingRate = 0;
+    uint32_t shadingRateAttrOffset = 0;
     uint32_t totalVSScalarAttrs = 0;
     uint8_t hasGS = 0;
     uint32_t gsMaxVertexCount = 0;

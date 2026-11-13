@@ -37,6 +37,8 @@ struct SetupTriangle {
 
     uint32_t isFrontFace = 1;
     uint32_t primitiveId = 0;
+    uint32_t viewportIndex = 0;
+    uint32_t shadingRate = 0;
     float invW[3]{};   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
     float depth[3]{};  // (z0, z1 - z0, z2 - z0)
 
@@ -54,7 +56,16 @@ struct RasterScene {
     uint32_t cullDistMask = 0;
     uint32_t clipAttrOffset = 0;
     uint32_t cullAttrOffset = 0;
-    D3D12_RECT scissorRect{0, 0, 0, 0};
+    bool hasViewportArrayIndex = false;
+    uint32_t vpIndexAttrOffset = 0;
+    bool hasPerPrimShadingRate = false;
+    uint32_t shadingRateAttrOffset = 0;
+    D3D12_SHADING_RATE drawShadingRate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER shadingRateCombiner = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+    D3D12_VIEWPORT viewports[16]{};
+    uint32_t numViewports = 1;
+    D3D12_RECT scissors[16]{};
+    uint32_t numScissors = 1;
 
     std::vector<SetupTriangle> triangles;
     std::vector<float> attrBaseArena;

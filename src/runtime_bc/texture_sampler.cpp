@@ -618,8 +618,8 @@ void nacelle_tex_sample(
     }
 
     float maxMipF = float(tex->mip_levels > 0 ? tex->mip_levels - 1 : 0);
-    lod = f_clamp(lod, minLod, f_min(maxLod, maxMipF));
     if (clampLod >= 0.0f) lod = f_max(lod, clampLod);
+    lod = f_clamp(lod, minLod, f_min(maxLod, maxMipF));
 
     bool useLinear = (lod <= 0.0f) ? linearMag : linearMin;
 

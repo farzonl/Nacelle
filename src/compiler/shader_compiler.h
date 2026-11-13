@@ -103,6 +103,8 @@ struct PixelBatchArgs {
     uint32_t coverageMask = 0;
     uint32_t isFrontFace = 1;
     uint32_t primitiveId = 0;
+    uint32_t viewportArrayIndex = 0;
+    uint32_t shadingRate = 0;
     float* tileColorSOA[8]{};           // Each points to 4 * 4096 floats: plane c * 4096 + pixIdx
     float* tileDepthSOA = nullptr;      // 4096 floats
     uint8_t* tileStencilSOA = nullptr;  // 4096 uint8_t
@@ -214,6 +216,10 @@ struct CompiledGraphicsPSO {
     uint32_t cullDistMask = 0;         // Bitmask of active SV_CullDistance scalar components (0..7)
     uint32_t clipAttrOffset = 0;       // Starting scalar slot in outAttrs/attrBaseArena for SV_ClipDistance
     uint32_t cullAttrOffset = 0;       // Starting scalar slot in outAttrs/attrBaseArena for SV_CullDistance
+    bool hasViewportArrayIndex = false;
+    uint32_t vpIndexAttrOffset = 0;    // Scalar slot in outAttrs/attrBaseArena for SV_ViewportArrayIndex
+    bool hasPerPrimShadingRate = false;
+    uint32_t shadingRateAttrOffset = 0;// Scalar slot in outAttrs/attrBaseArena for SV_ShadingRate
     uint32_t totalVSScalarAttrs = 0;   // Total scalar attributes emitted by VS into outAttrs
     bool psWritesDepth = false;
     bool psUsesDiscard = false;

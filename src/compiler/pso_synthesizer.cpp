@@ -849,6 +849,19 @@ bool synthesizeGraphicsPSOMLIR(
         }
     }
     nextExtraAttr += cullScalarCount;
+    bool hasViewportArrayIndex = false;
+    uint32_t vpIndexAttrOffset = 0;
+    bool hasPerPrimShadingRate = false;
+    uint32_t shadingRateAttrOffset = 0;
+    for (const auto& vo : preRastOutputs) {
+        if (vo.systemValueType == 5 && !hasViewportArrayIndex) {
+            hasViewportArrayIndex = true;
+            vpIndexAttrOffset = nextExtraAttr++;
+        } else if (vo.systemValueType == 29 && !hasPerPrimShadingRate) {
+            hasPerPrimShadingRate = true;
+            shadingRateAttrOffset = nextExtraAttr++;
+        }
+    }
     uint32_t totalVSScalarAttrs = hasTess ? numHSInputScalars : (hasGS ? (numGSInputRegs * 4) : nextExtraAttr);
     uint32_t totalPostDSVertexAttrs = hasGS ? (numGSInputRegs * 4) : nextExtraAttr;
     uint32_t totalPostGSVertexAttrs = nextExtraAttr;
@@ -1070,6 +1083,16 @@ bool synthesizeGraphicsPSOMLIR(
                         mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
                     }
                 }
+                return true;
+            }
+            if (!hasGS && !hasTess && sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) { // SV_ViewportArrayIndex
+                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(vpIndexAttrOffset * simdWidth * 4));
+                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
+                return true;
+            }
+            if (!hasGS && !hasTess && sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) { // SV_ShadingRate
+                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(shadingRateAttrOffset * simdWidth * 4));
+                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
                 return true;
             }
 
@@ -1445,6 +1468,18 @@ bool synthesizeGraphicsPSOMLIR(
                     }
                     return true;
                 }
+                if (!hasGS && sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
+                    mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
+                        outAttrs, static_cast<int64_t>(vpIndexAttrOffset * 4));
+                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                    return true;
+                }
+                if (!hasGS && sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
+                    mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
+                        outAttrs, static_cast<int64_t>(shadingRateAttrOffset * 4));
+                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                    return true;
+                }
                 auto it = dsToNextMap.find(sigId);
                 if (it != dsToNextMap.end() && it->second.psTargetRow >= 0) {
                     uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
@@ -1609,6 +1644,14 @@ bool synthesizeGraphicsPSOMLIR(
                         sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>((cullAttrOffset + idx) * 4)));
                     }
                 }
+                return true;
+            }
+            if (sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
+                sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>(vpIndexAttrOffset * 4)));
+                return true;
+            }
+            if (sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
+                sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>(shadingRateAttrOffset * 4)));
                 return true;
             }
             auto it = gsToPsMap.find(sigId);
@@ -1837,7 +1880,8 @@ bool synthesizeGraphicsPSOMLIR(
             }
         };
 
-        auto runDepthStencil = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value curRealMask, mlir::Value candZ) -> mlir::Value {
+        auto runDepthStencil = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value curRealMask, mlir::Value candZ,
+                                   mlir::Value candStencilRef8 = mlir::Value()) -> mlir::Value {
             IRHelpers dh{db, dloc, simdWidth};
             const auto& ds = desc.DepthStencilState;
             bool depthOn = ds.DepthEnable && (desc.DSVFormat != DXGI_FORMAT_UNKNOWN);
@@ -1853,9 +1897,13 @@ bool synthesizeGraphicsPSOMLIR(
 
             if (stencilOn) {
                 oldStencil = loadStencilVec(db, dloc);
-                mlir::Value ref32 = dh.loadScalar(i32Ty, dh.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
-                mlir::Value refScalar8 = mlir::arith::TruncIOp::create(db, dloc, dh.i8Ty(), ref32);
-                ref8 = mlir::vector::BroadcastOp::create(db, dloc, dh.vecTy(dh.i8Ty()), refScalar8);
+                if (candStencilRef8) {
+                    ref8 = candStencilRef8;
+                } else {
+                    mlir::Value ref32 = dh.loadScalar(i32Ty, dh.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
+                    mlir::Value refScalar8 = mlir::arith::TruncIOp::create(db, dloc, dh.i8Ty(), ref32);
+                    ref8 = mlir::vector::BroadcastOp::create(db, dloc, dh.vecTy(dh.i8Ty()), refScalar8);
+                }
                 mlir::Value rMask8 = dh.splatInt(dh.i8Ty(), ds.StencilReadMask);
                 writeMask8 = dh.splatInt(dh.i8Ty(), ds.StencilWriteMask);
                 mlir::Value refMasked = mlir::arith::AndIOp::create(db, dloc, ref8, rMask8);
@@ -1909,9 +1957,18 @@ bool synthesizeGraphicsPSOMLIR(
         };
 
         bool psWritesDepth = hasPS && psLoaded.writesDepth;
+        bool psWritesStencilRef = false;
+        if (hasPS) {
+            for (const auto& po : psLoaded.outputSigs) {
+                if (po.systemValueType == 20) { // SV_StencilRef
+                    psWritesStencilRef = true;
+                    break;
+                }
+            }
+        }
         bool psUsesDiscard = hasPS && psLoaded.usesDiscard;
         bool psHasSideEffects = hasPS && psLoaded.hasSideEffects;
-        bool canEarlyZ = !psWritesDepth && !psUsesDiscard && !psHasSideEffects;
+        bool canEarlyZ = !psWritesDepth && !psWritesStencilRef && !psUsesDiscard && !psHasSideEffects;
 
         mlir::Value realMaskAfterEarly = initRealMask;
         if (canEarlyZ) {
@@ -1935,9 +1992,12 @@ bool synthesizeGraphicsPSOMLIR(
                 // Interpolate PS inputs
                 mlir::Value wVec = ph.splatFlt(1.0);
                 mlir::Value invWVec = ph.splatFlt(1.0);
+                mlir::Value triIw0, triIw1, triIw2;
                 bool needInvW = false;
                 for (const auto& pi : psLoaded.inputSigs) {
-                    if (pi.systemValueType == 3 || (pi.systemValueType == 0 && pi.interpMode == 2)) {
+                    if (pi.systemValueType == 3 ||
+                        (pi.systemValueType == 0 && pi.interpMode == 2) ||
+                        (pi.systemValueType == 28 && pi.interpMode != 4)) {
                         needInvW = true;
                         break;
                     }
@@ -1947,6 +2007,9 @@ bool synthesizeGraphicsPSOMLIR(
                     mlir::Value iw0 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, triInvWPtr));
                     mlir::Value diw1 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 4)));
                     mlir::Value diw2 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 8)));
+                    triIw0 = iw0;
+                    triIw1 = mlir::arith::AddFOp::create(pb, ploc, iw0, diw1);
+                    triIw2 = mlir::arith::AddFOp::create(pb, ploc, iw0, diw2);
                     invWVec = mlir::arith::AddFOp::create(
                         pb, ploc, iw0,
                         mlir::arith::AddFOp::create(
@@ -2010,6 +2073,15 @@ bool synthesizeGraphicsPSOMLIR(
                     pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                 ph.storeScalar(interpZ, outDepthPtr);
 
+                mlir::Value outStencilRefPtr;
+                if (psWritesStencilRef) {
+                    outStencilRefPtr = mlir::LLVM::AllocaOp::create(
+                        pb, ploc, ptrTy, ph.vecTy(ph.i8Ty()), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                    mlir::Value initRef32 = ph.loadScalar(i32Ty, ph.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
+                    mlir::Value initRef8 = mlir::arith::TruncIOp::create(pb, ploc, ph.i8Ty(), initRef32);
+                    ph.storeScalar(mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(ph.i8Ty()), initRef8), outStencilRefPtr);
+                }
+
                 StageHooks psHooks;
                 psHooks.isPixelShader = true;
                 psHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -2022,8 +2094,52 @@ bool synthesizeGraphicsPSOMLIR(
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
+                    if (sig->systemValueType == 5) { // SV_ViewportArrayIndex
+                        mlir::Value vp32 = lh.loadScalar(
+                            i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, viewportArrayIndex)));
+                        mlir::Value v = mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(i32Ty), vp32).getResult();
+                        if (scalarTy != i32Ty) {
+                            v = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                        }
+                        out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
+                        return true;
+                    }
                     if (sig->systemValueType == 10) { // SV_PrimitiveID
                         mlir::Value v = mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(i32Ty), primId32).getResult();
+                        if (scalarTy != i32Ty) {
+                            v = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                        }
+                        out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
+                        return true;
+                    }
+                    if (sig->systemValueType == 28) { // SV_Barycentrics
+                        mlir::Value b0 = mlir::arith::SubFOp::create(
+                            lb, lloc, lh.splatFlt(1.0),
+                            mlir::arith::AddFOp::create(lb, lloc, baryI, baryJ));
+                        mlir::Value v = lh.splatFlt(0.0);
+                        if (sig->interpMode == 4) { // noperspective
+                            if (col == 0) v = b0;
+                            else if (col == 1) v = baryI;
+                            else if (col == 2) v = baryJ;
+                        } else { // perspective (linear)
+                            if (col == 0) {
+                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, b0, triIw0), wVec);
+                            } else if (col == 1) {
+                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, baryI, triIw1), wVec);
+                            } else if (col == 2) {
+                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, baryJ, triIw2), wVec);
+                            }
+                        }
+                        if (scalarTy != f32Ty) {
+                            v = mlir::arith::TruncFOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                        }
+                        out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
+                        return true;
+                    }
+                    if (sig->systemValueType == 29) { // SV_ShadingRate
+                        mlir::Value sr32 = lh.loadScalar(
+                            i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, shadingRate)));
+                        mlir::Value v = mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(i32Ty), sr32).getResult();
                         if (scalarTy != i32Ty) {
                             v = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), v);
                         }
@@ -2081,6 +2197,20 @@ bool synthesizeGraphicsPSOMLIR(
                     IRHelpers sh{sb, sloc, simdWidth};
                     mlir::Value vVec = val.vec;
                     mlir::Type et = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+                    if (sig->systemValueType == 20 && outStencilRefPtr) { // SV_StencilRef
+                        mlir::Value refVec8;
+                        if (mlir::isa<mlir::IntegerType>(et)) {
+                            refVec8 = (et == sh.i8Ty())
+                                          ? vVec
+                                          : mlir::arith::TruncIOp::create(sb, sloc, sh.vecTy(sh.i8Ty()), vVec).getResult();
+                        } else {
+                            mlir::Value asI32 = mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
+                            refVec8 = mlir::arith::TruncIOp::create(sb, sloc, sh.vecTy(sh.i8Ty()), asI32);
+                        }
+                        mlir::Value prev = sh.loadScalar(sh.vecTy(sh.i8Ty()), outStencilRefPtr);
+                        sh.storeScalar(mlir::arith::SelectOp::create(sb, sloc, writeMask, refVec8, prev), outStencilRefPtr);
+                        return true;
+                    }
                     if (et != f32Ty) {
                         vVec = mlir::isa<mlir::IntegerType>(et)
                                    ? mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vVec).getResult()
@@ -2109,7 +2239,10 @@ bool synthesizeGraphicsPSOMLIR(
                 // Late-Z if Early-Z was skipped
                 if (!canEarlyZ) {
                     mlir::Value finalZ = ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr);
-                    curRealMask = runDepthStencil(pb, ploc, curRealMask, finalZ);
+                    mlir::Value finalStencilRef = psWritesStencilRef
+                                                      ? ph.loadScalar(ph.vecTy(ph.i8Ty()), outStencilRefPtr)
+                                                      : mlir::Value();
+                    curRealMask = runDepthStencil(pb, ploc, curRealMask, finalZ, finalStencilRef);
                 }
 
                 // Fixed-function Output Merger Blending across active MRTs
@@ -2251,6 +2384,10 @@ bool synthesizeGraphicsPSOMLIR(
     outMeta.cullDistMask = cullDistMask;
     outMeta.clipAttrOffset = clipAttrOffset;
     outMeta.cullAttrOffset = cullAttrOffset;
+    outMeta.hasViewportArrayIndex = hasViewportArrayIndex ? 1 : 0;
+    outMeta.vpIndexAttrOffset = vpIndexAttrOffset;
+    outMeta.hasPerPrimShadingRate = hasPerPrimShadingRate ? 1 : 0;
+    outMeta.shadingRateAttrOffset = shadingRateAttrOffset;
     outMeta.totalVSScalarAttrs = totalVSScalarAttrs;
     outMeta.hasGS = hasGS ? 1 : 0;
     outMeta.gsMaxVertexCount = hasGS ? gsLoaded.gsMaxVertexCount : 0;
@@ -2314,6 +2451,10 @@ bool compileGraphicsPSO(
     outPSO.cullDistMask = meta.cullDistMask;
     outPSO.clipAttrOffset = meta.clipAttrOffset;
     outPSO.cullAttrOffset = meta.cullAttrOffset;
+    outPSO.hasViewportArrayIndex = meta.hasViewportArrayIndex != 0;
+    outPSO.vpIndexAttrOffset = meta.vpIndexAttrOffset;
+    outPSO.hasPerPrimShadingRate = meta.hasPerPrimShadingRate != 0;
+    outPSO.shadingRateAttrOffset = meta.shadingRateAttrOffset;
     outPSO.totalVSScalarAttrs = meta.totalVSScalarAttrs;
     outPSO.hasGS = meta.hasGS != 0;
     outPSO.gsMaxVertexCount = meta.gsMaxVertexCount;

@@ -97,6 +97,13 @@ struct CmdRSSetViewports { std::vector<D3D12_VIEWPORT> vps; };
 struct CmdRSSetScissors { std::vector<D3D12_RECT> rects; };
 struct CmdOMSetBlendFactor { float factor[4]{1, 1, 1, 1}; };
 struct CmdOMSetStencilRef { UINT ref = 0; };
+struct CmdRSSetShadingRate {
+    D3D12_SHADING_RATE rate = D3D12_SHADING_RATE_1X1;
+    D3D12_SHADING_RATE_COMBINER combiners[2]{
+        D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+    };
+};
 struct CmdOMSetRenderTargets { std::vector<NacelleRenderTargetDescriptor> rtvs; bool hasDSV = false; NacelleRenderTargetDescriptor dsv{}; };
 struct CmdClearRTV { NacelleRenderTargetDescriptor rtv{}; float rgba[4]{}; std::vector<D3D12_RECT> rects; };
 struct CmdClearDSV { NacelleRenderTargetDescriptor dsv{}; D3D12_CLEAR_FLAGS flags{}; float depth = 1.0f; UINT8 stencil = 0; std::vector<D3D12_RECT> rects; };
@@ -113,6 +120,7 @@ using RecordedCommand = std::variant<
     CmdCopyBufferRegion, CmdCopyTextureRegion, CmdCopyResource, CmdResolveSubresource,
     CmdIASetTopology, CmdIASetIndexBuffer, CmdIASetVertexBuffers,
     CmdRSSetViewports, CmdRSSetScissors, CmdOMSetBlendFactor, CmdOMSetStencilRef,
+    CmdRSSetShadingRate,
     CmdOMSetRenderTargets, CmdClearRTV, CmdClearDSV, CmdClearUAV,
     CmdExecuteBundle, CmdEndQuery, CmdResolveQueryData, CmdExecuteIndirect>;
 
@@ -213,7 +221,7 @@ public:
     void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC*) override {}
 
     // ID3D12GraphicsCommandList5
-    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE, const D3D12_SHADING_RATE_COMBINER*) override {}
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate, const D3D12_SHADING_RATE_COMBINER* combiners) override;
     void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource*) override {}
 
     // ID3D12GraphicsCommandList6
