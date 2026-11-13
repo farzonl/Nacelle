@@ -122,6 +122,13 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->Int64ShaderOps = TRUE;
         return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS4: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->Native16BitShaderOpsSupported = TRUE;
+        return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS9: {
         if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(pData);
