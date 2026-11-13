@@ -2422,6 +2422,78 @@ private:
         return mlir::arith::MulIOp::create(nb, loc, idx64, loadStride64());
     }
 
+    bool tryGetUniformScalar(mlir::Location loc, mlir::Value origVal, mlir::Value& outScalar) {
+        if (auto c = getConstIntValue(origVal)) {
+            outScalar = cInt(loc, i32Ty(), static_cast<int64_t>(*c));
+            return true;
+        }
+        SimdVal sv = getMapped(loc, origVal);
+        if (sv.isUniform()) {
+            outScalar = sv.lanes[0];
+            return true;
+        }
+        if (sv.kind == SimdVal::Kind::Vector) {
+            if (auto bcast = sv.vec.getDefiningOp<mlir::vector::BroadcastOp>()) {
+                if (!mlir::isa<mlir::VectorType>(bcast.getSource().getType())) {
+                    outScalar = bcast.getSource();
+                    return true;
+                }
+            }
+            if (auto cst = sv.vec.getDefiningOp<mlir::arith::ConstantOp>()) {
+                if (auto dea = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue())) {
+                    if (dea.isSplat()) {
+                        outScalar = mlir::arith::ConstantOp::create(
+                            b_, loc, mlir::cast<mlir::TypedAttr>(dea.getSplatValue<mlir::Attribute>()));
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    mlir::Value emitUniformBufferComponentLoad(
+        mlir::Location loc,
+        mlir::Type elemTy,
+        uint32_t elemBytes,
+        mlir::Value basePtr,
+        mlir::Value byteSize,
+        mlir::Value okPtr,
+        mlir::Value byteOff,
+        mlir::Value elemStride,
+        unsigned c) {
+        mlir::Value cOff = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), c * elemBytes));
+        mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
+        mlir::Value inBounds = mlir::arith::AndIOp::create(
+            b_, loc, okPtr,
+            mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
+        if (elemStride) {
+            mlir::Value elemEnd = cInt(loc, i32Ty(), (c + 1) * elemBytes);
+            mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::eq, elemStride, cInt(loc, i32Ty(), 0));
+            mlir::Value inElem = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
+            inBounds = mlir::arith::AndIOp::create(
+                b_, loc, inBounds, mlir::arith::OrIOp::create(b_, loc, strideZero, inElem));
+        }
+        mlir::Value val = mlir::scf::IfOp::create(
+                              b_, loc, inBounds,
+                              [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                                  mlir::Value ep = mlir::LLVM::GEPOp::create(
+                                      nb, nloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{cOff});
+                                  mlir::scf::YieldOp::create(
+                                      nb, nloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(nb, nloc, elemTy, ep)});
+                              },
+                              [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                                  SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                                  mlir::Value z = mlir::isa<mlir::FloatType>(elemTy) ? tmp.cFlt(nloc, elemTy, 0.0)
+                                                                                     : tmp.cInt(nloc, elemTy, 0);
+                                  mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{z});
+                              })
+                              .getResult(0);
+        return mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), val);
+    }
+
     bool packetizeBufferLoad(mlir::LLVM::CallOp call, bool isRawOp, std::string& outError) {
         mlir::Location loc = call.getLoc();
         SimdVal h = getMapped(loc, call.getOperand(1));
@@ -2437,6 +2509,41 @@ private:
         }
         mlir::Type elemTy = st.getBody()[0];
         uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+
+        mlir::Value uniformIdx;
+        mlir::Value uniformElemOff;
+        if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx) &&
+            (!hasElemOff || tryGetUniformScalar(loc, elemOffArg, uniformElemOff))) {
+            if (!hasElemOff) uniformElemOff = cInt(loc, i32Ty(), 0);
+            mlir::Value descP = h.lanes[0];
+            mlir::Value basePtr = loadDescBasePtr(loc, descP);
+            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
+            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
+                                         : mlir::Value();
+            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
+            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
+            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, uniformIdx, uniformElemOff, isRawOp, hasElemOff);
+
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = st;
+            for (unsigned c = 0; c < 4; ++c) {
+                if ((mask & (1u << c)) == 0) {
+                    mlir::Value z = mlir::isa<mlir::FloatType>(elemTy) ? cFlt(loc, elemTy, 0.0) : cInt(loc, elemTy, 0);
+                    outSt.fields.push_back({SimdVal::Kind::Vector, elemTy,
+                                            mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), z), {}, {}});
+                    continue;
+                }
+                mlir::Value bvec = emitUniformBufferComponentLoad(
+                    loc, elemTy, elemBytes, basePtr, byteSize, okPtr, byteOff, elemStride, c);
+                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
+            }
+            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+
         mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
         mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
 
@@ -2574,6 +2681,36 @@ private:
         mlir::Type elemTy = vt.getElementType();
         unsigned numElems = static_cast<unsigned>(vt.getNumElements());
         uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+
+        mlir::Value uniformIdx;
+        mlir::Value uniformElemOff;
+        if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx) &&
+            (!hasElemOff || tryGetUniformScalar(loc, elemOffArg, uniformElemOff))) {
+            if (!hasElemOff) uniformElemOff = cInt(loc, i32Ty(), 0);
+            mlir::Value descP = h.lanes[0];
+            mlir::Value basePtr = loadDescBasePtr(loc, descP);
+            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
+            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
+            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
+            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, uniformIdx, uniformElemOff, /*isRawOp=*/true, hasElemOff);
+
+            SimdVal vecVal;
+            vecVal.kind = SimdVal::Kind::Struct;
+            vecVal.origType = vt;
+            for (unsigned c = 0; c < numElems; ++c) {
+                mlir::Value bvec = emitUniformBufferComponentLoad(
+                    loc, elemTy, elemBytes, basePtr, byteSize, okPtr, byteOff, mlir::Value(), c);
+                vecVal.fields.push_back({SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
+            }
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = st;
+            outSt.fields.push_back(std::move(vecVal));
+            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+
         mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
         mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
 
