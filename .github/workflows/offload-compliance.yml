@@ -59,6 +59,14 @@ jobs:
             third_party/llvm-project \
             third_party/offload-test-suite
 
+      - name: Checkout Golden Images
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-golden-images
+          ref: main
+          path: golden-images
+          fetch-depth: 1
+
       - name: Compute third_party LLVM revision
         id: submodule-rev
         run: |
@@ -147,6 +155,7 @@ jobs:
             -DOFFLOADTEST_ENABLE_DEBUG=ON \
             -DOFFLOADTEST_ENABLE_VALIDATION=OFF \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DGOLDENIMAGE_DIR="${{ github.workspace }}/golden-images" \
             -DD3D12_WSL_FOUND=TRUE \
             -DD3D12_WSL_LIBRARIES="${{ github.workspace }}/build/libnacelle_d3d12.so;${{ github.workspace }}/build/third_party/DirectX-Headers/libDirectX-Headers.a" \
             -DCMAKE_CXX_FLAGS="-I${{ github.workspace }}/third_party/DirectX-Headers/include -I${{ github.workspace }}/src/common/posix_sal"
