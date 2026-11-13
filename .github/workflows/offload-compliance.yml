@@ -35,8 +35,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python test dependencies (lit, PyYAML)
-        run: python3 -m pip install --upgrade pip lit pyyaml
+      - name: Install Python test dependencies (lit, psutil, PyYAML)
+        run: python3 -m pip install --upgrade pip lit psutil pyyaml
 
       - name: Install system packages
         run: |
@@ -159,7 +159,7 @@ jobs:
           mv build-offload/bin/offloader build-offload/bin/offloader.bin
           printf '#!/bin/sh\nexec "%s/build-offload/bin/offloader.bin" --api=dx "$@"\n' "${{ github.workspace }}" > build-offload/bin/offloader
           chmod +x build-offload/bin/offloader
-          lit -v --output="${{ github.workspace }}/offload-results.json" "${{ github.workspace }}/build-offload/test/d3d12" || true
+          lit -v --timeout=60 --output="${{ github.workspace }}/offload-results.json" "${{ github.workspace }}/build-offload/test/d3d12" || true
           mv build-offload/bin/offloader.bin build-offload/bin/offloader
 
       - name: Restore historical compliance data cache
