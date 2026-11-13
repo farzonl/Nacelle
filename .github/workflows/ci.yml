@@ -3,7 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - ".github/workflows/windows-benchmark.yml"
+      - ".github/workflows/offload-compliance.yml"
+      - "pages/**"
+      - "scripts/**"
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - ".github/workflows/windows-benchmark.yml"
+      - ".github/workflows/offload-compliance.yml"
+      - "pages/**"
+      - "scripts/**"
+      - "**.md"
   workflow_dispatch:
 
 concurrency:
