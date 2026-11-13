@@ -486,7 +486,7 @@
 
     <section class="kpi-grid" aria-label="Latest compliance summary">
       <article class="card">
-        <div class="kpi-label">Pass Rate (Executed)</div>
+        <div class="kpi-label">Pass Rate (Total)</div>
         <div class="kpi-value" id="kpi-rate">—</div>
         <div class="kpi-sub" id="kpi-delta">Awaiting run data</div>
       </article>
@@ -529,6 +529,7 @@
           <span class="legend-item"><span class="swatch" style="background: var(--pass)"></span>✓ Passed</span>
           <span class="legend-item"><span class="swatch" style="background: var(--fail)"></span>✕ Failed</span>
           <span class="legend-item"><span class="swatch" style="background: var(--xfail)"></span>~ XFail</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--muted)"></span>Unsupported</span>
         </div>
       </div>
       <div class="svg-chart-wrap" id="category-svg-wrap"></div>
@@ -587,7 +588,7 @@
         failed: 140,
         xfail: 4,
         unsupported: 314,
-        passRate: 71.49,
+        passRate: 44.08,
         categories: [
           { name: "Feature/Textures", passed: 12, failed: 26, xfail: 0, unsupported: 0, passRate: 31.6 },
           { name: "Feature/HLSLLib", passed: 180, failed: 38, xfail: 2, unsupported: 0, passRate: 81.8 },
@@ -688,7 +689,7 @@
 
     function renderCategorySVG(entry) {
       const wrap = document.getElementById("category-svg-wrap");
-      const cats = (entry.categories || []).filter(c => (c.passed + c.failed + c.xfail) > 0);
+      const cats = (entry.categories || []).filter(c => (c.passed + c.failed + c.xfail + (c.unsupported || 0)) > 0);
       if (!cats.length) {
         wrap.innerHTML = `<p class="empty-note">No category breakdown recorded for this commit.</p>`;
         return;
@@ -704,10 +705,12 @@
 
       const rows = cats.map((c, i) => {
         const y = padTop + i * rowH;
-        const total = c.passed + c.failed + c.xfail;
+        const unsup = c.unsupported || 0;
+        const total = c.passed + c.failed + c.xfail + unsup;
         const wPass = (c.passed / total) * barW;
         const wFail = (c.failed / total) * barW;
         const wXfail = (c.xfail / total) * barW;
+        const wUnsup = (unsup / total) * barW;
         return `
           <g transform="translate(0, ${y})">
             <text x="${padLeft - 10}" y="17" text-anchor="end" font-size="12" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(c.name)}</text>
@@ -719,6 +722,9 @@
             </rect>
             <rect x="${(padLeft + wPass + wFail).toFixed(1)}" y="5" width="${wXfail.toFixed(1)}" height="16" fill="var(--xfail)">
               <title>${escapeHtml(c.name)}: ${c.xfail} xfail</title>
+            </rect>
+            <rect x="${(padLeft + wPass + wFail + wXfail).toFixed(1)}" y="5" width="${wUnsup.toFixed(1)}" height="16" fill="var(--muted)" opacity="0.45">
+              <title>${escapeHtml(c.name)}: ${unsup} unsupported</title>
             </rect>
             <text x="${padLeft + barW + 8}" y="17" font-size="12" font-family="var(--font-mono)" fill="var(--muted)">${c.passRate.toFixed(0)}%</text>
           </g>`;
@@ -934,15 +940,28 @@
       });
     }
 
+    function normalizeHistory(entries) {
+      return entries.map(entry => {
+        const total = entry.total ?? ((entry.passed || 0) + (entry.failed || 0) + (entry.xfail || 0) + (entry.unsupported || 0));
+        const passRate = total > 0 ? Math.round((10000 * (entry.passed || 0)) / total) / 100 : 0;
+        const categories = (entry.categories || []).map(c => {
+          const catTotal = (c.passed || 0) + (c.failed || 0) + (c.xfail || 0) + (c.unsupported || 0);
+          const catRate = catTotal > 0 ? Math.round((1000 * (c.passed || 0)) / catTotal) / 10 : 0;
+          return { ...c, passRate: catRate };
+        });
+        return { ...entry, total, passRate, categories };
+      });
+    }
+
     async function init() {
       setupThemeToggle();
       try {
         const resp = await fetch("data/history.json", { cache: "no-store" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const json = await resp.json();
-        historyData = Array.isArray(json) && json.length ? json : FALLBACK_HISTORY;
+        historyData = normalizeHistory(Array.isArray(json) && json.length ? json : FALLBACK_HISTORY);
       } catch {
-        historyData = FALLBACK_HISTORY;
+        historyData = normalizeHistory(FALLBACK_HISTORY);
       }
 
       selectedIndex = historyData.length - 1;
