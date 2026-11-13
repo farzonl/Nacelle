@@ -43,6 +43,7 @@ add_hlsl_dxil(bindless_sm66.hlsl cs_6_6 CSMain bindless_sm66.dxil)
 add_hlsl_dxil(divergent_cf_atomics.hlsl cs_6_0 CSMain divergent_cf_atomics.dxil)
 add_hlsl_dxil(wave_intrinsics.hlsl cs_6_0 CSMain wave_intrinsics.dxil)
 add_hlsl_dxil(prefix_sum_groupshared.hlsl cs_6_0 CSMain prefix_sum_groupshared.dxil)
+add_hlsl_dxil(interlocked_barrier.hlsl cs_6_6 CSMain interlocked_barrier.dxil)
 
 # Cross-backend benchmark shader (DXIL + SPIR-V)
 add_hlsl_dxil(bench_raymarch.hlsl cs_6_0 main bench_raymarch.dxil)
@@ -83,6 +84,7 @@ add_nacelle_test(simd_wave_test simd_wave_test.cpp)
 add_nacelle_test(rasterizer_pipeline_test rasterizer_pipeline_test.cpp)
 add_nacelle_test(pbr_render_test pbr_render_test.cpp)
 add_nacelle_test(pso_cache_bcn_test pso_cache_bcn_test.cpp)
+add_nacelle_test(interlocked_barrier_test interlocked_barrier_test.cpp)
 
 # lit / FileCheck compiler IR tests
 file(GLOB NACELLE_LIT_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/lit/*.test")

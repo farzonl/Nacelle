@@ -29,13 +29,18 @@ static std::optional<uint64_t> getConstIntValue(mlir::Value v) {
         if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
             return ia.getValue().getZExtValue();
         }
+        if (auto dea = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
+            if (dea.isSplat() && mlir::isa<mlir::IntegerType>(dea.getElementType())) {
+                return dea.getSplatValue<llvm::APInt>().getZExtValue();
+            }
+        }
     }
     if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>()) {
         if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
             return ia.getValue().getZExtValue();
         }
         if (auto dea = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
-            if (dea.isSplat()) {
+            if (dea.isSplat() && mlir::isa<mlir::IntegerType>(dea.getElementType())) {
                 return dea.getSplatValue<llvm::APInt>().getZExtValue();
             }
         }
@@ -49,11 +54,60 @@ static bool isUndefOrPoison(mlir::Value v) {
                  v.getDefiningOp<mlir::ub::PoisonOp>());
 }
 
+static bool extractConstStructInts(mlir::Value v, llvm::SmallVectorImpl<uint64_t>& out) {
+    if (!v) return false;
+    auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(v.getType());
+    if (!st) return false;
+    out.assign(st.getBody().size(), 0);
+
+    llvm::SmallVector<std::pair<size_t, mlir::Value>, 8> inserts;
+    mlir::Value cur = v;
+    while (auto iv = cur.getDefiningOp<mlir::LLVM::InsertValueOp>()) {
+        auto pos = iv.getPosition();
+        if (pos.size() == 1 && static_cast<size_t>(pos[0]) < out.size()) {
+            inserts.push_back({static_cast<size_t>(pos[0]), iv.getValue()});
+        }
+        cur = iv.getContainer();
+    }
+
+    bool recognized = !inserts.empty();
+    if (cur.getDefiningOp<mlir::LLVM::ZeroOp>() || isUndefOrPoison(cur)) {
+        recognized = true;
+    } else if (auto cst = cur.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+        if (auto arr = llvm::dyn_cast<mlir::ArrayAttr>(cst.getValue())) {
+            recognized = true;
+            for (size_t i = 0; i < arr.size() && i < out.size(); ++i) {
+                if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(arr[i])) {
+                    out[i] = ia.getValue().getZExtValue();
+                }
+            }
+        }
+    }
+
+    for (auto it = inserts.rbegin(); it != inserts.rend(); ++it) {
+        if (auto cv = getConstIntValue(it->second)) {
+            out[it->first] = *cv;
+        }
+    }
+    return recognized;
+}
+
 static bool isBarrierOp(mlir::Operation* op) {
     auto call = llvm::dyn_cast<mlir::LLVM::CallOp>(op);
     if (!call) return false;
     auto callee = call.getCallee();
-    return callee && callee->starts_with("dx.op.barrier");
+    if (!callee || !callee->starts_with("dx.op.barrier")) return false;
+    if (call.getNumOperands() == 0) return true;
+    uint64_t opNum = getConstIntValue(call.getOperand(0)).value_or(80);
+    if (opNum == 80 && call.getNumOperands() > 1) {
+        uint64_t mode = getConstIntValue(call.getOperand(1)).value_or(1);
+        return (mode & 1u) != 0; // DXIL::BarrierMode::SYNC_THREAD_GROUP
+    }
+    if ((opNum == 244 || opNum == 245) && call.getNumOperands() > 2) {
+        uint64_t sem = getConstIntValue(call.getOperand(2)).value_or(1);
+        return (sem & 1u) != 0; // DXIL::BarrierSemanticFlags::GroupSync
+    }
+    return true;
 }
 
 static bool opContainsBarrier(mlir::Operation* op) {
@@ -252,7 +306,10 @@ public:
             if (sv.lanes.size() == 1) {
                 return mlir::vector::BroadcastOp::create(b_, loc, vecTy(sv.lanes[0].getType()), sv.lanes[0]);
             }
-            mlir::Value v = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(sv.lanes[0].getType()));
+            mlir::Type elemTy = sv.lanes[0].getType();
+            mlir::Value v = mlir::LLVM::isCompatibleType(elemTy)
+                                ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)))
+                                : mlir::Value(mlir::ub::PoisonOp::create(b_, loc, vecTy(elemTy)));
             for (uint32_t l = 0; l < W_; ++l) {
                 v = mlir::vector::InsertOp::create(b_, loc, sv.lanes[l], v, static_cast<int64_t>(l));
             }
@@ -268,8 +325,11 @@ public:
         if (sv.kind == SimdVal::Kind::Lanes && !sv.lanes.empty()) {
             return sv.lanes.size() == 1 ? sv.lanes[0] : sv.lanes[l];
         }
-        if (sv.kind == SimdVal::Kind::Handle) {
+        if (sv.kind == SimdVal::Kind::Handle && !sv.lanes.empty()) {
             return sv.lanes.size() == 1 ? sv.lanes[0] : sv.lanes[l];
+        }
+        if (sv.kind == SimdVal::Kind::Struct && sv.fields.size() == 1) {
+            return laneValue(loc, sv.fields[0], l);
         }
         return nullptr;
     }
@@ -311,6 +371,8 @@ public:
     void flattenSimdTypes(mlir::Type origTy, llvm::SmallVectorImpl<mlir::Type>& outVecTypes) {
         if (mlir::isa<mlir::IntegerType, mlir::FloatType>(origTy)) {
             outVecTypes.push_back(vecTy(origTy));
+        } else if (origTy.isIndex()) {
+            outVecTypes.push_back(vecTy(i64Ty()));
         } else if (mlir::isa<mlir::LLVM::LLVMPointerType>(origTy)) {
             outVecTypes.push_back(mlir::LLVM::LLVMArrayType::get(ptrTy(), W_));
         } else if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(origTy)) {
@@ -325,6 +387,15 @@ public:
     void packSimdToValues(mlir::Location loc, const SimdVal& sv, llvm::SmallVectorImpl<mlir::Value>& out) {
         if (sv.kind == SimdVal::Kind::Vector) {
             out.push_back(sv.vec);
+        } else if (sv.origType && sv.origType.isIndex()) {
+            mlir::Value vec64 = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value idxL = laneValue(loc, sv, l);
+                mlir::Value i64L = idxL ? mlir::Value(mlir::arith::IndexCastOp::create(b_, loc, i64Ty(), idxL))
+                                        : cInt(loc, i64Ty(), 0);
+                vec64 = mlir::vector::InsertOp::create(b_, loc, i64L, vec64, static_cast<int64_t>(l));
+            }
+            out.push_back(vec64);
         } else if (sv.kind == SimdVal::Kind::Lanes || sv.kind == SimdVal::Kind::Handle) {
             mlir::Type arrTy = mlir::LLVM::LLVMArrayType::get(ptrTy(), W_);
             mlir::Value arr = mlir::LLVM::UndefOp::create(b_, loc, arrTy);
@@ -353,6 +424,17 @@ public:
         }
         if (mlir::isa<mlir::IntegerType, mlir::FloatType>(origTy)) {
             return {SimdVal::Kind::Vector, origTy, vals[cursor++], {}, {}};
+        }
+        if (origTy.isIndex()) {
+            SimdVal sv;
+            sv.kind = SimdVal::Kind::Lanes;
+            sv.origType = origTy;
+            mlir::Value vec64 = vals[cursor++];
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value i64L = mlir::vector::ExtractOp::create(b_, loc, vec64, static_cast<int64_t>(l));
+                sv.lanes.push_back(mlir::arith::IndexCastOp::create(b_, loc, origTy, i64L));
+            }
+            return sv;
         }
         if (mlir::isa<mlir::LLVM::LLVMPointerType>(origTy)) {
             SimdVal sv;
@@ -425,6 +507,21 @@ private:
 
     void storeScalar(mlir::Location loc, mlir::Value val, mlir::Value ptr) {
         mlir::LLVM::StoreOp::create(b_, loc, val, ptr);
+    }
+
+    mlir::Value createEntryAlloca(mlir::Location loc, mlir::Type elemTy, uint64_t count, unsigned align = 64) {
+        mlir::Block* curBlk = b_.getInsertionBlock();
+        mlir::Operation* parentOp = curBlk ? curBlk->getParentOp() : nullptr;
+        while (parentOp && !llvm::isa<mlir::func::FuncOp>(parentOp)) {
+            parentOp = parentOp->getParentOp();
+        }
+        if (auto fnOp = llvm::dyn_cast_or_null<mlir::func::FuncOp>(parentOp)) {
+            mlir::Block& entryBlk = fnOp.getBody().front();
+            mlir::OpBuilder eb(&entryBlk, entryBlk.begin());
+            mlir::Value sz = mlir::arith::ConstantIntOp::create(eb, loc, eb.getI32Type(), count);
+            return mlir::LLVM::AllocaOp::create(eb, loc, ptrTy(), elemTy, sz, align);
+        }
+        return mlir::LLVM::AllocaOp::create(b_, loc, ptrTy(), elemTy, cInt(loc, i32Ty(), count), align);
     }
 
     mlir::LLVM::LLVMFuncOp getOrDeclareRuntimeFn(
@@ -525,20 +622,22 @@ private:
             sv.origType = ptrTy();
             mlir::Type elemTy = allocaOp.getElemType();
             uint64_t count = getConstIntValue(allocaOp.getArraySize()).value_or(1);
-            if (count == 1) {
-                mlir::Type arrTy = mlir::LLVM::LLVMArrayType::get(elemTy, W_);
-                mlir::Value arrPtr = mlir::LLVM::AllocaOp::create(
-                    b_, loc, ptrTy(), arrTy, cInt(loc, i32Ty(), 1), 16);
+            mlir::Type slotTy = (count == 1) ? elemTy : mlir::Type(mlir::LLVM::LLVMArrayType::get(elemTy, count));
+            uint32_t numWaves = std::max<uint32_t>(1u, hooks_.numWaves);
+            mlir::Value baseAlloca = createEntryAlloca(loc, slotTy, static_cast<uint64_t>(numWaves) * W_, 64);
+            if (hooks_.waveIdx && numWaves > 1u) {
+                mlir::Value w32 = mlir::arith::IndexCastOp::create(b_, loc, i32Ty(), hooks_.waveIdx);
+                mlir::Value waveBase = mlir::arith::MulIOp::create(b_, loc, w32, cInt(loc, i32Ty(), W_));
                 for (uint32_t l = 0; l < W_; ++l) {
-                    mlir::Value lanePtr = mlir::LLVM::GEPOp::create(
-                        b_, loc, ptrTy(), arrTy, arrPtr,
-                        llvm::ArrayRef<mlir::LLVM::GEPArg>{0, static_cast<int32_t>(l)});
-                    sv.lanes.push_back(lanePtr);
+                    mlir::Value slotIdx = mlir::arith::AddIOp::create(b_, loc, waveBase, cInt(loc, i32Ty(), l));
+                    sv.lanes.push_back(mlir::LLVM::GEPOp::create(
+                        b_, loc, ptrTy(), slotTy, baseAlloca, mlir::ValueRange{slotIdx}));
                 }
             } else {
                 for (uint32_t l = 0; l < W_; ++l) {
-                    sv.lanes.push_back(mlir::LLVM::AllocaOp::create(
-                        b_, loc, ptrTy(), elemTy, cInt(loc, i32Ty(), count), 16));
+                    sv.lanes.push_back(mlir::LLVM::GEPOp::create(
+                        b_, loc, ptrTy(), slotTy, baseAlloca,
+                        llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(l)}));
                 }
             }
             setMapped(allocaOp.getRes(), sv);
@@ -647,7 +746,16 @@ private:
                 auto ifL = mlir::scf::IfOp::create(
                     b_, loc, mL,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        auto r = mlir::LLVM::AtomicRMWOp::create(nb, nloc, rmw.getBinOp(), pL, vL, rmw.getOrdering());
+                        mlir::Value r;
+                        if (mlir::isa<mlir::FloatType>(ty) && rmw.getBinOp() == mlir::LLVM::AtomicBinOp::xchg) {
+                            mlir::Type intTy = nb.getIntegerType(ty.getIntOrFloatBitWidth());
+                            mlir::Value vInt = mlir::arith::BitcastOp::create(nb, nloc, intTy, vL);
+                            mlir::Value rInt = mlir::LLVM::AtomicRMWOp::create(
+                                nb, nloc, mlir::LLVM::AtomicBinOp::xchg, pL, vInt, rmw.getOrdering());
+                            r = mlir::arith::BitcastOp::create(nb, nloc, ty, rInt);
+                        } else {
+                            r = mlir::LLVM::AtomicRMWOp::create(nb, nloc, rmw.getBinOp(), pL, vL, rmw.getOrdering());
+                        }
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{r});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -674,9 +782,19 @@ private:
                 auto ifL = mlir::scf::IfOp::create(
                     b_, loc, mL,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value cOp = cL;
+                        mlir::Value vOp = vL;
+                        if (mlir::isa<mlir::FloatType>(elemTy)) {
+                            mlir::Type intTy = nb.getIntegerType(elemTy.getIntOrFloatBitWidth());
+                            cOp = mlir::arith::BitcastOp::create(nb, nloc, intTy, cL);
+                            vOp = mlir::arith::BitcastOp::create(nb, nloc, intTy, vL);
+                        }
                         auto r = mlir::LLVM::AtomicCmpXchgOp::create(
-                            nb, nloc, pL, cL, vL, cx.getSuccessOrdering(), cx.getFailureOrdering());
+                            nb, nloc, pL, cOp, vOp, cx.getSuccessOrdering(), cx.getFailureOrdering());
                         mlir::Value oldV = mlir::LLVM::ExtractValueOp::create(nb, nloc, r, llvm::ArrayRef<int64_t>{0});
+                        if (mlir::isa<mlir::FloatType>(elemTy)) {
+                            oldV = mlir::arith::BitcastOp::create(nb, nloc, elemTy, oldV);
+                        }
                         mlir::Value ok = mlir::LLVM::ExtractValueOp::create(nb, nloc, r, llvm::ArrayRef<int64_t>{1});
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{oldV, ok});
                     },
@@ -1564,16 +1682,11 @@ private:
         if (op == 217) {
             // createHandleFromBinding(op, ResBind{lower, upper, space, class}, index, nonUniform)
             uint32_t lower = 0, space = 0, resClass = 0;
-            if (auto undefZero = arg(1).getDefiningOp<mlir::LLVM::ZeroOp>()) {
-                (void)undefZero;
-            } else if (auto cst = arg(1).getDefiningOp<mlir::LLVM::ConstantOp>()) {
-                if (auto arr = llvm::dyn_cast<mlir::ArrayAttr>(cst.getValue())) {
-                    if (arr.size() >= 4) {
-                        lower = static_cast<uint32_t>(llvm::cast<mlir::IntegerAttr>(arr[0]).getInt());
-                        space = static_cast<uint32_t>(llvm::cast<mlir::IntegerAttr>(arr[2]).getInt());
-                        resClass = static_cast<uint32_t>(llvm::cast<mlir::IntegerAttr>(arr[3]).getInt());
-                    }
-                }
+            llvm::SmallVector<uint64_t, 4> rbFields;
+            if (extractConstStructInts(arg(1), rbFields) && rbFields.size() >= 4) {
+                lower = static_cast<uint32_t>(rbFields[0]);
+                space = static_cast<uint32_t>(rbFields[2]);
+                resClass = static_cast<uint32_t>(rbFields[3]);
             } else {
                 // Fallback: resolve from Struct fields if constructed dynamically
                 SimdVal rb = getMapped(loc, arg(1));
@@ -1654,13 +1767,10 @@ private:
             // annotateHandle(op, handle, ResourceProperties{i32 kindFlags, i32 strideOrFmt})
             SimdVal h = getMapped(loc, arg(1));
             uint32_t kindFlags = 0, strideOrFmt = 0;
-            if (auto cst = arg(2).getDefiningOp<mlir::LLVM::ConstantOp>()) {
-                if (auto arr = llvm::dyn_cast<mlir::ArrayAttr>(cst.getValue())) {
-                    if (arr.size() >= 2) {
-                        kindFlags = static_cast<uint32_t>(llvm::cast<mlir::IntegerAttr>(arr[0]).getInt());
-                        strideOrFmt = static_cast<uint32_t>(llvm::cast<mlir::IntegerAttr>(arr[1]).getInt());
-                    }
-                }
+            llvm::SmallVector<uint64_t, 4> propFields;
+            if (extractConstStructInts(arg(2), propFields) && propFields.size() >= 2) {
+                kindFlags = static_cast<uint32_t>(propFields[0]);
+                strideOrFmt = static_cast<uint32_t>(propFields[1]);
             } else {
                 SimdVal rp = getMapped(loc, arg(2));
                 if (rp.fields.size() >= 2) {
@@ -1668,7 +1778,7 @@ private:
                     strideOrFmt = static_cast<uint32_t>(getConstIntValue(rp.fields[1].vec).value_or(0));
                 }
             }
-            h.resourceKind = kindFlags & 0xFFu;
+            if ((kindFlags & 0xFFu) != 0) h.resourceKind = kindFlags & 0xFFu;
             if ((kindFlags & 0xFFu) == 12u && strideOrFmt > 0) h.stride = strideOrFmt;
             if ((kindFlags & 0x1000u) != 0) h.resClass = 1u;
             setMapped(call.getResult(), h);
@@ -1726,8 +1836,12 @@ private:
             return true;
         }
 
-        // 5. Atomics (78, 79)
+        // 5. Atomics (78, 79) & Memory Fences without GroupSync (80, 244, 245)
         if (op == 78 || op == 79) return packetizeAtomicOp(call, op == 79, realMask, outError);
+        if (op == 80 || op == 244 || op == 245) {
+            mlir::LLVM::FenceOp::create(b_, loc, mlir::LLVM::AtomicOrdering::acq_rel);
+            return true;
+        }
 
         // 6. Textures (60..67, 72, 73, 74, 81)
         if ((op >= 60 && op <= 67) || op == 72 || op == 73 || op == 74 || op == 81) {
@@ -1864,35 +1978,38 @@ private:
         mlir::Location loc, mlir::OpBuilder& nb, const SimdVal& h, mlir::Value descPtr,
         mlir::Value idxL, mlir::Value elemOffL, bool isRawOp, bool hasElemOff) {
         auto ci = [&](uint64_t v) { return mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), v); };
+        auto loadStride64 = [&]() -> mlir::Value {
+            mlir::Value nullP = mlir::LLVM::ZeroOp::create(nb, loc, ptrTy());
+            mlir::Value isNull = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::eq, descPtr, nullP);
+            mlir::Value s32 = mlir::scf::IfOp::create(
+                                  nb, loc, isNull,
+                                  [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+                                      mlir::scf::YieldOp::create(
+                                          ib, iloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)});
+                                  },
+                                  [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+                                      mlir::Value sp = mlir::LLVM::GEPOp::create(
+                                          ib, iloc, ptrTy(), i8Ty(), descPtr,
+                                          llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
+                                      mlir::scf::YieldOp::create(
+                                          ib, iloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), sp)});
+                                  })
+                                  .getResult(0);
+            return mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), s32);
+        };
         mlir::Value idx64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), idxL);
         if (isRawOp) {
             if (!hasElemOff) {
                 return idx64; // ByteAddressBuffer: index IS byte offset
             }
             // StructuredBuffer: idx * stride + elemOff
-            mlir::Value strideVal;
-            if (h.stride > 0) {
-                strideVal = ci(h.stride);
-            } else {
-                mlir::Value sp = mlir::LLVM::GEPOp::create(
-                    nb, loc, ptrTy(), i8Ty(), descPtr,
-                    llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
-                strideVal = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), mlir::LLVM::LoadOp::create(nb, loc, i32Ty(), sp));
-            }
+            mlir::Value strideVal = (h.stride > 0) ? ci(h.stride) : loadStride64();
             mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
             return mlir::arith::AddIOp::create(nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, strideVal), e64);
         }
         // Legacy bufferLoad/bufferStore (68/69)
         if (hasElemOff) {
-            mlir::Value strideVal;
-            if (h.stride > 0) {
-                strideVal = ci(h.stride);
-            } else {
-                mlir::Value sp = mlir::LLVM::GEPOp::create(
-                    nb, loc, ptrTy(), i8Ty(), descPtr,
-                    llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
-                strideVal = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), mlir::LLVM::LoadOp::create(nb, loc, i32Ty(), sp));
-            }
+            mlir::Value strideVal = (h.stride > 0) ? ci(h.stride) : loadStride64();
             mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
             return mlir::arith::AddIOp::create(nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, strideVal), e64);
         }
@@ -1900,11 +2017,7 @@ private:
             return idx64; // RawBuffer
         }
         // Typed buffer: idx * desc.elem_stride
-        mlir::Value sp = mlir::LLVM::GEPOp::create(
-            nb, loc, ptrTy(), i8Ty(), descPtr,
-            llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
-        mlir::Value strideVal = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), mlir::LLVM::LoadOp::create(nb, loc, i32Ty(), sp));
-        return mlir::arith::MulIOp::create(nb, loc, idx64, strideVal);
+        return mlir::arith::MulIOp::create(nb, loc, idx64, loadStride64());
     }
 
     bool packetizeBufferLoad(mlir::LLVM::CallOp call, bool isRawOp, std::string& outError) {
@@ -2051,7 +2164,13 @@ private:
             }
         };
 
-        mlir::Value outVec = splatInt(loc, i32Ty(), 0);
+        mlir::Type resTy = call.getResult().getType();
+        uint32_t bitWidth = resTy.getIntOrFloatBitWidth();
+        uint32_t elemBytes = std::max<uint32_t>(1u, bitWidth / 8u);
+        bool isFloat = mlir::isa<mlir::FloatType>(resTy);
+        mlir::Type intTy = b_.getIntegerType(bitWidth);
+
+        mlir::Value outVec = isFloat ? splatFlt(loc, resTy, 0.0) : splatInt(loc, resTy, 0);
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
             mlir::Value descP = laneValue(loc, h, l);
@@ -2070,12 +2189,12 @@ private:
                     b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o1L),
                     mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), rp));
                 mlir::Value x64 = mlir::arith::MulIOp::create(
-                    b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o0L), cInt(loc, i64Ty(), 4));
+                    b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o0L), cInt(loc, i64Ty(), elemBytes));
                 byteOff = mlir::arith::AddIOp::create(b_, loc, y64, x64);
             } else {
                 byteOff = computeBufferByteOffset(loc, b_, h, descP, o0L, o1L, h.resourceKind == 11 || h.resourceKind == 12, hasOff1);
             }
-            mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), 4));
+            mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
             mlir::Value doOp = mlir::arith::AndIOp::create(
                 b_, loc, okPtr,
                 mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
@@ -2088,11 +2207,19 @@ private:
                                        mlir::Value ep = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{byteOff});
                                        mlir::Value r;
                                        if (isCmpXchg) {
+                                           mlir::Value cOp = isFloat ? mlir::Value(mlir::arith::BitcastOp::create(nb, nloc, intTy, cmpL)) : cmpL;
+                                           mlir::Value nOp = isFloat ? mlir::Value(mlir::arith::BitcastOp::create(nb, nloc, intTy, newL)) : newL;
                                            auto cx = mlir::LLVM::AtomicCmpXchgOp::create(
-                                               nb, nloc, ep, cmpL, newL,
+                                               nb, nloc, ep, cOp, nOp,
                                                mlir::LLVM::AtomicOrdering::seq_cst,
                                                mlir::LLVM::AtomicOrdering::acquire);
                                            r = mlir::LLVM::ExtractValueOp::create(nb, nloc, cx, llvm::ArrayRef<int64_t>{0});
+                                           if (isFloat) r = mlir::arith::BitcastOp::create(nb, nloc, resTy, r);
+                                       } else if (isFloat && toBinOp(atomicOp) == mlir::LLVM::AtomicBinOp::xchg) {
+                                           mlir::Value nOp = mlir::arith::BitcastOp::create(nb, nloc, intTy, newL);
+                                           r = mlir::LLVM::AtomicRMWOp::create(
+                                               nb, nloc, mlir::LLVM::AtomicBinOp::xchg, ep, nOp, mlir::LLVM::AtomicOrdering::seq_cst);
+                                           r = mlir::arith::BitcastOp::create(nb, nloc, resTy, r);
                                        } else {
                                            r = mlir::LLVM::AtomicRMWOp::create(
                                                nb, nloc, toBinOp(atomicOp), ep, newL, mlir::LLVM::AtomicOrdering::seq_cst);
@@ -2100,12 +2227,19 @@ private:
                                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{r});
                                    },
                                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 0)});
+                                       mlir::Value z;
+                                       if (isFloat) {
+                                           auto ft = llvm::cast<mlir::FloatType>(resTy);
+                                           z = mlir::arith::ConstantFloatOp::create(nb, nloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
+                                       } else {
+                                           z = mlir::arith::ConstantIntOp::create(nb, nloc, resTy, 0);
+                                       }
+                                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{z});
                                    })
                                    .getResult(0);
             outVec = mlir::vector::InsertOp::create(b_, loc, resL, outVec, static_cast<int64_t>(l));
         }
-        setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), outVec, {}, {}});
+        setMapped(call.getResult(), {SimdVal::Kind::Vector, resTy, outVec, {}, {}});
         return true;
     }
 
@@ -2143,8 +2277,7 @@ private:
             SimdVal h = getMapped(loc, call.getOperand(1));
             mlir::Value mipVec = vecOrZero(2, i32Ty(), 0.0);
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_tex_get_dims", nullptr, {ptrTy(), i32Ty(), ptrTy()});
-            mlir::Value tmp4 = mlir::LLVM::AllocaOp::create(
-                b_, loc, ptrTy(), mlir::LLVM::LLVMArrayType::get(i32Ty(), 4), cInt(loc, i32Ty(), 1), 16);
+            mlir::Value tmp4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(i32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> dims(4, splatInt(loc, i32Ty(), 0));
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value m = mlir::vector::ExtractOp::create(b_, loc, mipVec, static_cast<int64_t>(l));
@@ -2180,8 +2313,13 @@ private:
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     auto ext = [&](mlir::Value v) {
                         mlir::Value ev = mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
-                        if (mlir::isa<mlir::IntegerType>(ev.getType())) {
-                            ev = mlir::arith::SIToFPOp::create(nb, nloc, nb.getF32Type(), ev);
+                        if (auto it = llvm::dyn_cast<mlir::IntegerType>(ev.getType())) {
+                            if (it.getWidth() < 32) {
+                                ev = mlir::arith::ExtUIOp::create(nb, nloc, nb.getI32Type(), ev);
+                            } else if (it.getWidth() > 32) {
+                                ev = mlir::arith::TruncIOp::create(nb, nloc, nb.getI32Type(), ev);
+                            }
+                            ev = mlir::arith::BitcastOp::create(nb, nloc, nb.getF32Type(), ev);
                         }
                         return ev;
                     };
@@ -2206,8 +2344,7 @@ private:
             mlir::Value y = vecOrZero(4, i32Ty(), 0.0);
             mlir::Value z = vecOrZero(5, i32Ty(), 0.0);
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_tex_load", nullptr, {ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), ptrTy()});
-            mlir::Value out4 = mlir::LLVM::AllocaOp::create(
-                b_, loc, ptrTy(), mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), cInt(loc, i32Ty(), 1), 16);
+            mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
@@ -2235,8 +2372,13 @@ private:
             mlir::Type resElem = llvm::cast<mlir::LLVM::LLVMStructType>(st.origType).getBody()[0];
             for (unsigned c = 0; c < 4; ++c) {
                 mlir::Value v = rgba[c];
-                if (mlir::isa<mlir::IntegerType>(resElem)) {
-                    v = mlir::arith::FPToSIOp::create(b_, loc, vecTy(resElem), v);
+                if (auto it = llvm::dyn_cast<mlir::IntegerType>(resElem)) {
+                    v = mlir::arith::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
+                    if (it.getWidth() < 32) {
+                        v = mlir::arith::TruncIOp::create(b_, loc, vecTy(resElem), v);
+                    } else if (it.getWidth() > 32) {
+                        v = mlir::arith::ExtUIOp::create(b_, loc, vecTy(resElem), v);
+                    }
                 }
                 st.fields.push_back({SimdVal::Kind::Vector, resElem, v, {}, {}});
             }
@@ -2263,8 +2405,7 @@ private:
                           : getOrDeclareRuntimeFn(
                                 loc, "nacelle_tex_gather", nullptr,
                                 {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), i32Ty(), i32Ty(), i32Ty(), ptrTy()});
-            mlir::Value out4 = mlir::LLVM::AllocaOp::create(
-                b_, loc, ptrTy(), mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), cInt(loc, i32Ty(), 1), 16);
+            mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
@@ -2309,8 +2450,7 @@ private:
             auto projFn = getOrDeclareRuntimeFn(
                 loc, "nacelle_tex_project_lod_coords", nullptr,
                 {ptrTy(), f32Ty(), f32Ty(), f32Ty(), ptrTy()});
-            mlir::Value out3 = mlir::LLVM::AllocaOp::create(
-                b_, loc, ptrTy(), mlir::LLVM::LLVMArrayType::get(f32Ty(), 3), cInt(loc, i32Ty(), 1), 16);
+            mlir::Value out3 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 3), 1, 16);
             mlir::Value su = splatFlt(loc, f32Ty(), 0.0);
             mlir::Value sv = su;
             mlir::Value sw = su;
@@ -2484,8 +2624,7 @@ private:
             loc, "nacelle_tex_sample", nullptr,
             {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),
              f32Ty(), f32Ty(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), f32Ty(), ptrTy()});
-        mlir::Value out4 = mlir::LLVM::AllocaOp::create(
-            b_, loc, ptrTy(), mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), cInt(loc, i32Ty(), 1), 16);
+        mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
         llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
@@ -2792,6 +2931,10 @@ private:
     }
 
     bool packetizeMathOp(mlir::LLVM::CallOp call, uint32_t op, std::string& outError) {
+        if (call.getNumResults() == 0) {
+            outError = "Unsupported dx.op opcode: " + std::to_string(op);
+            return false;
+        }
         mlir::Location loc = call.getLoc();
         auto resTy = call.getResult().getType();
         auto vT = vecTy(resTy);
@@ -2852,7 +2995,8 @@ private:
                 x = mlir::arith::SelectOp::create(b_, loc, isNeg, inv, x);
             }
             mlir::Value lz = mlir::math::CountLeadingZerosOp::create(b_, loc, vT, x);
-            mlir::Value bitIdx = mlir::arith::SubIOp::create(b_, loc, splatInt(loc, resTy, 31), lz);
+            mlir::Value bitIdx = mlir::arith::SubIOp::create(
+                b_, loc, splatInt(loc, resTy, resTy.getIntOrFloatBitWidth() - 1), lz);
             mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, resTy, 0));
             return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), bitIdx));
         }
@@ -3151,12 +3295,12 @@ static void analyzeSegmentLiveness(
 static bool packetizeComputeBlockWithBarriers(
     mlir::OpBuilder& b, mlir::Location loc, mlir::ModuleOp mod,
     mlir::Block& srcBlock, const DxilLoadedShader& shader, const RootSignatureLayout& rootLayout,
-    uint32_t W, mlir::Value rootCtxPtr, mlir::Value gsBase,
+    uint32_t W, uint32_t numWavesVal, mlir::Value rootCtxPtr, mlir::Value gsBase,
     mlir::Value gx, mlir::Value gy, mlir::Value gz,
     mlir::Value totalThreads, mlir::Value numWaves,
     mlir::Value waveMaskArr, // [numWaves x vector<W x i1>] current active mask per wave
     llvm::DenseMap<mlir::Value, SpillSlot>& spills,
-    mlir::OpBuilder& entryAllocaBuilder,
+    mlir::Operation* entryAllocaAnchor,
     std::string& outError) {
     mlir::Type i32Ty = b.getI32Type();
     mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(b.getContext());
@@ -3168,14 +3312,15 @@ static bool packetizeComputeBlockWithBarriers(
             slot.isHandle = true;
             slot.handleProto = *proto;
         }
+        mlir::OpBuilder eb(entryAllocaAnchor);
         StageHooks unusedHooks;
-        SimdPacketizer helper(entryAllocaBuilder, mod, shader, rootLayout, W, rootCtxPtr, unusedHooks);
+        SimdPacketizer helper(eb, mod, shader, rootLayout, W, rootCtxPtr, unusedHooks);
         llvm::SmallVector<mlir::Type, 4> flatTys;
         helper.flattenSimdTypes(origTy, flatTys);
         slot.packedValTy = (flatTys.size() == 1) ? flatTys[0] : mlir::LLVM::LLVMStructType::getLiteral(b.getContext(), flatTys);
-        mlir::Value n32 = mlir::arith::IndexCastOp::create(entryAllocaBuilder, loc, i32Ty, numWaves);
+        mlir::Value n32 = mlir::arith::ConstantIntOp::create(eb, loc, i32Ty, numWavesVal);
         uint32_t vecAlign = std::max<uint32_t>(64, W * 8);
-        slot.arrPtr = mlir::LLVM::AllocaOp::create(entryAllocaBuilder, loc, ptrTy, slot.packedValTy, n32, vecAlign);
+        slot.arrPtr = mlir::LLVM::AllocaOp::create(eb, loc, ptrTy, slot.packedValTy, n32, vecAlign);
         return slot;
     };
 
@@ -3195,14 +3340,14 @@ static bool packetizeComputeBlockWithBarriers(
         }
         mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, loc, i32Ty, waveIdx);
         mlir::Value wp = mlir::LLVM::GEPOp::create(wb, loc, ptrTy, slot.packedValTy, slot.arrPtr, mlir::ValueRange{w32});
-        mlir::LLVM::StoreOp::create(wb, loc, valToStore, wp);
+        mlir::LLVM::StoreOp::create(wb, loc, valToStore, wp, 1u);
     };
 
     auto loadSpillAtWave = [&](mlir::OpBuilder& wb, SimdPacketizer& pkt, const SpillSlot& slot,
                                mlir::Value waveIdx) -> SimdVal {
         mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, loc, i32Ty, waveIdx);
         mlir::Value wp = mlir::LLVM::GEPOp::create(wb, loc, ptrTy, slot.packedValTy, slot.arrPtr, mlir::ValueRange{w32});
-        mlir::Value loaded = mlir::LLVM::LoadOp::create(wb, loc, slot.packedValTy, wp);
+        mlir::Value loaded = mlir::LLVM::LoadOp::create(wb, loc, slot.packedValTy, wp, 1u);
         llvm::SmallVector<mlir::Value, 4> flatVals;
         if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(slot.packedValTy); st && slot.isHandle == false && !mlir::isa<mlir::LLVM::LLVMStructType>(slot.origTy) && !mlir::isa<mlir::LLVM::LLVMArrayType>(slot.origTy)) {
             flatVals.push_back(loaded);
@@ -3239,10 +3384,12 @@ static bool packetizeComputeBlockWithBarriers(
                 mlir::Value mp = mlir::LLVM::GEPOp::create(
                     wb, wloc, ptrTy, mlir::VectorType::get({W}, wb.getI1Type()), waveMaskArr, mlir::ValueRange{w32});
                 mlir::Value activeMask = mlir::LLVM::LoadOp::create(
-                    wb, wloc, mlir::VectorType::get({W}, wb.getI1Type()), mp);
+                    wb, wloc, mlir::VectorType::get({W}, wb.getI1Type()), mp, 1u);
 
                 StageHooks hooks;
                 hooks.groupSharedBase = gsBase;
+                hooks.waveIdx = waveIdx;
+                hooks.numWaves = numWavesVal;
                 setupComputeThreadIds(wb, wloc, W, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
                 SimdPacketizer pkt(wb, mod, shader, rootLayout, W, rootCtxPtr, hooks);
                 for (mlir::Value rv : needReload) {
@@ -3283,24 +3430,24 @@ static bool packetizeComputeBlockWithBarriers(
 
             if (auto ifOp = llvm::dyn_cast<mlir::scf::IfOp>(op)) {
                 // Evaluate uniform condition at wave 0 lane 0
-                mlir::Value condScalar;
-                if (auto slotIt = spills.find(ifOp.getCondition()); slotIt != spills.end()) {
-                    StageHooks dummyHooks;
-                    SimdPacketizer pkt(b, mod, shader, rootLayout, W, rootCtxPtr, dummyHooks);
-                    SimdVal cVal = loadSpillAtWave(b, pkt, slotIt->second, c0);
-                    condScalar = mlir::vector::ExtractOp::create(b, loc, cVal.vec, 0);
-                } else {
-                    condScalar = mlir::arith::ConstantIntOp::create(b, loc, b.getI1Type(), 1);
-                }
+                StageHooks dummyHooks;
+                SimdPacketizer condPkt(b, mod, shader, rootLayout, W, rootCtxPtr, dummyHooks);
+                SimdVal cVal = spills.count(ifOp.getCondition())
+                                   ? loadSpillAtWave(b, condPkt, spills[ifOp.getCondition()], c0)
+                                   : condPkt.getMapped(loc, ifOp.getCondition());
+                mlir::Value condScalar = mlir::vector::ExtractOp::create(b, loc, condPkt.asVec(loc, cVal), 0);
                 for (mlir::Value r : ifOp.getResults()) spills[r] = allocSpillSlot(r.getType());
 
                 mlir::scf::IfOp::create(
                     b, loc, condScalar,
                     [&](mlir::OpBuilder& ib, mlir::Location iloc) {
-                        (void)packetizeComputeBlockWithBarriers(
-                            ib, iloc, mod, ifOp.getThenRegion().front(), shader, rootLayout, W,
-                            rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
-                            entryAllocaBuilder, outError);
+                        if (!packetizeComputeBlockWithBarriers(
+                                ib, iloc, mod, ifOp.getThenRegion().front(), shader, rootLayout, W, numWavesVal,
+                                rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
+                                entryAllocaAnchor, outError)) {
+                            mlir::scf::YieldOp::create(ib, iloc);
+                            return;
+                        }
                         if (auto yo = llvm::dyn_cast_or_null<mlir::scf::YieldOp>(ifOp.getThenRegion().front().getTerminator())) {
                             if (yo.getNumOperands() > 0) {
                                 mlir::scf::ForOp::create(ib, iloc, c0, numWaves, c1, mlir::ValueRange{},
@@ -3311,6 +3458,10 @@ static bool packetizeComputeBlockWithBarriers(
                                                                  SimdVal val = spills.count(yo.getOperand(k))
                                                                                    ? loadSpillAtWave(wb, pkt, spills[yo.getOperand(k)], waveIdx)
                                                                                    : pkt.getMapped(wloc, yo.getOperand(k));
+                                                                 if (val.kind == SimdVal::Kind::Handle) {
+                                                                     spills[ifOp.getResult(k)].isHandle = true;
+                                                                     spills[ifOp.getResult(k)].handleProto = val;
+                                                                 }
                                                                  storeSpillAtWave(wb, pkt, spills[ifOp.getResult(k)], waveIdx, val);
                                                              }
                                                              mlir::scf::YieldOp::create(wb, wloc);
@@ -3321,10 +3472,13 @@ static bool packetizeComputeBlockWithBarriers(
                     },
                     [&](mlir::OpBuilder& ib, mlir::Location iloc) {
                         if (!ifOp.getElseRegion().empty()) {
-                            (void)packetizeComputeBlockWithBarriers(
-                                ib, iloc, mod, ifOp.getElseRegion().front(), shader, rootLayout, W,
-                                rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
-                                entryAllocaBuilder, outError);
+                            if (!packetizeComputeBlockWithBarriers(
+                                    ib, iloc, mod, ifOp.getElseRegion().front(), shader, rootLayout, W, numWavesVal,
+                                    rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
+                                    entryAllocaAnchor, outError)) {
+                                mlir::scf::YieldOp::create(ib, iloc);
+                                return;
+                            }
                             if (auto yo = llvm::dyn_cast_or_null<mlir::scf::YieldOp>(ifOp.getElseRegion().front().getTerminator())) {
                                 if (yo.getNumOperands() > 0) {
                                     mlir::scf::ForOp::create(ib, iloc, c0, numWaves, c1, mlir::ValueRange{},
@@ -3335,6 +3489,10 @@ static bool packetizeComputeBlockWithBarriers(
                                                                      SimdVal val = spills.count(yo.getOperand(k))
                                                                                        ? loadSpillAtWave(wb, pkt, spills[yo.getOperand(k)], waveIdx)
                                                                                        : pkt.getMapped(wloc, yo.getOperand(k));
+                                                                     if (val.kind == SimdVal::Kind::Handle) {
+                                                                         spills[ifOp.getResult(k)].isHandle = true;
+                                                                         spills[ifOp.getResult(k)].handleProto = val;
+                                                                     }
                                                                      storeSpillAtWave(wb, pkt, spills[ifOp.getResult(k)], waveIdx, val);
                                                                  }
                                                                  mlir::scf::YieldOp::create(wb, wloc);
@@ -3351,7 +3509,9 @@ static bool packetizeComputeBlockWithBarriers(
 
                 llvm::SmallVector<SpillSlot, 8> beforeSlots, afterSlots;
                 for (unsigned i = 0; i < whileOp.getInits().size(); ++i) {
-                    SpillSlot bs = allocSpillSlot(whileOp.getInits()[i].getType());
+                    mlir::Value iv = whileOp.getInits()[i];
+                    const SimdVal* proto = (spills.count(iv) && spills[iv].isHandle) ? &spills[iv].handleProto : nullptr;
+                    SpillSlot bs = allocSpillSlot(iv.getType(), proto);
                     beforeSlots.push_back(bs);
                     spills[srcBefore.getArgument(i)] = bs;
                 }
@@ -3364,7 +3524,7 @@ static bool packetizeComputeBlockWithBarriers(
                     spills[whileOp.getResult(i)] = afterSlots[i];
                 }
 
-                // Initialize beforeSlots from whileOp.getInits()
+                // Initialize beforeSlots from whileOp.getInits() and zero-init afterSlots
                 mlir::scf::ForOp::create(
                     b, loc, c0, numWaves, c1, mlir::ValueRange{},
                     [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
@@ -3373,30 +3533,61 @@ static bool packetizeComputeBlockWithBarriers(
                         for (unsigned i = 0; i < whileOp.getInits().size(); ++i) {
                             mlir::Value iv = whileOp.getInits()[i];
                             SimdVal sv = spills.count(iv) ? loadSpillAtWave(wb, pkt, spills[iv], waveIdx) : pkt.getMapped(wloc, iv);
+                            if (sv.kind == SimdVal::Kind::Handle) {
+                                beforeSlots[i].isHandle = true;
+                                beforeSlots[i].handleProto = sv;
+                                spills[srcBefore.getArgument(i)] = beforeSlots[i];
+                            }
                             storeSpillAtWave(wb, pkt, beforeSlots[i], waveIdx, sv);
+                        }
+                        for (unsigned i = 0; i < afterSlots.size(); ++i) {
+                            storeSpillAtWave(wb, pkt, afterSlots[i], waveIdx, pkt.makeZeroSimd(wloc, afterSlots[i].origTy));
                         }
                         mlir::scf::YieldOp::create(wb, wloc);
                     });
 
                 // Save outer wave masks on stack
                 mlir::VectorType maskVecTy = mlir::VectorType::get({W}, b.getI1Type());
-                mlir::Value savedWaveMaskArr = mlir::LLVM::AllocaOp::create(
-                    entryAllocaBuilder, loc, ptrTy, maskVecTy,
-                    mlir::arith::IndexCastOp::create(entryAllocaBuilder, loc, i32Ty, numWaves),
-                    std::max<uint32_t>(64, W * 8));
+                mlir::Value savedWaveMaskArr;
+                {
+                    mlir::OpBuilder eb(entryAllocaAnchor);
+                    savedWaveMaskArr = mlir::LLVM::AllocaOp::create(
+                        eb, loc, ptrTy, maskVecTy,
+                        mlir::arith::ConstantIntOp::create(eb, loc, i32Ty, numWavesVal),
+                        std::max<uint32_t>(64, W * 8));
+                }
                 mlir::scf::ForOp::create(
                     b, loc, c0, numWaves, c1, mlir::ValueRange{},
                     [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
                         mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
                         mlir::Value srcP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                         mlir::Value dstP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, savedWaveMaskArr, mlir::ValueRange{w32});
-                        mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP), dstP);
+                        mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP, 1u), dstP, 1u);
                         mlir::scf::YieldOp::create(wb, wloc);
                     });
 
                 mlir::scf::WhileOp::create(
                     b, loc, mlir::TypeRange{}, mlir::ValueRange{},
                     [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange) {
+                        if (!packetizeComputeBlockWithBarriers(
+                                nb, nloc, mod, srcBefore, shader, rootLayout, W, numWavesVal, rootCtxPtr, gsBase,
+                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError)) {
+                            mlir::Value cFalse = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 0);
+                            mlir::scf::ConditionOp::create(nb, nloc, cFalse, mlir::ValueRange{});
+                            return;
+                        }
+
+                        auto condOp = llvm::cast<mlir::scf::ConditionOp>(srcBefore.getTerminator());
+                        for (unsigned i = 0; i < condOp.getArgs().size(); ++i) {
+                            mlir::Value ca = condOp.getArgs()[i];
+                            if (spills.count(ca) && spills[ca].isHandle && !afterSlots[i].isHandle) {
+                                afterSlots[i].isHandle = true;
+                                afterSlots[i].handleProto = spills[ca].handleProto;
+                                spills[srcAfter.getArgument(i)] = afterSlots[i];
+                                if (i < whileOp.getNumResults()) spills[whileOp.getResult(i)] = afterSlots[i];
+                            }
+                        }
+
                         mlir::Value cFalse = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 0);
                         auto anyLoop = mlir::scf::ForOp::create(
                             nb, nloc, c0, numWaves, c1, mlir::ValueRange{cFalse},
@@ -3405,28 +3596,36 @@ static bool packetizeComputeBlockWithBarriers(
                                 mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, W, waveIdx, totalThreads, baseMask);
                                 mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
                                 mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
-                                mlir::Value curMask = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp);
+                                mlir::Value curMask = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
 
                                 StageHooks hooks;
                                 hooks.groupSharedBase = gsBase;
+                                hooks.waveIdx = waveIdx;
+                                hooks.numWaves = numWavesVal;
                                 setupComputeThreadIds(wb, wloc, W, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
                                 SimdPacketizer pkt(wb, mod, shader, rootLayout, W, rootCtxPtr, hooks);
-                                llvm::SmallVector<mlir::Value, 8> needReload, needSpillUnused;
-                                analyzeSegmentLiveness(srcBefore.begin(), std::prev(srcBefore.end()), spills, needReload, needSpillUnused);
-                                for (mlir::Value rv : needReload) pkt.valueMap_[rv] = loadSpillAtWave(wb, pkt, spills[rv], waveIdx);
-                                for (unsigned i = 0; i < srcBefore.getNumArguments(); ++i) {
-                                    pkt.valueMap_[srcBefore.getArgument(i)] = loadSpillAtWave(wb, pkt, beforeSlots[i], waveIdx);
-                                }
-                                mlir::Value realMask = curMask;
-                                (void)pkt.packetizeBlockRange(srcBefore.begin(), std::prev(srcBefore.end()), curMask, realMask, outError);
 
-                                auto condOp = llvm::cast<mlir::scf::ConditionOp>(srcBefore.getTerminator());
-                                mlir::Value condVec = pkt.asVec(wloc, pkt.getMapped(wloc, condOp.getCondition()));
+                                mlir::Value condOpnd = condOp.getCondition();
+                                SimdVal condSimd = spills.count(condOpnd)
+                                                       ? loadSpillAtWave(wb, pkt, spills[condOpnd], waveIdx)
+                                                       : pkt.getMapped(wloc, condOpnd);
+                                mlir::Value condVec = pkt.asVec(wloc, condSimd);
                                 mlir::Value nextMask = mlir::arith::AndIOp::create(wb, wloc, curMask, condVec);
-                                mlir::LLVM::StoreOp::create(wb, wloc, nextMask, mp);
+                                mlir::LLVM::StoreOp::create(wb, wloc, nextMask, mp, 1u);
+
                                 for (unsigned i = 0; i < condOp.getArgs().size(); ++i) {
-                                    SimdVal cv = pkt.getMapped(wloc, condOp.getArgs()[i]);
-                                    storeSpillAtWave(wb, pkt, afterSlots[i], waveIdx, cv);
+                                    mlir::Value ca = condOp.getArgs()[i];
+                                    SimdVal cv = spills.count(ca)
+                                                     ? loadSpillAtWave(wb, pkt, spills[ca], waveIdx)
+                                                     : pkt.getMapped(wloc, ca);
+                                    if (cv.kind == SimdVal::Kind::Handle && !afterSlots[i].isHandle) {
+                                        afterSlots[i].isHandle = true;
+                                        afterSlots[i].handleProto = cv;
+                                        spills[srcAfter.getArgument(i)] = afterSlots[i];
+                                        if (i < whileOp.getNumResults()) spills[whileOp.getResult(i)] = afterSlots[i];
+                                    }
+                                    SimdVal prevAfter = loadSpillAtWave(wb, pkt, afterSlots[i], waveIdx);
+                                    storeSpillAtWave(wb, pkt, afterSlots[i], waveIdx, pkt.selectVal(wloc, curMask, cv, prevAfter));
                                 }
                                 mlir::Value waveAny = pkt.orReduce(wloc, nextMask);
                                 mlir::Value nextAny = mlir::arith::OrIOp::create(wb, wloc, acc[0], waveAny);
@@ -3435,9 +3634,12 @@ static bool packetizeComputeBlockWithBarriers(
                         mlir::scf::ConditionOp::create(nb, nloc, anyLoop.getResult(0), mlir::ValueRange{});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange) {
-                        (void)packetizeComputeBlockWithBarriers(
-                            nb, nloc, mod, srcAfter, shader, rootLayout, W, rootCtxPtr, gsBase,
-                            gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaBuilder, outError);
+                        if (!packetizeComputeBlockWithBarriers(
+                                nb, nloc, mod, srcAfter, shader, rootLayout, W, numWavesVal, rootCtxPtr, gsBase,
+                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError)) {
+                            mlir::scf::YieldOp::create(nb, nloc);
+                            return;
+                        }
                         if (auto yo = llvm::dyn_cast_or_null<mlir::scf::YieldOp>(srcAfter.getTerminator())) {
                             mlir::scf::ForOp::create(
                                 nb, nloc, c0, numWaves, c1, mlir::ValueRange{},
@@ -3446,10 +3648,15 @@ static bool packetizeComputeBlockWithBarriers(
                                     SimdPacketizer pkt(wb, mod, shader, rootLayout, W, rootCtxPtr, dh);
                                     mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
                                     mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
-                                    mlir::Value m = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp);
+                                    mlir::Value m = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
                                     for (unsigned i = 0; i < yo.getNumOperands(); ++i) {
                                         mlir::Value yv = yo.getOperand(i);
                                         SimdVal nextV = spills.count(yv) ? loadSpillAtWave(wb, pkt, spills[yv], waveIdx) : pkt.getMapped(wloc, yv);
+                                        if (nextV.kind == SimdVal::Kind::Handle && !beforeSlots[i].isHandle) {
+                                            beforeSlots[i].isHandle = true;
+                                            beforeSlots[i].handleProto = nextV;
+                                            spills[srcBefore.getArgument(i)] = beforeSlots[i];
+                                        }
                                         SimdVal prevV = loadSpillAtWave(wb, pkt, beforeSlots[i], waveIdx);
                                         storeSpillAtWave(wb, pkt, beforeSlots[i], waveIdx, pkt.selectVal(wloc, m, nextV, prevV));
                                     }
@@ -3466,10 +3673,13 @@ static bool packetizeComputeBlockWithBarriers(
                         mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
                         mlir::Value srcP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, savedWaveMaskArr, mlir::ValueRange{w32});
                         mlir::Value dstP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
-                        mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP), dstP);
+                        mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP, 1u), dstP, 1u);
                         mlir::scf::YieldOp::create(wb, wloc);
                     });
                 if (!outError.empty()) return false;
+            } else {
+                outError = "Unsupported structured control-flow op containing barrier";
+                return false;
             }
             ++it;
             segBegin = it;
@@ -3530,6 +3740,8 @@ bool packetizeComputeEntry(
                 mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
                 StageHooks hooks;
                 hooks.groupSharedBase = gsBase;
+                hooks.waveIdx = waveIdx;
+                hooks.numWaves = numWavesVal;
                 setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
                 SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
                 mlir::Value realMask = activeMask;
@@ -3541,7 +3753,7 @@ bool packetizeComputeEntry(
         mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
             b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal),
             std::max<uint32_t>(64, simdWidth * 8));
-        mlir::OpBuilder allocaB(entry, std::next(waveMaskArr.getDefiningOp()->getIterator()));
+        mlir::Operation* entryAllocaAnchor = waveMaskArr.getDefiningOp();
         // Initialize per-wave active masks
         mlir::scf::ForOp::create(
             b, loc, c0, numWaves, c1, mlir::ValueRange{},
@@ -3550,14 +3762,14 @@ bool packetizeComputeEntry(
                 (void)buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
                 mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
                 mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
-                mlir::LLVM::StoreOp::create(wb, wloc, activeMask, mp);
+                mlir::LLVM::StoreOp::create(wb, wloc, activeMask, mp, 1u);
                 mlir::scf::YieldOp::create(wb, wloc);
             });
 
         llvm::DenseMap<mlir::Value, SpillSlot> spills;
         (void)packetizeComputeBlockWithBarriers(
-            b, loc, mod, srcFunc.getBody().front(), shader, rootLayout, simdWidth,
-            rootCtx, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, allocaB, outError);
+            b, loc, mod, srcFunc.getBody().front(), shader, rootLayout, simdWidth, numWavesVal,
+            rootCtx, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError);
     }
 
     if (!outError.empty()) return false;

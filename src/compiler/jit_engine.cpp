@@ -111,7 +111,7 @@ std::string hashToHex128(uint64_t lo, uint64_t hi) {
 
 namespace {
 
-constexpr uint32_t kCompilerMagicVersion = 0x4E434A31; // 'NCJ1'
+constexpr uint32_t kCompilerMagicVersion = 0x4E434A32; // 'NCJ2'
 
 struct HashFeed {
     std::vector<uint8_t> buf;
@@ -217,7 +217,13 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
 
 llvm::Expected<llvm::orc::JITDylib&> createIsolatedDylibLocked(JitRuntime& rt) {
     std::string jdName = "nacelle_pso_jd_" + std::to_string(rt.dylibSeq.fetch_add(1, std::memory_order_relaxed));
-    return rt.jit->createJITDylib(std::move(jdName));
+    auto jdOrErr = rt.jit->createJITDylib(std::move(jdName));
+    if (!jdOrErr) return jdOrErr;
+    if (auto procJD = rt.jit->getProcessSymbolsJITDylib()) {
+        jdOrErr->addToLinkOrder(*procJD);
+    }
+    jdOrErr->addToLinkOrder(rt.jit->getMainJITDylib());
+    return jdOrErr;
 }
 
 bool emitObjectBytesO3(

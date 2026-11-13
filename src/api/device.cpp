@@ -122,6 +122,22 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->Int64ShaderOps = TRUE;
         return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS9: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->AtomicInt64OnTypedResourceSupported = TRUE;
+        o->AtomicInt64OnGroupSharedSupported = TRUE;
+        o->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
+        o->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+        return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS11: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11*>(pData);
+        o->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
+        return S_OK;
+    }
     case D3D12_FEATURE_ARCHITECTURE: {
         if (size < sizeof(D3D12_FEATURE_DATA_ARCHITECTURE)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_ARCHITECTURE*>(pData);

@@ -48,6 +48,8 @@ struct StageHooks {
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
     mlir::Value flatGroupId;                           // vector<W x i32>
     mlir::Value groupSharedBase;                       // !llvm.ptr
+    mlir::Value waveIdx;                               // index (optional, set in multi-wave compute)
+    uint32_t numWaves = 1;
 
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
                        const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadInput;
