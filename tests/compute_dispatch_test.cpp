@@ -215,6 +215,134 @@ int main() {
         }
     }
 
-    std::printf("compute_dispatch_test PASSED (vec_add, matmul, divergent_cf_atomics, prefix_sum_groupshared)\n");
+    // 5. byte_address_get_dims.dxil: ByteAddressBuffer & RWByteAddressBuffer GetDimensions (byte size)
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 2;
+        uavRange.BaseShaderRegister = 0;
+
+        D3D12_ROOT_PARAMETER rp[2]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable = {1, &srvRange};
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable = {1, &uavRange};
+
+        auto rs = createComputeRS(rt.device.Get(), 2, rp);
+        auto pso = createComputePSO(rt.device.Get(), rs.Get(), "byte_address_get_dims.dxil");
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 3;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        testutil::checkHR(rt.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap");
+
+        auto bA = rt.createBuffer(56, D3D12_HEAP_TYPE_DEFAULT);
+        auto bB = rt.createBuffer(28, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto bOut = rt.createBuffer(8, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        UINT inc = rt.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = heap->GetCPUDescriptorHandleForHeapStart();
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Buffer.NumElements = 14;
+        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        rt.device->CreateShaderResourceView(bA.Get(), &srvDesc, cpu0);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC outDesc{};
+        outDesc.Format = DXGI_FORMAT_UNKNOWN;
+        outDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        outDesc.Buffer.NumElements = 2;
+        outDesc.Buffer.StructureByteStride = 4;
+        rt.device->CreateUnorderedAccessView(bOut.Get(), nullptr, &outDesc, {cpu0.ptr + inc});
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavBDesc{};
+        uavBDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+        uavBDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavBDesc.Buffer.NumElements = 7;
+        uavBDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        rt.device->CreateUnorderedAccessView(bB.Get(), nullptr, &uavBDesc, {cpu0.ptr + 2 * inc});
+
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu0 = heap->GetGPUDescriptorHandleForHeapStart();
+        rt.resetCmd();
+        ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+        rt.cmdList->SetDescriptorHeaps(1, heaps);
+        rt.cmdList->SetComputeRootSignature(rs.Get());
+        rt.cmdList->SetPipelineState(pso.Get());
+        rt.cmdList->SetComputeRootDescriptorTable(0, gpu0);
+        rt.cmdList->SetComputeRootDescriptorTable(1, {gpu0.ptr + inc});
+        rt.cmdList->Dispatch(1, 1, 1);
+        rt.executeAndWait();
+
+        auto outRaw = rt.readbackBuffer(bOut.Get(), 8);
+        uint32_t dims[2]{};
+        std::memcpy(dims, outRaw.data(), sizeof(dims));
+        assert(dims[0] == 56);
+        assert(dims[1] == 28);
+    }
+
+    // 6. uav_counter_dec.dxil: RWStructuredBuffer::DecrementCounter() returns post-decrement value
+    {
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;
+
+        D3D12_ROOT_PARAMETER rp{};
+        rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp.DescriptorTable = {1, &uavRange};
+
+        auto rs = createComputeRS(rt.device.Get(), 1, &rp);
+        auto pso = createComputePSO(rt.device.Get(), rs.Get(), "uav_counter_dec.dxil");
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        testutil::checkHR(rt.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap");
+
+        auto bOut = rt.createBuffer(4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto bCounter = rt.createBuffer(4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        uint32_t zero = 0;
+        rt.uploadBuffer(bCounter.Get(), &zero, sizeof(zero));
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.NumElements = 1;
+        uavDesc.Buffer.StructureByteStride = 4;
+        rt.device->CreateUnorderedAccessView(bOut.Get(), bCounter.Get(), &uavDesc,
+                                             heap->GetCPUDescriptorHandleForHeapStart());
+
+        rt.resetCmd();
+        ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+        rt.cmdList->SetDescriptorHeaps(1, heaps);
+        rt.cmdList->SetComputeRootSignature(rs.Get());
+        rt.cmdList->SetPipelineState(pso.Get());
+        rt.cmdList->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        rt.cmdList->Dispatch(1, 1, 1);
+        rt.executeAndWait();
+
+        auto outRaw = rt.readbackBuffer(bOut.Get(), 4);
+        auto cntRaw = rt.readbackBuffer(bCounter.Get(), 4);
+        uint32_t outVal = 0;
+        uint32_t cntVal = 0;
+        std::memcpy(&outVal, outRaw.data(), sizeof(outVal));
+        std::memcpy(&cntVal, cntRaw.data(), sizeof(cntVal));
+        assert(outVal == 0xFFFFFFFCu);
+        assert(cntVal == 0xFFFFFFFCu);
+    }
+
+    std::printf("compute_dispatch_test PASSED (vec_add, matmul, divergent_cf_atomics, prefix_sum_groupshared, byte_address_get_dims, uav_counter_dec)\n");
     return 0;
 }
