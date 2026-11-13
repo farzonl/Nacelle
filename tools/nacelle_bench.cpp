@@ -16,6 +16,15 @@
 #include "../src/compiler/shader_compiler.h"
 #include "vk_minimal_loader.h"
 
+#if defined(__APPLE__)
+#include "metal_bench.h"
+#endif
+
+#if defined(_WIN32)
+#include <directx/d3d12.h>
+#include <dxgi1_4.h>
+#endif
+
 namespace {
 
 struct BenchParams {
@@ -263,7 +272,7 @@ std::vector<BenchResult> runVulkanBenchmarks(
     vkmin::VkApplicationInfo appInfo{};
     appInfo.sType = vkmin::VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "nacelle-bench";
-    appInfo.apiVersion = (1u << 22) | (1u << 12);
+    appInfo.apiVersion = (1u << 22) | (2u << 12);
 
     const char* portabilityExt = "VK_KHR_portability_enumeration";
     vkmin::VkInstanceCreateInfo ici{};
@@ -297,11 +306,27 @@ std::vector<BenchResult> runVulkanBenchmarks(
 
     for (auto pd : physDevs) {
         vkmin::VkPhysicalDeviceProperties props{};
-        vk.vkGetPhysicalDeviceProperties(pd, &props);
+        std::string driverName;
+        if (vk.vkGetPhysicalDeviceProperties2) {
+            vkmin::VkPhysicalDeviceDriverProperties drvProps{};
+            drvProps.sType = 1000196000u; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES
+            vkmin::VkPhysicalDeviceProperties2 props2{};
+            props2.sType = 1000059001u; // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+            props2.pNext = &drvProps;
+            vk.vkGetPhysicalDeviceProperties2(pd, &props2);
+            props = props2.properties;
+            driverName = drvProps.driverName;
+        } else {
+            vk.vkGetPhysicalDeviceProperties(pd, &props);
+        }
         std::string devName = props.deviceName;
 
         BenchResult r;
-        r.backend = "Vulkan: " + devName;
+        if (!driverName.empty() && devName.find(driverName) == std::string::npos) {
+            r.backend = "Vulkan (" + driverName + "): " + devName;
+        } else {
+            r.backend = "Vulkan: " + devName;
+        }
         r.shaderFormat = "SPIR-V";
 
         uint32_t qfCount = 0;
@@ -564,6 +589,244 @@ void writeJsonReport(const std::string& path, const std::vector<BenchResult>& re
 
 } // namespace
 
+#if defined(_WIN32)
+BenchResult runWarpBench(
+    const std::vector<uint8_t>& dxil,
+    uint32_t width,
+    uint32_t height,
+    uint32_t maxSteps,
+    uint32_t iters) {
+    BenchResult res;
+    res.backend = "Microsoft WARP";
+    res.shaderFormat = "DXIL";
+
+    HMODULE d3d12Lib = LoadLibraryA("d3d12.dll");
+    HMODULE dxgiLib = LoadLibraryA("dxgi.dll");
+    if (!d3d12Lib || !dxgiLib) {
+        if (d3d12Lib) FreeLibrary(d3d12Lib);
+        if (dxgiLib) FreeLibrary(dxgiLib);
+        res.status = "SKIPPED (d3d12.dll/dxgi.dll unavailable)";
+        return res;
+    }
+
+    using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+    using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    using PFN_D3D12SerializeRootSignature = HRESULT(WINAPI*)(
+        const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+
+    auto pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        GetProcAddress(dxgiLib, "CreateDXGIFactory1"));
+    auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
+        GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
+    auto pD3D12SerializeRootSignature = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
+        GetProcAddress(d3d12Lib, "D3D12SerializeRootSignature"));
+
+    if (!pCreateDXGIFactory1 || !pD3D12CreateDevice || !pD3D12SerializeRootSignature) {
+        FreeLibrary(d3d12Lib);
+        FreeLibrary(dxgiLib);
+        res.status = "SKIPPED (D3D12/DXGI entrypoints missing)";
+        return res;
+    }
+
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(pCreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory))) || !factory) {
+        FreeLibrary(d3d12Lib);
+        FreeLibrary(dxgiLib);
+        res.status = "SKIPPED (CreateDXGIFactory1 failed)";
+        return res;
+    }
+
+    IDXGIAdapter1* warpAdapter = nullptr;
+    if (FAILED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&warpAdapter))) || !warpAdapter) {
+        factory->Release();
+        FreeLibrary(d3d12Lib);
+        FreeLibrary(dxgiLib);
+        res.status = "SKIPPED (EnumWarpAdapter failed)";
+        return res;
+    }
+
+    ID3D12Device* dev = nullptr;
+    HRESULT hr = pD3D12CreateDevice(warpAdapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+    warpAdapter->Release();
+    factory->Release();
+    if (FAILED(hr) || !dev) {
+        FreeLibrary(d3d12Lib);
+        FreeLibrary(dxgiLib);
+        res.status = "FAILED (D3D12CreateDevice WARP)";
+        return res;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qDesc{};
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    ID3D12CommandQueue* queue = nullptr;
+    dev->CreateCommandQueue(&qDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
+
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor.ShaderRegister = 0;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 3;
+    rsDesc.pParameters = params;
+
+    ID3DBlob* rsBlob = nullptr;
+    pD3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
+    ID3D12RootSignature* rootSig = nullptr;
+    dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                             __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&rootSig));
+    rsBlob->Release();
+
+    auto t0 = std::chrono::steady_clock::now();
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = rootSig;
+    psoDesc.CS = {dxil.data(), dxil.size()};
+    ID3D12PipelineState* pso = nullptr;
+    hr = dev->CreateComputePipelineState(&psoDesc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
+    auto t1 = std::chrono::steady_clock::now();
+    res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    if (FAILED(hr) || !pso) {
+        rootSig->Release();
+        queue->Release();
+        dev->Release();
+        FreeLibrary(d3d12Lib);
+        FreeLibrary(dxgiLib);
+        res.status = "FAILED (CreateComputePipelineState)";
+        return res;
+    }
+
+    auto createBuf = [&](size_t bytes, D3D12_HEAP_TYPE heapType, D3D12_RESOURCE_FLAGS flags,
+                         D3D12_RESOURCE_STATES initState) -> ID3D12Resource* {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = heapType;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = bytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = flags;
+        ID3D12Resource* r = nullptr;
+        dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, initState, nullptr,
+                                     __uuidof(ID3D12Resource), reinterpret_cast<void**>(&r));
+        return r;
+    };
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    const size_t outBytes = pixelCount * 4 * sizeof(float);
+    ID3D12Resource* cb = createBuf(256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* srv = createBuf(64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* uav = createBuf(outBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* rb = createBuf(outBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    BenchParams bp{width, height, maxSteps, 0.5f};
+    void* p = nullptr;
+    cb->Map(0, nullptr, &p);
+    std::memcpy(p, &bp, sizeof(bp));
+    cb->Unmap(0, nullptr);
+
+    float dummyIn[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    srv->Map(0, nullptr, &p);
+    std::memcpy(p, dummyIn, sizeof(dummyIn));
+    srv->Unmap(0, nullptr);
+
+    ID3D12CommandAllocator* alloc = nullptr;
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&alloc));
+    ID3D12GraphicsCommandList* cl = nullptr;
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc, pso, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&cl));
+    cl->Close();
+
+    ID3D12Fence* fence = nullptr;
+    dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
+    HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    uint64_t fenceVal = 1;
+
+    auto runOnce = [&]() -> double {
+        alloc->Reset();
+        cl->Reset(alloc, pso);
+        cl->SetComputeRootSignature(rootSig);
+        cl->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+        cl->SetComputeRootShaderResourceView(1, srv->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(2, uav->GetGPUVirtualAddress());
+        cl->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        cl->Close();
+
+        ID3D12CommandList* lists[] = {cl};
+        auto s0 = std::chrono::steady_clock::now();
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, fenceVal);
+        if (fence->GetCompletedValue() < fenceVal) {
+            fence->SetEventOnCompletion(fenceVal, ev);
+            WaitForSingleObject(ev, INFINITE);
+        }
+        auto s1 = std::chrono::steady_clock::now();
+        ++fenceVal;
+        return std::chrono::duration<double, std::milli>(s1 - s0).count();
+    };
+
+    runOnce(); // Warmup
+    std::vector<double> samples;
+    samples.reserve(iters);
+    for (uint32_t i = 0; i < iters; ++i) {
+        samples.push_back(runOnce());
+    }
+
+    // Copy UAV to readback buffer for checksum verification
+    alloc->Reset();
+    cl->Reset(alloc, nullptr);
+    D3D12_RESOURCE_BARRIER bar{};
+    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource = uav;
+    bar.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cl->ResourceBarrier(1, &bar);
+    cl->CopyBufferRegion(rb, 0, uav, 0, outBytes);
+    cl->Close();
+    ID3D12CommandList* copyLists[] = {cl};
+    queue->ExecuteCommandLists(1, copyLists);
+    queue->Signal(fence, fenceVal);
+    if (fence->GetCompletedValue() < fenceVal) {
+        fence->SetEventOnCompletion(fenceVal, ev);
+        WaitForSingleObject(ev, INFINITE);
+    }
+
+    const float* outPtr = nullptr;
+    rb->Map(0, nullptr, reinterpret_cast<void**>(const_cast<float**>(&outPtr)));
+    double sum = 0.0;
+    for (size_t i = 0; i < pixelCount; ++i) sum += outPtr[i * 4];
+    rb->Unmap(0, nullptr);
+
+    res.medianMs = medianOf(samples);
+    res.minMs = *std::min_element(samples.begin(), samples.end());
+    res.checksum = sum;
+    res.ran = true;
+    res.status = "OK";
+
+    CloseHandle(ev);
+    fence->Release();
+    cl->Release();
+    alloc->Release();
+    rb->Release();
+    uav->Release();
+    srv->Release();
+    cb->Release();
+    pso->Release();
+    rootSig->Release();
+    queue->Release();
+    dev->Release();
+    FreeLibrary(d3d12Lib);
+    FreeLibrary(dxgiLib);
+    return res;
+}
+#endif
+
 int main(int argc, char** argv) {
     std::vector<uint32_t> widths = {4, 8, 16};
     uint32_t width = 256;
@@ -624,13 +887,7 @@ int main(int argc, char** argv) {
     }
 
 #if defined(_WIN32)
-    {
-        BenchResult warpRes;
-        warpRes.backend = "Microsoft WARP";
-        warpRes.shaderFormat = "DXIL";
-        warpRes.status = "SKIPPED (run via D3D12 WARP adapter on Windows)";
-        allResults.push_back(warpRes);
-    }
+    allResults.push_back(runWarpBench(dxil, width, height, maxSteps, iters));
 #else
     {
         BenchResult warpRes;
@@ -643,6 +900,24 @@ int main(int argc, char** argv) {
 
     auto vkResults = runVulkanBenchmarks(spv, width, height, maxSteps, iters);
     allResults.insert(allResults.end(), vkResults.begin(), vkResults.end());
+
+#if defined(__APPLE__)
+    {
+        auto mr = nacelle_bench::runMetalBench(dxil, width, height, maxSteps, iters);
+        BenchResult r;
+        r.backend = mr.backend;
+        r.shaderFormat = mr.shaderFormat;
+        r.simdWidth = 0;
+        r.compileMs = mr.compileMs;
+        r.meanMs = mr.meanMs;
+        r.medianMs = mr.medianMs;
+        r.minMs = mr.minMs;
+        r.checksum = mr.checksum;
+        r.ran = mr.ran;
+        r.status = mr.status;
+        allResults.push_back(std::move(r));
+    }
+#endif
 
     std::cout << "\n=== Nacelle Cross-Backend Benchmark (" << width << "x" << height
               << ", steps=" << maxSteps << ", iters=" << iters << ") ===\n";

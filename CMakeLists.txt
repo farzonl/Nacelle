@@ -215,7 +215,22 @@ target_include_directories(nacelle-compile SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} $
 target_compile_definitions(nacelle-compile PRIVATE ${LLVM_DEFS_LIST})
 target_link_libraries(nacelle-compile PRIVATE nacelle ${NACELLE_MLIR_LIBS} ${NACELLE_LLVM_LIBS})
 
-add_executable(nacelle-bench tools/nacelle_bench.cpp)
+if(APPLE)
+    add_executable(nacelle-bench tools/nacelle_bench.cpp tools/metal_bench.mm)
+    set_source_files_properties(tools/metal_bench.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    find_path(METAL_IRCONVERTER_INC metal_irconverter/metal_irconverter.h HINTS /usr/local/include /opt/homebrew/include)
+    find_library(METAL_IRCONVERTER_LIB metalirconverter HINTS /usr/local/lib /opt/homebrew/lib)
+    target_link_libraries(nacelle-bench PRIVATE "-framework Metal" "-framework Foundation")
+    if(METAL_IRCONVERTER_INC AND METAL_IRCONVERTER_LIB)
+        target_compile_definitions(nacelle-bench PRIVATE NACELLE_HAS_METAL_IRCONVERTER=1)
+        target_include_directories(nacelle-bench PRIVATE "${METAL_IRCONVERTER_INC}")
+        target_link_libraries(nacelle-bench PRIVATE "${METAL_IRCONVERTER_LIB}")
+        get_filename_component(METAL_IRCONVERTER_LIBDIR "${METAL_IRCONVERTER_LIB}" DIRECTORY)
+        set_target_properties(nacelle-bench PROPERTIES BUILD_RPATH "${METAL_IRCONVERTER_LIBDIR}")
+    endif()
+else()
+    add_executable(nacelle-bench tools/nacelle_bench.cpp)
+endif()
 add_dependencies(nacelle-bench nacelle_test_shaders)
 target_include_directories(nacelle-bench PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

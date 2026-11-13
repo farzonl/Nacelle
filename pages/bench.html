@@ -1,0 +1,737 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Nacelle — Windows Software Rasterizer Benchmarks</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+
+      --bg-light: #f8fafc;
+      --bg-dark: #0b0f17;
+      --surface-light: #ffffff;
+      --surface-dark: #111827;
+      --surface-alt-light: #f1f5f9;
+      --surface-alt-dark: #182235;
+      --border-light: #cbd5e1;
+      --border-dark: #293548;
+      --text-light: #0f172a;
+      --text-dark: #f1f5f9;
+      --muted-light: #475569;
+      --muted-dark: #94a3b8;
+      --accent-light: #0369a1;
+      --accent-dark: #38bdf8;
+      --nacelle-light: #0284c7;
+      --nacelle-dark: #38bdf8;
+      --warp-light: #7c3aed;
+      --warp-dark: #a78bfa;
+      --llvmpipe-light: #15803d;
+      --llvmpipe-dark: #4ade80;
+      --swift-light: #c2410c;
+      --swift-dark: #fb923c;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-alt: var(--surface-alt-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --accent: var(--accent-light);
+      --c-nacelle: var(--nacelle-light);
+      --c-warp: var(--warp-light);
+      --c-llvmpipe: var(--llvmpipe-light);
+      --c-swift: var(--swift-light);
+
+      --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --radius: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-alt: var(--surface-alt-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --accent: var(--accent-dark);
+        --c-nacelle: var(--nacelle-dark);
+        --c-warp: var(--warp-dark);
+        --c-llvmpipe: var(--llvmpipe-dark);
+        --c-swift: var(--swift-dark);
+      }
+    }
+
+    @supports (color: light-dark(white, black)) {
+      :root {
+        --bg: light-dark(var(--bg-light), var(--bg-dark));
+        --surface: light-dark(var(--surface-light), var(--surface-dark));
+        --surface-alt: light-dark(var(--surface-alt-light), var(--surface-alt-dark));
+        --border: light-dark(var(--border-light), var(--border-dark));
+        --text: light-dark(var(--text-light), var(--text-dark));
+        --muted: light-dark(var(--muted-light), var(--muted-dark));
+        --accent: light-dark(var(--accent-light), var(--accent-dark));
+        --c-nacelle: light-dark(var(--nacelle-light), var(--nacelle-dark));
+        --c-warp: light-dark(var(--warp-light), var(--warp-dark));
+        --c-llvmpipe: light-dark(var(--llvmpipe-light), var(--llvmpipe-dark));
+        --c-swift: light-dark(var(--swift-light), var(--swift-dark));
+      }
+    }
+
+    @media (forced-colors: active) {
+      :root {
+        --bg: Canvas;
+        --surface: Canvas;
+        --surface-alt: Canvas;
+        --border: ButtonText;
+        --text: CanvasText;
+        --muted: GrayText;
+        --accent: LinkText;
+        --c-nacelle: CanvasText;
+        --c-warp: CanvasText;
+        --c-llvmpipe: CanvasText;
+        --c-swift: CanvasText;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+      display: grid;
+      gap: 1.5rem;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1rem;
+    }
+
+    .title-group h1 {
+      margin: 0;
+      font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+
+    .title-group p {
+      margin: 0.25rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .meta-pill {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .meta-pill:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.25rem;
+    }
+
+    .kpi-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .kpi-value {
+      margin-top: 0.35rem;
+      font-size: 1.75rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+
+    .kpi-sub {
+      margin-top: 0.2rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .chart-card {
+      display: grid;
+      gap: 0.85rem;
+    }
+
+    .card-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .card-header h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.9rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      border: 1px solid var(--border);
+    }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 300px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.8rem;
+      min-width: 210px;
+      opacity: 0;
+      transform: translate(-50%, -105%);
+      transition: opacity 0.12s ease;
+      z-index: 5;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tooltip.visible { opacity: 1; }
+    .tooltip .tt-sha { font-family: var(--font-mono); font-weight: 700; color: var(--accent); }
+    .tooltip .tt-msg {
+      color: var(--muted);
+      margin: 0.15rem 0 0.3rem;
+      max-width: 240px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .svg-chart-wrap { width: 100%; overflow-x: auto; }
+    .svg-chart-wrap svg { display: block; width: 100%; height: auto; }
+
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(440px, 65vh);
+      container-type: inline-size;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    caption {
+      text-align: left;
+      padding: 0.65rem 0.85rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--muted);
+      background: var(--surface-alt);
+      border-bottom: 1px solid var(--border);
+    }
+
+    thead th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-weight: 600;
+      text-align: left;
+      padding: 0.6rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody th, tbody td {
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      z-index: 1;
+      background: var(--surface);
+      text-align: left;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    tbody tr:hover th, tbody tr:hover td { background: var(--surface-alt); }
+
+    .bench-table {
+      --label-2: "Format";
+      --label-3: "Median (ms)";
+      --label-4: "Min (ms)";
+      --label-5: "Compile (ms)";
+      --label-6: "Status";
+    }
+
+    @container (width < 600px) {
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      tr {
+        margin-block-end: 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      tbody th {
+        position: sticky;
+        inset-block-start: 0;
+        z-index: 2;
+        background: var(--surface-alt);
+        border-bottom: 1px solid var(--border);
+      }
+      tbody td {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+      td:nth-child(2)::before { content: var(--label-2) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(3)::before { content: var(--label-3) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(4)::before { content: var(--label-4) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(5)::before { content: var(--label-5) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(6)::before { content: var(--label-6) ": "; color: var(--muted); font-weight: 600; }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <div class="title-group">
+        <h1>Nacelle Windows Benchmarks</h1>
+        <p>Raymarch compute kernel (<span style="font-family: var(--font-mono)">256x256, 48 steps</span>): Nacelle vs Microsoft WARP vs llvmpipe vs SwiftShader</p>
+      </div>
+      <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
+        <a class="meta-pill" href="index.html">← Offload Compliance</a>
+        <a id="latest-run-link" class="meta-pill" href="https://github.com/farzonl/Nacelle" target="_blank" rel="noopener">
+          Latest commit: —
+        </a>
+      </div>
+    </header>
+
+    <section class="kpi-grid" aria-label="Latest benchmark median latencies">
+      <article class="card">
+        <div class="kpi-label">Nacelle (Best SIMD)</div>
+        <div class="kpi-value" id="kpi-nacelle" style="color: var(--c-nacelle)">—</div>
+        <div class="kpi-sub" id="kpi-nacelle-sub">—</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">Microsoft WARP</div>
+        <div class="kpi-value" id="kpi-warp" style="color: var(--c-warp)">—</div>
+        <div class="kpi-sub" id="kpi-warp-sub">—</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">Mesa llvmpipe</div>
+        <div class="kpi-value" id="kpi-llvmpipe" style="color: var(--c-llvmpipe)">—</div>
+        <div class="kpi-sub" id="kpi-llvmpipe-sub">—</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">SwiftShader</div>
+        <div class="kpi-value" id="kpi-swift" style="color: var(--c-swift)">—</div>
+        <div class="kpi-sub" id="kpi-swift-sub">—</div>
+      </article>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="trend-title">
+      <div class="card-header">
+        <h2 id="trend-title">Median Dispatch Time Over Commits (ms, lower is faster)</h2>
+        <div class="legend">
+          <span class="legend-item"><span class="swatch" style="background: var(--c-nacelle)"></span>Nacelle (Best)</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--c-warp)"></span>Microsoft WARP</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--c-llvmpipe)"></span>llvmpipe</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--c-swift)"></span>SwiftShader</span>
+        </div>
+      </div>
+      <div class="canvas-wrap" id="trend-wrap">
+        <canvas id="trend-canvas" aria-label="Line chart of median dispatch time across commits"></canvas>
+        <div class="tooltip" id="trend-tooltip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="bar-title">
+      <div class="card-header">
+        <h2 id="bar-title">Selected Commit Comparison (Median ms)</h2>
+      </div>
+      <div class="svg-chart-wrap" id="bar-svg-wrap"></div>
+    </section>
+
+    <section class="card" aria-labelledby="bench-table-caption">
+      <div tabindex="0" role="region" aria-labelledby="bench-table-caption" class="table-wrapper">
+        <table class="bench-table">
+          <caption id="bench-table-caption">Selected commit backend timings</caption>
+          <thead>
+            <tr>
+              <th scope="col">Backend</th>
+              <th scope="col">Format</th>
+              <th scope="col">Median (ms)</th>
+              <th scope="col">Min (ms)</th>
+              <th scope="col">Compile (ms)</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody id="bench-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const FALLBACK_BENCH = [
+      {
+        sha: "6bcd6be000000000000000000000000000000000",
+        shortSha: "6bcd6be",
+        message: "Sample preview (awaiting first Windows benchmark CI run)",
+        timestamp: new Date().toISOString(),
+        results: [
+          { backend: "Nacelle (SIMD-4)", shaderFormat: "DXIL", ran: true, compileMs: 12.0, medianMs: 8.5, minMs: 8.1, status: "OK" },
+          { backend: "Nacelle (SIMD-8)", shaderFormat: "DXIL", ran: true, compileMs: 14.0, medianMs: 6.2, minMs: 5.9, status: "OK" },
+          { backend: "Microsoft WARP", shaderFormat: "DXIL", ran: true, compileMs: 10.5, medianMs: 9.8, minMs: 9.4, status: "OK" },
+          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.2, medianMs: 11.4, minMs: 10.9, status: "OK" },
+          { backend: "Vulkan (SwiftShader)", shaderFormat: "SPIR-V", ran: true, compileMs: 22.0, medianMs: 16.5, minMs: 15.8, status: "OK" }
+        ]
+      }
+    ];
+
+    let benchHistory = [];
+    let selectedIndex = 0;
+    let hoveredIndex = -1;
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function extractMetrics(entry) {
+      const res = (entry.results || []).filter(r => r.ran);
+      const nacelle = res.filter(r => r.backend.startsWith("Nacelle"));
+      const bestNacelle = nacelle.length ? nacelle.reduce((a, b) => a.medianMs <= b.medianMs ? a : b) : null;
+      const warp = res.find(r => r.backend.toLowerCase().includes("warp")) || null;
+      const llvmpipe = res.find(r => r.backend.toLowerCase().includes("llvmpipe")) || null;
+      const swift = res.find(r => r.backend.toLowerCase().includes("swiftshader")) || null;
+      return { bestNacelle, warp, llvmpipe, swift };
+    }
+
+    function renderKPIs(idx) {
+      const entry = benchHistory[idx];
+      if (!entry) return;
+      const m = extractMetrics(entry);
+
+      const setKpi = (idVal, idSub, item) => {
+        document.getElementById(idVal).textContent = item ? `${item.medianMs.toFixed(2)} ms` : "—";
+        document.getElementById(idSub).textContent = item ? `${item.backend} · min ${item.minMs.toFixed(2)} ms` : "Not run";
+      };
+      setKpi("kpi-nacelle", "kpi-nacelle-sub", m.bestNacelle);
+      setKpi("kpi-warp", "kpi-warp-sub", m.warp);
+      setKpi("kpi-llvmpipe", "kpi-llvmpipe-sub", m.llvmpipe);
+      setKpi("kpi-swift", "kpi-swift-sub", m.swift);
+
+      const pill = document.getElementById("latest-run-link");
+      pill.textContent = `Commit ${entry.shortSha}`;
+      if (entry.runUrl) pill.href = entry.runUrl;
+    }
+
+    function colorForBackend(name) {
+      const n = name.toLowerCase();
+      if (n.includes("nacelle")) return "var(--c-nacelle)";
+      if (n.includes("warp")) return "var(--c-warp)";
+      if (n.includes("llvmpipe")) return "var(--c-llvmpipe)";
+      return "var(--c-swift)";
+    }
+
+    function renderBarSVG(entry) {
+      const wrap = document.getElementById("bar-svg-wrap");
+      const ran = (entry.results || []).filter(r => r.ran);
+      if (!ran.length) {
+        wrap.innerHTML = `<p style="color: var(--muted)">No benchmark results for this commit.</p>`;
+        return;
+      }
+
+      const maxMs = Math.max(...ran.map(r => r.medianMs), 1);
+      const rowH = 34;
+      const padLeft = 240;
+      const padRight = 90;
+      const width = 880;
+      const barW = width - padLeft - padRight;
+      const height = 16 + ran.length * rowH;
+
+      const rows = ran.map((r, i) => {
+        const y = 8 + i * rowH;
+        const w = Math.max(4, (r.medianMs / maxMs) * barW);
+        return `
+          <g transform="translate(0, ${y})">
+            <text x="${padLeft - 10}" y="20" text-anchor="end" font-size="12" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(r.backend)}</text>
+            <rect x="${padLeft}" y="6" width="${w.toFixed(1)}" height="18" rx="4" fill="${colorForBackend(r.backend)}">
+              <title>${escapeHtml(r.backend)}: ${r.medianMs.toFixed(2)} ms</title>
+            </rect>
+            <text x="${(padLeft + w + 8).toFixed(1)}" y="20" font-size="12" font-family="var(--font-mono)" fill="var(--muted)">${r.medianMs.toFixed(2)} ms</text>
+          </g>`;
+      }).join("");
+
+      wrap.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Backend median dispatch time comparison">
+          <title>Median dispatch time for ${escapeHtml(entry.shortSha)}</title>
+          ${rows}
+        </svg>`;
+    }
+
+    function renderTable(entry) {
+      const tbody = document.getElementById("bench-tbody");
+      tbody.innerHTML = (entry.results || []).map(r => `
+        <tr>
+          <th scope="row">${escapeHtml(r.backend)}</th>
+          <td>${escapeHtml(r.shaderFormat)}</td>
+          <td>${r.ran ? r.medianMs.toFixed(2) : "—"}</td>
+          <td>${r.ran ? r.minMs.toFixed(2) : "—"}</td>
+          <td>${r.ran ? r.compileMs.toFixed(2) : "—"}</td>
+          <td>${escapeHtml(r.status)}</td>
+        </tr>`).join("");
+    }
+
+    function drawTrendChart() {
+      const canvas = document.getElementById("trend-canvas");
+      const wrap = document.getElementById("trend-wrap");
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+
+      const W = rect.width;
+      const H = rect.height;
+      const pad = { top: 20, right: 24, bottom: 32, left: 54 };
+      const plotW = W - pad.left - pad.right;
+      const plotH = H - pad.top - pad.bottom;
+
+      const seriesDefs = [
+        { key: "bestNacelle", color: cssVar("--c-nacelle"), label: "Nacelle" },
+        { key: "warp", color: cssVar("--c-warp"), label: "WARP" },
+        { key: "llvmpipe", color: cssVar("--c-llvmpipe"), label: "llvmpipe" },
+        { key: "swift", color: cssVar("--c-swift"), label: "SwiftShader" }
+      ];
+
+      let maxMs = 1;
+      const parsed = benchHistory.map((h, i) => {
+        const m = extractMetrics(h);
+        for (const s of seriesDefs) {
+          if (m[s.key]) maxMs = Math.max(maxMs, m[s.key].medianMs);
+        }
+        return { h, m, i };
+      });
+      maxMs *= 1.12;
+
+      const borderCol = cssVar("--border");
+      const mutedCol = cssVar("--muted");
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.font = "11px " + cssVar("--font-mono");
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let g = 0; g <= 4; g++) {
+        const val = (maxMs * g) / 4;
+        const y = pad.top + plotH * (1 - g / 4);
+        ctx.strokeStyle = borderCol;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(W - pad.right, y);
+        ctx.stroke();
+        ctx.fillStyle = mutedCol;
+        ctx.fillText(val.toFixed(1), pad.left - 8, y);
+      }
+
+      const xFor = (i) => parsed.length === 1
+        ? pad.left + plotW / 2
+        : pad.left + (i / (parsed.length - 1)) * plotW;
+
+      for (const s of seriesDefs) {
+        const pts = parsed
+          .filter(p => p.m[s.key])
+          .map(p => ({ x: xFor(p.i), y: pad.top + plotH * (1 - p.m[s.key].medianMs / maxMs), i: p.i }));
+        if (pts.length > 1) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 2.2;
+          ctx.stroke();
+        }
+        for (const p of pts) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.i === selectedIndex || p.i === hoveredIndex ? 5 : 3.2, 0, Math.PI * 2);
+          ctx.fillStyle = s.color;
+          ctx.fill();
+        }
+      }
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const step = Math.max(1, Math.ceil(parsed.length / 8));
+      parsed.forEach((p, i) => {
+        if (i % step === 0 || i === parsed.length - 1) {
+          ctx.fillStyle = mutedCol;
+          ctx.fillText(p.h.shortSha, xFor(i), pad.top + plotH + 8);
+        }
+      });
+
+      canvas._xs = parsed.map((p, i) => ({ x: xFor(i), p }));
+    }
+
+    function selectCommit(idx) {
+      if (idx < 0 || idx >= benchHistory.length) return;
+      selectedIndex = idx;
+      renderKPIs(idx);
+      renderBarSVG(benchHistory[idx]);
+      renderTable(benchHistory[idx]);
+      drawTrendChart();
+    }
+
+    function setupInteraction() {
+      const canvas = document.getElementById("trend-canvas");
+      const tooltip = document.getElementById("trend-tooltip");
+      canvas.addEventListener("pointermove", (e) => {
+        const xs = canvas._xs || [];
+        if (!xs.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        let nearest = xs[0];
+        let best = Math.abs(mx - nearest.x);
+        for (const item of xs) {
+          const d = Math.abs(mx - item.x);
+          if (d < best) { best = d; nearest = item; }
+        }
+        hoveredIndex = nearest.p.i;
+        drawTrendChart();
+
+        const m = nearest.p.m;
+        const fmt = (it) => it ? `${it.medianMs.toFixed(2)}ms` : "—";
+        tooltip.innerHTML = `
+          <div class="tt-sha">${escapeHtml(nearest.p.h.shortSha)}</div>
+          <div class="tt-msg">${escapeHtml(nearest.p.h.message || "—")}</div>
+          <div>Nacelle: ${fmt(m.bestNacelle)} · WARP: ${fmt(m.warp)}</div>
+          <div>llvmpipe: ${fmt(m.llvmpipe)} · Swift: ${fmt(m.swift)}</div>`;
+        tooltip.style.left = `${Math.max(105, Math.min(rect.width - 105, nearest.x))}px`;
+        tooltip.style.top = `48px`;
+        tooltip.classList.add("visible");
+      });
+      canvas.addEventListener("pointerleave", () => {
+        hoveredIndex = -1;
+        tooltip.classList.remove("visible");
+        drawTrendChart();
+      });
+      canvas.addEventListener("click", () => {
+        if (hoveredIndex >= 0) selectCommit(hoveredIndex);
+      });
+    }
+
+    async function init() {
+      try {
+        const resp = await fetch("data/bench-history.json", { cache: "no-store" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const json = await resp.json();
+        benchHistory = Array.isArray(json) && json.length ? json : FALLBACK_BENCH;
+      } catch {
+        benchHistory = FALLBACK_BENCH;
+      }
+      selectedIndex = benchHistory.length - 1;
+      selectCommit(selectedIndex);
+      setupInteraction();
+      new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("trend-wrap"));
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => drawTrendChart());
+    }
+
+    init();
+  </script>
+</body>
+</html>

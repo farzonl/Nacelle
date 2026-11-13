@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Nacelle — Offload Test Suite Compliance</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+
+      --bg-light: #f8fafc;
+      --bg-dark: #0b0f17;
+      --surface-light: #ffffff;
+      --surface-dark: #111827;
+      --surface-alt-light: #f1f5f9;
+      --surface-alt-dark: #182235;
+      --border-light: #cbd5e1;
+      --border-dark: #293548;
+      --text-light: #0f172a;
+      --text-dark: #f1f5f9;
+      --muted-light: #475569;
+      --muted-dark: #94a3b8;
+      --accent-light: #0369a1;
+      --accent-dark: #38bdf8;
+      --pass-light: #15803d;
+      --pass-dark: #4ade80;
+      --fail-light: #b91c1c;
+      --fail-dark: #f87171;
+      --xfail-light: #a16207;
+      --xfail-dark: #fbbf24;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-alt: var(--surface-alt-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --accent: var(--accent-light);
+      --pass: var(--pass-light);
+      --fail: var(--fail-light);
+      --xfail: var(--xfail-light);
+
+      --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --radius: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-alt: var(--surface-alt-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --accent: var(--accent-dark);
+        --pass: var(--pass-dark);
+        --fail: var(--fail-dark);
+        --xfail: var(--xfail-dark);
+      }
+    }
+
+    @supports (color: light-dark(white, black)) {
+      :root {
+        --bg: light-dark(var(--bg-light), var(--bg-dark));
+        --surface: light-dark(var(--surface-light), var(--surface-dark));
+        --surface-alt: light-dark(var(--surface-alt-light), var(--surface-alt-dark));
+        --border: light-dark(var(--border-light), var(--border-dark));
+        --text: light-dark(var(--text-light), var(--text-dark));
+        --muted: light-dark(var(--muted-light), var(--muted-dark));
+        --accent: light-dark(var(--accent-light), var(--accent-dark));
+        --pass: light-dark(var(--pass-light), var(--pass-dark));
+        --fail: light-dark(var(--fail-light), var(--fail-dark));
+        --xfail: light-dark(var(--xfail-light), var(--xfail-dark));
+      }
+    }
+
+    @media (forced-colors: active) {
+      :root {
+        --bg: Canvas;
+        --surface: Canvas;
+        --surface-alt: Canvas;
+        --border: ButtonText;
+        --text: CanvasText;
+        --muted: GrayText;
+        --accent: LinkText;
+        --pass: CanvasText;
+        --fail: CanvasText;
+        --xfail: CanvasText;
+      }
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 4rem;
+      display: grid;
+      gap: 1.5rem;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1rem;
+    }
+
+    .title-group h1 {
+      margin: 0;
+      font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+
+    .title-group p {
+      margin: 0.25rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .meta-pill {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .meta-pill:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 1rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.25rem;
+    }
+
+    .kpi-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .kpi-value {
+      margin-top: 0.35rem;
+      font-size: 1.85rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+
+    .kpi-sub {
+      margin-top: 0.2rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .chart-card {
+      display: grid;
+      gap: 0.85rem;
+    }
+
+    .card-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .card-header h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.9rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      border: 1px solid var(--border);
+    }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 290px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.8rem;
+      min-width: 190px;
+      opacity: 0;
+      transform: translate(-50%, -105%);
+      transition: opacity 0.12s ease;
+      z-index: 5;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tooltip.visible {
+      opacity: 1;
+    }
+
+    .tooltip .tt-sha {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .tooltip .tt-msg {
+      color: var(--muted);
+      margin: 0.15rem 0 0.3rem;
+      max-width: 240px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .svg-chart-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .svg-chart-wrap svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    /* Responsive accessible table (per modern-web-guidance responsive-table) */
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(460px, 70vh);
+      container-type: inline-size;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    caption {
+      text-align: left;
+      padding: 0.65rem 0.85rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--muted);
+      background: var(--surface-alt);
+      border-bottom: 1px solid var(--border);
+    }
+
+    thead th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-weight: 600;
+      text-align: left;
+      padding: 0.6rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody th,
+    tbody td {
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      z-index: 1;
+      background: var(--surface);
+      text-align: left;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    tbody tr:hover th,
+    tbody tr:hover td {
+      background: var(--surface-alt);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.12rem 0.5rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .badge-pass { color: var(--pass); }
+    .badge-fail { color: var(--fail); }
+    .badge-xfail { color: var(--xfail); }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .commit-table {
+      --label-2: "Message";
+      --label-3: "Pass Rate";
+      --label-4: "Passed";
+      --label-5: "Failed";
+      --label-6: "XFail";
+      --label-7: "Date";
+    }
+
+    .category-table {
+      --label-2: "Pass Rate";
+      --label-3: "Passed";
+      --label-4: "Failed";
+      --label-5: "XFail";
+      --label-6: "Unsupported";
+    }
+
+    @container (width < 600px) {
+      table, thead, tbody, tr, th, td {
+        display: block;
+      }
+
+      thead {
+        display: none;
+      }
+
+      tr {
+        margin-block-end: 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      tbody th {
+        position: sticky;
+        inset-block-start: 0;
+        z-index: 2;
+        background: var(--surface-alt);
+        border-bottom: 1px solid var(--border);
+      }
+
+      tbody td {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      td:nth-child(2)::before { content: var(--label-2) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(3)::before { content: var(--label-3) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(4)::before { content: var(--label-4) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(5)::before { content: var(--label-5) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(6)::before { content: var(--label-6) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(7)::before { content: var(--label-7) ": "; color: var(--muted); font-weight: 600; }
+    }
+
+    .empty-note {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <div class="title-group">
+        <h1>Nacelle Offload Compliance</h1>
+        <p>Linux D3D12 (<span style="font-family: var(--font-mono)">offload-test-suite --api=dx</span>) pass rate &amp; regression history per commit</p>
+      </div>
+      <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
+        <a class="meta-pill" href="bench.html">Windows Benchmarks →</a>
+        <a id="latest-run-link" class="meta-pill" href="https://github.com/farzonl/Nacelle" target="_blank" rel="noopener">
+          Latest commit: —
+        </a>
+      </div>
+    </header>
+
+    <section class="kpi-grid" aria-label="Latest compliance summary">
+      <article class="card">
+        <div class="kpi-label">Pass Rate (Executed)</div>
+        <div class="kpi-value" id="kpi-rate">—</div>
+        <div class="kpi-sub" id="kpi-delta">Awaiting run data</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">Passed</div>
+        <div class="kpi-value" id="kpi-passed" style="color: var(--pass)">—</div>
+        <div class="kpi-sub" id="kpi-executed">Executed: —</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">Failed</div>
+        <div class="kpi-value" id="kpi-failed" style="color: var(--fail)">—</div>
+        <div class="kpi-sub" id="kpi-xfail">XFail: —</div>
+      </article>
+      <article class="card">
+        <div class="kpi-label">Unsupported</div>
+        <div class="kpi-value" id="kpi-unsupported">—</div>
+        <div class="kpi-sub" id="kpi-total">Total discovered: —</div>
+      </article>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="trend-title">
+      <div class="card-header">
+        <h2 id="trend-title">Compliance Trend Over Commits</h2>
+        <div class="legend">
+          <span class="legend-item"><span class="swatch" style="background: var(--accent)"></span>Pass Rate (%)</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--pass)"></span>Passed</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--fail)"></span>Failed</span>
+        </div>
+      </div>
+      <div class="canvas-wrap" id="trend-wrap">
+        <canvas id="trend-canvas" aria-label="Line chart of OffloadTest-d3d12 pass rate across commits"></canvas>
+        <div class="tooltip" id="trend-tooltip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="cat-chart-title">
+      <div class="card-header">
+        <h2 id="cat-chart-title">Suite Breakdown by Category (Selected Commit)</h2>
+        <div class="legend">
+          <span class="legend-item"><span class="swatch" style="background: var(--pass)"></span>✓ Passed</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--fail)"></span>✕ Failed</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--xfail)"></span>~ XFail</span>
+        </div>
+      </div>
+      <div class="svg-chart-wrap" id="category-svg-wrap"></div>
+    </section>
+
+    <section class="card" aria-labelledby="cat-table-caption">
+      <div tabindex="0" role="region" aria-labelledby="cat-table-caption" class="table-wrapper">
+        <table class="category-table">
+          <caption id="cat-table-caption">Category compliance details</caption>
+          <thead>
+            <tr>
+              <th scope="col">Category</th>
+              <th scope="col">Pass Rate</th>
+              <th scope="col">Passed</th>
+              <th scope="col">Failed</th>
+              <th scope="col">XFail</th>
+              <th scope="col">Unsupported</th>
+            </tr>
+          </thead>
+          <tbody id="category-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="commit-table-caption">
+      <div tabindex="0" role="region" aria-labelledby="commit-table-caption" class="table-wrapper">
+        <table class="commit-table">
+          <caption id="commit-table-caption">Commit history (click a row to inspect)</caption>
+          <thead>
+            <tr>
+              <th scope="col">Commit</th>
+              <th scope="col">Message</th>
+              <th scope="col">Pass Rate</th>
+              <th scope="col">Passed</th>
+              <th scope="col">Failed</th>
+              <th scope="col">XFail</th>
+              <th scope="col">Date</th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const FALLBACK_HISTORY = [
+      {
+        sha: "6bcd6be000000000000000000000000000000000",
+        shortSha: "6bcd6be",
+        message: "Sample preview (awaiting first CI Pages artifact)",
+        timestamp: new Date().toISOString(),
+        total: 819,
+        executed: 505,
+        passed: 361,
+        failed: 140,
+        xfail: 4,
+        unsupported: 314,
+        passRate: 71.49,
+        categories: [
+          { name: "Feature/Textures", passed: 12, failed: 26, xfail: 0, unsupported: 0, passRate: 31.6 },
+          { name: "Feature/HLSLLib", passed: 180, failed: 38, xfail: 2, unsupported: 0, passRate: 81.8 },
+          { name: "WaveOps", passed: 22, failed: 16, xfail: 0, unsupported: 0, passRate: 57.9 },
+          { name: "Graphics", passed: 5, failed: 8, xfail: 0, unsupported: 0, passRate: 38.5 }
+        ]
+      }
+    ];
+
+    let historyData = [];
+    let selectedIndex = 0;
+    let hoveredIndex = -1;
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function formatDate(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return Number.isNaN(d.getTime()) ? iso : d.toISOString().slice(0, 16).replace("T", " ") + "Z";
+    }
+
+    function renderKPIs(idx) {
+      const entry = historyData[idx];
+      if (!entry) return;
+      const prev = idx > 0 ? historyData[idx - 1] : null;
+
+      document.getElementById("kpi-rate").textContent = `${entry.passRate.toFixed(1)}%`;
+      document.getElementById("kpi-passed").textContent = `✓ ${entry.passed}`;
+      document.getElementById("kpi-failed").textContent = `✕ ${entry.failed}`;
+      document.getElementById("kpi-unsupported").textContent = String(entry.unsupported);
+      document.getElementById("kpi-executed").textContent = `Executed: ${entry.executed}`;
+      document.getElementById("kpi-xfail").textContent = `~ XFail: ${entry.xfail}`;
+      document.getElementById("kpi-total").textContent = `Total discovered: ${entry.total}`;
+
+      const deltaEl = document.getElementById("kpi-delta");
+      if (prev) {
+        const diff = (entry.passRate - prev.passRate).toFixed(2);
+        const sign = diff > 0 ? "+" : "";
+        deltaEl.textContent = `${sign}${diff}% vs ${prev.shortSha}`;
+      } else {
+        deltaEl.textContent = `Baseline (${entry.shortSha})`;
+      }
+
+      const pill = document.getElementById("latest-run-link");
+      pill.textContent = `Commit ${entry.shortSha} · ${entry.passRate.toFixed(1)}%`;
+      if (entry.runUrl) {
+        pill.href = entry.runUrl;
+      }
+    }
+
+    function renderCategorySVG(entry) {
+      const wrap = document.getElementById("category-svg-wrap");
+      const cats = (entry.categories || []).filter(c => (c.passed + c.failed + c.xfail) > 0);
+      if (!cats.length) {
+        wrap.innerHTML = `<p class="empty-note">No category breakdown recorded for this commit.</p>`;
+        return;
+      }
+
+      const rowH = 28;
+      const padTop = 8;
+      const padLeft = 195;
+      const padRight = 64;
+      const width = 880;
+      const barW = width - padLeft - padRight;
+      const height = padTop + cats.length * rowH + 10;
+
+      const rows = cats.map((c, i) => {
+        const y = padTop + i * rowH;
+        const total = c.passed + c.failed + c.xfail;
+        const wPass = (c.passed / total) * barW;
+        const wFail = (c.failed / total) * barW;
+        const wXfail = (c.xfail / total) * barW;
+        return `
+          <g transform="translate(0, ${y})">
+            <text x="${padLeft - 10}" y="17" text-anchor="end" font-size="12" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(c.name)}</text>
+            <rect x="${padLeft}" y="5" width="${wPass.toFixed(1)}" height="16" rx="2" fill="var(--pass)">
+              <title>${escapeHtml(c.name)}: ${c.passed} passed</title>
+            </rect>
+            <rect x="${(padLeft + wPass).toFixed(1)}" y="5" width="${wFail.toFixed(1)}" height="16" fill="var(--fail)">
+              <title>${escapeHtml(c.name)}: ${c.failed} failed</title>
+            </rect>
+            <rect x="${(padLeft + wPass + wFail).toFixed(1)}" y="5" width="${wXfail.toFixed(1)}" height="16" fill="var(--xfail)">
+              <title>${escapeHtml(c.name)}: ${c.xfail} xfail</title>
+            </rect>
+            <text x="${padLeft + barW + 8}" y="17" font-size="12" font-family="var(--font-mono)" fill="var(--muted)">${c.passRate.toFixed(0)}%</text>
+          </g>`;
+      }).join("");
+
+      wrap.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Category pass and fail breakdown bar chart">
+          <title>Offload test suite breakdown by category for ${escapeHtml(entry.shortSha)}</title>
+          ${rows}
+        </svg>`;
+    }
+
+    function renderTables(idx) {
+      const entry = historyData[idx];
+      const catBody = document.getElementById("category-tbody");
+      catBody.innerHTML = (entry.categories || []).map(c => `
+        <tr>
+          <th scope="row">${escapeHtml(c.name)}</th>
+          <td>${c.passRate.toFixed(1)}%</td>
+          <td><span class="badge badge-pass">✓ ${c.passed}</span></td>
+          <td><span class="badge badge-fail">✕ ${c.failed}</span></td>
+          <td><span class="badge badge-xfail">~ ${c.xfail}</span></td>
+          <td>${c.unsupported}</td>
+        </tr>`).join("");
+
+      const histBody = document.getElementById("history-tbody");
+      histBody.innerHTML = [...historyData].reverse().map((h, revIdx) => {
+        const realIdx = historyData.length - 1 - revIdx;
+        const active = realIdx === idx ? ' style="outline: 2px solid var(--accent); outline-offset: -2px;"' : "";
+        return `
+          <tr data-idx="${realIdx}" style="cursor: pointer"${active}>
+            <th scope="row">${escapeHtml(h.shortSha)}</th>
+            <td>${escapeHtml(h.message || "—")}</td>
+            <td><strong>${h.passRate.toFixed(1)}%</strong></td>
+            <td><span class="badge badge-pass">✓ ${h.passed}</span></td>
+            <td><span class="badge badge-fail">✕ ${h.failed}</span></td>
+            <td><span class="badge badge-xfail">~ ${h.xfail}</span></td>
+            <td>${escapeHtml(formatDate(h.timestamp))}</td>
+          </tr>`;
+      }).join("");
+
+      histBody.querySelectorAll("tr[data-idx]").forEach(row => {
+        row.addEventListener("click", () => {
+          selectCommit(Number(row.dataset.idx));
+        });
+      });
+    }
+
+    function drawTrendChart() {
+      const canvas = document.getElementById("trend-canvas");
+      const wrap = document.getElementById("trend-wrap");
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+
+      const W = rect.width;
+      const H = rect.height;
+      const pad = { top: 20, right: 24, bottom: 32, left: 48 };
+      const plotW = W - pad.left - pad.right;
+      const plotH = H - pad.top - pad.bottom;
+
+      const borderCol = cssVar("--border");
+      const mutedCol = cssVar("--muted");
+      const accentCol = cssVar("--accent");
+      const textCol = cssVar("--text");
+
+      ctx.clearRect(0, 0, W, H);
+
+      // Horizontal gridlines (0%, 25%, 50%, 75%, 100%)
+      ctx.font = "11px " + cssVar("--font-mono");
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (const pct of [0, 25, 50, 75, 100]) {
+        const y = pad.top + plotH * (1 - pct / 100);
+        ctx.strokeStyle = borderCol;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(W - pad.right, y);
+        ctx.stroke();
+
+        ctx.fillStyle = mutedCol;
+        ctx.fillText(`${pct}%`, pad.left - 8, y);
+      }
+
+      if (!historyData.length) return;
+
+      const pts = historyData.map((h, i) => {
+        const x = historyData.length === 1
+          ? pad.left + plotW / 2
+          : pad.left + (i / (historyData.length - 1)) * plotW;
+        const y = pad.top + plotH * (1 - Math.max(0, Math.min(100, h.passRate)) / 100);
+        return { x, y, h, i };
+      });
+
+      // Area gradient fill
+      if (pts.length > 1) {
+        const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
+        grad.addColorStop(0, "color-mix(in srgb, " + accentCol + " 28%, transparent)");
+        grad.addColorStop(1, "color-mix(in srgb, " + accentCol + " 2%, transparent)");
+
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pad.top + plotH);
+        ctx.lineTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) {
+          const xc = (pts[i - 1].x + pts[i].x) / 2;
+          ctx.bezierCurveTo(xc, pts[i - 1].y, xc, pts[i].y, pts[i].x, pts[i].y);
+        }
+        ctx.lineTo(pts[pts.length - 1].x, pad.top + plotH);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // Line stroke
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) {
+          const xc = (pts[i - 1].x + pts[i].x) / 2;
+          ctx.bezierCurveTo(xc, pts[i - 1].y, xc, pts[i].y, pts[i].x, pts[i].y);
+        }
+        ctx.strokeStyle = accentCol;
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+
+      // Points & X-axis labels
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const labelStep = Math.max(1, Math.ceil(pts.length / 8));
+      pts.forEach((p, i) => {
+        const isSelected = i === selectedIndex;
+        const isHovered = i === hoveredIndex;
+
+        if (isHovered) {
+          ctx.strokeStyle = mutedCol;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(p.x, pad.top);
+          ctx.lineTo(p.x, pad.top + plotH);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, isSelected || isHovered ? 5.5 : 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = isSelected ? textCol : accentCol;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = cssVar("--surface");
+        ctx.stroke();
+
+        if (i % labelStep === 0 || i === pts.length - 1) {
+          ctx.fillStyle = mutedCol;
+          ctx.fillText(p.h.shortSha, p.x, pad.top + plotH + 8);
+        }
+      });
+
+      canvas._points = pts;
+    }
+
+    function selectCommit(idx) {
+      if (idx < 0 || idx >= historyData.length) return;
+      selectedIndex = idx;
+      renderKPIs(idx);
+      renderCategorySVG(historyData[idx]);
+      renderTables(idx);
+      drawTrendChart();
+    }
+
+    function setupCanvasInteraction() {
+      const canvas = document.getElementById("trend-canvas");
+      const tooltip = document.getElementById("trend-tooltip");
+
+      canvas.addEventListener("pointermove", (e) => {
+        const pts = canvas._points || [];
+        if (!pts.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        let nearest = pts[0];
+        let bestDist = Math.abs(mx - nearest.x);
+        for (const p of pts) {
+          const d = Math.abs(mx - p.x);
+          if (d < bestDist) {
+            bestDist = d;
+            nearest = p;
+          }
+        }
+        hoveredIndex = nearest.i;
+        drawTrendChart();
+
+        tooltip.innerHTML = `
+          <div class="tt-sha">${escapeHtml(nearest.h.shortSha)} · ${nearest.h.passRate.toFixed(1)}%</div>
+          <div class="tt-msg">${escapeHtml(nearest.h.message || "—")}</div>
+          <div>✓ ${nearest.h.passed} &nbsp; ✕ ${nearest.h.failed} &nbsp; ~ ${nearest.h.xfail}</div>`;
+        tooltip.style.left = `${Math.max(95, Math.min(rect.width - 95, nearest.x))}px`;
+        tooltip.style.top = `${Math.max(48, nearest.y)}px`;
+        tooltip.classList.add("visible");
+      });
+
+      canvas.addEventListener("pointerleave", () => {
+        hoveredIndex = -1;
+        tooltip.classList.remove("visible");
+        drawTrendChart();
+      });
+
+      canvas.addEventListener("click", () => {
+        if (hoveredIndex >= 0) selectCommit(hoveredIndex);
+      });
+    }
+
+    async function init() {
+      try {
+        const resp = await fetch("data/history.json", { cache: "no-store" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const json = await resp.json();
+        historyData = Array.isArray(json) && json.length ? json : FALLBACK_HISTORY;
+      } catch {
+        historyData = FALLBACK_HISTORY;
+      }
+
+      selectedIndex = historyData.length - 1;
+      selectCommit(selectedIndex);
+      setupCanvasInteraction();
+
+      const ro = new ResizeObserver(() => drawTrendChart());
+      ro.observe(document.getElementById("trend-wrap"));
+
+      const mq = window.matchMedia("(prefers-color-scheme: dark)");
+      mq.addEventListener("change", () => drawTrendChart());
+    }
+
+    init();
+  </script>
+</body>
+</html>

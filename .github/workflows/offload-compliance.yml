@@ -1,0 +1,207 @@
+name: Offload Compliance (Linux)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: offload-compliance-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  offload-compliance:
+    name: Offload Test Suite Compliance (ubuntu-latest)
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies (lit, PyYAML)
+        run: python3 -m pip install --upgrade pip lit pyyaml
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            zlib1g-dev \
+            libzstd-dev
+
+      - name: Checkout required submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/DirectX-Headers \
+            third_party/DirectXMath \
+            third_party/bcdec \
+            third_party/thread-pool \
+            third_party/xxHash \
+            third_party/offload-test-suite
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
+          echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Install DirectXShaderCompiler (Linux)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk
+          curl -fsSL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz \
+            | tar -xzf - -C .sdk ./bin ./include ./lib
+
+      - name: Save DXC SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Restore third_party LLVM/MLIR binaries cache
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build and install third_party LLVM/MLIR/Clang
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.toolchains/llvm" \
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          rm -rf build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure and build Nacelle D3D12 library
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+          cmake --build build --target nacelle_d3d12 --parallel
+
+      - name: Configure and build offload-test-suite (d3d12)
+        run: |
+          cmake -S third_party/offload-test-suite -B build-offload -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DOFFLOADTEST_ENABLE_D3D12=ON \
+            -DOFFLOADTEST_ENABLE_VULKAN=OFF \
+            -DOFFLOADTEST_ENABLE_METAL=OFF \
+            -DOFFLOADTEST_ENABLE_DEBUG=ON \
+            -DOFFLOADTEST_ENABLE_VALIDATION=OFF \
+            -DOFFLOADTEST_DXC="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DD3D12_WSL_FOUND=TRUE \
+            -DD3D12_WSL_LIBRARIES="${{ github.workspace }}/build/libnacelle_d3d12.so;${{ github.workspace }}/build/third_party/DirectX-Headers/libDirectX-Headers.a" \
+            -DCMAKE_CXX_FLAGS="-I${{ github.workspace }}/third_party/DirectX-Headers/include -I${{ github.workspace }}/src/common/posix_sal"
+          cmake --build build-offload --target api-query offloader imgdiff --parallel
+
+      - name: Run OffloadTest-d3d12 against Nacelle
+        env:
+          LD_LIBRARY_PATH: "${{ github.workspace }}/build:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+        run: |
+          mv build-offload/bin/offloader build-offload/bin/offloader.bin
+          printf '#!/bin/sh\nexec "%s/build-offload/bin/offloader.bin" --api=dx "$@"\n' "${{ github.workspace }}" > build-offload/bin/offloader
+          chmod +x build-offload/bin/offloader
+          lit -v --output="${{ github.workspace }}/offload-results.json" "${{ github.workspace }}/build-offload/test/d3d12" || true
+          mv build-offload/bin/offloader.bin build-offload/bin/offloader
+
+      - name: Restore historical compliance data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .compliance-cache
+          key: offload-history-${{ github.event.workflow_run.head_sha || github.sha }}
+          restore-keys: |
+            offload-history-
+
+      - name: Record compliance history and build GitHub Pages site
+        run: |
+          TARGET_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_TS=$(git log -1 --pretty=%cI)
+          python3 scripts/record_offload_compliance.py \
+            --lit-json "${{ github.workspace }}/offload-results.json" \
+            --site-src "${{ github.workspace }}/pages" \
+            --out-dir "${{ github.workspace }}/_site" \
+            --sha "$TARGET_SHA" \
+            --message "$COMMIT_MSG" \
+            --author "$COMMIT_AUTHOR" \
+            --timestamp "$COMMIT_TS" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --pages-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" \
+            --history-cache "${{ github.workspace }}/.compliance-cache/history.json"
+
+      - name: Save historical compliance data cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .compliance-cache
+          key: offload-history-${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

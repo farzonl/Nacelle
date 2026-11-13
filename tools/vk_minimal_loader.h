@@ -99,7 +99,7 @@ struct VkInstanceCreateInfo {
 };
 
 struct VkPhysicalDeviceLimits {
-    uint8_t raw[504];
+    alignas(8) uint8_t raw[504];
 };
 
 struct VkPhysicalDeviceSparseProperties {
@@ -120,6 +120,28 @@ struct VkPhysicalDeviceProperties {
     uint8_t pipelineCacheUUID[16];
     VkPhysicalDeviceLimits limits;
     VkPhysicalDeviceSparseProperties sparseProperties;
+};
+
+struct VkConformanceVersion {
+    uint8_t major;
+    uint8_t minor;
+    uint8_t subminor;
+    uint8_t patch;
+};
+
+struct VkPhysicalDeviceDriverProperties {
+    uint32_t sType;
+    void* pNext;
+    uint32_t driverID;
+    char driverName[256];
+    char driverInfo[256];
+    VkConformanceVersion conformanceVersion;
+};
+
+struct VkPhysicalDeviceProperties2 {
+    uint32_t sType;
+    void* pNext;
+    VkPhysicalDeviceProperties properties;
 };
 
 struct VkQueueFamilyProperties {
@@ -340,6 +362,7 @@ struct Loader {
     void (VK_PTR* vkDestroyInstance)(VkInstance, const void*) = nullptr;
     VkResult (VK_PTR* vkEnumeratePhysicalDevices)(VkInstance, uint32_t*, VkPhysicalDevice*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceProperties)(VkPhysicalDevice, VkPhysicalDeviceProperties*) = nullptr;
+    void (VK_PTR* vkGetPhysicalDeviceProperties2)(VkPhysicalDevice, VkPhysicalDeviceProperties2*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceQueueFamilyProperties)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*) = nullptr;
     VkResult (VK_PTR* vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*) = nullptr;
@@ -421,6 +444,10 @@ struct Loader {
         loadSym(inst, vkDestroyInstance, "vkDestroyInstance");
         loadSym(inst, vkEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices");
         loadSym(inst, vkGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
+        loadSym(inst, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2");
+        if (!vkGetPhysicalDeviceProperties2) {
+            loadSym(inst, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2KHR");
+        }
         loadSym(inst, vkGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties");
         loadSym(inst, vkGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties");
         loadSym(inst, vkCreateDevice, "vkCreateDevice");

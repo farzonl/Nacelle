@@ -1,0 +1,279 @@
+name: Windows Benchmarks
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: windows-benchmark-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-benchmark:
+    name: Benchmark (Nacelle vs WARP vs llvmpipe vs SwiftShader)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 `
+            third_party/DirectX-Headers `
+            third_party/DirectXMath `
+            third_party/bcdec `
+            third_party/thread-pool `
+            third_party/xxHash
+
+      - name: Compute third_party submodule revisions
+        id: submodule-rev
+        run: |
+          $llvmRev = ((git ls-tree HEAD third_party/llvm-project) -split '\s+')[2]
+          $swiftRev = ((git ls-tree HEAD third_party/SwiftShader) -split '\s+')[2]
+          "llvm=$llvmRev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "swiftshader=$swiftRev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore DXC SDK cache (from CI)
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Install DirectXShaderCompiler (Windows fallback)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path .sdk
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -OutFile dxc.zip
+          Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
+          Remove-Item dxc.zip
+
+      - name: Save DXC SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Restore third_party LLVM/MLIR binaries cache (from CI)
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-Windows-x64-
+
+      - name: Build and install third_party LLVM/MLIR/Clang (fallback)
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/.toolchains/llvm" `
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" `
+            -DLLVM_TARGETS_TO_BUILD="host" `
+            -DLLVM_BUILD_UTILS=ON `
+            -DLLVM_INSTALL_UTILS=ON `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_USE_CRT_RELEASE=MD `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DMLIR_INCLUDE_TESTS=OFF `
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          Remove-Item -Recurse -Force build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Restore SwiftShader cache
+        id: cache-swiftshader
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/swiftshader
+          key: nacelle-swiftshader-Windows-x64-${{ steps.submodule-rev.outputs.swiftshader }}
+          restore-keys: |
+            nacelle-swiftshader-Windows-x64-
+
+      - name: Build SwiftShader (Windows)
+        if: steps.cache-swiftshader.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/SwiftShader
+          cmake -S third_party/SwiftShader -B build-swiftshader -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSWIFTSHADER_BUILD_TESTS=OFF `
+            -DSWIFTSHADER_BUILD_BENCHMARKS=OFF `
+            -DSWIFTSHADER_BUILD_SAMPLES=OFF `
+            -DSWIFTSHADER_WARNINGS_AS_ERRORS=OFF
+          cmake --build build-swiftshader --target vk_swiftshader --parallel
+          New-Item -ItemType Directory -Force -Path .toolchains/swiftshader
+          Copy-Item build-swiftshader/Windows/* .toolchains/swiftshader/ -Recurse -Force
+          Remove-Item -Recurse -Force build-swiftshader
+
+      - name: Save SwiftShader cache
+        if: always() && steps.cache-swiftshader.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/swiftshader
+          key: nacelle-swiftshader-Windows-x64-${{ steps.submodule-rev.outputs.swiftshader }}
+
+      - name: Check for preinstalled Lavapipe ICD
+        id: check-lavapipe
+        run: |
+          $icd = ""
+          if ($env:LAVAPIPE_ICD_JSON -and (Test-Path $env:LAVAPIPE_ICD_JSON)) {
+            $icd = $env:LAVAPIPE_ICD_JSON
+          } else {
+            $regPath = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+            if (Test-Path $regPath) {
+              $props = (Get-Item $regPath).Property | Where-Object { $_ -match "lvp_icd" -and (Test-Path $_) }
+              if ($props) { $icd = $props | Select-Object -First 1 }
+            }
+          }
+          if ($icd) {
+            Write-Host "Found preinstalled Lavapipe ICD: $icd"
+            "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "icd=$icd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Restore Mesa llvmpipe cache
+        if: steps.check-lavapipe.outputs.found != 'true'
+        id: cache-llvmpipe
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvmpipe
+          key: nacelle-llvmpipe-Windows-x64-26.2.6
+
+      - name: Download prebuilt Mesa llvmpipe (Windows)
+        if: steps.check-lavapipe.outputs.found != 'true' && steps.cache-llvmpipe.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path .toolchains/llvmpipe
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.6/mesa3d-26.2.6-release-msvc.7z" -OutFile mesa.7z
+          7z x mesa.7z -o.toolchains/llvmpipe -y
+          Remove-Item mesa.7z
+
+      - name: Save Mesa llvmpipe cache
+        if: always() && steps.check-lavapipe.outputs.found != 'true' && steps.cache-llvmpipe.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvmpipe
+          key: nacelle-llvmpipe-Windows-x64-26.2.6
+
+      - name: Ensure Vulkan Loader (vulkan-1.dll) is installed
+        run: |
+          if (-not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) {
+            Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/VulkanRT-X64-1.4.357.0-Installer.exe" -OutFile VulkanRT.exe
+            Start-Process -FilePath .\VulkanRT.exe -ArgumentList "/S" -Wait
+            Remove-Item VulkanRT.exe
+          }
+
+      - name: Configure and build nacelle-bench
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
+            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
+            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
+            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
+          cmake --build build --target nacelle-bench --parallel
+
+      - name: Run Windows benchmarks (Nacelle vs WARP vs llvmpipe vs SwiftShader)
+        run: |
+          $lvpIcd = "${{ steps.check-lavapipe.outputs.icd }}"
+          if (-not $lvpIcd) {
+            $lvpIcd = (Get-ChildItem -Path "$env:GITHUB_WORKSPACE\.toolchains\llvmpipe" -Recurse -Filter "lvp_icd*.json" | Select-Object -First 1).FullName
+          }
+          $swiftIcd = (Get-ChildItem -Path "$env:GITHUB_WORKSPACE\.toolchains\swiftshader" -Recurse -Filter "vk_swiftshader_icd.json" | Select-Object -First 1).FullName
+          $icds = @($lvpIcd, $swiftIcd) | Where-Object { $_ }
+          $env:VK_ICD_FILENAMES = ($icds -join ";")
+          $env:VK_DRIVER_FILES = $env:VK_ICD_FILENAMES
+          $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\llvmpipe\x64;$env:GITHUB_WORKSPACE\.toolchains\swiftshader;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
+          & "$env:GITHUB_WORKSPACE\build\nacelle-bench.exe" --iters 7 --json "$env:GITHUB_WORKSPACE\bench-results.json"
+
+      - name: Restore historical benchmark data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .bench-cache
+          key: bench-history-${{ github.event.workflow_run.head_sha || github.sha }}
+          restore-keys: |
+            bench-history-
+
+      - name: Record benchmark history and build GitHub Pages site
+        run: |
+          $targetSha = "${{ github.event.workflow_run.head_sha || github.sha }}"
+          $msg = git log -1 --pretty=%s
+          $author = git log -1 --pretty=%an
+          $ts = git log -1 --pretty=%cI
+          python scripts/record_bench_history.py `
+            --bench-json "$env:GITHUB_WORKSPACE\bench-results.json" `
+            --site-src "$env:GITHUB_WORKSPACE\pages" `
+            --out-dir "$env:GITHUB_WORKSPACE\_site" `
+            --sha "$targetSha" `
+            --message "$msg" `
+            --author "$author" `
+            --timestamp "$ts" `
+            --run-url "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" `
+            --pages-url "https://$($env:GITHUB_REPOSITORY_OWNER).github.io/$($env:GITHUB_EVENT_REPOSITORY_NAME)" `
+            --history-cache "$env:GITHUB_WORKSPACE\.bench-cache\bench-history.json"
+        env:
+          GITHUB_EVENT_REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+      - name: Save historical benchmark data cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .bench-cache
+          key: bench-history-${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
