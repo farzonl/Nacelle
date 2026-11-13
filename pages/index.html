@@ -5,9 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Nacelle — Offload Test Suite Compliance</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("nacelle-theme");
+        const theme = (saved === "light" || saved === "dark")
+          ? saved
+          : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = theme;
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
   <style>
     :root {
-      color-scheme: light dark;
+      color-scheme: light;
 
       --bg-light: #f8fafc;
       --bg-dark: #0b0f17;
@@ -49,7 +62,8 @@
     }
 
     @media (prefers-color-scheme: dark) {
-      :root {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
         --bg: var(--bg-dark);
         --surface: var(--surface-dark);
         --surface-alt: var(--surface-alt-dark);
@@ -63,19 +77,18 @@
       }
     }
 
-    @supports (color: light-dark(white, black)) {
-      :root {
-        --bg: light-dark(var(--bg-light), var(--bg-dark));
-        --surface: light-dark(var(--surface-light), var(--surface-dark));
-        --surface-alt: light-dark(var(--surface-alt-light), var(--surface-alt-dark));
-        --border: light-dark(var(--border-light), var(--border-dark));
-        --text: light-dark(var(--text-light), var(--text-dark));
-        --muted: light-dark(var(--muted-light), var(--muted-dark));
-        --accent: light-dark(var(--accent-light), var(--accent-dark));
-        --pass: light-dark(var(--pass-light), var(--pass-dark));
-        --fail: light-dark(var(--fail-light), var(--fail-dark));
-        --xfail: light-dark(var(--xfail-light), var(--xfail-dark));
-      }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: var(--bg-dark);
+      --surface: var(--surface-dark);
+      --surface-alt: var(--surface-alt-dark);
+      --border: var(--border-dark);
+      --text: var(--text-dark);
+      --muted: var(--muted-dark);
+      --accent: var(--accent-dark);
+      --pass: var(--pass-dark);
+      --fail: var(--fail-dark);
+      --xfail: var(--xfail-dark);
     }
 
     @media (forced-colors: active) {
@@ -146,11 +159,21 @@
       background: var(--surface);
       color: var(--text);
       text-decoration: none;
+      line-height: 1.3;
+    }
+
+    button.meta-pill {
+      cursor: pointer;
     }
 
     .meta-pill:hover {
       border-color: var(--accent);
       color: var(--accent);
+    }
+
+    .meta-pill:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
 
     .kpi-grid {
@@ -339,6 +362,7 @@
       padding: 0.55rem 0.85rem;
       border-bottom: 1px solid var(--border);
       vertical-align: middle;
+      color: var(--text);
     }
 
     tbody th {
@@ -346,6 +370,7 @@
       inset-inline-start: 0;
       z-index: 1;
       background: var(--surface);
+      color: var(--text);
       text-align: left;
       font-family: var(--font-mono);
       font-weight: 600;
@@ -451,6 +476,7 @@
         <p>Linux D3D12 (<span style="font-family: var(--font-mono)">offload-test-suite --api=dx</span>) pass rate &amp; regression history per commit</p>
       </div>
       <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
+        <button id="theme-toggle" class="meta-pill" type="button" aria-label="Toggle color theme">☀ Light</button>
         <a class="meta-pill" href="bench.html">Windows Benchmarks →</a>
         <a id="latest-run-link" class="meta-pill" href="https://github.com/farzonl/Nacelle" target="_blank" rel="noopener">
           Latest commit: —
@@ -460,7 +486,7 @@
 
     <section class="kpi-grid" aria-label="Latest compliance summary">
       <article class="card">
-        <div class="kpi-label">Pass Rate (Executed)</div>
+        <div class="kpi-label">Pass Rate (Total)</div>
         <div class="kpi-value" id="kpi-rate">—</div>
         <div class="kpi-sub" id="kpi-delta">Awaiting run data</div>
       </article>
@@ -503,6 +529,7 @@
           <span class="legend-item"><span class="swatch" style="background: var(--pass)"></span>✓ Passed</span>
           <span class="legend-item"><span class="swatch" style="background: var(--fail)"></span>✕ Failed</span>
           <span class="legend-item"><span class="swatch" style="background: var(--xfail)"></span>~ XFail</span>
+          <span class="legend-item"><span class="swatch" style="background: var(--muted)"></span>Unsupported</span>
         </div>
       </div>
       <div class="svg-chart-wrap" id="category-svg-wrap"></div>
@@ -561,7 +588,7 @@
         failed: 140,
         xfail: 4,
         unsupported: 314,
-        passRate: 71.49,
+        passRate: 44.08,
         categories: [
           { name: "Feature/Textures", passed: 12, failed: 26, xfail: 0, unsupported: 0, passRate: 31.6 },
           { name: "Feature/HLSLLib", passed: 180, failed: 38, xfail: 2, unsupported: 0, passRate: 81.8 },
@@ -574,6 +601,44 @@
     let historyData = [];
     let selectedIndex = 0;
     let hoveredIndex = -1;
+
+    function getActiveTheme() {
+      return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+    }
+
+    function applyTheme(theme, persist = false) {
+      document.documentElement.dataset.theme = theme;
+      if (persist) {
+        try { localStorage.setItem("nacelle-theme", theme); } catch {}
+      }
+      const btn = document.getElementById("theme-toggle");
+      if (btn) {
+        const isDark = theme === "dark";
+        btn.textContent = isDark ? "☀ Light mode" : "☾ Dark mode";
+        btn.setAttribute("aria-pressed", String(isDark));
+        btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
+      }
+    }
+
+    function setupThemeToggle() {
+      applyTheme(getActiveTheme(), false);
+      const btn = document.getElementById("theme-toggle");
+      if (btn) {
+        btn.addEventListener("click", () => {
+          const next = getActiveTheme() === "dark" ? "light" : "dark";
+          applyTheme(next, true);
+          drawTrendChart();
+        });
+      }
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+        try {
+          const saved = localStorage.getItem("nacelle-theme");
+          if (saved === "light" || saved === "dark") return;
+        } catch {}
+        applyTheme(e.matches ? "dark" : "light", false);
+        drawTrendChart();
+      });
+    }
 
     function cssVar(name) {
       return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -624,7 +689,7 @@
 
     function renderCategorySVG(entry) {
       const wrap = document.getElementById("category-svg-wrap");
-      const cats = (entry.categories || []).filter(c => (c.passed + c.failed + c.xfail) > 0);
+      const cats = (entry.categories || []).filter(c => (c.passed + c.failed + c.xfail + (c.unsupported || 0)) > 0);
       if (!cats.length) {
         wrap.innerHTML = `<p class="empty-note">No category breakdown recorded for this commit.</p>`;
         return;
@@ -640,10 +705,12 @@
 
       const rows = cats.map((c, i) => {
         const y = padTop + i * rowH;
-        const total = c.passed + c.failed + c.xfail;
+        const unsup = c.unsupported || 0;
+        const total = c.passed + c.failed + c.xfail + unsup;
         const wPass = (c.passed / total) * barW;
         const wFail = (c.failed / total) * barW;
         const wXfail = (c.xfail / total) * barW;
+        const wUnsup = (unsup / total) * barW;
         return `
           <g transform="translate(0, ${y})">
             <text x="${padLeft - 10}" y="17" text-anchor="end" font-size="12" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(c.name)}</text>
@@ -655,6 +722,9 @@
             </rect>
             <rect x="${(padLeft + wPass + wFail).toFixed(1)}" y="5" width="${wXfail.toFixed(1)}" height="16" fill="var(--xfail)">
               <title>${escapeHtml(c.name)}: ${c.xfail} xfail</title>
+            </rect>
+            <rect x="${(padLeft + wPass + wFail + wXfail).toFixed(1)}" y="5" width="${wUnsup.toFixed(1)}" height="16" fill="var(--muted)" opacity="0.45">
+              <title>${escapeHtml(c.name)}: ${unsup} unsupported</title>
             </rect>
             <text x="${padLeft + barW + 8}" y="17" font-size="12" font-family="var(--font-mono)" fill="var(--muted)">${c.passRate.toFixed(0)}%</text>
           </g>`;
@@ -870,14 +940,28 @@
       });
     }
 
+    function normalizeHistory(entries) {
+      return entries.map(entry => {
+        const total = entry.total ?? ((entry.passed || 0) + (entry.failed || 0) + (entry.xfail || 0) + (entry.unsupported || 0));
+        const passRate = total > 0 ? Math.round((10000 * (entry.passed || 0)) / total) / 100 : 0;
+        const categories = (entry.categories || []).map(c => {
+          const catTotal = (c.passed || 0) + (c.failed || 0) + (c.xfail || 0) + (c.unsupported || 0);
+          const catRate = catTotal > 0 ? Math.round((1000 * (c.passed || 0)) / catTotal) / 10 : 0;
+          return { ...c, passRate: catRate };
+        });
+        return { ...entry, total, passRate, categories };
+      });
+    }
+
     async function init() {
+      setupThemeToggle();
       try {
         const resp = await fetch("data/history.json", { cache: "no-store" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const json = await resp.json();
-        historyData = Array.isArray(json) && json.length ? json : FALLBACK_HISTORY;
+        historyData = normalizeHistory(Array.isArray(json) && json.length ? json : FALLBACK_HISTORY);
       } catch {
-        historyData = FALLBACK_HISTORY;
+        historyData = normalizeHistory(FALLBACK_HISTORY);
       }
 
       selectedIndex = historyData.length - 1;
@@ -886,9 +970,6 @@
 
       const ro = new ResizeObserver(() => drawTrendChart());
       ro.observe(document.getElementById("trend-wrap"));
-
-      const mq = window.matchMedia("(prefers-color-scheme: dark)");
-      mq.addEventListener("change", () => drawTrendChart());
     }
 
     init();

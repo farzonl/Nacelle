@@ -53,13 +53,14 @@ def parse_lit_json(path: Path) -> dict:
                 "elapsed": round(float(t.get("elapsed", 0.0)), 3),
             })
 
+    total = len(tests)
     executed = counts["PASS"] + counts["FAIL"] + counts["XFAIL"]
-    pass_rate = round((100.0 * counts["PASS"] / executed), 2) if executed > 0 else 0.0
+    pass_rate = round((100.0 * counts["PASS"] / total), 2) if total > 0 else 0.0
 
     cat_list = []
     for cat, c in sorted(categories.items(), key=lambda kv: (-kv[1]["failed"], kv[0])):
-        cat_exec = c["passed"] + c["failed"] + c["xfail"]
-        cat_rate = round((100.0 * c["passed"] / cat_exec), 1) if cat_exec > 0 else 0.0
+        cat_total = c["passed"] + c["failed"] + c["xfail"] + c["unsupported"]
+        cat_rate = round((100.0 * c["passed"] / cat_total), 1) if cat_total > 0 else 0.0
         cat_list.append({
             "name": cat,
             "passed": c["passed"],
@@ -70,7 +71,7 @@ def parse_lit_json(path: Path) -> dict:
         })
 
     return {
-        "total": len(tests),
+        "total": total,
         "executed": executed,
         "passed": counts["PASS"],
         "failed": counts["FAIL"],
@@ -184,9 +185,9 @@ def main() -> None:
             pass
 
     print(
-        f"Recorded {entry['shortSha']}: {entry['passed']}/{entry['executed']} passed "
-        f"({entry['passRate']}%), {entry['failed']} failed, {entry['xfail']} xfail, "
-        f"{entry['unsupported']} unsupported. History length: {len(history)}"
+        f"Recorded {entry['shortSha']}: {entry['passed']}/{entry['total']} passed "
+        f"({entry['passRate']}%, {entry['executed']} executed), {entry['failed']} failed, "
+        f"{entry['xfail']} xfail, {entry['unsupported']} unsupported. History length: {len(history)}"
     )
 
 
