@@ -1,0 +1,16 @@
+// RUN: %dxc -T cs_6_0 -E CSMain -Fo %t.dxil %S/../shaders/vec_add.hlsl
+// RUN: %nacelle_compile --simd-width=4 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W4
+// RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W8
+// RUN: %nacelle_compile --simd-width=16 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W16
+
+// W4: func.func @nacelle_cs_test
+// W4: vector<4x
+// W4: arith.addf{{.*}}vector<4xf32>
+
+// W8: func.func @nacelle_cs_test
+// W8: vector<8x
+// W8: arith.addf{{.*}}vector<8xf32>
+
+// W16: func.func @nacelle_cs_test
+// W16: vector<16x
+// W16: arith.addf{{.*}}vector<16xf32>

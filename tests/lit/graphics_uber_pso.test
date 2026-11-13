@@ -1,0 +1,34 @@
+// RUN: %split_file %s %t
+// RUN: %dxc -T vs_6_0 -E VSMain -Fo %t/vs.dxil %t/shader.hlsl
+// RUN: %dxc -T ps_6_0 -E PSMain -Fo %t/ps.dxil %t/shader.hlsl
+// RUN: %nacelle_compile --vs %t/vs.dxil --ps %t/ps.dxil --simd-width=8 --blend=alpha --depth=less --emit-simd-mlir | %FileCheck %s --check-prefix=GFX
+// RUN: %nacelle_compile --vs %t/vs.dxil --simd-width=8 --depth=less --emit-simd-mlir | %FileCheck %s --check-prefix=DEPTHONLY
+
+//--- shader.hlsl
+struct VSIn {
+    float3 pos : POSITION;
+    float4 col : COLOR;
+};
+
+struct PSIn {
+    float4 pos : SV_Position;
+    float4 col : COLOR;
+};
+
+PSIn VSMain(VSIn input) {
+    PSIn o;
+    o.pos = float4(input.pos, 1.0);
+    o.col = input.col;
+    return o;
+}
+
+float4 PSMain(PSIn input) : SV_Target {
+    return input.col;
+}
+
+// GFX: func.func @nacelle_vs_test
+// GFX: func.func @nacelle_ps_test
+// GFX: vector<8xf32>
+
+// DEPTHONLY: func.func @nacelle_vs_test
+// DEPTHONLY: func.func @nacelle_ps_test

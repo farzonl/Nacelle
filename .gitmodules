@@ -1,0 +1,27 @@
+[submodule "third_party/offload-test-suite"]
+	path = third_party/offload-test-suite
+	url = https://github.com/llvm/offload-test-suite.git
+[submodule "third_party/DirectX-Headers"]
+	path = third_party/DirectX-Headers
+	url = https://github.com/microsoft/DirectX-Headers.git
+[submodule "third_party/DirectXMath"]
+	path = third_party/DirectXMath
+	url = https://github.com/microsoft/DirectXMath.git
+[submodule "third_party/SwiftShader"]
+	path = third_party/SwiftShader
+	url = https://swiftshader.googlesource.com/SwiftShader
+[submodule "third_party/bcdec"]
+	path = third_party/bcdec
+	url = https://github.com/iOrange/bcdec.git
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa.git
+[submodule "third_party/thread-pool"]
+	path = third_party/thread-pool
+	url = https://github.com/bshoshany/thread-pool.git
+[submodule "third_party/xxHash"]
+	path = third_party/xxHash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "third_party/llvm-project"]
+	path = third_party/llvm-project
+	url = https://github.com/llvm/llvm-project.git

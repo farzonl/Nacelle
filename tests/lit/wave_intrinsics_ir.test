@@ -1,0 +1,10 @@
+// RUN: %dxc -T cs_6_0 -E CSMain -Fo %t.dxil %S/../shaders/wave_intrinsics.hlsl
+// RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=SIMD
+// RUN: %nacelle_compile --simd-width=8 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM
+
+// SIMD: func.func @nacelle_cs_test
+// SIMD-DAG: vector<8x
+// SIMD-NOT: dx.op.wave
+
+// LLVM: define void @nacelle_cs_test
+// LLVM-NOT: dx.op.wave
