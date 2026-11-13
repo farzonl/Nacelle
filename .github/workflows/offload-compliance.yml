@@ -146,7 +146,7 @@ jobs:
             -DOFFLOADTEST_ENABLE_METAL=OFF \
             -DOFFLOADTEST_ENABLE_DEBUG=ON \
             -DOFFLOADTEST_ENABLE_VALIDATION=OFF \
-            -DOFFLOADTEST_DXC="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DD3D12_WSL_FOUND=TRUE \
             -DD3D12_WSL_LIBRARIES="${{ github.workspace }}/build/libnacelle_d3d12.so;${{ github.workspace }}/build/third_party/DirectX-Headers/libDirectX-Headers.a" \
             -DCMAKE_CXX_FLAGS="-I${{ github.workspace }}/third_party/DirectX-Headers/include -I${{ github.workspace }}/src/common/posix_sal"
