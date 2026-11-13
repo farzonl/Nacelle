@@ -229,6 +229,18 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
                                 out.threadGroupSize[k] = std::max(1u, mdAsUInt(tgs->getOperand(k).get(), 1));
                             }
                         }
+                    } else if (tag == 11) { // kDxilWaveSizeTag
+                        if (auto* ws = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (ws->getNumOperands() >= 1) {
+                                uint32_t minW = mdAsUInt(ws->getOperand(0).get(), 0);
+                                uint32_t prefW =
+                                    (ws->getNumOperands() >= 3) ? mdAsUInt(ws->getOperand(2).get(), 0) : 0;
+                                uint32_t chosen = (prefW > 0) ? prefW : minW;
+                                if (chosen >= 4 && chosen <= 128 && (chosen & (chosen - 1)) == 0) {
+                                    out.waveSize = chosen;
+                                }
+                            }
+                        }
                     }
                 }
             }

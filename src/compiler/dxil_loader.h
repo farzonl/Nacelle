@@ -44,6 +44,7 @@ struct DxilLoadedShader {
     uint32_t smMajor = 6;
     uint32_t smMinor = 0;
     uint32_t threadGroupSize[3]{1, 1, 1};
+    uint32_t waveSize = 0;
     uint32_t groupSharedBytes = 0;
     uint8_t shaderHash[16]{};
 

@@ -1074,7 +1074,9 @@ bool compileComputePSO(
     auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
     if (!mlirMod) return false;
 
-    if (!packetizeComputeEntry(*mlirMod, shader, effectiveLayout, simdWidth, symbolName, outError)) {
+    if (!packetizeComputeEntry(
+            *mlirMod, shader, effectiveLayout, (shader.waveSize > 0) ? shader.waveSize : simdWidth, symbolName,
+            outError)) {
         return false;
     }
 
