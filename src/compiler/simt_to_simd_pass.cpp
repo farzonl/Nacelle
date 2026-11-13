@@ -3174,7 +3174,8 @@ static bool packetizeComputeBlockWithBarriers(
         helper.flattenSimdTypes(origTy, flatTys);
         slot.packedValTy = (flatTys.size() == 1) ? flatTys[0] : mlir::LLVM::LLVMStructType::getLiteral(b.getContext(), flatTys);
         mlir::Value n32 = mlir::arith::IndexCastOp::create(entryAllocaBuilder, loc, i32Ty, numWaves);
-        slot.arrPtr = mlir::LLVM::AllocaOp::create(entryAllocaBuilder, loc, ptrTy, slot.packedValTy, n32, 16);
+        uint32_t vecAlign = std::max<uint32_t>(64, W * 8);
+        slot.arrPtr = mlir::LLVM::AllocaOp::create(entryAllocaBuilder, loc, ptrTy, slot.packedValTy, n32, vecAlign);
         return slot;
     };
 
@@ -3381,7 +3382,8 @@ static bool packetizeComputeBlockWithBarriers(
                 mlir::VectorType maskVecTy = mlir::VectorType::get({W}, b.getI1Type());
                 mlir::Value savedWaveMaskArr = mlir::LLVM::AllocaOp::create(
                     entryAllocaBuilder, loc, ptrTy, maskVecTy,
-                    mlir::arith::IndexCastOp::create(entryAllocaBuilder, loc, i32Ty, numWaves), 16);
+                    mlir::arith::IndexCastOp::create(entryAllocaBuilder, loc, i32Ty, numWaves),
+                    std::max<uint32_t>(64, W * 8));
                 mlir::scf::ForOp::create(
                     b, loc, c0, numWaves, c1, mlir::ValueRange{},
                     [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
@@ -3537,7 +3539,8 @@ bool packetizeComputeEntry(
     } else {
         mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
         mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
-            b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal), 16);
+            b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal),
+            std::max<uint32_t>(64, simdWidth * 8));
         mlir::OpBuilder allocaB(entry, std::next(waveMaskArr.getDefiningOp()->getIterator()));
         // Initialize per-wave active masks
         mlir::scf::ForOp::create(

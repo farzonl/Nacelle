@@ -250,11 +250,11 @@ struct QuadBatchEmitter {
     PixelBatchArgs args{};
     uint32_t quadsPerBatch = 1;
     uint32_t qCount = 0;
-    uint32_t quadOffsets[kMaxSimdWidth / 4]{};
-    float pixelX[kMaxSimdWidth]{};
-    float pixelY[kMaxSimdWidth]{};
-    float baryI[kMaxSimdWidth]{};
-    float baryJ[kMaxSimdWidth]{};
+    alignas(64) uint32_t quadOffsets[kMaxSimdWidth / 4]{};
+    alignas(64) float pixelX[kMaxSimdWidth]{};
+    alignas(64) float pixelY[kMaxSimdWidth]{};
+    alignas(64) float baryI[kMaxSimdWidth]{};
+    alignas(64) float baryJ[kMaxSimdWidth]{};
 
     void flush() {
         if (qCount == 0) return;
