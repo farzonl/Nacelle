@@ -35,7 +35,7 @@ else()
     llvm_map_components_to_libnames(NACELLE_LLVM_LIBS
         Core Object BitReader BitWriter IRReader Linker Passes Analysis
         TransformUtils ScalarOpts Vectorize InstCombine AggressiveInstCombine
-        IPO OrcJIT OrcTargetProcess OrcShared ExecutionEngine JITLink MC
+        IPO OrcJIT OrcDebugging OrcTargetProcess OrcShared ExecutionEngine JITLink MC
         Support Target TargetParser native
     )
 endif()

@@ -6,7 +6,7 @@
 int main() {
     // 1. DXCore adapter factory enumeration
     ComPtr<IDXCoreAdapterFactory> factory;
-    testutil::checkHR(DXCoreCreateAdapterFactory(IID_PPV_ARGS(&factory)), "DXCoreCreateAdapterFactory");
+    testutil::checkHR(NacelleCreateAdapterFactory(IID_PPV_ARGS(&factory)), "NacelleCreateAdapterFactory");
 
     const GUID attrs[] = {DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE};
     ComPtr<IDXCoreAdapterList> list;
@@ -25,11 +25,11 @@ int main() {
 
     // 2. D3D12 Debug interface & Device creation from DXCore adapter
     ComPtr<ID3D12Debug> debug;
-    testutil::checkHR(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)), "D3D12GetDebugInterface");
+    testutil::checkHR(NacelleGetDebugInterface(IID_PPV_ARGS(&debug)), "NacelleGetDebugInterface");
     debug->EnableDebugLayer();
 
     ComPtr<ID3D12Device> adapterDev;
-    testutil::checkHR(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&adapterDev)), "D3D12CreateDevice");
+    testutil::checkHR(NacelleCreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&adapterDev)), "NacelleCreateDevice");
 
     // 3. TestRuntime copy & fence test
     testutil::TestRuntime rt;
