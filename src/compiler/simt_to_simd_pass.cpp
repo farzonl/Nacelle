@@ -2365,9 +2365,9 @@ private:
         if (op == 66) { // textureLoad(op, srv, mip, x, y, z, off0, off1, off2)
             SimdVal h = getMapped(loc, call.getOperand(1));
             mlir::Value mip = vecOrZero(2, i32Ty(), 0.0);
-            mlir::Value x = vecOrZero(3, i32Ty(), 0.0);
-            mlir::Value y = vecOrZero(4, i32Ty(), 0.0);
-            mlir::Value z = vecOrZero(5, i32Ty(), 0.0);
+            mlir::Value x = mlir::arith::AddIOp::create(b_, loc, vecOrZero(3, i32Ty(), 0.0), vecOrZero(6, i32Ty(), 0.0));
+            mlir::Value y = mlir::arith::AddIOp::create(b_, loc, vecOrZero(4, i32Ty(), 0.0), vecOrZero(7, i32Ty(), 0.0));
+            mlir::Value z = mlir::arith::AddIOp::create(b_, loc, vecOrZero(5, i32Ty(), 0.0), vecOrZero(8, i32Ty(), 0.0));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_tex_load", nullptr, {ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), ptrTy()});
             mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
@@ -2612,12 +2612,13 @@ private:
         mlir::Value u = vecOrZero(3, f32Ty(), 0.0);
         mlir::Value v = vecOrZero(4, f32Ty(), 0.0);
         mlir::Value w = vecOrZero(5, f32Ty(), 0.0);
+        mlir::Value c3 = vecOrZero(6, f32Ty(), 0.0);
         mlir::Value offX = vecOrZero(7, i32Ty(), 0.0);
         mlir::Value offY = vecOrZero(8, i32Ty(), 0.0);
         mlir::Value offZ = vecOrZero(9, i32Ty(), 0.0);
 
         uint32_t lodMode = 0;
-        mlir::Value ddxU = splatFlt(loc, f32Ty(), 0.0), ddxV = ddxU, ddyU = ddxU, ddyV = ddxU;
+        mlir::Value ddxU = splatFlt(loc, f32Ty(), 0.0), ddxV = ddxU, ddxW = ddxU, ddyU = ddxU, ddyV = ddxU, ddyW = ddxU;
         mlir::Value bias = ddxU, expLod = ddxU, clampLod = splatFlt(loc, f32Ty(), -1.0);
 
         if (op == 60 || op == 61) {
@@ -2625,7 +2626,8 @@ private:
             if (hooks_.isPixelShader) {
                 auto [ux, uy] = computeQuadFiniteDiff(loc, u, false);
                 auto [vx, vy] = computeQuadFiniteDiff(loc, v, false);
-                ddxU = ux; ddyU = uy; ddxV = vx; ddyV = vy;
+                auto [wx, wy] = computeQuadFiniteDiff(loc, w, false);
+                ddxU = ux; ddyU = uy; ddxV = vx; ddyV = vy; ddxW = wx; ddyW = wy;
             }
             if (op == 61) {
                 bias = vecOrZero(10, f32Ty(), 0.0);
@@ -2640,14 +2642,17 @@ private:
             lodMode = 0u;
             ddxU = vecOrZero(10, f32Ty(), 0.0);
             ddxV = vecOrZero(11, f32Ty(), 0.0);
+            ddxW = vecOrZero(12, f32Ty(), 0.0);
             ddyU = vecOrZero(13, f32Ty(), 0.0);
             ddyV = vecOrZero(14, f32Ty(), 0.0);
+            ddyW = vecOrZero(15, f32Ty(), 0.0);
             clampLod = vecOrZero(16, f32Ty(), -1.0);
         }
 
         auto fn = getOrDeclareRuntimeFn(
             loc, "nacelle_tex_sample", nullptr,
-            {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),
+            {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),
+             f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),
              f32Ty(), f32Ty(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), f32Ty(), ptrTy()});
         mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
         llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
@@ -2660,8 +2665,8 @@ private:
                 mlir::LLVM::CallOp::create(
                     nb, nloc, fn,
                     mlir::ValueRange{
-                        tp, sp, ex(u), ex(v), ex(w),
-                        ex(ddxU), ex(ddxV), ex(ddyU), ex(ddyV),
+                        tp, sp, ex(u), ex(v), ex(w), ex(c3),
+                        ex(ddxU), ex(ddxV), ex(ddxW), ex(ddyU), ex(ddyV), ex(ddyW),
                         ex(bias), ex(expLod),
                         mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), lodMode),
                         ex(offX), ex(offY), ex(offZ), ex(clampLod), out4});

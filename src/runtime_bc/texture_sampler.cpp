@@ -263,6 +263,34 @@ static inline __attribute__((always_inline)) void write_texel_ptr(
         ptr[3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
         return;
     }
+    case 24: { // R10G10B10A2_UNORM
+        uint32_t r = static_cast<uint32_t>(f_clamp(in[0], 0.0f, 1.0f) * 1023.0f + 0.5f);
+        uint32_t g = static_cast<uint32_t>(f_clamp(in[1], 0.0f, 1.0f) * 1023.0f + 0.5f);
+        uint32_t b = static_cast<uint32_t>(f_clamp(in[2], 0.0f, 1.0f) * 1023.0f + 0.5f);
+        uint32_t a = static_cast<uint32_t>(f_clamp(in[3], 0.0f, 1.0f) * 3.0f + 0.5f);
+        uint32_t v = (r & 0x3FFu) | ((g & 0x3FFu) << 10) | ((b & 0x3FFu) << 20) | ((a & 0x3u) << 30);
+        __builtin_memcpy(ptr, &v, 4);
+        return;
+    }
+    case 11: { // R16G16B16A16_UNORM
+        uint16_t* u = reinterpret_cast<uint16_t*>(ptr);
+        for (int i = 0; i < 4; ++i) {
+            u[i] = static_cast<uint16_t>(f_clamp(in[i], 0.0f, 1.0f) * 65535.0f + 0.5f);
+        }
+        return;
+    }
+    case 34: { // R16G16_FLOAT
+        uint16_t* h = reinterpret_cast<uint16_t*>(ptr);
+        h[0] = float_to_half(in[0]);
+        h[1] = float_to_half(in[1]);
+        return;
+    }
+    case 35: { // R16G16_UNORM
+        uint16_t* u = reinterpret_cast<uint16_t*>(ptr);
+        u[0] = static_cast<uint16_t>(f_clamp(in[0], 0.0f, 1.0f) * 65535.0f + 0.5f);
+        u[1] = static_cast<uint16_t>(f_clamp(in[1], 0.0f, 1.0f) * 65535.0f + 0.5f);
+        return;
+    }
     case 39:
     case 40:
     case 41:
@@ -270,6 +298,20 @@ static inline __attribute__((always_inline)) void write_texel_ptr(
     case 43:
         __builtin_memcpy(ptr, in, 4);
         return;
+    case 49: // R8G8_UNORM
+        ptr[0] = static_cast<uint8_t>(f_clamp(in[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+        ptr[1] = static_cast<uint8_t>(f_clamp(in[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+        return;
+    case 54: { // R16_FLOAT
+        uint16_t h = float_to_half(in[0]);
+        __builtin_memcpy(ptr, &h, 2);
+        return;
+    }
+    case 56: { // R16_UNORM
+        uint16_t u = static_cast<uint16_t>(f_clamp(in[0], 0.0f, 1.0f) * 65535.0f + 0.5f);
+        __builtin_memcpy(ptr, &u, 2);
+        return;
+    }
     case 61:
         ptr[0] = static_cast<uint8_t>(f_clamp(in[0], 0.0f, 1.0f) * 255.0f + 0.5f);
         return;
@@ -389,7 +431,7 @@ static inline __attribute__((always_inline)) void fetch_texel_mip(
 
 static inline __attribute__((always_inline)) void sample_mip_2d(
     const BC_Descriptor* tex, uint32_t mip, float u, float v, int32_t slice,
-    bool linearFilter, uint32_t addrU, uint32_t addrV, uint32_t addrW, uint32_t borderKind,
+    bool linearFilter, uint32_t reduction, uint32_t addrU, uint32_t addrV, uint32_t addrW, uint32_t borderKind,
     int32_t offX, int32_t offY, float out[4]) {
     uint32_t w = tex->width >> mip;
     uint32_t h = tex->height >> mip;
@@ -417,9 +459,52 @@ static inline __attribute__((always_inline)) void sample_mip_2d(
     fetch_texel_mip(tex, mip, x0 + 1, y0 + 1, slice, addrU, addrV, addrW, borderKind, c11);
 
     for (int i = 0; i < 4; ++i) {
-        float top = f_lerp(c00[i], c10[i], tx);
-        float bot = f_lerp(c01[i], c11[i], tx);
-        out[i] = f_lerp(top, bot, ty);
+        if (reduction == 2) {
+            out[i] = f_min(f_min(c00[i], c10[i]), f_min(c01[i], c11[i]));
+        } else if (reduction == 3) {
+            out[i] = f_max(f_max(c00[i], c10[i]), f_max(c01[i], c11[i]));
+        } else {
+            float top = f_lerp(c00[i], c10[i], tx);
+            float bot = f_lerp(c01[i], c11[i], tx);
+            out[i] = f_lerp(top, bot, ty);
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) void sample_mip_3d(
+    const BC_Descriptor* tex, uint32_t mip, float u, float v, float wCoord,
+    bool linearFilter, uint32_t reduction, uint32_t addrU, uint32_t addrV, uint32_t addrW, uint32_t borderKind,
+    int32_t offX, int32_t offY, int32_t offZ, float out[4]) {
+    uint32_t d = tex->depth_or_array >> mip;
+    if (d == 0) d = 1;
+
+    if (!linearFilter) {
+        uint32_t w = tex->width >> mip;
+        uint32_t h = tex->height >> mip;
+        if (w == 0) w = 1;
+        if (h == 0) h = 1;
+        int32_t ix = static_cast<int32_t>(f_floor(u * float(w))) + offX;
+        int32_t iy = static_cast<int32_t>(f_floor(v * float(h))) + offY;
+        int32_t iz = static_cast<int32_t>(f_floor(wCoord * float(d))) + offZ;
+        fetch_texel_mip(tex, mip, ix, iy, iz, addrU, addrV, addrW, borderKind, out);
+        return;
+    }
+
+    float fz = wCoord * float(d) - 0.5f + float(offZ);
+    int32_t z0 = static_cast<int32_t>(f_floor(fz));
+    float tz = fz - float(z0);
+
+    float c0[4], c1[4];
+    sample_mip_2d(tex, mip, u, v, z0, true, reduction, addrU, addrV, addrW, borderKind, offX, offY, c0);
+    sample_mip_2d(tex, mip, u, v, z0 + 1, true, reduction, addrU, addrV, addrW, borderKind, offX, offY, c1);
+    for (int i = 0; i < 4; ++i) {
+        if (reduction == 2) {
+            out[i] = f_min(c0[i], c1[i]);
+        } else if (reduction == 3) {
+            out[i] = f_max(c0[i], c1[i]);
+        } else {
+            out[i] = f_lerp(c0[i], c1[i], tz);
+        }
     }
 }
 
@@ -447,7 +532,8 @@ static inline __attribute__((always_inline)) void map_cube_coords(
 
 static inline __attribute__((always_inline)) void resolve_sample_coords(
     const BC_Descriptor* tex, float u, float v, float w,
-    float& su, float& sv, int32_t& slice, uint32_t& addrU, uint32_t& addrV) {
+    float& su, float& sv, int32_t& slice, uint32_t& addrU, uint32_t& addrV,
+    float c3 = 0.0f) {
     uint32_t dim = tex->view_flags & 0xFFu;
     uint32_t firstArraySlice = (tex->view_flags >> 16) & 0xFFFFu;
     slice = static_cast<int32_t>(firstArraySlice);
@@ -457,12 +543,17 @@ static inline __attribute__((always_inline)) void resolve_sample_coords(
         sv = 0.5f;
     } else if (dim == 3) { // TEXTURE1DARRAY
         sv = 0.5f;
-        slice += static_cast<int32_t>(v + 0.5f);
+        slice += static_cast<int32_t>(f_floor(v + 0.5f));
     } else if (dim == 5 || dim == 7) { // TEXTURE2DARRAY / TEXTURE2DMSARRAY
-        slice += static_cast<int32_t>(w + 0.5f);
+        slice += static_cast<int32_t>(f_floor(w + 0.5f));
     } else if (dim == 9 || dim == 10) { // TEXTURECUBE / TEXTURECUBEARRAY
         int32_t face = 0;
         map_cube_coords(u, v, w, su, sv, face);
+        if (dim == 10) {
+            int32_t cube = static_cast<int32_t>(f_floor(c3 + 0.5f));
+            if (cube < 0) cube = 0;
+            slice += cube * 6;
+        }
         slice += face;
         addrU = addrV = 2; // CLAMP on cube faces
     }
@@ -471,15 +562,14 @@ static inline __attribute__((always_inline)) void resolve_sample_coords(
 void nacelle_tex_sample(
     const BC_Descriptor* tex,
     const BC_Descriptor* samp,
-    float u, float v, float w,
-    float ddx_u, float ddx_v,
-    float ddy_u, float ddy_v,
+    float u, float v, float w, float c3,
+    float ddx_u, float ddx_v, float ddx_w,
+    float ddy_u, float ddy_v, float ddy_w,
     float bias, float explicitLod,
     uint32_t lodMode, // 0=grad(ddx/ddy), 1=bias, 2=explicitLevel
     int32_t offX, int32_t offY, int32_t offZ,
     float clampLod,
     float* outRGBA) {
-    (void)offZ;
     if (!tex || !tex->base_ptr) {
         outRGBA[0] = outRGBA[1] = outRGBA[2] = 0.0f;
         outRGBA[3] = 1.0f;
@@ -492,13 +582,15 @@ void nacelle_tex_sample(
     uint32_t addrV = (sflags >> 11) & 0x7u;
     uint32_t addrW = (sflags >> 14) & 0x7u;
     uint32_t borderKind = (sflags >> 26) & 0x3u;
+    uint32_t reduction = (sflags >> 28) & 0x3u;
     float sampBias = samp ? samp->mip_lod_bias : 0.0f;
     float minLod = samp ? float(samp->view_flags & 0xFFFFu) / 256.0f : 0.0f;
     float maxLod = samp ? float((samp->view_flags >> 16) & 0xFFFFu) / 256.0f : 16.0f;
 
+    uint32_t dim = tex->view_flags & 0xFFu;
     int32_t slice = 0;
     float su = u, sv = v;
-    resolve_sample_coords(tex, u, v, w, su, sv, slice, addrU, addrV);
+    resolve_sample_coords(tex, u, v, w, su, sv, slice, addrU, addrV, c3);
 
     bool linearMag = (filter & 0x04u) != 0;
     bool linearMin = (filter & 0x10u) != 0;
@@ -510,9 +602,10 @@ void nacelle_tex_sample(
         lod = explicitLod;
     } else {
         float fw = float(tex->width);
-        float fh = float(tex->height);
-        float dx2 = ddx_u * ddx_u * fw * fw + ddx_v * ddx_v * fh * fh;
-        float dy2 = ddy_u * ddy_u * fw * fw + ddy_v * ddy_v * fh * fh;
+        float fh = (dim == 2 || dim == 3) ? 0.0f : float(tex->height);
+        float fd = (dim == 8) ? float(tex->depth_or_array) : 0.0f;
+        float dx2 = ddx_u * ddx_u * fw * fw + ddx_v * ddx_v * fh * fh + ddx_w * ddx_w * fd * fd;
+        float dy2 = ddy_u * ddy_u * fw * fw + ddy_v * ddy_v * fh * fh + ddy_w * ddy_w * fd * fd;
         float rho2 = f_max(dx2, dy2);
         if (isAniso) {
             float min2 = f_min(dx2, dy2);
@@ -530,9 +623,17 @@ void nacelle_tex_sample(
 
     bool useLinear = (lod <= 0.0f) ? linearMag : linearMin;
 
+    auto sampleMip = [&](uint32_t mipIdx, float out[4]) {
+        if (dim == 8) {
+            sample_mip_3d(tex, mipIdx, su, sv, w, useLinear, reduction, addrU, addrV, addrW, borderKind, offX, offY, offZ, out);
+        } else {
+            sample_mip_2d(tex, mipIdx, su, sv, slice, useLinear, reduction, addrU, addrV, addrW, borderKind, offX, offY, out);
+        }
+    };
+
     if (!linearMip || tex->mip_levels <= 1) {
         uint32_t m0 = static_cast<uint32_t>(f_clamp(f_floor(lod + 0.5f), 0.0f, maxMipF));
-        sample_mip_2d(tex, m0, su, sv, slice, useLinear, addrU, addrV, addrW, borderKind, offX, offY, outRGBA);
+        sampleMip(m0, outRGBA);
         return;
     }
 
@@ -540,14 +641,20 @@ void nacelle_tex_sample(
     uint32_t m1 = m0 + 1 < tex->mip_levels ? m0 + 1 : m0;
     float frac = lod - float(m0);
     float c0[4], c1[4];
-    sample_mip_2d(tex, m0, su, sv, slice, useLinear, addrU, addrV, addrW, borderKind, offX, offY, c0);
+    sampleMip(m0, c0);
     if (m1 == m0 || frac <= 0.001f) {
         outRGBA[0] = c0[0]; outRGBA[1] = c0[1]; outRGBA[2] = c0[2]; outRGBA[3] = c0[3];
         return;
     }
-    sample_mip_2d(tex, m1, su, sv, slice, useLinear, addrU, addrV, addrW, borderKind, offX, offY, c1);
+    sampleMip(m1, c1);
     for (int i = 0; i < 4; ++i) {
-        outRGBA[i] = f_lerp(c0[i], c1[i], frac);
+        if (reduction == 2) {
+            outRGBA[i] = f_min(c0[i], c1[i]);
+        } else if (reduction == 3) {
+            outRGBA[i] = f_max(c0[i], c1[i]);
+        } else {
+            outRGBA[i] = f_lerp(c0[i], c1[i], frac);
+        }
     }
 }
 
@@ -582,7 +689,10 @@ float nacelle_tex_sample_cmp(
     uint32_t cmpFunc = (sflags >> 17) & 0xFu;
     uint32_t borderKind = (sflags >> 26) & 0x3u;
     uint32_t mip = isLevelZero ? 0 : static_cast<uint32_t>(f_clamp(explicitLod, 0.0f, float(tex->mip_levels > 0 ? tex->mip_levels - 1 : 0)));
-    (void)w;
+
+    int32_t slice = 0;
+    float su = u, sv = v;
+    resolve_sample_coords(tex, u, v, w, su, sv, slice, addrU, addrV);
 
     uint32_t width = tex->width >> mip;
     uint32_t height = tex->height >> mip;
@@ -592,26 +702,26 @@ float nacelle_tex_sample_cmp(
     bool linear = (filter & 0x14u) != 0;
     float t[4];
     if (!linear) {
-        int32_t ix = static_cast<int32_t>(f_floor(u * float(width))) + offX;
-        int32_t iy = static_cast<int32_t>(f_floor(v * float(height))) + offY;
-        fetch_texel_mip(tex, mip, ix, iy, 0, addrU, addrV, addrW, borderKind, t);
+        int32_t ix = static_cast<int32_t>(f_floor(su * float(width))) + offX;
+        int32_t iy = static_cast<int32_t>(f_floor(sv * float(height))) + offY;
+        fetch_texel_mip(tex, mip, ix, iy, slice, addrU, addrV, addrW, borderKind, t);
         return eval_cmp(cmpFunc, cmpVal, t[0]);
     }
 
-    float fx = u * float(width) - 0.5f + float(offX);
-    float fy = v * float(height) - 0.5f + float(offY);
+    float fx = su * float(width) - 0.5f + float(offX);
+    float fy = sv * float(height) - 0.5f + float(offY);
     int32_t x0 = static_cast<int32_t>(f_floor(fx));
     int32_t y0 = static_cast<int32_t>(f_floor(fy));
     float tx = fx - float(x0);
     float ty = fy - float(y0);
 
-    fetch_texel_mip(tex, mip, x0, y0, 0, addrU, addrV, addrW, borderKind, t);
+    fetch_texel_mip(tex, mip, x0, y0, slice, addrU, addrV, addrW, borderKind, t);
     float c00 = eval_cmp(cmpFunc, cmpVal, t[0]);
-    fetch_texel_mip(tex, mip, x0 + 1, y0, 0, addrU, addrV, addrW, borderKind, t);
+    fetch_texel_mip(tex, mip, x0 + 1, y0, slice, addrU, addrV, addrW, borderKind, t);
     float c10 = eval_cmp(cmpFunc, cmpVal, t[0]);
-    fetch_texel_mip(tex, mip, x0, y0 + 1, 0, addrU, addrV, addrW, borderKind, t);
+    fetch_texel_mip(tex, mip, x0, y0 + 1, slice, addrU, addrV, addrW, borderKind, t);
     float c01 = eval_cmp(cmpFunc, cmpVal, t[0]);
-    fetch_texel_mip(tex, mip, x0 + 1, y0 + 1, 0, addrU, addrV, addrW, borderKind, t);
+    fetch_texel_mip(tex, mip, x0 + 1, y0 + 1, slice, addrU, addrV, addrW, borderKind, t);
     float c11 = eval_cmp(cmpFunc, cmpVal, t[0]);
 
     return f_lerp(f_lerp(c00, c10, tx), f_lerp(c01, c11, tx), ty);
@@ -625,13 +735,31 @@ void nacelle_tex_load(
         outRGBA[0] = outRGBA[1] = outRGBA[2] = outRGBA[3] = 0.0f;
         return;
     }
+    uint32_t dim = tex->view_flags & 0xFFu;
+    uint32_t firstSlice = (tex->view_flags >> 16) & 0xFFFFu;
+    if (dim == 2) { // TEXTURE1D
+        y = 0;
+        z = 0;
+    } else if (dim == 3) { // TEXTURE1DARRAY: DXIL passes slice in y
+        z = y;
+        y = 0;
+    } else if (dim == 4) { // TEXTURE2D
+        z = 0;
+    }
+
     uint32_t w = tex->width >> mip;
     uint32_t h = tex->height >> mip;
-    if (w == 0) w = 1;
-    if (h == 0) h = 1;
-    if (x < 0 || y < 0 || uint32_t(x) >= w || uint32_t(y) >= h || z < 0 || uint32_t(z) >= tex->depth_or_array) {
+    if (w == 0 && tex->width > 0) w = 1;
+    if (h == 0 && tex->height > 0) h = 1;
+    uint32_t d = (dim == 8) ? (tex->depth_or_array >> mip) : tex->depth_or_array;
+    if (d == 0 && tex->depth_or_array > 0) d = 1;
+
+    if (x < 0 || y < 0 || z < 0 || uint32_t(x) >= w || uint32_t(y) >= h || uint32_t(z) >= d) {
         outRGBA[0] = outRGBA[1] = outRGBA[2] = outRGBA[3] = 0.0f;
         return;
+    }
+    if (dim == 3 || dim == 5 || dim == 7 || dim == 8 || dim == 9 || dim == 10) {
+        z += static_cast<int32_t>(firstSlice);
     }
     fetch_texel_mip(tex, uint32_t(mip), x, y, z, 2, 2, 2, 0, outRGBA);
 }
@@ -641,14 +769,43 @@ void nacelle_tex_store(
     int32_t x, int32_t y, int32_t z,
     float r, float g, float b, float a) {
     if (!tex || !tex->base_ptr) return;
+    uint32_t dim = tex->view_flags & 0xFFu;
+    uint32_t viewMip = (tex->view_flags >> 8) & 0xFFu;
+    uint32_t firstSlice = (tex->view_flags >> 16) & 0xFFFFu;
+    if (dim == 2) { // TEXTURE1D
+        y = 0;
+        z = 0;
+    } else if (dim == 3) { // TEXTURE1DARRAY: DXIL passes slice in y
+        z = y;
+        y = 0;
+    } else if (dim == 4) { // TEXTURE2D
+        z = 0;
+    }
+
     if (x < 0 || y < 0 || z < 0 ||
         uint32_t(x) >= tex->width || uint32_t(y) >= tex->height || uint32_t(z) >= tex->depth_or_array) {
         return;
     }
-    uint8_t* ptr = static_cast<uint8_t*>(tex->base_ptr) +
-                   uint64_t(z) * tex->row_pitch * tex->height +
-                   uint64_t(y) * tex->row_pitch +
-                   uint64_t(x) * tex->elem_stride;
+
+    uint8_t* ptr = nullptr;
+    const auto* meta = reinterpret_cast<const BC_TextureMetadata*>(tex->extra_ptr);
+    if (meta && meta->mip_levels > 0) {
+        if (viewMip >= meta->mip_levels) viewMip = meta->mip_levels - 1;
+        const auto& m = meta->mips[viewMip];
+        uint8_t* base = static_cast<uint8_t*>(tex->base_ptr) + m.offset;
+        int32_t sliceOrZ = z + static_cast<int32_t>(firstSlice);
+        if (dim == 8) { // TEXTURE3D
+            base += uint64_t(sliceOrZ) * m.slice_pitch;
+        } else if ((dim == 3 || dim == 5) && meta->array_size > 1) {
+            base += uint64_t(sliceOrZ) * meta->array_slice_stride;
+        }
+        ptr = base + uint64_t(y) * m.row_pitch + uint64_t(x) * tex->elem_stride;
+    } else {
+        ptr = static_cast<uint8_t*>(tex->base_ptr) +
+              uint64_t(z) * tex->row_pitch * tex->height +
+              uint64_t(y) * tex->row_pitch +
+              uint64_t(x) * tex->elem_stride;
+    }
     float in[4]{r, g, b, a};
     write_texel_ptr(ptr, tex->format, in);
 }
@@ -759,7 +916,7 @@ float nacelle_tex_calc_lod(
     float maxLod = samp ? float((samp->view_flags >> 16) & 0xFFFFu) / 256.0f : 16.0f;
 
     float fw = float(tex->width);
-    float fh = (dim == 3 || dim == 4) ? 0.0f : float(tex->height);
+    float fh = (dim == 2 || dim == 3) ? 0.0f : float(tex->height);
     float fd = (dim == 8) ? float(tex->depth_or_array) : 0.0f;
 
     float dx2 = ddx_u * ddx_u * fw * fw + ddx_v * ddx_v * fh * fh + ddx_w * ddx_w * fd * fd;
@@ -794,13 +951,26 @@ void nacelle_tex_get_dims(const BC_Descriptor* tex, uint32_t mip, uint32_t* outD
         outDims4[3] = 0;
         return;
     }
+    uint32_t dim = tex->view_flags & 0xFFu;
+    if (mip >= tex->mip_levels) {
+        outDims4[0] = outDims4[1] = outDims4[2] = 0;
+        outDims4[3] = tex->mip_levels;
+        return;
+    }
     uint32_t w = tex->width >> mip;
     uint32_t h = tex->height >> mip;
     if (w == 0 && tex->width > 0) w = 1;
     if (h == 0 && tex->height > 0) h = 1;
+    uint32_t d = tex->depth_or_array;
+    if (dim == 8) { // TEXTURE3D
+        d = tex->depth_or_array >> mip;
+        if (d == 0 && tex->depth_or_array > 0) d = 1;
+    } else if (dim == 10) { // TEXTURECUBEARRAY
+        d = tex->depth_or_array / 6u;
+    }
     outDims4[0] = w;
-    outDims4[1] = h;
-    outDims4[2] = tex->depth_or_array;
+    outDims4[1] = (dim == 3) ? d : h;
+    outDims4[2] = (dim == 5 || dim == 7 || dim == 8 || dim == 10) ? d : 0;
     outDims4[3] = tex->mip_levels;
 }
 

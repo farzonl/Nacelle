@@ -181,6 +181,11 @@ void loadTileDSV(
                 uint16_t v = 0;
                 std::memcpy(&v, p, 2);
                 depthSOA[pixIdx] = static_cast<float>(v) / 65535.0f;
+            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                float d = 1.0f;
+                std::memcpy(&d, p, 4);
+                depthSOA[pixIdx] = d;
+                stencilSOA[pixIdx] = p[4];
             } else {
                 float rgba[4]{};
                 unpackPixelRGBA32F(dsv.format, p, rgba);
@@ -226,6 +231,9 @@ void storeTileDSV(
             } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
                 uint16_t d16 = static_cast<uint16_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 65535.0f + 0.5f);
                 std::memcpy(p, &d16, 2);
+            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                std::memcpy(p, &depthSOA[pixIdx], 4);
+                p[4] = stencilSOA[pixIdx];
             } else {
                 float rgba[4] = {depthSOA[pixIdx], 0.0f, 0.0f, 0.0f};
                 packPixelRGBA32F(dsv.format, rgba, p);
