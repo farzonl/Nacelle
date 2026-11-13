@@ -106,8 +106,11 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         std::memset(o, 0, sizeof(*o));
         o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
+        o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_2;
         o->DoublePrecisionFloatShaderOps = TRUE;
         o->OutputMergerLogicOp = TRUE;
+        o->PSSpecifiedStencilRefSupported = TRUE;
+        o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -122,11 +125,27 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->Int64ShaderOps = TRUE;
         return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS3: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS3)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS3*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->BarycentricsSupported = TRUE;
+        return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS4: {
         if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS4)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4*>(pData);
         std::memset(o, 0, sizeof(*o));
         o->Native16BitShaderOpsSupported = TRUE;
+        return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS6: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->AdditionalShadingRatesSupported = TRUE;
+        o->PerPrimitiveShadingRateSupportedWithViewportIndexing = TRUE;
+        o->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
         return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS9: {

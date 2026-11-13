@@ -75,13 +75,39 @@ void clipPolygonPlane(
     }
 }
 
+uint32_t combineShadingRate(
+    D3D12_SHADING_RATE baseRate,
+    uint32_t primRate,
+    D3D12_SHADING_RATE_COMBINER combiner) {
+    uint32_t a = static_cast<uint32_t>(baseRate);
+    uint32_t b = primRate;
+    uint32_t ax = (a >> 2) & 0x3u, ay = a & 0x3u;
+    uint32_t bx = (b >> 2) & 0x3u, by = b & 0x3u;
+    switch (combiner) {
+    case D3D12_SHADING_RATE_COMBINER_OVERRIDE:
+        return b;
+    case D3D12_SHADING_RATE_COMBINER_MIN:
+        return (std::min(ax, bx) << 2) | std::min(ay, by);
+    case D3D12_SHADING_RATE_COMBINER_MAX:
+        return (std::max(ax, bx) << 2) | std::max(ay, by);
+    case D3D12_SHADING_RATE_COMBINER_SUM:
+        return (std::min(2u, ax + bx) << 2) | std::min(2u, ay + by);
+    case D3D12_SHADING_RATE_COMBINER_PASSTHROUGH:
+    default:
+        return a;
+    }
+}
+
 void setupClippedTriangle(
     const ShadedVertex& v0,
     const ShadedVertex& v1,
     const ShadedVertex& v2,
     const float* flatAttrsV0,
     uint32_t primitiveId,
+    uint32_t viewportIndex,
+    uint32_t shadingRate,
     const D3D12_VIEWPORT& vp,
+    const D3D12_RECT& scissor,
     const D3D12_RASTERIZER_DESC& rast,
     RasterScene& scene) {
     if (v0.clipW <= 1e-7f || v1.clipW <= 1e-7f || v2.clipW <= 1e-7f) return;
@@ -130,10 +156,10 @@ void setupClippedTriangle(
     int64_t minFy = std::min({fy0, fy1, fy2});
     int64_t maxFy = std::max({fy0, fy1, fy2});
 
-    int32_t minX = std::max<int32_t>(scene.scissorRect.left, static_cast<int32_t>((minFx - 128 + 255) >> 8));
-    int32_t maxX = std::min<int32_t>(scene.scissorRect.right, static_cast<int32_t>((maxFx - 128) >> 8) + 1);
-    int32_t minY = std::max<int32_t>(scene.scissorRect.top, static_cast<int32_t>((minFy - 128 + 255) >> 8));
-    int32_t maxY = std::min<int32_t>(scene.scissorRect.bottom, static_cast<int32_t>((maxFy - 128) >> 8) + 1);
+    int32_t minX = std::max<int32_t>(scissor.left, static_cast<int32_t>((minFx - 128 + 255) >> 8));
+    int32_t maxX = std::min<int32_t>(scissor.right, static_cast<int32_t>((maxFx - 128) >> 8) + 1);
+    int32_t minY = std::max<int32_t>(scissor.top, static_cast<int32_t>((minFy - 128 + 255) >> 8));
+    int32_t maxY = std::min<int32_t>(scissor.bottom, static_cast<int32_t>((maxFy - 128) >> 8) + 1);
 
     if (minX >= maxX || minY >= maxY) return;
 
@@ -151,6 +177,8 @@ void setupClippedTriangle(
     tri.maxY = maxY;
     tri.isFrontFace = isFront ? 1u : 0u;
     tri.primitiveId = primitiveId;
+    tri.viewportIndex = viewportIndex;
+    tri.shadingRate = shadingRate;
 
     int64_t signFlip = isCW ? 1 : -1;
     int64_t posArea256 = signedArea256 * signFlip;
@@ -228,12 +256,27 @@ void processTriangle(
     const ShadedVertex& v1,
     const ShadedVertex& v2,
     uint32_t primitiveId,
-    const D3D12_VIEWPORT& vp,
+    const D3D12_VIEWPORT& /*defaultVp*/,
     const D3D12_RASTERIZER_DESC& rast,
     RasterScene& scene,
     std::vector<ShadedVertex>& polyA,
     std::vector<ShadedVertex>& polyB) {
     uint32_t numScalars = scene.numPSInputScalars;
+
+    uint32_t rawVpIdx = 0;
+    if (scene.hasViewportArrayIndex && scene.vpIndexAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&rawVpIdx, &v0.attrs[scene.vpIndexAttrOffset], sizeof(rawVpIdx));
+    }
+    uint32_t vpIdx = (rawVpIdx < scene.numViewports) ? rawVpIdx : 0u;
+    uint32_t scIdx = (rawVpIdx < scene.numScissors) ? rawVpIdx : 0u;
+    const D3D12_VIEWPORT& vp = scene.viewports[vpIdx];
+    const D3D12_RECT& scissor = scene.scissors[scIdx];
+
+    uint32_t primSR = 0;
+    if (scene.hasPerPrimShadingRate && scene.shadingRateAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&primSR, &v0.attrs[scene.shadingRateAttrOffset], sizeof(primSR));
+    }
+    uint32_t shadingRate = combineShadingRate(scene.drawShadingRate, primSR, scene.shadingRateCombiner);
 
     // SV_CullDistance: cull entire primitive if all vertices have < 0 for any active cull component
     if (scene.cullDistMask != 0) {
@@ -278,7 +321,7 @@ void processTriangle(
         return true;
     };
     if (inside(v0) && inside(v1) && inside(v2)) {
-        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vp, rast, scene);
+        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene);
         return;
     }
 
@@ -315,7 +358,7 @@ void processTriangle(
     }
 
     for (size_t k = 1; k + 1 < polyB.size(); ++k) {
-        setupClippedTriangle(polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vp, rast, scene);
+        setupClippedTriangle(polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene);
     }
 }
 
@@ -364,14 +407,29 @@ bool buildRasterScene(
         vp = state.viewports[0];
     }
 
-    D3D12_RECT scissor{0, 0, static_cast<LONG>(fbW), static_cast<LONG>(fbH)};
-    if (state.numScissors > 0) {
-        scissor.left = std::max<LONG>(0, state.scissors[0].left);
-        scissor.top = std::max<LONG>(0, state.scissors[0].top);
-        scissor.right = std::min<LONG>(static_cast<LONG>(fbW), state.scissors[0].right);
-        scissor.bottom = std::min<LONG>(static_cast<LONG>(fbH), state.scissors[0].bottom);
+    D3D12_RECT defaultScissor{0, 0, static_cast<LONG>(fbW), static_cast<LONG>(fbH)};
+    outScene.numViewports = std::max<uint32_t>(1u, std::min<uint32_t>(state.numViewports, 16u));
+    outScene.numScissors = std::max<uint32_t>(1u, std::min<uint32_t>(state.numScissors, 16u));
+    for (uint32_t i = 0; i < 16; ++i) {
+        outScene.viewports[i] = (i < state.numViewports) ? state.viewports[i] : vp;
+        if (i < state.numScissors) {
+            outScene.scissors[i].left = std::max<LONG>(0, state.scissors[i].left);
+            outScene.scissors[i].top = std::max<LONG>(0, state.scissors[i].top);
+            outScene.scissors[i].right = std::min<LONG>(static_cast<LONG>(fbW), state.scissors[i].right);
+            outScene.scissors[i].bottom = std::min<LONG>(static_cast<LONG>(fbH), state.scissors[i].bottom);
+        } else {
+            outScene.scissors[i] = (state.numScissors > 0) ? outScene.scissors[0] : defaultScissor;
+        }
     }
-    if (scissor.left >= scissor.right || scissor.top >= scissor.bottom) {
+    bool anyNonEmptyScissor = false;
+    for (uint32_t i = 0; i < outScene.numScissors; ++i) {
+        if (outScene.scissors[i].left < outScene.scissors[i].right &&
+            outScene.scissors[i].top < outScene.scissors[i].bottom) {
+            anyNonEmptyScissor = true;
+            break;
+        }
+    }
+    if (!anyNonEmptyScissor) {
         return false;
     }
 
@@ -385,7 +443,12 @@ bool buildRasterScene(
     outScene.cullDistMask = compiled->cullDistMask;
     outScene.clipAttrOffset = compiled->clipAttrOffset;
     outScene.cullAttrOffset = compiled->cullAttrOffset;
-    outScene.scissorRect = scissor;
+    outScene.hasViewportArrayIndex = compiled->hasViewportArrayIndex;
+    outScene.vpIndexAttrOffset = compiled->vpIndexAttrOffset;
+    outScene.hasPerPrimShadingRate = compiled->hasPerPrimShadingRate;
+    outScene.shadingRateAttrOffset = compiled->shadingRateAttrOffset;
+    outScene.drawShadingRate = state.shadingRate;
+    outScene.shadingRateCombiner = state.shadingRateCombiners[0];
     outScene.triangles.clear();
     outScene.attrBaseArena.clear();
     outScene.attrFlatArena.clear();

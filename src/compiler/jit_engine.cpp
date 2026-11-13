@@ -415,6 +415,10 @@ void applyGraphicsMeta(
     outPSO.cullDistMask = meta.cullDistMask;
     outPSO.clipAttrOffset = meta.clipAttrOffset;
     outPSO.cullAttrOffset = meta.cullAttrOffset;
+    outPSO.hasViewportArrayIndex = meta.hasViewportArrayIndex != 0;
+    outPSO.vpIndexAttrOffset = meta.vpIndexAttrOffset;
+    outPSO.hasPerPrimShadingRate = meta.hasPerPrimShadingRate != 0;
+    outPSO.shadingRateAttrOffset = meta.shadingRateAttrOffset;
     outPSO.totalVSScalarAttrs = meta.totalVSScalarAttrs;
     outPSO.hasGS = meta.hasGS != 0;
     outPSO.gsMaxVertexCount = meta.gsMaxVertexCount;
