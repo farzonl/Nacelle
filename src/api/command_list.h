@@ -124,7 +124,7 @@ struct ExecutionState {
     GraphicsExecutionState gfx{};
 };
 
-class NacelleCommandList : public D3D12DeviceChildBase<ID3D12GraphicsCommandList> {
+class NacelleCommandList : public D3D12DeviceChildBase<ID3D12GraphicsCommandList6> {
 public:
     NacelleCommandList(ID3D12Device* device,
                     D3D12_COMMAND_LIST_TYPE type,
@@ -186,6 +186,38 @@ public:
     void STDMETHODCALLTYPE BeginEvent(UINT, const void*, UINT) override {}
     void STDMETHODCALLTYPE EndEvent() override {}
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* pCommandSignature, UINT MaxCommandCount, ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset, ID3D12Resource* pCountBuffer, UINT64 CountBufferOffset) override;
+
+    // ID3D12GraphicsCommandList1
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override {}
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override {}
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT, FLOAT) override {}
+    void STDMETHODCALLTYPE SetSamplePositions(UINT, UINT, D3D12_SAMPLE_POSITION*) override {}
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource*, UINT, UINT, UINT, ID3D12Resource*, UINT, D3D12_RECT*, DXGI_FORMAT, D3D12_RESOLVE_MODE) override {}
+    void STDMETHODCALLTYPE SetViewInstanceMask(UINT) override {}
+
+    // ID3D12GraphicsCommandList2
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER*, const D3D12_WRITEBUFFERIMMEDIATE_MODE*) override {}
+
+    // ID3D12GraphicsCommandList3
+    void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession*) override {}
+
+    // ID3D12GraphicsCommandList4
+    void STDMETHODCALLTYPE BeginRenderPass(UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS) override {}
+    void STDMETHODCALLTYPE EndRenderPass() override {}
+    void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
+    void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*, UINT, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*) override {}
+    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*, UINT, const D3D12_GPU_VIRTUAL_ADDRESS*) override {}
+    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS, D3D12_GPU_VIRTUAL_ADDRESS, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE) override {}
+    void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject*) override {}
+    void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC*) override {}
+
+    // ID3D12GraphicsCommandList5
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE, const D3D12_SHADING_RATE_COMBINER*) override {}
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource*) override {}
+
+    // ID3D12GraphicsCommandList6
+    void STDMETHODCALLTYPE DispatchMesh(UINT, UINT, UINT) override {}
 
     void execute(BS::thread_pool<>& pool, ExecutionState& state) const;
 

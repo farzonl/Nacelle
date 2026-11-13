@@ -150,6 +150,36 @@ void NacelleCommandList::releaseRecordedRefs() {
 
 HRESULT STDMETHODCALLTYPE NacelleCommandList::QueryInterface(REFIID riid, void** ppvObject) {
     if (!ppvObject) return E_POINTER;
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList6))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList6*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList5))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList5*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList4))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList4*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList3))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList3*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList2))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList2*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList1))) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList1*>(this);
+        AddRef();
+        return S_OK;
+    }
     if (InlineIsEqualGUID(riid, __uuidof(ID3D12GraphicsCommandList))) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList*>(this);
         AddRef();
