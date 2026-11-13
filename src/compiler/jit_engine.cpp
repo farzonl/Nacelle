@@ -23,6 +23,7 @@
 #include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/Attributes.h>
+#include <llvm/IR/FMF.h>
 #include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
@@ -284,7 +285,9 @@ bool emitObjectBytesO3(
     const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
     const bool strictFp = strictFpEnv && strictFpEnv[0] == '1';
     if (!strictFp) {
+#if LLVM_VERSION_MAJOR < 24
         jtmbOrErr->getOptions().AllowFPOpFusion = llvm::FPOpFusion::Fast;
+#endif
         llvm::FastMathFlags fmf;
         fmf.setAllowContract(true);
         fmf.setAllowReassoc(true);
