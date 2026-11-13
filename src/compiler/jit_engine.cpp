@@ -1,6 +1,8 @@
 #include "jit_engine.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -219,7 +221,7 @@ llvm::Expected<llvm::orc::JITTargetMachineBuilder> createHostJTMB(llvm::CodeGenO
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::None);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
@@ -368,9 +370,6 @@ void runTier1Optimize(llvm::Module& mod) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::FunctionPassManager fpm;
-    fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-    fpm.addPass(llvm::EarlyCSEPass(true));
-    fpm.addPass(llvm::InstCombinePass());
     fpm.addPass(llvm::SimplifyCFGPass());
 
     for (llvm::Function& fn : mod) {
@@ -655,18 +654,23 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     });
 
-    mlir::PassManager pm(mlirMod.getContext());
-    pm.addPass(mlir::createSCFToControlFlowPass());
-    pm.addPass(mlir::createConvertVectorToLLVMPass());
-    pm.addPass(mlir::createConvertMathToLLVMPass());
-    pm.addPass(mlir::createConvertMathToLibmPass());
-    pm.addPass(mlir::createArithToLLVMConversionPass());
-    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-    pm.addPass(mlir::createConvertFuncToLLVMPass());
-    pm.addPass(mlir::createUBToLLVMConversionPass());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+    thread_local mlir::MLIRContext* cachedCtx = nullptr;
+    thread_local std::unique_ptr<mlir::PassManager> cachedPM;
+    if (cachedCtx != mlirMod.getContext() || !cachedPM) {
+        cachedCtx = mlirMod.getContext();
+        cachedPM = std::make_unique<mlir::PassManager>(cachedCtx);
+        cachedPM->addPass(mlir::createSCFToControlFlowPass());
+        cachedPM->addPass(mlir::createConvertVectorToLLVMPass());
+        cachedPM->addPass(mlir::createConvertMathToLLVMPass());
+        cachedPM->addPass(mlir::createConvertMathToLibmPass());
+        cachedPM->addPass(mlir::createArithToLLVMConversionPass());
+        cachedPM->addPass(mlir::createConvertControlFlowToLLVMPass());
+        cachedPM->addPass(mlir::createConvertFuncToLLVMPass());
+        cachedPM->addPass(mlir::createUBToLLVMConversionPass());
+        cachedPM->addPass(mlir::createReconcileUnrealizedCastsPass());
+    }
 
-    if (mlir::failed(pm.run(mlirMod))) {
+    if (mlir::failed(cachedPM->run(mlirMod))) {
         outError = "MLIR LLVM lowering pipeline failed";
         return nullptr;
     }
@@ -856,10 +860,12 @@ bool jitCompileComputeTier1AndScheduleTier2(
     CompiledComputePSO& outPSO,
     std::string& outError) {
     JitRuntime& rt = getJitRuntime();
+    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
+    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
     // Snapshot unoptimized IR bitcode before Tier-1 mutates `llvmMod`.
     llvm::SmallString<0> bcBytes;
-    {
+    if (scheduleTier2) {
         llvm::raw_svector_ostream bcOS(bcBytes);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
@@ -892,7 +898,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
     outPSO.symbolName = symbolName;
     outPSO.fn.store(reinterpret_cast<CompiledComputeFn>(tier1Addr), std::memory_order_release);
 
-    if (const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2"); noT2 && noT2[0] == '1') {
+    if (!scheduleTier2) {
         return true;
     }
 
@@ -1089,11 +1095,20 @@ bool compileComputePSO(
         return true;
     }
 
+    const char* profEnv = std::getenv("NACELLE_PROFILE_COMPILE");
+    const bool profileCompile = profEnv && profEnv[0] == '1';
+    using Clock = std::chrono::steady_clock;
+    auto msSince = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto tStart = Clock::now();
+
     auto llvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader shader;
     if (!loadAndUpgradeDXIL(desc.CS, *llvmCtx, shader, outError)) {
         return false;
     }
+    const auto tDxil = Clock::now();
 
     const RootSignatureLayout& effectiveLayout =
         (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
@@ -1103,16 +1118,20 @@ bool compileComputePSO(
     thread_local mlir::MLIRContext mlirCtx;
     auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
     if (!mlirMod) return false;
+    const auto tLift = Clock::now();
 
+    const uint32_t effectiveWidth = (shader.waveSize > 0) ? shader.waveSize : simdWidth;
     if (!packetizeComputeEntry(
-            *mlirMod, shader, effectiveLayout, (shader.waveSize > 0) ? shader.waveSize : simdWidth, symbolName,
+            *mlirMod, shader, effectiveLayout, effectiveWidth, symbolName,
             outError)) {
         return false;
     }
+    const auto tPacketize = Clock::now();
 
     auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
     auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
     if (!linkedMod) return false;
+    const auto tTranslate = Clock::now();
 
     CachedPSOMeta meta;
     meta.simdWidth = simdWidth;
@@ -1127,8 +1146,23 @@ bool compileComputePSO(
     outPSO.groupSharedBytes = meta.groupSharedBytes;
     outPSO.simdWidth = simdWidth;
 
-    return jitCompileComputeTier1AndScheduleTier2(
+    bool ok = jitCompileComputeTier1AndScheduleTier2(
         std::move(linkedMod), std::move(outLlvmCtx), symbolName, meta, outPSO, outError);
+    const auto tTier1 = Clock::now();
+
+    if (profileCompile) {
+        std::fprintf(
+            stderr,
+            "[NacelleCompile] W=%u total=%.2fms (dxil=%.2fms lift=%.2fms packetize=%.2fms mlir2llvm=%.2fms tier1=%.2fms)\n",
+            effectiveWidth,
+            msSince(tStart, tTier1),
+            msSince(tStart, tDxil),
+            msSince(tDxil, tLift),
+            msSince(tLift, tPacketize),
+            msSince(tPacketize, tTranslate),
+            msSince(tTranslate, tTier1));
+    }
+    return ok;
 }
 
 void waitForAllAsyncJITTasks() {
