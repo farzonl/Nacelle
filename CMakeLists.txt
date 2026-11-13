@@ -171,6 +171,9 @@ endif()
 
 # Shared D3D12/DXCore drop-in library: libnacelle_d3d12
 add_library(nacelle_d3d12 SHARED ${NACELLE_SOURCES})
+if(WIN32)
+    target_sources(nacelle_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/api/nacelle_d3d12.def")
+endif()
 add_dependencies(nacelle_d3d12 nacelle_embedded_bc)
 target_include_directories(nacelle_d3d12
     PUBLIC

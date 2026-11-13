@@ -765,7 +765,7 @@ bool synthesizeGraphicsPSOMLIR(
             if (sig->systemValueType == 3) { // SV_Position -> outPosXYZW[col * W + lane]
                 if (col < 4) {
                     mlir::Value dst = sh.gepBytes(outPosXYZW, static_cast<int64_t>(col * simdWidth * 4));
-                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst);
+                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
                 }
                 return true;
             }
@@ -774,7 +774,7 @@ bool synthesizeGraphicsPSOMLIR(
             if (it != vsToPsMap.end() && it->second.psTargetRow >= 0) {
                 uint32_t scalarSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
                 mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(scalarSlot * simdWidth * 4));
-                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst);
+                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
             }
             return true;
         };
@@ -813,7 +813,7 @@ bool synthesizeGraphicsPSOMLIR(
         // Load PixelBatchArgs vectors
         auto loadVecFromArgField = [&](size_t fieldOffset) -> mlir::Value {
             mlir::Value p = h.loadScalar(ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(fieldOffset)));
-            return h.loadScalar(h.vecTy(f32Ty), p);
+            return mlir::LLVM::LoadOp::create(b, loc, h.vecTy(f32Ty), p, /*alignment=*/4);
         };
         mlir::Value pixelX = loadVecFromArgField(offsetof(PixelBatchArgs, pixelX));
         mlir::Value pixelY = loadVecFromArgField(offsetof(PixelBatchArgs, pixelY));

@@ -401,6 +401,7 @@ void scanDxilFlags(llvm::Function& fn, DxilLoadedShader& out) {
             case 60: // Sample
             case 61: // SampleBias
             case 64: // SampleCmp
+            case 81: // CalculateLevelOfDetail
             case 83: // DerivCoarseX
             case 84: // DerivCoarseY
             case 85: // DerivFineX
