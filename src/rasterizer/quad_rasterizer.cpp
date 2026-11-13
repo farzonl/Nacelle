@@ -427,6 +427,7 @@ void rasterizeTiles(
             emitter.args.triInvW = tri.invW;
             emitter.args.triDepth = tri.depth;
             emitter.args.isFrontFace = tri.isFrontFace;
+            emitter.args.primitiveId = tri.primitiveId;
 
             int32_t qMinX = minX & ~1;
             int32_t qMaxX = (maxX + 1) & ~1;

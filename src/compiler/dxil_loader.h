@@ -50,6 +50,24 @@ struct DxilLoadedShader {
     std::vector<DxilResourceRecord> resources;
     std::vector<DxilSigRecord> inputSigs;
     std::vector<DxilSigRecord> outputSigs;
+    std::vector<DxilSigRecord> patchConstSigs;
+
+    // Geometry shader state (stage == "gs")
+    uint32_t gsInputPrimitive = 0;   // 1=point, 2=line, 3=triangle, 4=lineadj, 5=triangleadj
+    uint32_t gsMaxVertexCount = 0;
+    uint32_t gsActiveStreamMask = 1;
+    uint32_t gsOutputTopology = 5;   // 1=point, 3=linestrip, 5=trianglestrip
+    uint32_t gsInstanceCount = 1;
+
+    // Hull / Domain shader state (stage == "hs" / "ds")
+    std::string hsPatchConstFnName;
+    uint32_t hsInputControlPointCount = 0;
+    uint32_t hsOutputControlPointCount = 0;
+    uint32_t tessDomain = 0;         // 1=isoline, 2=tri, 3=quad
+    uint32_t tessPartitioning = 0;   // 1=integer, 2=pow2, 3=fractional_odd, 4=fractional_even
+    uint32_t tessOutputPrimitive = 0;// 1=point, 2=line, 3=triangle_cw, 4=triangle_ccw
+    float hsMaxTessFactor = 64.0f;
+    uint32_t dsInputControlPointCount = 0;
 
     bool hasBarrier = false;
     bool hasDerivativesOrImplicitSample = false;
@@ -63,6 +81,7 @@ struct DxilLoadedShader {
     const DxilResourceRecord* findResource(uint32_t resClass, uint32_t rangeId) const;
     const DxilSigRecord* findInputSig(uint32_t sigId) const;
     const DxilSigRecord* findOutputSig(uint32_t sigId) const;
+    const DxilSigRecord* findPatchConstSig(uint32_t sigId) const;
 };
 
 /// Returns the host TargetTriple + DataLayout string cached from LLJIT host detection.

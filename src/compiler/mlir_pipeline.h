@@ -21,6 +21,7 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
     std::unique_ptr<llvm::Module> llvmModule,
     const std::string& entryName,
     mlir::MLIRContext& mlirCtx,
-    std::string& outError);
+    std::string& outError,
+    const std::string& extraEntryName = "");
 
 } // namespace nacelle

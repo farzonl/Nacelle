@@ -36,6 +36,7 @@ struct SetupTriangle {
     float invArea = 0.0f;
 
     uint32_t isFrontFace = 1;
+    uint32_t primitiveId = 0;
     float invW[3]{};   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
     float depth[3]{};  // (z0, z1 - z0, z2 - z0)
 
@@ -49,6 +50,10 @@ struct RasterScene {
     uint32_t numTilesX = 0;
     uint32_t numTilesY = 0;
     uint32_t numPSInputScalars = 0;
+    uint32_t clipDistMask = 0;
+    uint32_t cullDistMask = 0;
+    uint32_t clipAttrOffset = 0;
+    uint32_t cullAttrOffset = 0;
     D3D12_RECT scissorRect{0, 0, 0, 0};
 
     std::vector<SetupTriangle> triangles;

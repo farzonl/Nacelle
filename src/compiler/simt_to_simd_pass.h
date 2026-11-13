@@ -54,9 +54,25 @@ struct StageHooks {
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
                        const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadInput;
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, const SimdVal& vertexAxis,
+                       mlir::Type scalarTy, SimdVal& out)> loadInputWithVertex;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
                        const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value realMask)> storeOutput;
     std::function<void(mlir::OpBuilder&, mlir::Location, mlir::Value condVec,
                        mlir::Value execMask, mlir::Value& realMask)> onDiscard;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t streamId, mlir::Value realMask)> emitStream;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t streamId, mlir::Value realMask)> cutStream;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadPrimitiveId;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadGSInstanceId;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadOutputControlPointId;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadDomainLocation;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, const SimdVal& cpId,
+                       mlir::Type scalarTy, SimdVal& out)> loadOutputControlPoint;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadPatchConstant;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value realMask)> storePatchConstant;
 };
 
 /// Packetizes a lifted Compute entry function (`func.func @entryName`) into

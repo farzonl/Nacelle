@@ -102,12 +102,56 @@ struct PixelBatchArgs {
     const float* triDepth = nullptr;    // [3]: (z0, z1 - z0, z2 - z0)
     uint32_t coverageMask = 0;
     uint32_t isFrontFace = 1;
+    uint32_t primitiveId = 0;
     float* tileColorSOA[8]{};           // Each points to 4 * 4096 floats: plane c * 4096 + pixIdx
     float* tileDepthSOA = nullptr;      // 4096 floats
     uint8_t* tileStencilSOA = nullptr;  // 4096 uint8_t
 };
 
 using CompiledPixelQuadFn = void (*)(const PixelBatchArgs* args);
+
+/// Geometry Uber-PSO kernel: executes one input primitive (with lane 0 active).
+using CompiledGeometryFn = void (*)(
+    const DriverRootContext* rootCtx,
+    const float* inVertPosXYZW,   // [numInVerts * 4]
+    const float* inVertAttrs,     // [numInVerts * numGSInputScalars]
+    uint32_t primId,
+    uint32_t gsInstanceId,
+    float* outVertPosXYZW,        // [maxVertexCount * 4]
+    float* outVertAttrs,          // [maxVertexCount * numOutScalars]
+    uint32_t* outStripVertCounts, // [maxVertexCount]
+    uint32_t* outTotalVerts,      // [1]
+    uint32_t* outNumStrips);      // [1]
+
+/// Hull shader control-point kernel: executes one output control point (lane 0 active).
+using CompiledHullCPFn = void (*)(
+    const DriverRootContext* rootCtx,
+    const float* inCPAttrs,  // [hsInputCPCount * numHSInputScalars]
+    uint32_t patchId,
+    uint32_t outCpId,
+    float* outCPAttrs);      // [numHSOutputScalars]
+
+/// Hull shader patch-constant kernel: executes once per patch (lane 0 active).
+using CompiledHullPCFn = void (*)(
+    const DriverRootContext* rootCtx,
+    const float* inCPAttrs,   // [hsInputCPCount * numHSInputScalars]
+    const float* outCPAttrs,  // [hsOutputCPCount * numHSOutputScalars]
+    uint32_t patchId,
+    float* outPatchConsts,    // [numPatchConstScalars]
+    float* outTessFactors);   // [6]: 4 edge + 2 inside
+
+/// Domain shader kernel: executes one tessellated vertex (lane 0 active).
+using CompiledDomainFn = void (*)(
+    const DriverRootContext* rootCtx,
+    const float* inCPAttrs,     // [hsOutputCPCount * numHSOutputScalars]
+    const float* inPatchConsts, // [numPatchConstScalars]
+    const float* inTessFactors, // [6]
+    uint32_t patchId,
+    float domU,
+    float domV,
+    float domW,
+    float* outPosXYZW,          // [4]
+    float* outAttrs);           // [numDSOutScalars]
 
 struct PsoUpdateBox;
 
@@ -141,11 +185,36 @@ struct CompiledGraphicsPSO {
 
     std::atomic<CompiledVertexFn> vsFn{nullptr};
     std::atomic<CompiledPixelQuadFn> psFn{nullptr};
+    std::atomic<CompiledGeometryFn> gsFn{nullptr};
+    std::atomic<CompiledHullCPFn> hsFn{nullptr};
+    std::atomic<CompiledHullPCFn> hsPcFn{nullptr};
+    std::atomic<CompiledDomainFn> dsFn{nullptr};
+    bool hasGS = false;
+    uint32_t gsMaxVertexCount = 0;
+    uint32_t gsOutputTopology = 5;
+    uint32_t gsInstanceCount = 1;
+    uint32_t numGSInputScalars = 0;
+    bool hasTess = false;
+    uint32_t hsInputCPCount = 0;
+    uint32_t hsOutputCPCount = 0;
+    uint32_t tessDomain = 0;
+    uint32_t tessPartitioning = 0;
+    uint32_t tessOutputPrimitive = 0;
+    float hsMaxTessFactor = 64.0f;
+    uint32_t numHSInputScalars = 0;
+    uint32_t numHSOutputScalars = 0;
+    uint32_t numPatchConstScalars = 0;
+    std::string gsSymbolName;
     uint32_t simdWidth = 4;
     uint32_t numVSOutputRegs = 0;      // Including SV_Position
     int32_t posOutputReg = 0;          // Register index of SV_Position in OSGN
     uint32_t numPSInputRegs = 0;       // Max PS input register count
     uint32_t flatInterpMask = 0;       // Bitmask of VS->PS output regs using nointerpolation
+    uint32_t clipDistMask = 0;         // Bitmask of active SV_ClipDistance scalar components (0..7)
+    uint32_t cullDistMask = 0;         // Bitmask of active SV_CullDistance scalar components (0..7)
+    uint32_t clipAttrOffset = 0;       // Starting scalar slot in outAttrs/attrBaseArena for SV_ClipDistance
+    uint32_t cullAttrOffset = 0;       // Starting scalar slot in outAttrs/attrBaseArena for SV_CullDistance
+    uint32_t totalVSScalarAttrs = 0;   // Total scalar attributes emitted by VS into outAttrs
     bool psWritesDepth = false;
     bool psUsesDiscard = false;
     bool psHasSideEffects = false;
