@@ -37,12 +37,13 @@ void runWaveWidth(uint32_t width) {
     ComPtr<ID3D12PipelineState> pso;
     testutil::checkHR(rt.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "CreateComputePSO");
 
-    constexpr UINT N = 32;
+    constexpr UINT N = 64;
+    constexpr UINT kWaveOutBytes = 48; // 12 uints in WaveOut (wave_intrinsics.hlsl)
     std::vector<uint32_t> in(N);
     for (UINT i = 0; i < N; ++i) in[i] = i + 1;
 
     auto bIn = rt.createBuffer(N * 4, D3D12_HEAP_TYPE_DEFAULT);
-    auto bOut = rt.createBuffer(N * 4 * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto bOut = rt.createBuffer(N * kWaveOutBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     rt.uploadBuffer(bIn.Get(), in.data(), N * 4);
 
     rt.resetCmd();
@@ -53,8 +54,8 @@ void runWaveWidth(uint32_t width) {
     rt.cmdList->Dispatch(1, 1, 1);
     rt.executeAndWait();
 
-    auto raw = rt.readbackBuffer(bOut.Get(), N * 4 * 4);
-    std::vector<uint32_t> out(N * 4);
+    auto raw = rt.readbackBuffer(bOut.Get(), N * kWaveOutBytes);
+    std::vector<uint32_t> out(N * (kWaveOutBytes / sizeof(uint32_t)));
     std::memcpy(out.data(), raw.data(), raw.size());
 
     // Verify outputs are non-zero and consistent with wave width

@@ -487,7 +487,8 @@ private:
             SimdVal cur = agg;
             for (int64_t idx : ev.getPosition()) {
                 if (cur.kind == SimdVal::Kind::Struct && static_cast<size_t>(idx) < cur.fields.size()) {
-                    cur = cur.fields[static_cast<size_t>(idx)];
+                    SimdVal next = cur.fields[static_cast<size_t>(idx)];
+                    cur = std::move(next);
                 } else {
                     cur = makeZeroSimd(loc, ev.getType());
                     break;
