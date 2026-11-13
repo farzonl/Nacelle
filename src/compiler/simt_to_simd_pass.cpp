@@ -3212,16 +3212,54 @@ private:
             return true;
         }
 
-        // Convert activeMask (vector<Wxi1>) into a scalar uint32 ballot mask
-        auto buildBallotScalar = [&](mlir::Value m) -> mlir::Value {
-            mlir::Value bits = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i32Ty()), m);
-            mlir::Value shl = mlir::arith::ShLIOp::create(b_, loc, bits, laneIota(loc));
-            return mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, shl);
+        // Convert activeMask (vector<Wxi1>) into 4 x i32 ballot words covering up to 128 lanes.
+        auto buildBallotWords = [&](mlir::Value m) -> std::array<mlir::Value, 4> {
+            mlir::Value zero = cInt(loc, i32Ty(), 0);
+            if (W_ <= 32) {
+                mlir::Value bits = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i32Ty()), m);
+                mlir::Value shl = mlir::arith::ShLIOp::create(b_, loc, bits, laneIota(loc));
+                mlir::Value w0 = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, shl);
+                return {w0, zero, zero, zero};
+            }
+            mlir::VectorType v32i32 = mlir::VectorType::get({32}, i32Ty());
+            llvm::SmallVector<int32_t, 32> iotaVals(32);
+            for (int32_t i = 0; i < 32; ++i) iotaVals[i] = i;
+            mlir::Value iota32 = mlir::arith::ConstantOp::create(
+                b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(iotaVals)));
+            std::array<mlir::Value, 4> words{zero, zero, zero, zero};
+            uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
+            for (uint32_t w = 0; w < numWords; ++w) {
+                mlir::Value slice = mlir::vector::ExtractStridedSliceOp::create(
+                    b_, loc, m, llvm::ArrayRef<int64_t>{static_cast<int64_t>(w * 32u)},
+                    llvm::ArrayRef<int64_t>{32}, llvm::ArrayRef<int64_t>{1});
+                mlir::Value bits = mlir::arith::ExtUIOp::create(b_, loc, v32i32, slice);
+                mlir::Value shl = mlir::arith::ShLIOp::create(b_, loc, bits, iota32);
+                words[w] = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, shl);
+            }
+            return words;
+        };
+
+        auto buildFirstActiveLane = [&](mlir::Value m) -> mlir::Value {
+            auto words = buildBallotWords(m);
+            if (W_ <= 32) {
+                return mlir::arith::MinUIOp::create(
+                    b_, loc, mlir::math::CountTrailingZerosOp::create(b_, loc, words[0]), cInt(loc, i32Ty(), W_ - 1));
+            }
+            mlir::Value firstIdx = cInt(loc, i32Ty(), W_ - 1);
+            uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
+            for (int w = static_cast<int>(numWords) - 1; w >= 0; --w) {
+                mlir::Value nz = mlir::arith::CmpIOp::create(
+                    b_, loc, mlir::arith::CmpIPredicate::ne, words[w], cInt(loc, i32Ty(), 0));
+                mlir::Value idx = mlir::arith::AddIOp::create(
+                    b_, loc, cInt(loc, i32Ty(), static_cast<uint64_t>(w) * 32u),
+                    mlir::math::CountTrailingZerosOp::create(b_, loc, words[w]));
+                firstIdx = mlir::arith::SelectOp::create(b_, loc, nz, idx, firstIdx);
+            }
+            return firstIdx;
         };
 
         if (op == 110) { // waveIsFirstLane
-            mlir::Value ballot = buildBallotScalar(activeMask);
-            mlir::Value firstIdx = mlir::math::CountTrailingZerosOp::create(b_, loc, ballot);
+            mlir::Value firstIdx = buildFirstActiveLane(activeMask);
             mlir::Value firstVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), firstIdx);
             mlir::Value isFirst = mlir::arith::CmpIOp::create(
                 b_, loc, mlir::arith::CmpIPredicate::eq, laneIota(loc), firstVec);
@@ -3247,20 +3285,20 @@ private:
         }
         if (op == 116) { // waveActiveBallot(cond) -> %dx.types.fouri32
             mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
-            mlir::Value ballot = buildBallotScalar(condVec);
+            auto words = buildBallotWords(condVec);
             SimdVal st;
             st.kind = SimdVal::Kind::Struct;
             st.origType = call.getResult().getType();
-            st.fields.push_back({SimdVal::Kind::Vector, i32Ty(), mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), ballot), {}, {}});
-            for (int i = 1; i < 4; ++i) st.fields.push_back({SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
+            for (int i = 0; i < 4; ++i) {
+                st.fields.push_back({SimdVal::Kind::Vector, i32Ty(),
+                                     mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), words[i]), {}, {}});
+            }
             setMapped(call.getResult(), st);
             return true;
         }
         if (op == 118) { // waveReadLaneFirst(val)
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(1)));
-            mlir::Value ballot = buildBallotScalar(activeMask);
-            mlir::Value firstIdx = mlir::arith::MinUIOp::create(
-                b_, loc, mlir::math::CountTrailingZerosOp::create(b_, loc, ballot), cInt(loc, i32Ty(), W_ - 1));
+            mlir::Value firstIdx = buildFirstActiveLane(activeMask);
             mlir::Value scalar = mlir::vector::ExtractOp::create(
                 b_, loc, valVec, mlir::OpFoldResult{mlir::arith::IndexCastOp::create(b_, loc, b_.getIndexType(), firstIdx)});
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
@@ -3284,9 +3322,7 @@ private:
         }
         if (op == 115) { // waveActiveAllEqual(val)
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(1)));
-            mlir::Value ballot = buildBallotScalar(activeMask);
-            mlir::Value firstIdx = mlir::arith::MinUIOp::create(
-                b_, loc, mlir::math::CountTrailingZerosOp::create(b_, loc, ballot), cInt(loc, i32Ty(), W_ - 1));
+            mlir::Value firstIdx = buildFirstActiveLane(activeMask);
             mlir::Value firstScalar = mlir::vector::ExtractOp::create(
                 b_, loc, valVec, mlir::OpFoldResult{mlir::arith::IndexCastOp::create(b_, loc, b_.getIndexType(), firstIdx)});
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
@@ -3400,30 +3436,66 @@ private:
         }
         if (op == 135) { // waveAllBitCount(cond) -> i32
             mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
-            mlir::Value ballot = buildBallotScalar(condVec);
-            mlir::Value cnt = mlir::math::CtPopOp::create(b_, loc, ballot);
+            auto words = buildBallotWords(condVec);
+            uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
+            mlir::Value cnt = mlir::math::CtPopOp::create(b_, loc, words[0]);
+            for (uint32_t w = 1; w < numWords; ++w) {
+                mlir::Value wc = mlir::math::CtPopOp::create(b_, loc, words[w]);
+                cnt = mlir::arith::AddIOp::create(b_, loc, cnt, wc);
+            }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), cnt), {}, {}});
             return true;
         }
         if (op == 136) { // wavePrefixBitCount(cond) -> i32
             mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
-            mlir::Value ballot = buildBallotScalar(condVec);
-            mlir::Value ballotVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), ballot);
-            llvm::SmallVector<int32_t, 16> laneMasks;
-            laneMasks.reserve(W_);
-            for (uint32_t l = 0; l < W_; ++l) {
-                laneMasks.push_back(static_cast<int32_t>((uint32_t(1) << l) - 1u));
+            auto words = buildBallotWords(condVec);
+            if (W_ <= 32) {
+                mlir::Value ballotVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), words[0]);
+                llvm::SmallVector<int32_t, 32> laneMasks;
+                laneMasks.reserve(W_);
+                for (uint32_t l = 0; l < W_; ++l) {
+                    laneMasks.push_back(static_cast<int32_t>((uint32_t(1) << l) - 1u));
+                }
+                mlir::Value maskVec = mlir::arith::ConstantOp::create(
+                    b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(vecTy(i32Ty())), llvm::ArrayRef<int32_t>(laneMasks)));
+                mlir::Value masked = mlir::arith::AndIOp::create(b_, loc, ballotVec, maskVec);
+                mlir::Value cntVec = mlir::math::CtPopOp::create(b_, loc, masked);
+                setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), cntVec, {}, {}});
+                return true;
             }
-            mlir::Value maskVec = mlir::arith::ConstantOp::create(
-                b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(vecTy(i32Ty())), llvm::ArrayRef<int32_t>(laneMasks)));
-            mlir::Value masked = mlir::arith::AndIOp::create(b_, loc, ballotVec, maskVec);
-            mlir::Value cntVec = mlir::math::CtPopOp::create(b_, loc, masked);
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), cntVec, {}, {}});
+            mlir::VectorType v32i32 = mlir::VectorType::get({32}, i32Ty());
+            llvm::SmallVector<int32_t, 32> laneMasks32(32);
+            for (int32_t l = 0; l < 32; ++l) {
+                laneMasks32[l] = static_cast<int32_t>((uint32_t(1) << l) - 1u);
+            }
+            mlir::Value maskVec32 = mlir::arith::ConstantOp::create(
+                b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(laneMasks32)));
+            mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()));
+            mlir::Value prefixSum = cInt(loc, i32Ty(), 0);
+            uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
+            for (uint32_t w = 0; w < numWords; ++w) {
+                mlir::Value bVec = mlir::vector::BroadcastOp::create(b_, loc, v32i32, words[w]);
+                mlir::Value inWord = mlir::math::CtPopOp::create(b_, loc, mlir::arith::AndIOp::create(b_, loc, bVec, maskVec32));
+                mlir::Value chunk = mlir::arith::AddIOp::create(
+                    b_, loc, inWord, mlir::vector::BroadcastOp::create(b_, loc, v32i32, prefixSum));
+                outVec = mlir::vector::InsertStridedSliceOp::create(
+                    b_, loc, chunk, outVec, llvm::ArrayRef<int64_t>{static_cast<int64_t>(w * 32u)},
+                    llvm::ArrayRef<int64_t>{1});
+                if (w + 1 < numWords) {
+                    prefixSum = mlir::arith::AddIOp::create(b_, loc, prefixSum, mlir::math::CtPopOp::create(b_, loc, words[w]));
+                }
+            }
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), outVec, {}, {}});
             return true;
         }
         if (op == 166) { // waveMultiPrefixOp(value, mask0, mask1, mask2, mask3, op, sop)
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(1)));
-            mlir::Value mask0Vec = asVec(loc, getMapped(loc, arg(2)));
+            std::array<mlir::Value, 4> maskVecs{
+                asVec(loc, getMapped(loc, arg(2))),
+                asVec(loc, getMapped(loc, arg(3))),
+                asVec(loc, getMapped(loc, arg(4))),
+                asVec(loc, getMapped(loc, arg(5))),
+            };
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
             uint32_t kind = static_cast<uint32_t>(getConstIntValue(arg(6)).value_or(0)); // 0=Sum, 1=BitAnd, 2=BitOr, 3=BitXor, 4=Prod
             bool isFloat = mlir::isa<mlir::FloatType>(et);
@@ -3437,41 +3509,70 @@ private:
                 idScalar = isFloat ? cFlt(loc, et, 0.0) : cInt(loc, et, 0);
             }
 
-            llvm::SmallVector<mlir::Value, 16> vals(W_), act(W_);
-            for (uint32_t j = 0; j < W_; ++j) {
-                vals[j] = mlir::vector::ExtractOp::create(b_, loc, valVec, static_cast<int64_t>(j));
-                act[j] = mlir::vector::ExtractOp::create(b_, loc, activeMask, static_cast<int64_t>(j));
-            }
+            mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b_, loc, 0);
+            mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b_, loc, 1);
+            mlir::Value cW = mlir::arith::ConstantIndexOp::create(b_, loc, W_);
+            mlir::Value initOut = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(et));
+            uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
 
-            mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(et));
-            for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value mask0L = mlir::vector::ExtractOp::create(b_, loc, mask0Vec, static_cast<int64_t>(l));
-                mlir::Value acc = idScalar;
-                for (uint32_t j = 0; j < l; ++j) {
-                    mlir::Value shifted = mlir::arith::ShRUIOp::create(b_, loc, mask0L, cInt(loc, i32Ty(), j));
-                    mlir::Value bitJ = mlir::arith::AndIOp::create(b_, loc, shifted, cInt(loc, i32Ty(), 1));
-                    mlir::Value inGroup = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ne, bitJ, cInt(loc, i32Ty(), 0));
-                    mlir::Value take = mlir::arith::AndIOp::create(b_, loc, inGroup, act[j]);
-
-                    mlir::Value cand;
-                    if (kind == 0) {
-                        cand = isFloat ? mlir::arith::AddFOp::create(b_, loc, acc, vals[j]).getResult()
-                                       : mlir::arith::AddIOp::create(b_, loc, acc, vals[j]).getResult();
-                    } else if (kind == 1) {
-                        cand = mlir::arith::AndIOp::create(b_, loc, acc, vals[j]);
-                    } else if (kind == 2) {
-                        cand = mlir::arith::OrIOp::create(b_, loc, acc, vals[j]);
-                    } else if (kind == 3) {
-                        cand = mlir::arith::XOrIOp::create(b_, loc, acc, vals[j]);
-                    } else {
-                        cand = isFloat ? mlir::arith::MulFOp::create(b_, loc, acc, vals[j]).getResult()
-                                       : mlir::arith::MulIOp::create(b_, loc, acc, vals[j]).getResult();
+            auto outer = mlir::scf::ForOp::create(
+                b_, loc, c0, cW, c1, mlir::ValueRange{initOut},
+                [&](mlir::OpBuilder& ob, mlir::Location oloc, mlir::Value lIdx, mlir::ValueRange outerArgs) {
+                    mlir::Value curOut = outerArgs[0];
+                    llvm::SmallVector<mlir::Value, 4> maskL(numWords);
+                    for (uint32_t w = 0; w < numWords; ++w) {
+                        maskL[w] = mlir::vector::ExtractOp::create(ob, oloc, maskVecs[w], mlir::OpFoldResult{lIdx});
                     }
-                    acc = mlir::arith::SelectOp::create(b_, loc, take, cand, acc);
-                }
-                outVec = mlir::vector::InsertOp::create(b_, loc, acc, outVec, static_cast<int64_t>(l));
-            }
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, outVec, {}, {}});
+                    auto inner = mlir::scf::ForOp::create(
+                        ob, oloc, c0, lIdx, c1, mlir::ValueRange{idScalar},
+                        [&](mlir::OpBuilder& ib, mlir::Location iloc, mlir::Value jIdx, mlir::ValueRange innerArgs) {
+                            mlir::Value acc = innerArgs[0];
+                            mlir::Value j32 = mlir::arith::IndexCastOp::create(ib, iloc, i32Ty(), jIdx);
+                            mlir::Value maskWordL = maskL[0];
+                            if (numWords > 1) {
+                                mlir::Value wIdx = mlir::arith::ShRUIOp::create(
+                                    ib, iloc, j32, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 5));
+                                for (uint32_t w = 1; w < numWords; ++w) {
+                                    mlir::Value isW = mlir::arith::CmpIOp::create(
+                                        ib, iloc, mlir::arith::CmpIPredicate::eq, wIdx,
+                                        mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), w));
+                                    maskWordL = mlir::arith::SelectOp::create(ib, iloc, isW, maskL[w], maskWordL);
+                                }
+                            }
+                            mlir::Value bitIdx = mlir::arith::AndIOp::create(
+                                ib, iloc, j32, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 31));
+                            mlir::Value shifted = mlir::arith::ShRUIOp::create(ib, iloc, maskWordL, bitIdx);
+                            mlir::Value bitJ = mlir::arith::AndIOp::create(
+                                ib, iloc, shifted, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 1));
+                            mlir::Value inGroup = mlir::arith::CmpIOp::create(
+                                ib, iloc, mlir::arith::CmpIPredicate::ne, bitJ,
+                                mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0));
+                            mlir::Value actJ = mlir::vector::ExtractOp::create(ib, iloc, activeMask, mlir::OpFoldResult{jIdx});
+                            mlir::Value take = mlir::arith::AndIOp::create(ib, iloc, inGroup, actJ);
+                            mlir::Value valJ = mlir::vector::ExtractOp::create(ib, iloc, valVec, mlir::OpFoldResult{jIdx});
+
+                            mlir::Value cand;
+                            if (kind == 0) {
+                                cand = isFloat ? mlir::arith::AddFOp::create(ib, iloc, acc, valJ).getResult()
+                                               : mlir::arith::AddIOp::create(ib, iloc, acc, valJ).getResult();
+                            } else if (kind == 1) {
+                                cand = mlir::arith::AndIOp::create(ib, iloc, acc, valJ);
+                            } else if (kind == 2) {
+                                cand = mlir::arith::OrIOp::create(ib, iloc, acc, valJ);
+                            } else if (kind == 3) {
+                                cand = mlir::arith::XOrIOp::create(ib, iloc, acc, valJ);
+                            } else {
+                                cand = isFloat ? mlir::arith::MulFOp::create(ib, iloc, acc, valJ).getResult()
+                                               : mlir::arith::MulIOp::create(ib, iloc, acc, valJ).getResult();
+                            }
+                            mlir::Value nextAcc = mlir::arith::SelectOp::create(ib, iloc, take, cand, acc);
+                            mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{nextAcc});
+                        });
+                    mlir::Value nextOut = mlir::vector::InsertOp::create(
+                        ob, oloc, inner.getResult(0), curOut, mlir::OpFoldResult{lIdx});
+                    mlir::scf::YieldOp::create(ob, oloc, mlir::ValueRange{nextOut});
+                });
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, outer.getResult(0), {}, {}});
             return true;
         }
         return false;

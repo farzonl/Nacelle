@@ -115,8 +115,8 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(pData);
         uint32_t w = getTargetSimdWidth();
         o->WaveOps = TRUE;
-        o->WaveLaneCountMin = w;
-        o->WaveLaneCountMax = w;
+        o->WaveLaneCountMin = 4;
+        o->WaveLaneCountMax = 128;
         o->TotalLaneCount = w * std::max<uint32_t>(1, std::thread::hardware_concurrency());
         o->ExpandedComputeResourceStates = TRUE;
         o->Int64ShaderOps = TRUE;
