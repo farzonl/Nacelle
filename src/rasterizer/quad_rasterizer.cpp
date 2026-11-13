@@ -8,6 +8,7 @@
 #include "../api/pipeline.h"
 #include "../api/resource.h"
 #include "../common/format_utils.h"
+#include "../common/fp_env.h"
 
 namespace nacelle {
 namespace {
@@ -360,6 +361,7 @@ void rasterizeTiles(
     const uint32_t quadsPerBatch = std::max<uint32_t>(1, W / 4);
 
     auto processTile = [&](size_t idx) {
+        ScopedFlushDenormals flushDenorms;
         thread_local TileScratch scratch;
         uint32_t tileIdx = activeTiles[idx];
         uint32_t txTile = tileIdx % scene.numTilesX;

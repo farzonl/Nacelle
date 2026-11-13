@@ -8,6 +8,7 @@
 
 #include "../api/pipeline.h"
 #include "../api/resource.h"
+#include "../common/fp_env.h"
 
 namespace nacelle {
 namespace {
@@ -300,6 +301,7 @@ bool buildRasterScene(
         vsFn = compiled->vsFn.load(std::memory_order_acquire);
     }
     if (!vsFn) return false;
+    ScopedFlushDenormals flushDenorms;
 
     // Determine framebuffer dimensions from bound RTVs or DSV
     uint32_t fbW = 0;
