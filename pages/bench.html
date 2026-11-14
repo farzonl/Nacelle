@@ -126,9 +126,9 @@
     .container {
       max-width: 1180px;
       margin: 0 auto;
-      padding: 2rem 1.25rem 4rem;
+      padding: 2.25rem 1.5rem 4.5rem;
       display: grid;
-      gap: 1.5rem;
+      gap: 1.75rem;
     }
 
     header {
@@ -190,7 +190,9 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 1.1rem 1.25rem;
+      padding: 1.35rem 1.5rem;
+      display: grid;
+      gap: 1rem;
     }
 
     .kpi-label {
@@ -218,7 +220,7 @@
 
     .chart-card {
       display: grid;
-      gap: 0.85rem;
+      gap: 1rem;
     }
 
     .card-header {
@@ -226,7 +228,7 @@
       flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.85rem 1.25rem;
     }
 
     .card-header h2 {
@@ -366,11 +368,97 @@
     tbody tr:hover th, tbody tr:hover td { background: var(--surface-alt); }
 
     .bench-table {
-      --label-2: "Format";
-      --label-3: "Median (ms)";
-      --label-4: "Min (ms)";
-      --label-5: "Compile (ms)";
-      --label-6: "Status";
+      --label-2: "Category";
+      --label-3: "Backend";
+      --label-4: "Cold (ms)";
+      --label-5: "Hot (ms)";
+      --label-6: "Short (ms)";
+      --label-7: "Long (ms)";
+      --label-8: "Peak (MB)";
+      --label-9: "Score";
+      --label-10: "Status";
+    }
+
+    .winners-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.95rem;
+    }
+
+    .winner-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+    }
+
+    .winner-card .w-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+
+    .winner-card .w-val {
+      font-family: var(--font-mono);
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--accent);
+      word-break: break-word;
+    }
+
+    .winner-card .w-sub {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.2rem;
+    }
+
+    .controls-row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    select.meta-pill, button.meta-pill {
+      cursor: pointer;
+      background: var(--surface-alt);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      padding: 0.42rem 0.85rem;
+    }
+
+    button.meta-pill:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    th.sortable {
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    th.sortable:hover,
+    th.sortable.active-sort {
+      color: var(--accent);
+    }
+
+    .pagination-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      margin-top: 0.25rem;
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--muted);
     }
 
     @container (width < 600px) {
@@ -406,8 +494,8 @@
   <main class="container">
     <header>
       <div class="title-group">
-        <h1>Nacelle Windows Benchmarks</h1>
-        <p>Raymarch compute kernel (<span style="font-family: var(--font-mono)">256x256, 48 steps</span>): Nacelle vs Microsoft WARP vs llvmpipe vs SwiftShader</p>
+        <h1>Nacelle Shader &amp; Rasterizer Benchmarks</h1>
+        <p>Cross-backend shader suite (Compute, Vertex, Pixel, Geometry, Tessellation, Ray Tracing) + Cold/Hot JIT, Short/Long Jobs &amp; Memory Profile</p>
       </div>
       <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
         <button id="theme-toggle" class="meta-pill" type="button" aria-label="Toggle color theme">☀ Light</button>
@@ -418,69 +506,103 @@
       </div>
     </header>
 
-    <section class="kpi-grid" aria-label="Latest benchmark median latencies">
-      <article class="card">
-        <div class="kpi-label">Nacelle (Best SIMD)</div>
-        <div class="kpi-value" id="kpi-nacelle" style="color: var(--c-nacelle)">—</div>
-        <div class="kpi-sub" id="kpi-nacelle-sub">—</div>
-      </article>
-      <article class="card">
-        <div class="kpi-label">Microsoft WARP</div>
-        <div class="kpi-value" id="kpi-warp" style="color: var(--c-warp)">—</div>
-        <div class="kpi-sub" id="kpi-warp-sub">—</div>
-      </article>
-      <article class="card">
-        <div class="kpi-label">Mesa llvmpipe</div>
-        <div class="kpi-value" id="kpi-llvmpipe" style="color: var(--c-llvmpipe)">—</div>
-        <div class="kpi-sub" id="kpi-llvmpipe-sub">—</div>
-      </article>
-      <article class="card">
-        <div class="kpi-label">SwiftShader</div>
-        <div class="kpi-value" id="kpi-swift" style="color: var(--c-swift)">—</div>
-        <div class="kpi-sub" id="kpi-swift-sub">—</div>
-      </article>
+    <section aria-label="Global benchmark scope and summary" style="display: grid; gap: 1rem;">
+      <div class="card-header">
+        <div class="controls-row">
+          <label for="global-scope" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Scope &amp; Metric:</label>
+          <select id="global-scope" class="meta-pill" aria-label="Select global benchmark scope and metric"></select>
+        </div>
+        <span id="kpi-context" style="font-size: 0.82rem; color: var(--muted); font-family: var(--font-mono);">Commit —</span>
+      </div>
+      <div class="kpi-grid" id="kpi-grid" aria-label="Selected commit benchmark metrics"></div>
+    </section>
+
+    <section class="card" aria-labelledby="winners-title">
+      <div class="card-header">
+        <h2 id="winners-title">Category &amp; Regime Winners</h2>
+        <span class="meta-pill" id="overall-winner-pill">Overall Winner: —</span>
+      </div>
+      <div class="winners-grid" id="winners-grid"></div>
     </section>
 
     <section class="card chart-card" aria-labelledby="trend-title">
       <div class="card-header">
-        <h2 id="trend-title">Median Dispatch Time Over Commits (ms, lower is faster)</h2>
-        <div class="legend">
-          <span class="legend-item"><span class="swatch" style="background: var(--c-nacelle)"></span>Nacelle (Best)</span>
-          <span class="legend-item"><span class="swatch" style="background: var(--c-warp)"></span>Microsoft WARP</span>
-          <span class="legend-item"><span class="swatch" style="background: var(--c-llvmpipe)"></span>llvmpipe</span>
-          <span class="legend-item"><span class="swatch" style="background: var(--c-swift)"></span>SwiftShader</span>
-        </div>
+        <h2 id="trend-title">Historical Trend Over Commits</h2>
+        <div class="legend" id="trend-legend"></div>
       </div>
       <div class="canvas-wrap" id="trend-wrap">
-        <canvas id="trend-canvas" aria-label="Line chart of median dispatch time across commits"></canvas>
+        <canvas id="trend-canvas" aria-label="Line chart of benchmark metric across commits"></canvas>
         <div class="tooltip" id="trend-tooltip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="mem-trend-title">
+      <div class="card-header">
+        <h2 id="mem-trend-title">Historical Memory Usage Over Commits (Peak RSS MB, lower is better)</h2>
+        <div class="legend" id="mem-trend-legend"></div>
+      </div>
+      <div class="canvas-wrap" id="mem-trend-wrap">
+        <canvas id="mem-trend-canvas" aria-label="Line chart of peak memory usage across commits"></canvas>
+        <div class="tooltip" id="mem-trend-tooltip" role="status" aria-live="polite"></div>
       </div>
     </section>
 
     <section class="card chart-card" aria-labelledby="bar-title">
       <div class="card-header">
-        <h2 id="bar-title">Selected Commit Comparison (Median ms)</h2>
+        <h2 id="bar-title">Selected Commit Comparison</h2>
+        <div class="controls-row">
+          <select id="sort-metric" class="meta-pill" aria-label="Sort by metric">
+            <option value="medianMs:asc">Sort: Hot (ms) ↑</option>
+            <option value="coldMs:asc">Sort: Cold (ms) ↑</option>
+            <option value="shortJobMs:asc">Sort: Short (ms) ↑</option>
+            <option value="longJobMs:asc">Sort: Long (ms) ↑</option>
+            <option value="peakRssMb:asc">Sort: Peak (MB) ↑</option>
+            <option value="default:asc">Sort: Suite Order</option>
+          </select>
+          <select id="page-size" class="meta-pill" aria-label="Rows per page">
+            <option value="12">12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
       </div>
       <div class="svg-chart-wrap" id="bar-svg-wrap"></div>
+      <div class="pagination-bar" id="bar-pagination"></div>
     </section>
 
     <section class="card" aria-labelledby="bench-table-caption">
+      <div class="card-header">
+        <h2 id="bench-table-title">Shader, Regime &amp; Memory Profile Timings</h2>
+        <div class="controls-row">
+          <select id="table-page-size" class="meta-pill" aria-label="Table rows per page">
+            <option value="12">12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
       <div tabindex="0" role="region" aria-labelledby="bench-table-caption" class="table-wrapper">
         <table class="bench-table">
-          <caption id="bench-table-caption">Selected commit backend timings</caption>
+          <caption id="bench-table-caption">Selected commit shader, regime &amp; memory profile timings (click column headers to sort)</caption>
           <thead>
             <tr>
-              <th scope="col">Backend</th>
-              <th scope="col">Format</th>
-              <th scope="col">Median (ms)</th>
-              <th scope="col">Min (ms)</th>
-              <th scope="col">Compile (ms)</th>
-              <th scope="col">Status</th>
+              <th scope="col" class="sortable" data-sort="benchName">Benchmark</th>
+              <th scope="col" class="sortable" data-sort="category">Category</th>
+              <th scope="col" class="sortable" data-sort="backend">Backend</th>
+              <th scope="col" class="sortable" data-sort="coldMs">Cold (ms)</th>
+              <th scope="col" class="sortable" data-sort="medianMs">Hot (ms)</th>
+              <th scope="col" class="sortable" data-sort="shortJobMs">Short (ms)</th>
+              <th scope="col" class="sortable" data-sort="longJobMs">Long (ms)</th>
+              <th scope="col" class="sortable" data-sort="peakRssMb">Peak (MB)</th>
+              <th scope="col" class="sortable" data-sort="status">Status</th>
             </tr>
           </thead>
           <tbody id="bench-tbody"></tbody>
         </table>
       </div>
+      <div class="pagination-bar" id="table-pagination"></div>
     </section>
   </main>
 
@@ -492,11 +614,11 @@
         message: "Sample preview (awaiting first Windows benchmark CI run)",
         timestamp: new Date().toISOString(),
         results: [
-          { backend: "Nacelle (SIMD-4)", shaderFormat: "DXIL", ran: true, compileMs: 12.0, medianMs: 8.5, minMs: 8.1, status: "OK" },
-          { backend: "Nacelle (SIMD-8)", shaderFormat: "DXIL", ran: true, compileMs: 14.0, medianMs: 6.2, minMs: 5.9, status: "OK" },
-          { backend: "Microsoft WARP", shaderFormat: "DXIL", ran: true, compileMs: 10.5, medianMs: 9.8, minMs: 9.4, status: "OK" },
-          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.2, medianMs: 11.4, minMs: 10.9, status: "OK" },
-          { backend: "Vulkan (SwiftShader)", shaderFormat: "SPIR-V", ran: true, compileMs: 22.0, medianMs: 16.5, minMs: 15.8, status: "OK" }
+          { backend: "Nacelle (SIMD-4)", shaderFormat: "DXIL", ran: true, compileMs: 12.0, medianMs: 8.5, minMs: 8.1, peakRssMb: 68.2, status: "OK" },
+          { backend: "Nacelle (SIMD-8)", shaderFormat: "DXIL", ran: true, compileMs: 14.0, medianMs: 6.2, minMs: 5.9, peakRssMb: 68.1, status: "OK" },
+          { backend: "Microsoft WARP", shaderFormat: "DXIL", ran: true, compileMs: 10.5, medianMs: 9.8, minMs: 9.4, peakRssMb: 84.5, status: "OK" },
+          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.2, medianMs: 11.4, minMs: 10.9, peakRssMb: 79.0, status: "OK" },
+          { backend: "Vulkan (SwiftShader)", shaderFormat: "SPIR-V", ran: true, compileMs: 22.0, medianMs: 16.5, minMs: 15.8, peakRssMb: 92.3, status: "OK" }
         ]
       }
     ];
@@ -555,95 +677,407 @@
         .replace(/"/g, "&quot;");
     }
 
-    function extractMetrics(entry) {
-      const res = (entry.results || []).filter(r => r.ran);
-      const nacelle = res.filter(r => r.backend.startsWith("Nacelle"));
-      const bestNacelle = nacelle.length ? nacelle.reduce((a, b) => a.medianMs <= b.medianMs ? a : b) : null;
-      const warp = res.find(r => r.backend.toLowerCase().includes("warp")) || null;
-      const llvmpipe = res.find(r => r.backend.toLowerCase().includes("llvmpipe")) || null;
-      const swift = res.find(r => r.backend.toLowerCase().includes("swiftshader")) || null;
-      return { bestNacelle, warp, llvmpipe, swift };
+    function getEntrySuites(entry) {
+      return (entry.suites && entry.suites.length) ? entry.suites : (entry.results || []);
+    }
+
+    function geomean(arr) {
+      const pos = arr.filter(x => x > 0);
+      if (!pos.length) return 0;
+      return Math.exp(pos.reduce((s, x) => s + Math.log(x), 0) / pos.length);
+    }
+
+    const BACKEND_FAMILIES = [
+      { key: "bestNacelle", label: "Nacelle (Best)", color: "#0284c7", cssVarName: "--c-nacelle", match: b => b.startsWith("nacelle") },
+      { key: "warp", label: "Microsoft WARP", color: "#7c3aed", cssVarName: "--c-warp", match: b => b.includes("warp") },
+      { key: "llvmpipe", label: "Mesa llvmpipe", color: "#15803d", cssVarName: "--c-llvmpipe", match: b => b.includes("llvmpipe") },
+      { key: "swift", label: "SwiftShader", color: "#c2410c", cssVarName: "--c-swift", match: b => b.includes("swiftshader") },
+      { key: "moltenvk", label: "Vulkan (MoltenVK)", color: "#0d9488", match: b => b.includes("moltenvk") },
+      { key: "kosmickrisp", label: "Vulkan (KosmicKrisp)", color: "#db2777", match: b => b.includes("kosmickrisp") },
+      { key: "metal", label: "Metal (IRConverter)", color: "#ca8a04", match: b => b.includes("metal") },
+    ];
+
+    function familyColor(fam) {
+      return fam.cssVarName ? cssVar(fam.cssVarName) : fam.color;
+    }
+
+    function colorForBackend(name) {
+      const n = (name || "").toLowerCase();
+      const fam = BACKEND_FAMILIES.find(f => f.match(n));
+      return fam ? (fam.cssVarName ? `var(${fam.cssVarName})` : fam.color) : "var(--accent)";
+    }
+
+    function extractMetrics(entry, trendKey = "shader:bench_raymarch:medianMs") {
+      const suites = getEntrySuites(entry).filter(r => r.ran);
+      const pickGroup = (items, field, agg = "min") => {
+        if (!items.length) return null;
+        if (agg === "geomean") {
+          const vals = items.map(x => Number(x[field] || 0)).filter(v => v > 0);
+          if (!vals.length) return null;
+          return { val: geomean(vals), backend: items[0].backend, minMs: Math.min(...vals) };
+        }
+        const best = items.reduce((a, b) => (Number(a[field] || 0) <= Number(b[field] || 0) ? a : b));
+        return { val: Number(best[field] || 0), backend: best.backend, minMs: Number(best.minMs || best.medianMs || 0) };
+      };
+
+      const buckets = {};
+      for (const f of BACKEND_FAMILIES) buckets[f.key] = [];
+      const [mode, param, field] = trendKey.split(":");
+
+      for (const r of suites) {
+        const b = (r.backend || "").toLowerCase();
+        const fam = BACKEND_FAMILIES.find(f => f.match(b));
+        if (!fam) continue;
+        if (mode === "shader" && (r.benchId || "bench_raymarch") !== param) continue;
+        if (mode === "cat" && r.category !== param) continue;
+        buckets[fam.key].push(r);
+      }
+
+      if (mode === "overall") {
+        const gms = entry.overallGeomeanMs || {};
+        const out = { unit: "ms" };
+        for (const f of BACKEND_FAMILIES) {
+          let bestB = null, bestMs = Infinity;
+          for (const [b, ms] of Object.entries(gms)) {
+            if (f.match(b.toLowerCase()) && ms > 0 && ms < bestMs) { bestMs = ms; bestB = b; }
+          }
+          out[f.key] = bestB ? { val: bestMs, backend: bestB, minMs: bestMs } : null;
+        }
+        return out;
+      }
+
+      const fName = field || "medianMs";
+      const agg = (mode === "regime" || mode === "cat") ? "geomean" : "min";
+      const unit = fName.toLowerCase().includes("mb") ? "MB" : "ms";
+      const out = { unit };
+      for (const fam of BACKEND_FAMILIES) {
+        out[fam.key] = pickGroup(buckets[fam.key], fName, agg);
+      }
+      return out;
+    }
+
+    function getActiveFamilies() {
+      const active = new Set(["bestNacelle"]);
+      for (const h of benchHistory) {
+        for (const r of getEntrySuites(h)) {
+          if (!r.ran) continue;
+          const b = (r.backend || "").toLowerCase();
+          const fam = BACKEND_FAMILIES.find(f => f.match(b));
+          if (fam) active.add(fam.key);
+        }
+      }
+      return BACKEND_FAMILIES.filter(f => active.has(f.key));
+    }
+
+    function getGlobalScope() {
+      return document.getElementById("global-scope")?.value || "shader:bench_raymarch:medianMs";
+    }
+
+    function getMemoryScopeKey(scope) {
+      const [mode, param] = scope.split(":");
+      if (mode === "cat") return `cat:${param}:peakRssMb`;
+      if (mode === "shader") return `shader:${param}:peakRssMb`;
+      return "regime:all:peakRssMb";
     }
 
     function renderKPIs(idx) {
       const entry = benchHistory[idx];
       if (!entry) return;
-      const m = extractMetrics(entry);
+      const scope = getGlobalScope();
+      const memScope = getMemoryScopeKey(scope);
+      const m = extractMetrics(entry, scope);
+      const memM = extractMetrics(entry, memScope);
+      const ctxEl = document.getElementById("kpi-context");
+      if (ctxEl) {
+        ctxEl.textContent = `Commit ${entry.shortSha} · ${m.unit === "MB" ? "MB (lower is better)" : "ms (lower is faster)"}`;
+      }
+      const families = getActiveFamilies();
 
-      const setKpi = (idVal, idSub, item) => {
-        document.getElementById(idVal).textContent = item ? `${item.medianMs.toFixed(2)} ms` : "—";
-        document.getElementById(idSub).textContent = item ? `${item.backend} · min ${item.minMs.toFixed(2)} ms` : "Not run";
-      };
-      setKpi("kpi-nacelle", "kpi-nacelle-sub", m.bestNacelle);
-      setKpi("kpi-warp", "kpi-warp-sub", m.warp);
-      setKpi("kpi-llvmpipe", "kpi-llvmpipe-sub", m.llvmpipe);
-      setKpi("kpi-swift", "kpi-swift-sub", m.swift);
+      const grid = document.getElementById("kpi-grid");
+      if (grid) {
+        grid.innerHTML = families.map(f => {
+          const item = m[f.key];
+          const memItem = memM[f.key];
+          const memSuffix = memItem ? ` · ${memItem.val.toFixed(1)} MB peak` : "";
+          const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
+          return `
+            <article class="card" style="gap: 0.25rem;">
+              <div class="kpi-label">${escapeHtml(f.label)}</div>
+              <div class="kpi-value" style="color: ${col}">${item ? `${item.val.toFixed(2)} ${m.unit}` : "—"}</div>
+              <div class="kpi-sub">${item ? `${escapeHtml(item.backend)}${memSuffix}` : "Not run"}</div>
+            </article>`;
+        }).join("");
+      }
+
+      for (const legendId of ["trend-legend", "mem-trend-legend"]) {
+        const legend = document.getElementById(legendId);
+        if (legend) {
+          legend.innerHTML = families.map(f => {
+            const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
+            return `<span class="legend-item"><span class="swatch" style="background: ${col}"></span>${escapeHtml(f.label)}</span>`;
+          }).join("");
+        }
+      }
 
       const pill = document.getElementById("latest-run-link");
       pill.textContent = `Commit ${entry.shortSha}`;
       if (entry.runUrl) pill.href = entry.runUrl;
     }
 
-    function colorForBackend(name) {
-      const n = name.toLowerCase();
-      if (n.includes("nacelle")) return "var(--c-nacelle)";
-      if (n.includes("warp")) return "var(--c-warp)";
-      if (n.includes("llvmpipe")) return "var(--c-llvmpipe)";
-      return "var(--c-swift)";
+    function renderWinners(entry) {
+      const grid = document.getElementById("winners-grid");
+      const overallPill = document.getElementById("overall-winner-pill");
+      if (overallPill) {
+        const ow = entry.overallWinner || "—";
+        const gm = entry.overallGeomeanMs && entry.overallGeomeanMs[ow] ? ` (${Number(entry.overallGeomeanMs[ow]).toFixed(2)} ms geomean)` : "";
+        overallPill.textContent = `Overall Winner: ${ow}${gm}`;
+      }
+      const cats = entry.categoryWinners || [];
+      const regs = entry.regimeWinners || [];
+      const cards = [];
+      for (const c of cats) {
+        const val = c.geomean_ms || 0;
+        cards.push(`
+          <div class="winner-card">
+            <div class="w-label">${escapeHtml(c.category)} Winner</div>
+            <div class="w-val">${escapeHtml(c.winner || "N/A")}</div>
+            <div class="w-sub">${val > 0 ? Number(val).toFixed(2) + " ms" : "—"}</div>
+          </div>`);
+      }
+      for (const r of regs) {
+        cards.push(`
+          <div class="winner-card">
+            <div class="w-label">${escapeHtml(r.regime)}</div>
+            <div class="w-val">${escapeHtml(r.winner || "N/A")}</div>
+            <div class="w-sub">${r.value > 0 ? Number(r.value).toFixed(2) + " " + escapeHtml(r.unit || "") : "—"}</div>
+          </div>`);
+      }
+      grid.innerHTML = cards.length ? cards.join("") : `<p style="color:var(--muted)">Single-shader legacy entry (upgrade CI to v2 for full category winners).</p>`;
+    }
+
+    let suiteFilter = "avg:all";
+    let sortField = "medianMs";
+    let sortDir = "asc";
+    let currentPage = 1;
+    let pageSize = 12;
+
+    function aggregateByStage(suites, categoryFilter) {
+      const target = categoryFilter === "all" ? suites : suites.filter(r => r.category === categoryFilter);
+      const groups = new Map();
+      for (const r of target) {
+        const cat = r.category || "Compute";
+        const key = `${cat}\0${r.backend}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+      }
+      const out = [];
+      for (const group of groups.values()) {
+        const cat = group[0].category || "Compute";
+        const backend = group[0].backend;
+        const ranRows = group.filter(r => r.ran);
+        const testLabel = `${cat} Avg (${ranRows.length || group.length} test${(ranRows.length || group.length) === 1 ? "" : "s"})`;
+        if (ranRows.length > 0) {
+          out.push({
+            benchId: `stage:${cat}`,
+            benchName: testLabel,
+            category: cat,
+            backend,
+            coldMs: geomean(ranRows.map(r => Number(r.coldMs || r.compileMs || 0))),
+            medianMs: geomean(ranRows.map(r => Number(r.medianMs || 0))),
+            shortJobMs: geomean(ranRows.map(r => Number(r.shortJobMs || 0))),
+            longJobMs: geomean(ranRows.map(r => Number(r.longJobMs || 0))),
+            peakRssMb: geomean(ranRows.map(r => Number(r.peakRssMb || 0))),
+            ran: true,
+            status: `AVG (${ranRows.length}/${group.length})`,
+          });
+        } else {
+          out.push({
+            benchId: `stage:${cat}`,
+            benchName: testLabel,
+            category: cat,
+            backend,
+            coldMs: 0,
+            medianMs: 0,
+            shortJobMs: 0,
+            longJobMs: 0,
+            peakRssMb: 0,
+            ran: false,
+            status: group[0].status,
+          });
+        }
+      }
+      return out;
+    }
+
+    function getFilteredSortedSuites(entry) {
+      const suites = getEntrySuites(entry);
+      const [mode, param] = getGlobalScope().split(":");
+      let filtered;
+      if (mode === "shader") {
+        filtered = suites.filter(r => (r.benchId || "bench_raymarch") === param);
+      } else if (mode === "cat") {
+        filtered = aggregateByStage(suites, param);
+      } else {
+        filtered = aggregateByStage(suites, "all");
+      }
+      if (sortField === "default") return filtered;
+
+      const numericFields = new Set(["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"]);
+      const isNum = numericFields.has(sortField);
+      const valOf = (r) => {
+        if (!r.ran) return isNum ? (sortDir === "asc" ? Infinity : -Infinity) : "~~~";
+        if (sortField === "coldMs") return Number(r.coldMs || r.compileMs || 0);
+        if (isNum) return Number(r[sortField] || 0);
+        return String(r[sortField] || r.benchId || "").toLowerCase();
+      };
+      filtered.sort((a, b) => {
+        const va = valOf(a);
+        const vb = valOf(b);
+        if (va < vb) return sortDir === "asc" ? -1 : 1;
+        if (va > vb) return sortDir === "asc" ? 1 : -1;
+        return 0;
+      });
+      return filtered;
+    }
+
+    function getPagedRows(rows) {
+      if (pageSize <= 0) return { items: rows, totalPages: 1, total: rows.length, start: 0 };
+      const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+      if (currentPage > totalPages) currentPage = totalPages;
+      if (currentPage < 1) currentPage = 1;
+      const start = (currentPage - 1) * pageSize;
+      return { items: rows.slice(start, start + pageSize), totalPages, total: rows.length, start };
+    }
+
+    function renderPaginationControls(containerId, pageInfo) {
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      if (pageInfo.total === 0) {
+        el.innerHTML = "";
+        return;
+      }
+      const from = pageInfo.start + 1;
+      const to = pageInfo.start + pageInfo.items.length;
+      el.innerHTML = `
+        <span>Showing ${from}–${to} of ${pageInfo.total}</span>
+        <div class="controls-row">
+          <button type="button" class="meta-pill" data-page-act="prev" ${currentPage <= 1 ? "disabled" : ""}>← Prev</button>
+          <span>Page ${currentPage} / ${pageInfo.totalPages}</span>
+          <button type="button" class="meta-pill" data-page-act="next" ${currentPage >= pageInfo.totalPages ? "disabled" : ""}>Next →</button>
+        </div>`;
+      el.querySelector('[data-page-act="prev"]')?.addEventListener("click", () => {
+        if (currentPage > 1) { currentPage--; renderCommitData(benchHistory[selectedIndex]); }
+      });
+      el.querySelector('[data-page-act="next"]')?.addEventListener("click", () => {
+        if (currentPage < pageInfo.totalPages) { currentPage++; renderCommitData(benchHistory[selectedIndex]); }
+      });
+    }
+
+    function updateSortHeaders() {
+      document.querySelectorAll("th.sortable").forEach(th => {
+        const f = th.dataset.sort;
+        const base = th.dataset.baseLabel || th.textContent.replace(/ [▲▼⇅]$/, "");
+        th.dataset.baseLabel = base;
+        const isActive = (f === sortField);
+        th.classList.toggle("active-sort", isActive);
+        th.textContent = isActive ? `${base} ${sortDir === "asc" ? "▲" : "▼"}` : `${base} ⇅`;
+      });
+      const sortSelect = document.getElementById("sort-metric");
+      if (sortSelect) {
+        const candidate = `${sortField}:${sortDir}`;
+        if ([...sortSelect.options].some(o => o.value === candidate)) {
+          sortSelect.value = candidate;
+        }
+      }
+      const pageVal = pageSize <= 0 ? "all" : String(pageSize);
+      const pageSel = document.getElementById("page-size");
+      if (pageSel) pageSel.value = pageVal;
+      const tablePageSel = document.getElementById("table-page-size");
+      if (tablePageSel) tablePageSel.value = pageVal;
+    }
+
+    function formatBenchName(r) {
+      return String(r.benchName || r.benchId || "Raymarcher").replace(/\s*\(Shadertoy PS\)\s*$/i, "");
     }
 
     function renderBarSVG(entry) {
       const wrap = document.getElementById("bar-svg-wrap");
-      const ran = (entry.results || []).filter(r => r.ran);
+      const allRan = getFilteredSortedSuites(entry).filter(r => r.ran);
+      const pageInfo = getPagedRows(allRan);
+      const ran = pageInfo.items;
+      renderPaginationControls("bar-pagination", pageInfo);
       if (!ran.length) {
-        wrap.innerHTML = `<p style="color: var(--muted)">No benchmark results for this commit.</p>`;
+        wrap.innerHTML = `<p style="color: var(--muted)">No benchmark results for this filter.</p>`;
         return;
       }
 
-      const maxMs = Math.max(...ran.map(r => r.medianMs), 1);
+      const barMetric = (sortField === "coldMs" || sortField === "shortJobMs" || sortField === "longJobMs" || sortField === "peakRssMb")
+        ? sortField : "medianMs";
+      const unit = barMetric === "peakRssMb" ? "MB" : "ms";
+      const valOf = (r) => barMetric === "coldMs" ? Number(r.coldMs || r.compileMs || 0) : Number(r[barMetric] || 0);
+      const maxVal = Math.max(...ran.map(valOf), 0.1);
+      const labels = ran.map(r => `${formatBenchName(r)} · ${r.backend}`);
+      const maxLabelLen = Math.max(...labels.map(l => l.length), 20);
       const rowH = 34;
-      const padLeft = 240;
-      const padRight = 90;
-      const width = 880;
-      const barW = width - padLeft - padRight;
-      const height = 16 + ran.length * rowH;
+      const padLeft = Math.max(240, Math.min(480, Math.ceil(maxLabelLen * 6.8) + 28));
+      const padRight = 115;
+      const barW = 500;
+      const width = padLeft + barW + padRight;
+      const height = 20 + ran.length * rowH;
 
       const rows = ran.map((r, i) => {
-        const y = 8 + i * rowH;
-        const w = Math.max(4, (r.medianMs / maxMs) * barW);
+        const y = 10 + i * rowH;
+        const v = valOf(r);
+        const w = Math.max(4, (v / maxVal) * barW);
+        const label = labels[i];
+        const valText = `${barMetric === "peakRssMb" ? v.toFixed(1) : v.toFixed(2)} ${unit}`;
         return `
           <g transform="translate(0, ${y})">
-            <text x="${padLeft - 10}" y="20" text-anchor="end" font-size="12" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(r.backend)}</text>
-            <rect x="${padLeft}" y="6" width="${w.toFixed(1)}" height="18" rx="4" fill="${colorForBackend(r.backend)}">
-              <title>${escapeHtml(r.backend)}: ${r.medianMs.toFixed(2)} ms</title>
+            <text x="${padLeft - 14}" y="19" text-anchor="end" font-size="11" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(label)}</text>
+            <rect x="${padLeft}" y="6" width="${w.toFixed(1)}" height="16" rx="4" fill="${colorForBackend(r.backend)}">
+              <title>${escapeHtml(label)}: ${valText}</title>
             </rect>
-            <text x="${(padLeft + w + 8).toFixed(1)}" y="20" font-size="12" font-family="var(--font-mono)" fill="var(--muted)">${r.medianMs.toFixed(2)} ms</text>
+            <text x="${(padLeft + w + 12).toFixed(1)}" y="19" font-size="11" font-family="var(--font-mono)" fill="var(--muted)">${valText}</text>
           </g>`;
       }).join("");
 
       wrap.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Backend median dispatch time comparison">
-          <title>Median dispatch time for ${escapeHtml(entry.shortSha)}</title>
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Backend benchmark comparison">
+          <title>Benchmark comparison for ${escapeHtml(entry.shortSha)}</title>
           ${rows}
         </svg>`;
     }
 
     function renderTable(entry) {
       const tbody = document.getElementById("bench-tbody");
-      tbody.innerHTML = (entry.results || []).map(r => `
+      const allRows = getFilteredSortedSuites(entry);
+      const pageInfo = getPagedRows(allRows);
+      renderPaginationControls("table-pagination", pageInfo);
+      updateSortHeaders();
+      tbody.innerHTML = pageInfo.items.map(r => `
         <tr>
-          <th scope="row">${escapeHtml(r.backend)}</th>
-          <td>${escapeHtml(r.shaderFormat)}</td>
+          <th scope="row">${escapeHtml(formatBenchName(r))}</th>
+          <td>${escapeHtml(r.category || "Compute")}</td>
+          <td>${escapeHtml(r.backend)}</td>
+          <td>${r.ran && r.coldMs ? r.coldMs.toFixed(2) : (r.ran ? r.compileMs.toFixed(2) : "—")}</td>
           <td>${r.ran ? r.medianMs.toFixed(2) : "—"}</td>
-          <td>${r.ran ? r.minMs.toFixed(2) : "—"}</td>
-          <td>${r.ran ? r.compileMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.shortJobMs ? r.shortJobMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.longJobMs ? r.longJobMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
           <td>${escapeHtml(r.status)}</td>
         </tr>`).join("");
     }
 
-    function drawTrendChart() {
-      const canvas = document.getElementById("trend-canvas");
-      const wrap = document.getElementById("trend-wrap");
+    function renderCommitData(entry) {
+      if (!entry) return;
+      renderBarSVG(entry);
+      renderTable(entry);
+    }
+
+    function drawSingleTrendCanvas(canvasId, wrapId, trendKey) {
+      const canvas = document.getElementById(canvasId);
+      const wrap = document.getElementById(wrapId);
+      if (!canvas || !wrap) return;
       const rect = wrap.getBoundingClientRect();
       if (!rect.width || !rect.height) return;
 
@@ -655,26 +1089,25 @@
 
       const W = rect.width;
       const H = rect.height;
-      const pad = { top: 20, right: 24, bottom: 32, left: 54 };
+      const pad = { top: 24, right: 32, bottom: 38, left: 68 };
       const plotW = W - pad.left - pad.right;
       const plotH = H - pad.top - pad.bottom;
 
-      const seriesDefs = [
-        { key: "bestNacelle", color: cssVar("--c-nacelle"), label: "Nacelle" },
-        { key: "warp", color: cssVar("--c-warp"), label: "WARP" },
-        { key: "llvmpipe", color: cssVar("--c-llvmpipe"), label: "llvmpipe" },
-        { key: "swift", color: cssVar("--c-swift"), label: "SwiftShader" }
-      ];
+      const seriesDefs = getActiveFamilies().map(f => ({
+        key: f.key,
+        color: familyColor(f),
+        label: f.label,
+      }));
 
-      let maxMs = 1;
+      let maxVal = 1;
       const parsed = benchHistory.map((h, i) => {
-        const m = extractMetrics(h);
+        const m = extractMetrics(h, trendKey);
         for (const s of seriesDefs) {
-          if (m[s.key]) maxMs = Math.max(maxMs, m[s.key].medianMs);
+          if (m[s.key]) maxVal = Math.max(maxVal, m[s.key].val);
         }
         return { h, m, i };
       });
-      maxMs *= 1.12;
+      maxVal *= 1.12;
 
       const borderCol = cssVar("--border");
       const mutedCol = cssVar("--muted");
@@ -685,7 +1118,7 @@
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
       for (let g = 0; g <= 4; g++) {
-        const val = (maxMs * g) / 4;
+        const val = (maxVal * g) / 4;
         const y = pad.top + plotH * (1 - g / 4);
         ctx.strokeStyle = borderCol;
         ctx.beginPath();
@@ -693,7 +1126,7 @@
         ctx.lineTo(W - pad.right, y);
         ctx.stroke();
         ctx.fillStyle = mutedCol;
-        ctx.fillText(val.toFixed(1), pad.left - 8, y);
+        ctx.fillText(val >= 100 ? Math.round(val).toString() : val.toFixed(1), pad.left - 8, y);
       }
 
       const xFor = (i) => parsed.length === 1
@@ -703,7 +1136,7 @@
       for (const s of seriesDefs) {
         const pts = parsed
           .filter(p => p.m[s.key])
-          .map(p => ({ x: xFor(p.i), y: pad.top + plotH * (1 - p.m[s.key].medianMs / maxMs), i: p.i }));
+          .map(p => ({ x: xFor(p.i), y: pad.top + plotH * (1 - p.m[s.key].val / maxVal), i: p.i }));
         if (pts.length > 1) {
           ctx.beginPath();
           ctx.moveTo(pts[0].x, pts[0].y);
@@ -711,10 +1144,22 @@
           ctx.strokeStyle = s.color;
           ctx.lineWidth = 2.2;
           ctx.stroke();
+        } else if (pts.length === 1) {
+          ctx.save();
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, pts[0].y);
+          ctx.lineTo(W - pad.right, pts[0].y);
+          ctx.strokeStyle = s.color;
+          ctx.globalAlpha = 0.35;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.restore();
         }
         for (const p of pts) {
           ctx.beginPath();
-          ctx.arc(p.x, p.y, p.i === selectedIndex || p.i === hoveredIndex ? 5 : 3.2, 0, Math.PI * 2);
+          const radius = pts.length === 1 ? 5.5 : (p.i === selectedIndex || p.i === hoveredIndex ? 5 : 3.2);
+          ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
           ctx.fillStyle = s.color;
           ctx.fill();
           ctx.lineWidth = 1.5;
@@ -736,18 +1181,71 @@
       canvas._xs = parsed.map((p, i) => ({ x: xFor(i), p }));
     }
 
+    function drawTrendChart() {
+      const scope = getGlobalScope();
+      const memKey = getMemoryScopeKey(scope);
+      drawSingleTrendCanvas("trend-canvas", "trend-wrap", scope);
+      drawSingleTrendCanvas("mem-trend-canvas", "mem-trend-wrap", memKey);
+    }
+
+    function populateTrendSelector() {
+      const sel = document.getElementById("global-scope");
+      if (!sel) return;
+      const seenShaders = new Map([["bench_raymarch", { name: "Raymarcher (ALU+CF)", cat: "Compute" }]]);
+      for (const h of benchHistory) {
+        for (const r of getEntrySuites(h)) {
+          const id = r.benchId || "bench_raymarch";
+          if (!seenShaders.has(id)) {
+            seenShaders.set(id, { name: formatBenchName(r), cat: r.category || "Compute" });
+          }
+        }
+      }
+
+      const overallOpts = [
+        { val: "overall:all:medianMs", label: "Overall Geomean (All Stages, ms)" },
+        { val: "regime:all:coldMs", label: "Regime: Cold JIT Time (geomean ms)" },
+        { val: "regime:all:medianMs", label: "Regime: Hot JIT Time (geomean ms)" },
+        { val: "regime:all:shortJobMs", label: "Regime: Short-Running Job (geomean ms)" },
+        { val: "regime:all:longJobMs", label: "Regime: Long-Running Job (geomean ms)" },
+      ];
+      const stageOpts = [
+        { val: "cat:Compute:medianMs", label: "Stage Avg: Compute (ms)" },
+        { val: "cat:Vertex:medianMs", label: "Stage Avg: Vertex (ms)" },
+        { val: "cat:Pixel:medianMs", label: "Stage Avg: Pixel (ms)" },
+        { val: "cat:Geometry:medianMs", label: "Stage Avg: Geometry (ms)" },
+        { val: "cat:Tessellation:medianMs", label: "Stage Avg: Tessellation (ms)" },
+        { val: "cat:Ray Tracing:medianMs", label: "Stage Avg: Ray Tracing (ms)" },
+      ];
+      const shaderOpts = [...seenShaders.entries()].map(([id, info]) => ({
+        val: `shader:${id}:medianMs`,
+        label: `Test: ${info.name} (${info.cat})`
+      }));
+
+      const renderGroup = (label, items) =>
+        `<optgroup label="${escapeHtml(label)}">${items.map(o => `<option value="${escapeHtml(o.val)}">${escapeHtml(o.label)}</option>`).join("")}</optgroup>`;
+
+      sel.innerHTML =
+        renderGroup("Overall & Regimes", overallOpts) +
+        renderGroup("Per-Stage Averages", stageOpts) +
+        renderGroup("Individual Shaders", shaderOpts);
+      sel.value = "shader:bench_raymarch:medianMs";
+    }
+
     function selectCommit(idx) {
       if (idx < 0 || idx >= benchHistory.length) return;
       selectedIndex = idx;
+      currentPage = 1;
       renderKPIs(idx);
-      renderBarSVG(benchHistory[idx]);
-      renderTable(benchHistory[idx]);
+      renderWinners(benchHistory[idx]);
+      renderCommitData(benchHistory[idx]);
       drawTrendChart();
     }
 
-    function setupInteraction() {
-      const canvas = document.getElementById("trend-canvas");
-      const tooltip = document.getElementById("trend-tooltip");
+    function attachTrendInteraction(canvasId, tooltipId) {
+      const canvas = document.getElementById(canvasId);
+      const tooltip = document.getElementById(tooltipId);
+      if (!canvas || !tooltip) return;
+
       canvas.addEventListener("pointermove", (e) => {
         const xs = canvas._xs || [];
         if (!xs.length) return;
@@ -763,13 +1261,15 @@
         drawTrendChart();
 
         const m = nearest.p.m;
-        const fmt = (it) => it ? `${it.medianMs.toFixed(2)}ms` : "—";
+        const fmt = (it) => it ? `${it.val.toFixed(2)} ${m.unit}` : "—";
         const dot = (col) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${col};margin-right:4px;"></span>`;
+        const lines = getActiveFamilies().map(f =>
+          `<div>${dot(familyColor(f))}${escapeHtml(f.label)}: ${fmt(m[f.key])}</div>`
+        ).join("");
         tooltip.innerHTML = `
           <div class="tt-sha">${escapeHtml(nearest.p.h.shortSha)}</div>
           <div class="tt-msg">${escapeHtml(nearest.p.h.message || "—")}</div>
-          <div>${dot("var(--c-nacelle)")}Nacelle: ${fmt(m.bestNacelle)} · ${dot("var(--c-warp)")}WARP: ${fmt(m.warp)}</div>
-          <div>${dot("var(--c-llvmpipe)")}llvmpipe: ${fmt(m.llvmpipe)} · ${dot("var(--c-swift)")}Swift: ${fmt(m.swift)}</div>`;
+          ${lines}`;
         tooltip.style.left = `${Math.max(105, Math.min(rect.width - 105, nearest.x))}px`;
         tooltip.style.top = `48px`;
         tooltip.classList.add("visible");
@@ -784,6 +1284,52 @@
       });
     }
 
+    function setupInteraction() {
+      document.getElementById("global-scope")?.addEventListener("change", (e) => {
+        const [mode, , field] = e.target.value.split(":");
+        if (mode === "regime" && field) {
+          sortField = field;
+          sortDir = "asc";
+        }
+        currentPage = 1;
+        renderKPIs(selectedIndex);
+        renderCommitData(benchHistory[selectedIndex]);
+        drawTrendChart();
+      });
+      document.getElementById("sort-metric")?.addEventListener("change", (e) => {
+        const [field, dir] = e.target.value.split(":");
+        sortField = field;
+        sortDir = dir || "asc";
+        currentPage = 1;
+        renderCommitData(benchHistory[selectedIndex]);
+      });
+      const onPageSizeChange = (e) => {
+        const val = e.target.value;
+        pageSize = val === "all" ? 0 : Number(val);
+        currentPage = 1;
+        renderCommitData(benchHistory[selectedIndex]);
+      };
+      document.getElementById("page-size")?.addEventListener("change", onPageSizeChange);
+      document.getElementById("table-page-size")?.addEventListener("change", onPageSizeChange);
+      document.querySelectorAll("th.sortable").forEach((th) => {
+        th.addEventListener("click", () => {
+          const field = th.dataset.sort;
+          if (!field) return;
+          if (sortField === field) {
+            sortDir = sortDir === "asc" ? "desc" : "asc";
+          } else {
+            sortField = field;
+            sortDir = "asc";
+          }
+          currentPage = 1;
+          renderCommitData(benchHistory[selectedIndex]);
+        });
+      });
+
+      attachTrendInteraction("trend-canvas", "trend-tooltip");
+      attachTrendInteraction("mem-trend-canvas", "mem-trend-tooltip");
+    }
+
     async function init() {
       try {
         const resp = await fetch("data/bench-history.json", { cache: "no-store" });
@@ -794,10 +1340,12 @@
         benchHistory = FALLBACK_BENCH;
       }
       setupThemeToggle();
+      populateTrendSelector();
       selectedIndex = benchHistory.length - 1;
       selectCommit(selectedIndex);
       setupInteraction();
       new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("trend-wrap"));
+      new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("mem-trend-wrap"));
     }
 
     init();

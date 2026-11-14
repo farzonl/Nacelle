@@ -36,6 +36,40 @@ def load_existing_history(pages_url: str | None, cache_file: Path | None) -> lis
     return []
 
 
+def get_num(r: dict, camel: str, snake: str, default: float = 0.0) -> float:
+    val = r.get(camel)
+    if val is None:
+        val = r.get(snake, default)
+    return float(val)
+
+
+def normalize_result(r: dict) -> dict:
+    return {
+        "benchId": r.get("benchId") or r.get("bench_id", "bench_raymarch"),
+        "benchName": r.get("benchName") or r.get("bench_name", "Raymarcher"),
+        "category": r.get("category", "Compute"),
+        "backend": r.get("backend", ""),
+        "shaderFormat": r.get("shaderFormat") or r.get("shader_format", ""),
+        "simdWidth": int(get_num(r, "simdWidth", "simd_width", 0)),
+        "ran": bool(r.get("ran", False)),
+        "compileMs": round(get_num(r, "compileMs", "compile_ms"), 3),
+        "firstDispatchMs": round(get_num(r, "firstDispatchMs", "first_dispatch_ms"), 3),
+        "coldMs": round(get_num(r, "coldMs", "cold_ms"), 3),
+        "meanMs": round(get_num(r, "meanMs", "mean_ms"), 3),
+        "medianMs": round(get_num(r, "medianMs", "median_ms"), 3),
+        "minMs": round(get_num(r, "minMs", "min_ms"), 3),
+        "shortJobMs": round(get_num(r, "shortJobMs", "short_job_ms"), 3),
+        "longJobMs": round(get_num(r, "longJobMs", "long_job_ms"), 3),
+        "rssBeforeMb": round(get_num(r, "rssBeforeMb", "rss_before_mb"), 2),
+        "rssAfterCompileMb": round(get_num(r, "rssAfterCompileMb", "rss_after_compile_mb"), 2),
+        "rssAfterRunMb": round(get_num(r, "rssAfterRunMb", "rss_after_run_mb"), 2),
+        "rssDeltaMb": round(get_num(r, "rssDeltaMb", "rss_delta_mb"), 2),
+        "peakRssMb": round(get_num(r, "peakRssMb", "peak_rss_mb"), 2),
+        "checksum": round(float(r.get("checksum", 0.0)), 2),
+        "status": r.get("status", ""),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bench-json", required=True, type=Path)
@@ -56,15 +90,14 @@ def main() -> None:
     results = raw.get("results")
     if results is None:
         results = raw.get("benchmarks", [])
+    suites = raw.get("suites")
+    if suites is None:
+        suites = results
+
     ts = args.timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def get_num(r: dict, camel: str, snake: str) -> float:
-        val = r.get(camel)
-        if val is None:
-            val = r.get(snake, 0.0)
-        return float(val)
-
     entry = {
+        "version": int(raw.get("version", 1)),
         "sha": args.sha,
         "shortSha": args.sha[:7],
         "message": args.message.splitlines()[0][:120] if args.message else "",
@@ -72,19 +105,12 @@ def main() -> None:
         "timestamp": ts,
         "runUrl": args.run_url,
         "os": "Windows",
-        "results": [
-            {
-                "backend": r.get("backend", ""),
-                "shaderFormat": r.get("shaderFormat") or r.get("shader_format", ""),
-                "ran": bool(r.get("ran", False)),
-                "compileMs": round(get_num(r, "compileMs", "compile_ms"), 3),
-                "medianMs": round(get_num(r, "medianMs", "median_ms"), 3),
-                "minMs": round(get_num(r, "minMs", "min_ms"), 3),
-                "checksum": round(float(r.get("checksum", 0.0)), 2),
-                "status": r.get("status", ""),
-            }
-            for r in results
-        ],
+        "overallWinner": raw.get("overall_winner") or raw.get("overallWinner", ""),
+        "overallGeomeanMs": raw.get("overall_geomean_ms") or raw.get("overallGeomeanMs", {}),
+        "categoryWinners": raw.get("category_winners") or raw.get("categoryWinners", []),
+        "regimeWinners": raw.get("regime_winners") or raw.get("regimeWinners", []),
+        "results": [normalize_result(r) for r in results],
+        "suites": [normalize_result(r) for r in suites],
     }
 
     history = load_existing_history(args.pages_url, args.history_cache)
@@ -126,7 +152,7 @@ def main() -> None:
                         json.dump(obj, f, indent=2)
 
     ran_backends = [f"{r['backend']}={r['medianMs']}ms" for r in entry["results"] if r["ran"]]
-    print(f"Recorded benchmark {entry['shortSha']}: {', '.join(ran_backends)}. History length: {len(history)}")
+    print(f"Recorded benchmark {entry['shortSha']}: {', '.join(ran_backends)}. Suites: {len(entry['suites'])}. History length: {len(history)}")
 
 
 if __name__ == "__main__":

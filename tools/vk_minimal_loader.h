@@ -39,6 +39,10 @@ using VkPipelineCache = uint64_t;
 using VkDescriptorPool = uint64_t;
 using VkDescriptorSet = uint64_t;
 using VkFence = uint64_t;
+using VkImage = uint64_t;
+using VkImageView = uint64_t;
+using VkRenderPass = uint64_t;
+using VkFramebuffer = uint64_t;
 
 constexpr VkResult VK_SUCCESS = 0;
 constexpr uint64_t VK_NULL_HANDLE = 0;
@@ -63,14 +67,57 @@ constexpr uint32_t VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET = 35;
 constexpr uint32_t VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39;
 constexpr uint32_t VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40;
 constexpr uint32_t VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 42;
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14;
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO = 19;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO = 20;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO = 22;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO = 23;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO = 24;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO = 26;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO = 27;
+constexpr uint32_t VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO = 28;
+constexpr uint32_t VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO = 37;
+constexpr uint32_t VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO = 38;
+constexpr uint32_t VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO = 43;
 
+constexpr VkFlags VK_QUEUE_GRAPHICS_BIT = 0x00000001;
 constexpr VkFlags VK_QUEUE_COMPUTE_BIT = 0x00000002;
+constexpr VkFlags VK_BUFFER_USAGE_TRANSFER_DST_BIT = 0x00000002;
+constexpr VkFlags VK_BUFFER_USAGE_VERTEX_BUFFER_BIT = 0x00000080;
 constexpr VkFlags VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT = 0x00000010;
 constexpr VkFlags VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 0x00000020;
+constexpr VkFlags VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 0x00000001;
 constexpr VkFlags VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002;
 constexpr VkFlags VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x00000004;
 constexpr uint32_t VK_SHARING_MODE_EXCLUSIVE = 0;
+constexpr uint32_t VK_SHADER_STAGE_VERTEX_BIT = 0x00000001;
+constexpr uint32_t VK_SHADER_STAGE_FRAGMENT_BIT = 0x00000010;
 constexpr uint32_t VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020;
+constexpr uint32_t VK_PIPELINE_BIND_POINT_GRAPHICS = 0;
+constexpr uint32_t VK_PIPELINE_BIND_POINT_COMPUTE = 1;
+constexpr uint32_t VK_FORMAT_R8G8B8A8_UNORM = 37;
+constexpr uint32_t VK_FORMAT_R32G32B32_SFLOAT = 106;
+constexpr uint32_t VK_IMAGE_TYPE_2D = 1;
+constexpr uint32_t VK_IMAGE_TILING_OPTIMAL = 0;
+constexpr uint32_t VK_IMAGE_USAGE_TRANSFER_SRC_BIT = 0x00000001;
+constexpr uint32_t VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = 0x00000010;
+constexpr uint32_t VK_IMAGE_LAYOUT_UNDEFINED = 0;
+constexpr uint32_t VK_IMAGE_LAYOUT_GENERAL = 1;
+constexpr uint32_t VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2;
+constexpr uint32_t VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6;
+constexpr uint32_t VK_IMAGE_VIEW_TYPE_2D = 1;
+constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 0x00000001;
+constexpr uint32_t VK_SAMPLE_COUNT_1_BIT = 0x00000001;
+constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3;
+constexpr uint32_t VK_POLYGON_MODE_FILL = 0;
+constexpr uint32_t VK_CULL_MODE_NONE = 0;
+constexpr uint32_t VK_FRONT_FACE_COUNTER_CLOCKWISE = 0;
+constexpr uint32_t VK_ATTACHMENT_LOAD_OP_CLEAR = 1;
+constexpr uint32_t VK_ATTACHMENT_STORE_OP_STORE = 0;
+constexpr uint32_t VK_ATTACHMENT_LOAD_OP_DONT_CARE = 2;
+constexpr uint32_t VK_ATTACHMENT_STORE_OP_DONT_CARE = 1;
+constexpr uint32_t VK_SUBPASS_CONTENTS_INLINE = 0;
 constexpr uint32_t VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6;
 constexpr uint32_t VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
 constexpr uint32_t VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
@@ -349,6 +396,282 @@ struct VkFenceCreateInfo {
     VkFlags flags;
 };
 
+struct VkExtent3D {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+};
+
+struct VkExtent2D {
+    uint32_t width;
+    uint32_t height;
+};
+
+struct VkOffset2D {
+    int32_t x;
+    int32_t y;
+};
+
+struct VkOffset3D {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+};
+
+struct VkRect2D {
+    VkOffset2D offset;
+    VkExtent2D extent;
+};
+
+struct VkViewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float minDepth;
+    float maxDepth;
+};
+
+struct VkImageCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t imageType;
+    uint32_t format;
+    VkExtent3D extent;
+    uint32_t mipLevels;
+    uint32_t arrayLayers;
+    uint32_t samples;
+    uint32_t tiling;
+    VkFlags usage;
+    uint32_t sharingMode;
+    uint32_t queueFamilyIndexCount;
+    const uint32_t* pQueueFamilyIndices;
+    uint32_t initialLayout;
+};
+
+struct VkImageSubresourceRange {
+    VkFlags aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct VkComponentMapping {
+    uint32_t r, g, b, a;
+};
+
+struct VkImageViewCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkImage image;
+    uint32_t viewType;
+    uint32_t format;
+    VkComponentMapping components;
+    VkImageSubresourceRange subresourceRange;
+};
+
+struct VkAttachmentDescription {
+    VkFlags flags;
+    uint32_t format;
+    uint32_t samples;
+    uint32_t loadOp;
+    uint32_t storeOp;
+    uint32_t stencilLoadOp;
+    uint32_t stencilStoreOp;
+    uint32_t initialLayout;
+    uint32_t finalLayout;
+};
+
+struct VkAttachmentReference {
+    uint32_t attachment;
+    uint32_t layout;
+};
+
+struct VkSubpassDescription {
+    VkFlags flags;
+    uint32_t pipelineBindPoint;
+    uint32_t inputAttachmentCount;
+    const VkAttachmentReference* pInputAttachments;
+    uint32_t colorAttachmentCount;
+    const VkAttachmentReference* pColorAttachments;
+    const VkAttachmentReference* pResolveAttachments;
+    const VkAttachmentReference* pDepthStencilAttachment;
+    uint32_t preserveAttachmentCount;
+    const uint32_t* pPreserveAttachments;
+};
+
+struct VkRenderPassCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t attachmentCount;
+    const VkAttachmentDescription* pAttachments;
+    uint32_t subpassCount;
+    const VkSubpassDescription* pSubpasses;
+    uint32_t dependencyCount;
+    const void* pDependencies;
+};
+
+struct VkFramebufferCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkRenderPass renderPass;
+    uint32_t attachmentCount;
+    const VkImageView* pAttachments;
+    uint32_t width;
+    uint32_t height;
+    uint32_t layers;
+};
+
+struct VkVertexInputBindingDescription {
+    uint32_t binding;
+    uint32_t stride;
+    uint32_t inputRate;
+};
+
+struct VkVertexInputAttributeDescription {
+    uint32_t location;
+    uint32_t binding;
+    uint32_t format;
+    uint32_t offset;
+};
+
+struct VkPipelineVertexInputStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t vertexBindingDescriptionCount;
+    const VkVertexInputBindingDescription* pVertexBindingDescriptions;
+    uint32_t vertexAttributeDescriptionCount;
+    const VkVertexInputAttributeDescription* pVertexAttributeDescriptions;
+};
+
+struct VkPipelineInputAssemblyStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t topology;
+    VkBool32 primitiveRestartEnable;
+};
+
+struct VkPipelineViewportStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t viewportCount;
+    const VkViewport* pViewports;
+    uint32_t scissorCount;
+    const VkRect2D* pScissors;
+};
+
+struct VkPipelineRasterizationStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 depthClampEnable;
+    VkBool32 rasterizerDiscardEnable;
+    uint32_t polygonMode;
+    VkFlags cullMode;
+    uint32_t frontFace;
+    VkBool32 depthBiasEnable;
+    float depthBiasConstantFactor;
+    float depthBiasClamp;
+    float depthBiasSlopeFactor;
+    float lineWidth;
+};
+
+struct VkPipelineMultisampleStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t rasterizationSamples;
+    VkBool32 sampleShadingEnable;
+    float minSampleShading;
+    const uint32_t* pSampleMask;
+    VkBool32 alphaToCoverageEnable;
+    VkBool32 alphaToOneEnable;
+};
+
+struct VkPipelineColorBlendAttachmentState {
+    VkBool32 blendEnable;
+    uint32_t srcColorBlendFactor;
+    uint32_t dstColorBlendFactor;
+    uint32_t colorBlendOp;
+    uint32_t srcAlphaBlendFactor;
+    uint32_t dstAlphaBlendFactor;
+    uint32_t alphaBlendOp;
+    VkFlags colorWriteMask;
+};
+
+struct VkPipelineColorBlendStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 logicOpEnable;
+    uint32_t logicOp;
+    uint32_t attachmentCount;
+    const VkPipelineColorBlendAttachmentState* pAttachments;
+    float blendConstants[4];
+};
+
+struct VkGraphicsPipelineCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t stageCount;
+    const VkPipelineShaderStageCreateInfo* pStages;
+    const VkPipelineVertexInputStateCreateInfo* pVertexInputState;
+    const VkPipelineInputAssemblyStateCreateInfo* pInputAssemblyState;
+    const void* pTessellationState;
+    const VkPipelineViewportStateCreateInfo* pViewportState;
+    const VkPipelineRasterizationStateCreateInfo* pRasterizationState;
+    const VkPipelineMultisampleStateCreateInfo* pMultisampleState;
+    const void* pDepthStencilState;
+    const VkPipelineColorBlendStateCreateInfo* pColorBlendState;
+    const void* pDynamicState;
+    VkPipelineLayout layout;
+    VkRenderPass renderPass;
+    uint32_t subpass;
+    VkPipeline basePipelineHandle;
+    int32_t basePipelineIndex;
+};
+
+union VkClearValue {
+    float float32[4];
+    int32_t int32[4];
+    uint32_t uint32[4];
+};
+
+struct VkRenderPassBeginInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkRenderPass renderPass;
+    VkFramebuffer framebuffer;
+    VkRect2D renderArea;
+    uint32_t clearValueCount;
+    const VkClearValue* pClearValues;
+};
+
+struct VkImageSubresourceLayers {
+    VkFlags aspectMask;
+    uint32_t mipLevel;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct VkBufferImageCopy {
+    VkDeviceSize bufferOffset;
+    uint32_t bufferRowLength;
+    uint32_t bufferImageHeight;
+    VkImageSubresourceLayers imageSubresource;
+    VkOffset3D imageOffset;
+    VkExtent3D imageExtent;
+};
+
 struct Loader {
 #if defined(_WIN32)
     HMODULE lib = nullptr;
@@ -399,6 +722,22 @@ struct Loader {
     VkResult (VK_PTR* vkQueueSubmit)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence) = nullptr;
     VkResult (VK_PTR* vkQueueWaitIdle)(VkQueue) = nullptr;
     VkResult (VK_PTR* vkResetCommandBuffer)(VkCommandBuffer, VkFlags) = nullptr;
+    VkResult (VK_PTR* vkCreateImage)(VkDevice, const VkImageCreateInfo*, const void*, VkImage*) = nullptr;
+    void (VK_PTR* vkDestroyImage)(VkDevice, VkImage, const void*) = nullptr;
+    void (VK_PTR* vkGetImageMemoryRequirements)(VkDevice, VkImage, VkMemoryRequirements*) = nullptr;
+    VkResult (VK_PTR* vkBindImageMemory)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) = nullptr;
+    VkResult (VK_PTR* vkCreateImageView)(VkDevice, const VkImageViewCreateInfo*, const void*, VkImageView*) = nullptr;
+    void (VK_PTR* vkDestroyImageView)(VkDevice, VkImageView, const void*) = nullptr;
+    VkResult (VK_PTR* vkCreateRenderPass)(VkDevice, const VkRenderPassCreateInfo*, const void*, VkRenderPass*) = nullptr;
+    void (VK_PTR* vkDestroyRenderPass)(VkDevice, VkRenderPass, const void*) = nullptr;
+    VkResult (VK_PTR* vkCreateFramebuffer)(VkDevice, const VkFramebufferCreateInfo*, const void*, VkFramebuffer*) = nullptr;
+    void (VK_PTR* vkDestroyFramebuffer)(VkDevice, VkFramebuffer, const void*) = nullptr;
+    VkResult (VK_PTR* vkCreateGraphicsPipelines)(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const void*, VkPipeline*) = nullptr;
+    void (VK_PTR* vkCmdBeginRenderPass)(VkCommandBuffer, const VkRenderPassBeginInfo*, uint32_t) = nullptr;
+    void (VK_PTR* vkCmdEndRenderPass)(VkCommandBuffer) = nullptr;
+    void (VK_PTR* vkCmdBindVertexBuffers)(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*) = nullptr;
+    void (VK_PTR* vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+    void (VK_PTR* vkCmdCopyImageToBuffer)(VkCommandBuffer, VkImage, uint32_t, VkBuffer, uint32_t, const VkBufferImageCopy*) = nullptr;
 
     ~Loader() {
 #if defined(_WIN32)
@@ -484,6 +823,22 @@ struct Loader {
         loadSym(inst, vkQueueSubmit, "vkQueueSubmit");
         loadSym(inst, vkQueueWaitIdle, "vkQueueWaitIdle");
         loadSym(inst, vkResetCommandBuffer, "vkResetCommandBuffer");
+        loadSym(inst, vkCreateImage, "vkCreateImage");
+        loadSym(inst, vkDestroyImage, "vkDestroyImage");
+        loadSym(inst, vkGetImageMemoryRequirements, "vkGetImageMemoryRequirements");
+        loadSym(inst, vkBindImageMemory, "vkBindImageMemory");
+        loadSym(inst, vkCreateImageView, "vkCreateImageView");
+        loadSym(inst, vkDestroyImageView, "vkDestroyImageView");
+        loadSym(inst, vkCreateRenderPass, "vkCreateRenderPass");
+        loadSym(inst, vkDestroyRenderPass, "vkDestroyRenderPass");
+        loadSym(inst, vkCreateFramebuffer, "vkCreateFramebuffer");
+        loadSym(inst, vkDestroyFramebuffer, "vkDestroyFramebuffer");
+        loadSym(inst, vkCreateGraphicsPipelines, "vkCreateGraphicsPipelines");
+        loadSym(inst, vkCmdBeginRenderPass, "vkCmdBeginRenderPass");
+        loadSym(inst, vkCmdEndRenderPass, "vkCmdEndRenderPass");
+        loadSym(inst, vkCmdBindVertexBuffers, "vkCmdBindVertexBuffers");
+        loadSym(inst, vkCmdDraw, "vkCmdDraw");
+        loadSym(inst, vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
         return vkEnumeratePhysicalDevices && vkCreateDevice && vkCreateComputePipelines && vkCmdDispatch;
     }
 };
