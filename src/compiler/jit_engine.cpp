@@ -1156,7 +1156,7 @@ bool compileComputePSO(
             ? shader.embeddedRootSig
             : rootLayout;
 
-    thread_local mlir::MLIRContext mlirCtx;
+    thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
     auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
     if (!mlirMod) return false;
     const auto tLift = Clock::now();
