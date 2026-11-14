@@ -441,7 +441,11 @@ void unifyExitBlocks(llvm::Function& fn) {
     for (auto* ri : rets) {
         llvm::BasicBlock* srcBB = ri->getParent();
         if (retPhi) retPhi->addIncoming(ri->getReturnValue(), srcBB);
+#if LLVM_VERSION_MAJOR >= 23
         llvm::UncondBrInst::Create(exitBB, srcBB);
+#else
+        llvm::BranchInst::Create(exitBB, srcBB);
+#endif
         ri->eraseFromParent();
     }
 }
@@ -565,7 +569,11 @@ bool loadAndUpgradeDXIL(
             outError = llvm::toString(containerOrErr.takeError());
             return false;
         }
+#if LLVM_VERSION_MAJOR >= 23
         auto dxilOpt = containerOrErr->getDXIL(false);
+#else
+        auto dxilOpt = containerOrErr->getDXIL();
+#endif
         if (!dxilOpt.has_value()) {
             outError = "DXContainer missing DXIL program part";
             return false;

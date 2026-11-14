@@ -1,4 +1,4 @@
-find_program(DXC_EXECUTABLE dxc HINTS /usr/local/bin /opt/homebrew/bin REQUIRED)
+find_program(DXC_EXECUTABLE dxc HINTS "${CMAKE_SOURCE_DIR}/.sdk/bin" /usr/local/bin /opt/homebrew/bin REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_program(FILECHECK_EXECUTABLE FileCheck HINTS "${LLVM_TOOLS_BINARY_DIR}" /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin REQUIRED)
 find_program(SPLIT_FILE_EXECUTABLE split-file HINTS "${LLVM_TOOLS_BINARY_DIR}" /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin REQUIRED)
@@ -160,3 +160,18 @@ add_test(
     NAME nacelle_bench_smoke
     COMMAND $<TARGET_FILE:nacelle-bench> --quick --simd-width=4,8
 )
+
+# Viewer smoke tests (headless + SDL3 dummy driver when SDL3 is enabled)
+add_test(
+    NAME nacelle_viewer_headless
+    COMMAND $<TARGET_FILE:nacelle_viewer> --headless --frames 2
+)
+if(NACELLE_VIEWER_HAS_SDL3)
+    add_test(
+        NAME nacelle_viewer_sdl
+        COMMAND $<TARGET_FILE:nacelle_viewer> --frames 2
+    )
+    set_tests_properties(nacelle_viewer_sdl PROPERTIES
+        ENVIRONMENT "SDL_VIDEO_DRIVER=dummy;SDL_RENDER_DRIVER=software"
+    )
+endif()
