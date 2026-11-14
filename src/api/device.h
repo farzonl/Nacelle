@@ -118,7 +118,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE CreateMetaCommand(REFGUID, UINT, const void*, SIZE_T, REFIID, void**) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE CreateStateObject(const D3D12_STATE_OBJECT_DESC*, REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CreateStateObject(const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) override;
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) override;

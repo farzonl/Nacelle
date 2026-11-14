@@ -8,6 +8,7 @@
 
 #include "com_base.h"
 #include "../compiler/shader_compiler.h"
+#include "../rasterizer/raytracing_pipeline.h"
 
 namespace nacelle {
 
@@ -113,6 +114,33 @@ private:
 
     std::mutex mu_;
     std::unordered_map<std::string, StoredEntry> entries_;
+};
+
+class NacelleStateObject
+    : public D3D12PageableBase<ID3D12StateObject>,
+      public ID3D12StateObjectProperties {
+public:
+    NacelleStateObject(ID3D12Device* device, CompiledDxrStateObject compiled);
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
+    ULONG STDMETHODCALLTYPE AddRef() override { return D3D12PageableBase::AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return D3D12PageableBase::Release(); }
+
+    void* STDMETHODCALLTYPE GetShaderIdentifier(LPCWSTR pExportName) override;
+    UINT64 STDMETHODCALLTYPE GetShaderStackSize(LPCWSTR pExportName) override {
+        (void)pExportName;
+        return 4096;
+    }
+    UINT64 STDMETHODCALLTYPE GetPipelineStackSize() override { return stackSize_; }
+    void STDMETHODCALLTYPE SetPipelineStackSize(UINT64 PipelineStackSizeInBytes) override {
+        stackSize_ = PipelineStackSizeInBytes;
+    }
+
+    const CompiledDxrStateObject& compiled() const { return compiled_; }
+
+private:
+    CompiledDxrStateObject compiled_;
+    UINT64 stackSize_ = 65536;
 };
 
 } // namespace nacelle

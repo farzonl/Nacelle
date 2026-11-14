@@ -1,6 +1,9 @@
 #include "device.h"
 
+#include "../compiler/dxil_loader.h"
+#include "../compiler/jit_engine.h"
 #include "../rasterizer/raytracing_bvh.h"
+#include <llvm/IR/LLVMContext.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -671,5 +674,182 @@ HRESULT NacelleCreateSwapChain(
 }
 
 } // extern "C"
+
+static std::string wideToNarrowAscii(LPCWSTR ws) {
+    std::string s;
+    if (!ws) return s;
+    for (const wchar_t* p = ws; *p; ++p) {
+        s.push_back(static_cast<char>(*p & 0x7F));
+    }
+    return s;
+}
+
+HRESULT STDMETHODCALLTYPE NacelleDevice::CreateStateObject(
+    const D3D12_STATE_OBJECT_DESC* pDesc,
+    REFIID riid,
+    void** ppStateObject) {
+    if (!ppStateObject) return E_POINTER;
+    *ppStateObject = nullptr;
+    if (!pDesc || !pDesc->pSubobjects) return E_INVALIDARG;
+
+    struct LibSubobj {
+        D3D12_SHADER_BYTECODE bytecode{};
+        std::vector<std::pair<std::string, std::string>> exports; // (exportName, importName)
+    };
+    struct HitGroupInfo {
+        std::string exportName;
+        std::string chName;
+        std::string ahName;
+        std::string isName;
+    };
+
+    std::vector<LibSubobj> libs;
+    std::vector<HitGroupInfo> hitGroups;
+    RootSignatureLayout globalRootLayout;
+    uint32_t maxPayloadBytes = 64;
+    uint32_t maxAttrBytes = 32;
+    uint32_t maxRecursionDepth = 1;
+
+    for (UINT i = 0; i < pDesc->NumSubobjects; ++i) {
+        const auto& sub = pDesc->pSubobjects[i];
+        if (!sub.pDesc) continue;
+        switch (sub.Type) {
+            case D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
+                const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(sub.pDesc);
+                LibSubobj ls;
+                ls.bytecode = ld->DXILLibrary;
+                for (UINT e = 0; e < ld->NumExports; ++e) {
+                    const auto& ex = ld->pExports[e];
+                    std::string expName = wideToNarrowAscii(ex.Name);
+                    std::string impName = ex.ExportToRename ? wideToNarrowAscii(ex.ExportToRename) : expName;
+                    ls.exports.emplace_back(std::move(expName), std::move(impName));
+                }
+                libs.push_back(std::move(ls));
+                break;
+            }
+            case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
+                const auto* hg = static_cast<const D3D12_HIT_GROUP_DESC*>(sub.pDesc);
+                HitGroupInfo info;
+                info.exportName = wideToNarrowAscii(hg->HitGroupExport);
+                info.chName = wideToNarrowAscii(hg->ClosestHitShaderImport);
+                info.ahName = wideToNarrowAscii(hg->AnyHitShaderImport);
+                info.isName = wideToNarrowAscii(hg->IntersectionShaderImport);
+                hitGroups.push_back(std::move(info));
+                break;
+            }
+            case D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE: {
+                const auto* grs = static_cast<const D3D12_GLOBAL_ROOT_SIGNATURE*>(sub.pDesc);
+                if (grs->pGlobalRootSignature) {
+                    auto* rs = static_cast<NacelleRootSignature*>(grs->pGlobalRootSignature);
+                    globalRootLayout = rs->layout();
+                }
+                break;
+            }
+            case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG: {
+                const auto* sc = static_cast<const D3D12_RAYTRACING_SHADER_CONFIG*>(sub.pDesc);
+                if (sc->MaxPayloadSizeInBytes > 0) maxPayloadBytes = sc->MaxPayloadSizeInBytes;
+                if (sc->MaxAttributeSizeInBytes > 0) maxAttrBytes = sc->MaxAttributeSizeInBytes;
+                break;
+            }
+            case D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG: {
+                const auto* pc = static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(sub.pDesc);
+                if (pc->MaxTraceRecursionDepth > 0) maxRecursionDepth = pc->MaxTraceRecursionDepth;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    CompiledDxrStateObject compiled;
+    compiled.maxPayloadBytes = maxPayloadBytes;
+    compiled.maxAttrBytes = maxAttrBytes;
+    compiled.maxRecursionDepth = maxRecursionDepth;
+    compiled.simdWidth = 4;
+
+    std::unordered_map<std::string, uint32_t> shaderNameToIdx;
+    for (const auto& lib : libs) {
+        llvm::LLVMContext listCtx;
+        std::vector<DxilLibraryExport> libExports;
+        std::string err;
+        if (!listDxilLibraryExports(lib.bytecode, listCtx, libExports, err)) {
+            std::fprintf(stderr, "[Nacelle] CreateStateObject listDxilLibraryExports failed: %s\n", err.c_str());
+            return E_FAIL;
+        }
+
+        auto compileOne = [&](const std::string& publicName, const std::string& importName, uint32_t kind) -> bool {
+            DxrShaderFn fn = nullptr;
+            std::string compErr;
+            if (!compileDxrShader(lib.bytecode, importName, globalRootLayout, compiled.simdWidth, fn, compErr)) {
+                std::fprintf(stderr, "[Nacelle] CreateStateObject compileDxrShader(%s) failed: %s\n",
+                             importName.c_str(), compErr.c_str());
+                return false;
+            }
+            const uint32_t idx = static_cast<uint32_t>(compiled.shaders.size());
+            CompiledDxrShader cs;
+            cs.exportName = publicName;
+            cs.shaderKind = kind;
+            cs.fn = fn;
+            compiled.shaders.push_back(std::move(cs));
+            shaderNameToIdx[publicName] = idx;
+
+            NacelleShaderIdentifier id{};
+            id.entryIndex = idx;
+            id.isHitGroup = 0;
+            compiled.identifiers[publicName] = id;
+            return true;
+        };
+
+        if (lib.exports.empty()) {
+            for (const auto& le : libExports) {
+                if (!compileOne(le.exportName, le.exportName, le.shaderKind)) {
+                    return E_FAIL;
+                }
+            }
+        } else {
+            for (const auto& [expName, impName] : lib.exports) {
+                uint32_t kind = 0;
+                for (const auto& le : libExports) {
+                    if (le.exportName == impName) {
+                        kind = le.shaderKind;
+                        break;
+                    }
+                }
+                if (!compileOne(expName, impName, kind)) {
+                    return E_FAIL;
+                }
+            }
+        }
+    }
+
+    for (const auto& hg : hitGroups) {
+        CompiledDxrHitGroup chg;
+        chg.exportName = hg.exportName;
+        if (!hg.chName.empty()) {
+            auto it = shaderNameToIdx.find(hg.chName);
+            if (it != shaderNameToIdx.end()) chg.closestHitIdx = it->second;
+        }
+        if (!hg.ahName.empty()) {
+            auto it = shaderNameToIdx.find(hg.ahName);
+            if (it != shaderNameToIdx.end()) chg.anyHitIdx = it->second;
+        }
+        if (!hg.isName.empty()) {
+            auto it = shaderNameToIdx.find(hg.isName);
+            if (it != shaderNameToIdx.end()) chg.intersectionIdx = it->second;
+        }
+        const uint32_t hgIdx = static_cast<uint32_t>(compiled.hitGroups.size());
+        compiled.hitGroups.push_back(std::move(chg));
+
+        NacelleShaderIdentifier id{};
+        id.entryIndex = hgIdx;
+        id.isHitGroup = 1;
+        compiled.identifiers[hg.exportName] = id;
+    }
+
+    auto* stateObj = new NacelleStateObject(this, std::move(compiled));
+    HRESULT hr = stateObj->QueryInterface(riid, ppStateObject);
+    stateObj->Release();
+    return hr;
+}
 
 } // namespace nacelle

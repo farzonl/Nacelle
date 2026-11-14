@@ -562,6 +562,16 @@ void STDMETHODCALLTYPE NacelleCommandList::CopyRaytracingAccelerationStructure(
         DestAccelerationStructureData, SourceAccelerationStructureData, Mode});
 }
 
+void STDMETHODCALLTYPE NacelleCommandList::SetPipelineState1(ID3D12StateObject* pStateObject) {
+    if (closed_) return;
+    commands_.push_back(CmdSetStateObject{static_cast<NacelleStateObject*>(pStateObject)});
+}
+
+void STDMETHODCALLTYPE NacelleCommandList::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) {
+    if (closed_ || !pDesc) return;
+    commands_.push_back(CmdDispatchRays{*pDesc});
+}
+
 namespace {
 
 void applyRootSignatureStaticSamplers(const NacelleRootSignature* sig, DriverRootContext& ctx) {
@@ -1242,6 +1252,12 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 buildRaytracingAccelerationStructure(&localDesc);
             } else if constexpr (std::is_same_v<T, CmdCopyRaytracingAS>) {
                 copyRaytracingAccelerationStructure(c.dest, c.src, c.mode);
+            } else if constexpr (std::is_same_v<T, CmdSetStateObject>) {
+                state.stateObject = c.stateObj;
+            } else if constexpr (std::is_same_v<T, CmdDispatchRays>) {
+                if (state.stateObject) {
+                    executeDispatchRays(pool, c.desc, state.computeCtx, state.stateObject->compiled());
+                }
             } else if constexpr (std::is_same_v<T, CmdExecuteIndirect>) {
                 if (!c.sig || !c.argBuf) return;
                 UINT count = c.maxCount;

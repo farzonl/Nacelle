@@ -1137,3 +1137,92 @@ float nacelle_rayquery_state_mat(int32_t op, int32_t handle, int32_t row, int32_
 }
 
 } // extern "C"
+
+namespace nacelle {
+
+namespace {
+
+PipelineHitResult hitInfoToPipelineResult(const HitInfo& info, bool isHit, bool isProcedural, uint32_t customHitKind) {
+    PipelineHitResult r{};
+    r.hit = isHit;
+    r.isProcedural = isProcedural;
+    r.t = info.t;
+    r.baryU = info.baryU;
+    r.baryV = info.baryV;
+    r.hitKind = isProcedural ? customHitKind : (info.frontFace ? 254u : 255u);
+    r.instanceIndex = info.instanceIndex;
+    r.instanceID = info.instanceID;
+    r.geometryIndex = info.geometryIndex;
+    r.primitiveIndex = info.primitiveIndex;
+    r.instanceContributionToHitGroupIndex = info.instanceContributionToHitGroupIndex;
+    std::memcpy(r.objOrigin, info.objOrigin, sizeof(r.objOrigin));
+    std::memcpy(r.objDir, info.objDir, sizeof(r.objDir));
+    std::memcpy(r.objToWorld, info.objToWorld, sizeof(r.objToWorld));
+    std::memcpy(r.worldToObj, info.worldToObj, sizeof(r.worldToObj));
+    return r;
+}
+
+} // namespace
+
+PipelineHitResult traceRayForPipeline(
+    const void* tlasPtr,
+    uint32_t rayFlags,
+    uint32_t instanceMask,
+    float ox,
+    float oy,
+    float oz,
+    float tMin,
+    float dx,
+    float dy,
+    float dz,
+    float tMax,
+    DxrAnyHitFn onAnyHit,
+    DxrIntersectionFn onIntersection,
+    void* userData) {
+    const int32_t h = nacelle_rayquery_alloc(0);
+    nacelle_rayquery_trace_inline(
+        h, tlasPtr, static_cast<int32_t>(rayFlags), static_cast<int32_t>(instanceMask),
+        ox, oy, oz, tMin, dx, dy, dz, tMax);
+
+    auto* rq = getQuery(h);
+    uint32_t committedCustomHitKind = 0;
+
+    while (nacelle_rayquery_proceed(h)) {
+        if (rq->candidateType == kCandidateNonOpaqueTriangle) {
+            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, true, false, 0);
+            int32_t act = onAnyHit ? onAnyHit(userData, cand) : 0;
+            if (act == 0 || act == 2) {
+                nacelle_rayquery_commit_triangle(h);
+                if (act == 2) {
+                    nacelle_rayquery_abort(h);
+                    break;
+                }
+            }
+        } else if (rq->candidateType == kCandidateProceduralPrimitive && onIntersection) {
+            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, true, true, 0);
+            float committedT = rq->committed.t;
+            bool accepted = false;
+            bool endSearch = false;
+            uint32_t hitKind = 0;
+            float baryU = 0.0f;
+            float baryV = 0.0f;
+            onIntersection(userData, cand, committedT, accepted, endSearch, hitKind, baryU, baryV);
+            if (accepted && committedT >= rq->tMin && committedT <= rq->committed.t) {
+                nacelle_rayquery_commit_procedural(h, committedT);
+                rq->committed.baryU = baryU;
+                rq->committed.baryV = baryV;
+                committedCustomHitKind = hitKind;
+            }
+            if (endSearch) {
+                nacelle_rayquery_abort(h);
+                break;
+            }
+        }
+    }
+
+    const bool hasHit = rq->committed.status != kCommittedNothing;
+    const bool isProc = rq->committed.status == kCommittedProceduralHit;
+    return hitInfoToPipelineResult(rq->committed, hasHit, isProc, committedCustomHitKind);
+}
+
+} // namespace nacelle

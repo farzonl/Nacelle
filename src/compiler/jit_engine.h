@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "shader_compiler.h"
+#include "../rasterizer/raytracing_pipeline.h"
 
 namespace llvm {
 class LLVMContext;
@@ -122,5 +123,13 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
 void clearInMemoryPSOCacheForTesting();
 bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>& outBlob);
 bool importCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, const uint8_t* data, size_t size);
+
+bool compileDxrShader(
+    const D3D12_SHADER_BYTECODE& dxilLib,
+    const std::string& exportName,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    DxrShaderFn& outFn,
+    std::string& outError);
 
 } // namespace nacelle

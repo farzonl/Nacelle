@@ -20,6 +20,20 @@ function(add_hlsl_dxil hlsl_name profile entry out_name)
     set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
 endfunction()
 
+function(add_hlsl_dxil_lib hlsl_name profile out_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
+    set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
+    add_custom_command(
+        OUTPUT "${dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${profile} -O3 -Fo "${dst}" "${src}"
+        DEPENDS "${src}"
+        COMMENT "Compiling HLSL Library -> DXIL: ${hlsl_name} (${profile}) -> ${out_name}"
+    )
+    list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
+    set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
+endfunction()
+
 function(add_hlsl_spirv hlsl_name profile entry out_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
     set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
@@ -31,6 +45,20 @@ function(add_hlsl_spirv hlsl_name profile entry out_name)
                 -T ${profile} -E ${entry} -O3 -Fo "${dst}" "${src}"
         DEPENDS "${src}"
         COMMENT "Compiling HLSL -> SPIR-V: ${hlsl_name} (${profile}, ${entry}) -> ${out_name}"
+    )
+    list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
+    set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
+endfunction()
+
+function(add_hlsl_dxil_lib hlsl_name profile out_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
+    set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
+    add_custom_command(
+        OUTPUT "${dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${profile} -O3 -Fo "${dst}" "${src}"
+        DEPENDS "${src}"
+        COMMENT "Compiling HLSL Library -> DXIL: ${hlsl_name} (${profile}) -> ${out_name}"
     )
     list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
     set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
@@ -88,6 +116,7 @@ add_hlsl_dxil(graphics_features.hlsl ps_6_4 BabLoad4PS gfx_bab_load4_ps.dxil)
 add_hlsl_dxil(graphics_features.hlsl vs_6_4 MsaaDiagVS gfx_msaa_diag_vs.dxil)
 add_hlsl_dxil(graphics_features.hlsl ps_6_4 MsaaDiagPS gfx_msaa_diag_ps.dxil)
 add_hlsl_dxil(raytracing_inline.hlsl cs_6_5 RayQueryMain raytracing_inline_cs.dxil)
+add_hlsl_dxil_lib(raytracing_pipeline.hlsl lib_6_5 raytracing_pipeline.dxil)
 
 # Converted Shadertoy pixel shaders (DXIL)
 add_hlsl_dxil(light_cycle.hlsl ps_6_0 PSMain light_cycle.dxil)
@@ -139,6 +168,7 @@ add_nacelle_test(simd_wave_test simd_wave_test.cpp)
 add_nacelle_test(rasterizer_pipeline_test rasterizer_pipeline_test.cpp)
 add_nacelle_test(graphics_features_test graphics_features_test.cpp)
 add_nacelle_test(raytracing_inline_test raytracing_inline_test.cpp)
+add_nacelle_test(raytracing_pipeline_test raytracing_pipeline_test.cpp)
 add_nacelle_test(pbr_render_test pbr_render_test.cpp)
 add_nacelle_test(pso_cache_bcn_test pso_cache_bcn_test.cpp)
 add_nacelle_test(interlocked_barrier_test interlocked_barrier_test.cpp)

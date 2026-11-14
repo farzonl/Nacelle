@@ -177,6 +177,7 @@ set(NACELLE_SOURCES
     src/compiler/pso_synthesizer.cpp
     src/rasterizer/geometry_pipe.cpp
     src/rasterizer/raytracing_bvh.cpp
+    src/rasterizer/raytracing_pipeline.cpp
     src/rasterizer/tile_binner.cpp
     src/rasterizer/quad_rasterizer.cpp
 )

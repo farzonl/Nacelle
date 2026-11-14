@@ -131,6 +131,9 @@ struct CmdCopyRaytracingAS {
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE;
 };
 
+struct CmdSetStateObject { NacelleStateObject* stateObj = nullptr; };
+struct CmdDispatchRays { D3D12_DISPATCH_RAYS_DESC desc{}; };
+
 using RecordedCommand = std::variant<
     CmdSetPipelineState, CmdSetRootSignature, CmdSetDescriptorHeaps,
     CmdSetRootDescTable, CmdSetRoot32BitConsts, CmdSetRootView,
@@ -141,10 +144,11 @@ using RecordedCommand = std::variant<
     CmdRSSetShadingRate,
     CmdOMSetRenderTargets, CmdClearRTV, CmdClearDSV, CmdClearUAV,
     CmdExecuteBundle, CmdEndQuery, CmdResolveQueryData, CmdExecuteIndirect,
-    CmdBuildRaytracingAS, CmdCopyRaytracingAS>;
+    CmdBuildRaytracingAS, CmdCopyRaytracingAS, CmdSetStateObject, CmdDispatchRays>;
 
 struct ExecutionState {
     NacellePipelineState* pso = nullptr;
+    NacelleStateObject* stateObject = nullptr;
     NacelleRootSignature* computeRootSig = nullptr;
     NacelleRootSignature* graphicsRootSig = nullptr;
     DriverRootContext computeCtx{};
@@ -242,8 +246,8 @@ public:
         D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
         D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) override;
-    void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject*) override {}
-    void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC*) override {}
+    void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject* pStateObject) override;
+    void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) override;
 
     // ID3D12GraphicsCommandList5
     void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate, const D3D12_SHADING_RATE_COMBINER* combiners) override;

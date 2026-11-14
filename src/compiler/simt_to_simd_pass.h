@@ -44,6 +44,7 @@ struct SimdVal {
 struct StageHooks {
     bool isPixelShader = false;
     llvm::SmallVector<mlir::Value, 3> threadId;        // vector<W x i32>
+    llvm::SmallVector<mlir::Value, 3> dispatchRaysDim; // vector<W x i32>
     llvm::SmallVector<mlir::Value, 3> groupId;         // vector<W x i32>
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
     mlir::Value flatGroupId;                           // vector<W x i32>
@@ -100,6 +101,14 @@ bool packetizeRegionWithHooks(
     mlir::Value initExecMask,
     mlir::Value& inoutRealMask,
     StageHooks& hooks,
+    std::string& outError);
+
+bool packetizeDxrEntry(
+    mlir::ModuleOp mod,
+    const DxilLoadedShader& shader,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    const std::string& symbolName,
     std::string& outError);
 
 } // namespace nacelle

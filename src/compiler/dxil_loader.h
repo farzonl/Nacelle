@@ -22,6 +22,7 @@ struct DxilResourceRecord {
     uint32_t rangeSize = 1;        // UINT32_MAX if unbounded
     uint32_t resourceKind = 0;     // DXIL ResourceKind (1=Tex1D, 2=Tex2D, ..., 10=TypedBuffer, 11=RawBuffer, 12=StructuredBuffer, 13=CBuffer, 14=Sampler)
     uint32_t structuredStride = 0; // Bytes for StructuredBuffer, byte size for CBuffer
+    std::string symbolName;        // Global variable name in DXIL library modules
 };
 
 struct DxilSigRecord {
@@ -92,6 +93,25 @@ const std::string& getHostTargetTripleString();
 /// Unpacks a D3D12_SHADER_BYTECODE DXContainer or raw DXIL bitcode into upgraded LLVM 23 IR.
 bool loadAndUpgradeDXIL(
     const D3D12_SHADER_BYTECODE& bytecode,
+    llvm::LLVMContext& llvmCtx,
+    DxilLoadedShader& outShader,
+    std::string& outError);
+
+struct DxilLibraryExport {
+    std::string exportName;
+    std::string mangledName;
+    uint32_t shaderKind = 0; // 7=RayGen, 8=Intersection, 9=AnyHit, 10=ClosestHit, 11=Miss, 12=Callable
+};
+
+bool listDxilLibraryExports(
+    const D3D12_SHADER_BYTECODE& bytecode,
+    llvm::LLVMContext& llvmCtx,
+    std::vector<DxilLibraryExport>& outExports,
+    std::string& outError);
+
+bool loadAndUpgradeDXILLibraryExport(
+    const D3D12_SHADER_BYTECODE& bytecode,
+    const std::string& exportName,
     llvm::LLVMContext& llvmCtx,
     DxilLoadedShader& outShader,
     std::string& outError);

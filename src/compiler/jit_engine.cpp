@@ -272,6 +272,15 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         addSym("nacelle_rayquery_state_f32", &nacelle_rayquery_state_f32);
         addSym("nacelle_rayquery_state_vec", &nacelle_rayquery_state_vec);
         addSym("nacelle_rayquery_state_mat", &nacelle_rayquery_state_mat);
+        addSym("nacelle_dxr_trace_ray", &nacelle_dxr_trace_ray);
+        addSym("nacelle_dxr_state_i32", &nacelle_dxr_state_i32);
+        addSym("nacelle_dxr_state_f32", &nacelle_dxr_state_f32);
+        addSym("nacelle_dxr_state_vec", &nacelle_dxr_state_vec);
+        addSym("nacelle_dxr_state_mat", &nacelle_dxr_state_mat);
+        addSym("nacelle_dxr_ignore_hit", &nacelle_dxr_ignore_hit);
+        addSym("nacelle_dxr_accept_hit_and_end_search", &nacelle_dxr_accept_hit_and_end_search);
+        addSym("nacelle_dxr_report_hit", &nacelle_dxr_report_hit);
+        addSym("nacelle_dxr_call_shader", &nacelle_dxr_call_shader);
         if (auto err = rt.jit->getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(syms)))) {
             outError = llvm::toString(std::move(err));
             rt.jit.reset();
@@ -1270,6 +1279,62 @@ bool importCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, const uint8_t* data, 
     bool ok1 = writeFileAtomic(dir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
     bool ok2 = writeFileAtomic(dir / (hex + ".o"), objPtr, objLen, tId);
     return ok1 && ok2;
+}
+
+bool compileDxrShader(
+    const D3D12_SHADER_BYTECODE& dxilLib,
+    const std::string& exportName,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    DxrShaderFn& outFn,
+    std::string& outError) {
+    outFn = nullptr;
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    DxilLoadedShader shader;
+    if (!loadAndUpgradeDXILLibraryExport(dxilLib, exportName, *llvmCtx, shader, outError)) {
+        return false;
+    }
+
+    const RootSignatureLayout& effectiveLayout =
+        (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
+            ? shader.embeddedRootSig
+            : rootLayout;
+
+    thread_local mlir::MLIRContext mlirCtx;
+    auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
+    if (!mlirMod) return false;
+
+    const std::string symbolName = "nacelle_dxr_" + exportName;
+    if (!packetizeDxrEntry(*mlirMod, shader, effectiveLayout, simdWidth, symbolName, outError)) {
+        return false;
+    }
+
+    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
+    if (!linkedMod) return false;
+
+    auto& rt = getJitRuntime();
+    std::lock_guard<std::mutex> lock(rt.mu);
+    ensureLLJITLocked(rt, outError);
+    if (!rt.jit) return false;
+
+    auto jdOrErr = createIsolatedDylibLocked(rt);
+    if (!jdOrErr) {
+        outError = llvm::toString(jdOrErr.takeError());
+        return false;
+    }
+    llvm::orc::JITDylib& jd = *jdOrErr;
+    if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(linkedMod), std::move(outLlvmCtx)))) {
+        outError = llvm::toString(std::move(err));
+        return false;
+    }
+    auto symOrErr = rt.jit->lookup(jd, symbolName);
+    if (!symOrErr) {
+        outError = llvm::toString(symOrErr.takeError());
+        return false;
+    }
+    outFn = reinterpret_cast<DxrShaderFn>(symOrErr->getValue());
+    return outFn != nullptr;
 }
 
 } // namespace nacelle
