@@ -2399,10 +2399,89 @@ private:
         return packetizeMathOp(call, op, outError);
     }
 
-    mlir::Value isDescReservedBuffer(mlir::Location loc, mlir::Value descP) {
-        mlir::Value vf = loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, view_flags), 0);
-        mlir::Value flag = mlir::arith::AndIOp::create(b_, loc, vf, cInt(loc, i32Ty(), kDescViewFlagReservedBuffer));
-        return mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ne, flag, cInt(loc, i32Ty(), 0));
+    struct BufferDescInfo {
+        mlir::Value descP;
+        mlir::Value basePtr;
+        mlir::Value byteSize;
+        mlir::Value isReserved;
+        mlir::Value okPtr;
+        mlir::Value elemStride;
+        mlir::Value stride64;
+    };
+
+    BufferDescInfo loadBufferDescInfo(
+        mlir::Location loc,
+        mlir::OpBuilder& nb,
+        const SimdVal& h,
+        mlir::Value descPtr,
+        bool needElemStride,
+        bool needStride64) {
+        BufferDescInfo info;
+        info.descP = descPtr;
+        if (h.isRootConstants) {
+            info.basePtr = descPtr;
+            info.byteSize = mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), UINT64_MAX);
+            info.isReserved = mlir::arith::ConstantIntOp::create(nb, loc, i1Ty(), 0);
+            mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(nb, loc, ptrTy());
+            info.okPtr = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::ne, descPtr, nullPtr);
+            if (needElemStride) info.elemStride = mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), 0);
+            if (needStride64) info.stride64 = mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), h.stride);
+            return info;
+        }
+
+        bool loadEs = needElemStride || (needStride64 && h.stride == 0);
+        mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(nb, loc, ptrTy());
+        mlir::Value isNull = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::eq, descPtr, nullPtr);
+        auto ifOp = mlir::scf::IfOp::create(
+            nb, loc, isNull,
+            [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+                llvm::SmallVector<mlir::Value, 4> z = {
+                    mlir::LLVM::ZeroOp::create(ib, iloc, ptrTy()),
+                    mlir::arith::ConstantIntOp::create(ib, iloc, i64Ty(), 0),
+                    mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)};
+                if (loadEs) z.push_back(mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0));
+                mlir::scf::YieldOp::create(ib, iloc, z);
+            },
+            [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+                auto p = mlir::LLVM::LoadOp::create(ib, iloc, ptrTy(), descPtr);
+                p.setInvariant(true);
+                mlir::Value bsp = mlir::LLVM::GEPOp::create(
+                    ib, iloc, ptrTy(), i8Ty(), descPtr,
+                    llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, byte_size))});
+                auto bs = mlir::LLVM::LoadOp::create(ib, iloc, i64Ty(), bsp);
+                bs.setInvariant(true);
+                mlir::Value vfp = mlir::LLVM::GEPOp::create(
+                    ib, iloc, ptrTy(), i8Ty(), descPtr,
+                    llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, view_flags))});
+                auto vf = mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), vfp);
+                vf.setInvariant(true);
+                llvm::SmallVector<mlir::Value, 4> vals = {p, bs, vf};
+                if (loadEs) {
+                    mlir::Value esp = mlir::LLVM::GEPOp::create(
+                        ib, iloc, ptrTy(), i8Ty(), descPtr,
+                        llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
+                    auto es = mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), esp);
+                    es.setInvariant(true);
+                    vals.push_back(es);
+                }
+                mlir::scf::YieldOp::create(ib, iloc, vals);
+            });
+        info.basePtr = ifOp.getResult(0);
+        info.byteSize = ifOp.getResult(1);
+        mlir::Value vf = ifOp.getResult(2);
+        mlir::Value flag = mlir::arith::AndIOp::create(
+            nb, loc, vf, mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), kDescViewFlagReservedBuffer));
+        info.isReserved = mlir::arith::CmpIOp::create(
+            nb, loc, mlir::arith::CmpIPredicate::ne, flag, mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), 0));
+        info.okPtr = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::ne, info.basePtr, nullPtr);
+        mlir::Value loadedEs = loadEs ? ifOp.getResult(3) : mlir::Value();
+        if (needElemStride) info.elemStride = loadedEs;
+        if (needStride64) {
+            info.stride64 = (h.stride > 0)
+                                ? mlir::Value(mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), h.stride))
+                                : mlir::Value(mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), loadedEs));
+        }
+        return info;
     }
 
     mlir::Value resolveReservedBufferElemPtr(
@@ -2560,135 +2639,89 @@ private:
         });
     }
 
-    bool packetizeCBufferLoad(mlir::LLVM::CallOp call, bool isLegacy, std::string& outError) {
-        mlir::Location loc = call.getLoc();
-        SimdVal h = getMapped(loc, call.getOperand(1));
-        mlir::Value idxArg = call.getOperand(2);
-        auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(call.getResult().getType());
-        if (!st) {
-            outError = "cbufferLoad expected struct return type";
-            return false;
-        }
-        mlir::Type elemTy = st.getBody()[0];
-        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
-
-        auto idxConst = getConstIntValue(idxArg);
-        if (h.isUniform() && idxConst.has_value()) {
-            uint64_t byteOff = isLegacy ? (*idxConst * 16) : *idxConst;
-            mlir::Value ptr = h.lanes[0];
-            mlir::Value dataBase = h.isRootConstants ? ptr : loadDescBasePtr(loc, ptr);
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value isReserved = h.isRootConstants ? cInt(loc, i1Ty(), 0) : isDescReservedBuffer(loc, ptr);
-            mlir::Value byteSize = h.isRootConstants
-                                       ? cInt(loc, i64Ty(), UINT64_MAX)
-                                       : loadDescU64Field(loc, ptr, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, dataBase, nullP);
-            SimdVal outSt;
-            outSt.kind = SimdVal::Kind::Struct;
-            outSt.origType = st;
-            for (unsigned f = 0; f < st.getBody().size(); ++f) {
-                mlir::Value cOff = cInt(loc, i64Ty(), byteOff + f * elemBytes);
-                mlir::Value cEnd = cInt(loc, i64Ty(), byteOff + (f + 1) * elemBytes);
-                mlir::Value inBounds = h.isRootConstants
-                                           ? okPtr
-                                           : mlir::Value(mlir::arith::AndIOp::create(
-                                                 b_, loc, okPtr,
-                                                 mlir::arith::CmpIOp::create(
-                                                     b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize)));
-                auto [val, _] = emitScalarBufferComponentLoad(
-                    loc, elemTy, elemBytes, ptr, dataBase, isReserved, inBounds, cOff);
-                mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), val);
-                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
+    std::pair<mlir::Value, mlir::Value> emitReservedElemLoad(
+        mlir::OpBuilder& rb,
+        mlir::Location rloc,
+        mlir::Type elemTy,
+        uint32_t elemBytes,
+        mlir::Value descP,
+        mlir::Value tileTablePtr,
+        mlir::Value inBounds,
+        mlir::Value cOff) {
+        auto makeZero = [&](mlir::OpBuilder& zb, mlir::Location zloc) -> mlir::Value {
+            if (mlir::isa<mlir::FloatType>(elemTy)) {
+                auto ft = llvm::cast<mlir::FloatType>(elemTy);
+                return mlir::arith::ConstantFloatOp::create(
+                    zb, zloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
             }
-            setMapped(call.getResult(), outSt);
-            return true;
-        }
-
-        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
-        SimdVal outSt;
-        outSt.kind = SimdVal::Kind::Struct;
-        outSt.origType = st;
-        const unsigned numFields = static_cast<unsigned>(st.getBody().size());
-        llvm::SmallVector<mlir::Value, 8> fieldVecs(numFields, mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
-        for (uint32_t l = 0; l < W_; ++l) {
-            mlir::Value ptr = laneValue(loc, h, l);
-            mlir::Value dataBase = h.isRootConstants ? ptr : loadDescBasePtr(loc, ptr);
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value ok = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, dataBase, nullP);
-            mlir::Value isReserved = h.isRootConstants ? cInt(loc, i1Ty(), 0) : isDescReservedBuffer(loc, ptr);
-            mlir::Value byteSize = h.isRootConstants
-                                       ? cInt(loc, i64Ty(), UINT64_MAX)
-                                       : loadDescU64Field(loc, ptr, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-            mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), idxL);
-            mlir::Value off64 = isLegacy ? mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16)) : idx64;
-            for (unsigned f = 0; f < st.getBody().size(); ++f) {
-                mlir::Value cOff = mlir::arith::AddIOp::create(b_, loc, off64, cInt(loc, i64Ty(), f * elemBytes));
-                mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
-                mlir::Value inBounds = h.isRootConstants
-                                           ? ok
-                                           : mlir::Value(mlir::arith::AndIOp::create(
-                                                 b_, loc, ok,
-                                                 mlir::arith::CmpIOp::create(
-                                                     b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize)));
-                auto [val, _] = emitScalarBufferComponentLoad(
-                    loc, elemTy, elemBytes, ptr, dataBase, isReserved, inBounds, cOff);
-                fieldVecs[f] = mlir::vector::InsertOp::create(b_, loc, val, fieldVecs[f], static_cast<int64_t>(l));
-            }
-        }
-        for (unsigned f = 0; f < numFields; ++f) {
-            outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, fieldVecs[f], {}, {}});
-        }
-        setMapped(call.getResult(), outSt);
-        return true;
+            return mlir::arith::ConstantIntOp::create(zb, zloc, elemTy, 0);
+        };
+        auto loadIf = mlir::scf::IfOp::create(
+            rb, rloc, inBounds,
+            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                mlir::Value ep = resolveReservedBufferElemPtr(tb, tloc, descP, tileTablePtr, cOff, elemBytes);
+                mlir::Value nullP = mlir::LLVM::ZeroOp::create(tb, tloc, ptrTy());
+                mlir::Value mapped = mlir::LLVM::ICmpOp::create(
+                    tb, tloc, mlir::LLVM::ICmpPredicate::ne, ep, nullP);
+                mlir::Value v =
+                    mlir::scf::IfOp::create(
+                        tb, tloc, mapped,
+                        [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                            mlir::scf::YieldOp::create(
+                                lb, lloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(lb, lloc, elemTy, ep)});
+                        },
+                        [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                            mlir::scf::YieldOp::create(lb, lloc, mlir::ValueRange{makeZero(lb, lloc)});
+                        })
+                        .getResult(0);
+                mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{v, mapped});
+            },
+            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                mlir::Value t = mlir::arith::ConstantIntOp::create(tb, tloc, i1Ty(), 1);
+                mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{makeZero(tb, tloc), t});
+            });
+        return {loadIf.getResult(0), loadIf.getResult(1)};
     }
 
-    // Computes per-lane buffer element base byte offset
-    mlir::Value computeBufferByteOffset(
-        mlir::Location loc, mlir::OpBuilder& nb, const SimdVal& h, mlir::Value descPtr,
+    void emitReservedElemStore(
+        mlir::OpBuilder& rb,
+        mlir::Location rloc,
+        uint32_t elemBytes,
+        mlir::Value descP,
+        mlir::Value tileTablePtr,
+        mlir::Value doStore,
+        mlir::Value cOff,
+        mlir::Value valScalar) {
+        mlir::scf::IfOp::create(rb, rloc, doStore, [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+            mlir::Value ep = resolveReservedBufferElemPtr(tb, tloc, descP, tileTablePtr, cOff, elemBytes);
+            mlir::Value nullP = mlir::LLVM::ZeroOp::create(tb, tloc, ptrTy());
+            mlir::Value mapped = mlir::LLVM::ICmpOp::create(
+                tb, tloc, mlir::LLVM::ICmpPredicate::ne, ep, nullP);
+            mlir::scf::IfOp::create(tb, tloc, mapped, [&](mlir::OpBuilder& sb, mlir::Location sloc) {
+                mlir::LLVM::StoreOp::create(sb, sloc, valScalar, ep);
+                mlir::scf::YieldOp::create(sb, sloc);
+            });
+            mlir::scf::YieldOp::create(tb, tloc);
+        });
+    }
+
+    mlir::Value computeBufferByteOffsetScalar(
+        mlir::Location loc, mlir::OpBuilder& nb, const SimdVal& h, mlir::Value stride64,
         mlir::Value idxL, mlir::Value elemOffL, bool isRawOp, bool hasElemOff) {
-        auto ci = [&](uint64_t v) { return mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), v); };
-        auto loadStride64 = [&]() -> mlir::Value {
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(nb, loc, ptrTy());
-            mlir::Value isNull = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::eq, descPtr, nullP);
-            mlir::Value s32 = mlir::scf::IfOp::create(
-                                  nb, loc, isNull,
-                                  [&](mlir::OpBuilder& ib, mlir::Location iloc) {
-                                      mlir::scf::YieldOp::create(
-                                          ib, iloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)});
-                                  },
-                                  [&](mlir::OpBuilder& ib, mlir::Location iloc) {
-                                      mlir::Value sp = mlir::LLVM::GEPOp::create(
-                                          ib, iloc, ptrTy(), i8Ty(), descPtr,
-                                          llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
-                                      auto strideVal = mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), sp);
-                                      strideVal.setInvariant(true);
-                                      mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{strideVal});
-                                  })
-                                  .getResult(0);
-            return mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), s32);
-        };
         mlir::Value idx64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), idxL);
         if (isRawOp) {
-            if (!hasElemOff) {
-                return idx64; // ByteAddressBuffer: index IS byte offset
-            }
-            // StructuredBuffer: idx * stride + elemOff
-            mlir::Value strideVal = (h.stride > 0) ? ci(h.stride) : loadStride64();
+            if (!hasElemOff) return idx64;
             mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
-            return mlir::arith::AddIOp::create(nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, strideVal), e64);
+            return mlir::arith::AddIOp::create(
+                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, stride64), e64);
         }
-        // Legacy bufferLoad/bufferStore (68/69)
         if (hasElemOff) {
-            mlir::Value strideVal = (h.stride > 0) ? ci(h.stride) : loadStride64();
             mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
-            return mlir::arith::AddIOp::create(nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, strideVal), e64);
+            return mlir::arith::AddIOp::create(
+                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, stride64), e64);
         }
-        if (h.resourceKind == 11) {
-            return idx64; // RawBuffer
-        }
-        // Typed buffer: idx * desc.elem_stride
-        return mlir::arith::MulIOp::create(nb, loc, idx64, loadStride64());
+        if (h.resourceKind == 11) return idx64;
+        return mlir::arith::MulIOp::create(nb, loc, idx64, stride64);
     }
 
     bool tryGetUniformScalar(mlir::Location loc, mlir::Value origVal, mlir::Value& outScalar) {
@@ -2721,35 +2754,155 @@ private:
         return false;
     }
 
-    std::pair<mlir::Value, mlir::Value> emitUniformBufferComponentLoad(
+    std::pair<llvm::SmallVector<mlir::Value, 16>, mlir::Value> emitCoalescedUniformBufferLoad(
         mlir::Location loc,
         mlir::Type elemTy,
         uint32_t elemBytes,
-        mlir::Value descP,
-        mlir::Value basePtr,
-        mlir::Value isReserved,
-        mlir::Value byteSize,
-        mlir::Value okPtr,
+        const BufferDescInfo& info,
+        bool isRootConstants,
+        bool nonStraddling,
         mlir::Value byteOff,
-        mlir::Value elemStride,
-        unsigned c) {
-        mlir::Value cOff = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), c * elemBytes));
-        mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
-        mlir::Value inBounds = mlir::arith::AndIOp::create(
-            b_, loc, okPtr,
-            mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-        if (elemStride) {
-            mlir::Value elemEnd = cInt(loc, i32Ty(), (c + 1) * elemBytes);
-            mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::eq, elemStride, cInt(loc, i32Ty(), 0));
-            mlir::Value inElem = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
-            inBounds = mlir::arith::AndIOp::create(
-                b_, loc, inBounds, mlir::arith::OrIOp::create(b_, loc, strideZero, inElem));
+        unsigned totalComps,
+        llvm::ArrayRef<unsigned> activeComps) {
+        mlir::Value zeroVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
+        if (activeComps.empty()) {
+            return {llvm::SmallVector<mlir::Value, 16>(totalComps, zeroVec), splatInt(loc, i32Ty(), 1)};
         }
-        auto [val, mapped] = emitScalarBufferComponentLoad(
-            loc, elemTy, elemBytes, descP, basePtr, isReserved, inBounds, cOff);
-        return {mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), val), mapped};
+
+        auto makeScalarZero = [&](mlir::OpBuilder& zb, mlir::Location zloc) -> mlir::Value {
+            if (mlir::isa<mlir::FloatType>(elemTy)) {
+                auto ft = llvm::cast<mlir::FloatType>(elemTy);
+                return mlir::arith::ConstantFloatOp::create(
+                    zb, zloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
+            }
+            return mlir::arith::ConstantIntOp::create(zb, zloc, elemTy, 0);
+        };
+
+        auto compInBounds = [&](mlir::OpBuilder& zb, mlir::Location zloc, unsigned c) -> std::pair<mlir::Value, mlir::Value> {
+            mlir::Value cOff = (c == 0)
+                                   ? byteOff
+                                   : mlir::Value(mlir::arith::AddIOp::create(
+                                         zb, zloc, byteOff,
+                                         mlir::arith::ConstantIntOp::create(zb, zloc, i64Ty(), uint64_t(c) * elemBytes)));
+            if (isRootConstants) return {cOff, info.okPtr};
+            mlir::Value cEnd = mlir::arith::AddIOp::create(
+                zb, zloc, cOff, mlir::arith::ConstantIntOp::create(zb, zloc, i64Ty(), elemBytes));
+            mlir::Value ok = mlir::arith::AndIOp::create(
+                zb, zloc, info.okPtr,
+                mlir::arith::CmpIOp::create(zb, zloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+            if (info.elemStride) {
+                mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(zb, zloc, i32Ty(), (c + 1) * elemBytes);
+                mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                    zb, zloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
+                    mlir::arith::ConstantIntOp::create(zb, zloc, i32Ty(), 0));
+                mlir::Value inElem = mlir::arith::CmpIOp::create(
+                    zb, zloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
+                ok = mlir::arith::AndIOp::create(zb, zloc, ok, mlir::arith::OrIOp::create(zb, zloc, strideZero, inElem));
+            }
+            return {cOff, ok};
+        };
+
+        auto emitNormalScalarLoads = [&](mlir::OpBuilder& nb, mlir::Location nloc) -> llvm::SmallVector<mlir::Value, 16> {
+            auto [lastOff, fullOk] = compInBounds(nb, nloc, activeComps.back());
+            (void)lastOff;
+            auto fullIf = mlir::scf::IfOp::create(
+                nb, nloc, fullOk,
+                [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                    mlir::Value baseElemPtr = mlir::LLVM::GEPOp::create(
+                        tb, tloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{byteOff});
+                    llvm::SmallVector<mlir::Value, 16> vals;
+                    vals.reserve(activeComps.size());
+                    for (unsigned c : activeComps) {
+                        mlir::Value ep = (c == 0)
+                                             ? baseElemPtr
+                                             : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                   tb, tloc, ptrTy(), i8Ty(), baseElemPtr,
+                                                   llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                        vals.push_back(mlir::LLVM::LoadOp::create(tb, tloc, elemTy, ep));
+                    }
+                    mlir::scf::YieldOp::create(tb, tloc, vals);
+                },
+                [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                    if (activeComps.size() == 1 || nonStraddling || isRootConstants) {
+                        llvm::SmallVector<mlir::Value, 16> zeros(activeComps.size(), makeScalarZero(eb, eloc));
+                        mlir::scf::YieldOp::create(eb, eloc, zeros);
+                        return;
+                    }
+                    auto [firstOff, firstOk] = compInBounds(eb, eloc, activeComps.front());
+                    auto partialIf = mlir::scf::IfOp::create(
+                        eb, eloc, firstOk,
+                        [&](mlir::OpBuilder& pb, mlir::Location ploc) {
+                            llvm::SmallVector<mlir::Value, 16> vals;
+                            vals.reserve(activeComps.size());
+                            mlir::Value ep0 = mlir::LLVM::GEPOp::create(
+                                pb, ploc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{firstOff});
+                            vals.push_back(mlir::LLVM::LoadOp::create(pb, ploc, elemTy, ep0));
+                            for (size_t idx = 1; idx + 1 < activeComps.size(); ++idx) {
+                                auto [mOff, mOk] = compInBounds(pb, ploc, activeComps[idx]);
+                                mlir::Value mv =
+                                    mlir::scf::IfOp::create(
+                                        pb, ploc, mOk,
+                                        [&](mlir::OpBuilder& mb, mlir::Location mloc) {
+                                            mlir::Value mep = mlir::LLVM::GEPOp::create(
+                                                mb, mloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{mOff});
+                                            mlir::scf::YieldOp::create(
+                                                mb, mloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(mb, mloc, elemTy, mep)});
+                                        },
+                                        [&](mlir::OpBuilder& mb, mlir::Location mloc) {
+                                            mlir::scf::YieldOp::create(mb, mloc, mlir::ValueRange{makeScalarZero(mb, mloc)});
+                                        })
+                                        .getResult(0);
+                                vals.push_back(mv);
+                            }
+                            vals.push_back(makeScalarZero(pb, ploc));
+                            mlir::scf::YieldOp::create(pb, ploc, vals);
+                        },
+                        [&](mlir::OpBuilder& pb, mlir::Location ploc) {
+                            llvm::SmallVector<mlir::Value, 16> zeros(activeComps.size(), makeScalarZero(pb, ploc));
+                            mlir::scf::YieldOp::create(pb, ploc, zeros);
+                        });
+                    mlir::scf::YieldOp::create(eb, eloc, partialIf.getResults());
+                });
+            return llvm::SmallVector<mlir::Value, 16>(fullIf.getResults().begin(), fullIf.getResults().end());
+        };
+
+        llvm::SmallVector<mlir::Value, 16> outVecs(totalComps, zeroVec);
+        if (isRootConstants) {
+            auto scalars = emitNormalScalarLoads(b_, loc);
+            for (size_t i = 0; i < activeComps.size(); ++i) {
+                outVecs[activeComps[i]] = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), scalars[i]);
+            }
+            return {outVecs, splatInt(loc, i32Ty(), 1)};
+        }
+
+        auto ifRes = mlir::scf::IfOp::create(
+            b_, loc, info.isReserved,
+            [&](mlir::OpBuilder& rb, mlir::Location rloc) {
+                mlir::Value allMapped = mlir::arith::ConstantIntOp::create(rb, rloc, i1Ty(), 1);
+                llvm::SmallVector<mlir::Value, 17> yielded;
+                yielded.reserve(activeComps.size() + 1);
+                for (unsigned c : activeComps) {
+                    auto [cOff, ok] = compInBounds(rb, rloc, c);
+                    auto [v, mapped] = emitReservedElemLoad(
+                        rb, rloc, elemTy, elemBytes, info.descP, info.basePtr, ok, cOff);
+                    allMapped = mlir::arith::AndIOp::create(rb, rloc, allMapped, mapped);
+                    yielded.push_back(v);
+                }
+                yielded.push_back(mlir::arith::ExtUIOp::create(rb, rloc, i32Ty(), allMapped));
+                mlir::scf::YieldOp::create(rb, rloc, yielded);
+            },
+            [&](mlir::OpBuilder& rb, mlir::Location rloc) {
+                auto vals = emitNormalScalarLoads(rb, rloc);
+                vals.push_back(mlir::arith::ConstantIntOp::create(rb, rloc, i32Ty(), 1));
+                mlir::scf::YieldOp::create(rb, rloc, vals);
+            });
+
+        for (size_t i = 0; i < activeComps.size(); ++i) {
+            outVecs[activeComps[i]] = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), ifRes.getResult(i));
+        }
+        mlir::Value statusVec = mlir::vector::BroadcastOp::create(
+            b_, loc, vecTy(i32Ty()), ifRes.getResult(activeComps.size()));
+        return {outVecs, statusVec};
     }
 
     mlir::Value computeBufferByteOffsetVec(
@@ -2771,23 +2924,19 @@ private:
         return mlir::arith::MulIOp::create(nb, loc, idx64Vec, stride64Vec);
     }
 
-    std::pair<mlir::Value, mlir::Value> computeBufferComponentBoundsVec(
+    mlir::Value computeBufferBoundsMaskVec(
         mlir::Location loc, mlir::OpBuilder& nb, mlir::Value byteOffVec, mlir::Value byteSizeVec,
         mlir::Value okPtrVec, mlir::Value elemStrideOkVec, uint32_t c, uint32_t elemBytes) {
-        auto splatI64 = [&](uint64_t v) {
-            return mlir::arith::ConstantOp::create(
-                nb, loc, mlir::DenseElementsAttr::get(vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), v)));
-        };
-        mlir::Value cOffVec = (c == 0) ? byteOffVec
-                                       : mlir::Value(mlir::arith::AddIOp::create(nb, loc, byteOffVec, splatI64(uint64_t(c) * elemBytes)));
-        mlir::Value cEndVec = mlir::arith::AddIOp::create(nb, loc, cOffVec, splatI64(elemBytes));
+        mlir::Value endBytesSplat = mlir::arith::ConstantOp::create(
+            nb, loc, mlir::DenseElementsAttr::get(vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c + 1) * elemBytes)));
+        mlir::Value cEndVec = mlir::arith::AddIOp::create(nb, loc, byteOffVec, endBytesSplat);
         mlir::Value inBoundsVec = mlir::arith::AndIOp::create(
             nb, loc, okPtrVec,
             mlir::arith::CmpIOp::create(nb, loc, mlir::arith::CmpIPredicate::ule, cEndVec, byteSizeVec));
         if (elemStrideOkVec) {
             inBoundsVec = mlir::arith::AndIOp::create(nb, loc, inBoundsVec, elemStrideOkVec);
         }
-        return {cOffVec, inBoundsVec};
+        return inBoundsVec;
     }
 
     std::pair<mlir::Value, mlir::Value> checkContiguousByteOffsets(
@@ -2835,6 +2984,723 @@ private:
         return mlir::arith::OrIOp::create(nb, loc, strideZero, inElem);
     }
 
+    bool packetizeCBufferLoad(mlir::LLVM::CallOp call, bool isLegacy, std::string& outError) {
+        mlir::Location loc = call.getLoc();
+        SimdVal h = getMapped(loc, call.getOperand(1));
+        mlir::Value idxArg = call.getOperand(2);
+        auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(call.getResult().getType());
+        if (!st) {
+            outError = "cbufferLoad expected struct return type";
+            return false;
+        }
+        const unsigned numFields = static_cast<unsigned>(st.getBody().size());
+        mlir::Type elemTy = st.getBody()[0];
+        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+
+        uint32_t usedMask = 0;
+        bool allExtract = true;
+        for (mlir::Operation* user : call.getResult().getUsers()) {
+            if (auto ev = llvm::dyn_cast<mlir::LLVM::ExtractValueOp>(user)) {
+                auto pos = ev.getPosition();
+                if (!pos.empty() && pos[0] >= 0 && pos[0] < 32) {
+                    usedMask |= (1u << static_cast<uint32_t>(pos[0]));
+                    continue;
+                }
+            }
+            allExtract = false;
+            break;
+        }
+        if (!allExtract) {
+            usedMask = (numFields >= 32) ? UINT32_MAX : ((1u << numFields) - 1u);
+        }
+        llvm::SmallVector<unsigned, 8> activeComps;
+        for (unsigned f = 0; f < numFields; ++f) {
+            if (f >= 32 || (usedMask & (1u << f)) != 0) activeComps.push_back(f);
+        }
+
+        mlir::Value uniformIdx;
+        if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx)) {
+            mlir::Value byteOff;
+            if (auto idxConst = getConstIntValue(idxArg)) {
+                byteOff = cInt(loc, i64Ty(), isLegacy ? (*idxConst * 16) : *idxConst);
+            } else {
+                mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), uniformIdx);
+                byteOff = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
+            }
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
+            auto [compVecs, _] = emitCoalescedUniformBufferLoad(
+                loc, elemTy, elemBytes, info, h.isRootConstants, /*nonStraddling=*/false, byteOff, numFields, activeComps);
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = st;
+            for (unsigned f = 0; f < numFields; ++f) {
+                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, compVecs[f], {}, {}});
+            }
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+
+        mlir::Value zeroElemVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
+        SimdVal outSt;
+        outSt.kind = SimdVal::Kind::Struct;
+        outSt.origType = st;
+        if (activeComps.empty()) {
+            for (unsigned f = 0; f < numFields; ++f) {
+                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, zeroElemVec, {}, {}});
+            }
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+
+        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
+        if (h.isUniform()) {
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
+            mlir::Value idx64Vec = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i64Ty()), idxVec);
+            mlir::Value off64Vec = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64Vec, splatInt(loc, i64Ty(), 16))) : idx64Vec;
+
+            auto emitGatherCBuffer = [&](mlir::OpBuilder& gb, mlir::Location gloc) -> llvm::SmallVector<mlir::Value, 8> {
+                mlir::Value okPtrVec = mlir::vector::BroadcastOp::create(gb, gloc, vecTy(i1Ty()), info.okPtr);
+                mlir::Value byteSizeVec = h.isRootConstants
+                                              ? mlir::Value()
+                                              : mlir::Value(mlir::vector::BroadcastOp::create(gb, gloc, vecTy(i64Ty()), info.byteSize));
+                llvm::SmallVector<mlir::Value, 8> gathered;
+                gathered.reserve(activeComps.size());
+                for (unsigned f : activeComps) {
+                    mlir::Value inBoundsVec = h.isRootConstants
+                                                  ? okPtrVec
+                                                  : computeBufferBoundsMaskVec(
+                                                        gloc, gb, off64Vec, byteSizeVec, okPtrVec, mlir::Value(), f, elemBytes);
+                    mlir::Value compBase = (f == 0)
+                                               ? info.basePtr
+                                               : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                     gb, gloc, ptrTy(), i8Ty(), info.basePtr,
+                                                     llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(f * elemBytes)}));
+                    mlir::Value ptrs = mlir::LLVM::GEPOp::create(
+                        gb, gloc, vecTy(ptrTy()), i8Ty(), compBase, mlir::ValueRange{off64Vec});
+                    gathered.push_back(mlir::LLVM::masked_gather::create(
+                        gb, gloc, vecTy(elemTy), ptrs, inBoundsVec, mlir::ValueRange{zeroElemVec}, /*alignment=*/1));
+                }
+                return gathered;
+            };
+
+            llvm::SmallVector<mlir::Value, 8> activeVecs;
+            if (h.isRootConstants) {
+                activeVecs = emitGatherCBuffer(b_, loc);
+            } else {
+                auto ifRes = mlir::scf::IfOp::create(
+                    b_, loc, info.isReserved,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
+                        mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
+                        mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                        llvm::SmallVector<mlir::Value, 8> initArgs(activeComps.size(), zeroElemVec);
+                        auto loop = mlir::scf::ForOp::create(
+                            nb, nloc, c0, cW, c1, initArgs,
+                            [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
+                                mlir::Value offL = mlir::vector::ExtractOp::create(lb, lloc, off64Vec, mlir::OpFoldResult{lIdx});
+                                llvm::SmallVector<mlir::Value, 8> nextArgs(iterArgs.begin(), iterArgs.end());
+                                for (size_t i = 0; i < activeComps.size(); ++i) {
+                                    unsigned f = activeComps[i];
+                                    mlir::Value cOff = (f == 0)
+                                                           ? offL
+                                                           : mlir::Value(mlir::arith::AddIOp::create(
+                                                                 lb, lloc, offL,
+                                                                 mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(f) * elemBytes)));
+                                    mlir::Value cEnd = mlir::arith::AddIOp::create(
+                                        lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
+                                    mlir::Value inBounds = mlir::arith::AndIOp::create(
+                                        lb, lloc, info.okPtr,
+                                        mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                    auto [val, _] = emitReservedElemLoad(
+                                        lb, lloc, elemTy, elemBytes, info.descP, info.basePtr, inBounds, cOff);
+                                    nextArgs[i] = mlir::vector::InsertOp::create(lb, lloc, val, nextArgs[i], mlir::OpFoldResult{lIdx});
+                                }
+                                mlir::scf::YieldOp::create(lb, lloc, nextArgs);
+                            });
+                        mlir::scf::YieldOp::create(nb, nloc, loop.getResults());
+                    },
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::scf::YieldOp::create(nb, nloc, emitGatherCBuffer(nb, nloc));
+                    });
+                activeVecs.assign(ifRes.getResults().begin(), ifRes.getResults().end());
+            }
+
+            llvm::SmallVector<mlir::Value, 8> fieldVecs(numFields, zeroElemVec);
+            for (size_t i = 0; i < activeComps.size(); ++i) fieldVecs[activeComps[i]] = activeVecs[i];
+            for (unsigned f = 0; f < numFields; ++f) {
+                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, fieldVecs[f], {}, {}});
+            }
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+
+        llvm::SmallVector<mlir::Value, 8> fieldVecs(numFields, zeroElemVec);
+        for (uint32_t l = 0; l < W_; ++l) {
+            mlir::Value ptr = laneValue(loc, h, l);
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, ptr, /*needElemStride=*/false, /*needStride64=*/false);
+            mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
+            mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), idxL);
+            mlir::Value off64 = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
+            for (unsigned f : activeComps) {
+                mlir::Value cOff = (f == 0) ? off64 : mlir::Value(mlir::arith::AddIOp::create(b_, loc, off64, cInt(loc, i64Ty(), uint64_t(f) * elemBytes)));
+                mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
+                mlir::Value inBounds = h.isRootConstants
+                                           ? info.okPtr
+                                           : mlir::Value(mlir::arith::AndIOp::create(
+                                                 b_, loc, info.okPtr,
+                                                 mlir::arith::CmpIOp::create(
+                                                     b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize)));
+                auto [val, _] = emitScalarBufferComponentLoad(
+                    loc, elemTy, elemBytes, ptr, info.basePtr, info.isReserved, inBounds, cOff);
+                fieldVecs[f] = mlir::vector::InsertOp::create(b_, loc, val, fieldVecs[f], static_cast<int64_t>(l));
+            }
+        }
+        for (unsigned f = 0; f < numFields; ++f) {
+            outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, fieldVecs[f], {}, {}});
+        }
+        setMapped(call.getResult(), outSt);
+        return true;
+    }
+
+    std::pair<llvm::SmallVector<mlir::Value, 16>, mlir::Value> emitPacketizedBufferLoads(
+        mlir::Location loc,
+        const SimdVal& h,
+        mlir::Value idxArg,
+        mlir::Value elemOffArg,
+        bool hasElemOff,
+        bool isRawOp,
+        mlir::Type elemTy,
+        unsigned totalComps,
+        llvm::ArrayRef<unsigned> activeComps) {
+        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+        mlir::Value zeroElemVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
+        if (activeComps.empty()) {
+            return {llvm::SmallVector<mlir::Value, 16>(totalComps, zeroElemVec), splatInt(loc, i32Ty(), 1)};
+        }
+
+        bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
+        bool needsStride = hasElemOff || (!isRawOp && h.resourceKind != 11);
+        auto elemOffConst = hasElemOff ? getConstIntValue(elemOffArg) : std::optional<uint64_t>{};
+        unsigned lastActiveComp = activeComps.back();
+        bool nonStraddling = hasElemOff && h.resourceKind == 12 && h.stride > 0 && elemOffConst.has_value() &&
+                             (*elemOffConst + uint64_t(lastActiveComp + 1) * elemBytes <= h.stride);
+
+        mlir::Value uniformIdx;
+        mlir::Value uniformElemOff;
+        bool isUniformIdx = tryGetUniformScalar(loc, idxArg, uniformIdx);
+        bool isUniformElemOff = !hasElemOff || tryGetUniformScalar(loc, elemOffArg, uniformElemOff);
+        if (h.isUniform() && isUniformIdx && isUniformElemOff) {
+            if (!hasElemOff) uniformElemOff = cInt(loc, i32Ty(), 0);
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], hasElemStride, needsStride);
+            mlir::Value byteOff = computeBufferByteOffsetScalar(
+                loc, b_, h, info.stride64, uniformIdx, uniformElemOff, isRawOp, hasElemOff);
+            return emitCoalescedUniformBufferLoad(
+                loc, elemTy, elemBytes, info, h.isRootConstants, nonStraddling, byteOff, totalComps, activeComps);
+        }
+
+        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
+        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
+
+        if (h.isUniform()) {
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], hasElemStride, needsStride);
+            mlir::Value stride64Vec = needsStride
+                                          ? mlir::Value(mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), info.stride64))
+                                          : mlir::Value();
+
+            auto ifRes = mlir::scf::IfOp::create(
+                b_, loc, info.isReserved,
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
+                    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
+                    mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                    llvm::SmallVector<mlir::Value, 17> initArgs(activeComps.size(), zeroElemVec);
+                    initArgs.push_back(mlir::arith::ConstantOp::create(
+                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                    auto loop = mlir::scf::ForOp::create(
+                        nb, nloc, c0, cW, c1, initArgs,
+                        [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
+                            mlir::Value idxL = mlir::vector::ExtractOp::create(lb, lloc, idxVec, mlir::OpFoldResult{lIdx});
+                            mlir::Value eL = hasElemOff
+                                                 ? mlir::Value(mlir::vector::ExtractOp::create(lb, lloc, elemOffVec, mlir::OpFoldResult{lIdx}))
+                                                 : mlir::Value(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                            mlir::Value byteOff = computeBufferByteOffsetScalar(
+                                lloc, lb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
+                            mlir::Value laneMapped = mlir::arith::ConstantIntOp::create(lb, lloc, i1Ty(), 1);
+                            llvm::SmallVector<mlir::Value, 17> nextArgs(iterArgs.begin(), iterArgs.end());
+                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                unsigned c = activeComps[i];
+                                mlir::Value cOff = (c == 0)
+                                                       ? byteOff
+                                                       : mlir::Value(mlir::arith::AddIOp::create(
+                                                             lb, lloc, byteOff,
+                                                             mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(c) * elemBytes)));
+                                mlir::Value cEnd = mlir::arith::AddIOp::create(
+                                    lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
+                                mlir::Value inBounds = mlir::arith::AndIOp::create(
+                                    lb, lloc, info.okPtr,
+                                    mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                if (info.elemStride) {
+                                    mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), (c + 1) * elemBytes);
+                                    mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                                        lb, lloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
+                                        mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                                    mlir::Value inElem = mlir::arith::CmpIOp::create(
+                                        lb, lloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
+                                    inBounds = mlir::arith::AndIOp::create(
+                                        lb, lloc, inBounds, mlir::arith::OrIOp::create(lb, lloc, strideZero, inElem));
+                                }
+                                auto [val, compMapped] = emitReservedElemLoad(
+                                    lb, lloc, elemTy, elemBytes, info.descP, info.basePtr, inBounds, cOff);
+                                laneMapped = mlir::arith::AndIOp::create(lb, lloc, laneMapped, compMapped);
+                                nextArgs[i] = mlir::vector::InsertOp::create(lb, lloc, val, nextArgs[i], mlir::OpFoldResult{lIdx});
+                            }
+                            mlir::Value laneStatus = mlir::arith::ExtUIOp::create(lb, lloc, i32Ty(), laneMapped);
+                            nextArgs[activeComps.size()] = mlir::vector::InsertOp::create(
+                                lb, lloc, laneStatus, nextArgs[activeComps.size()], mlir::OpFoldResult{lIdx});
+                            mlir::scf::YieldOp::create(lb, lloc, nextArgs);
+                        });
+                    mlir::scf::YieldOp::create(nb, nloc, loop.getResults());
+                },
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::Value byteOffVec = computeBufferByteOffsetVec(
+                        nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
+                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), info.byteSize);
+                    mlir::Value okPtrVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), info.okPtr);
+
+                    llvm::SmallVector<mlir::Value, 16> inBounds(activeComps.size());
+                    if (nonStraddling) {
+                        mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, info.elemStride, lastActiveComp, elemBytes);
+                        mlir::Value sharedMask = computeBufferBoundsMaskVec(
+                            nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, lastActiveComp, elemBytes);
+                        for (size_t i = 0; i < activeComps.size(); ++i) inBounds[i] = sharedMask;
+                    } else {
+                        for (size_t i = 0; i < activeComps.size(); ++i) {
+                            unsigned c = activeComps[i];
+                            mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, info.elemStride, c, elemBytes);
+                            inBounds[i] = computeBufferBoundsMaskVec(
+                                nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, c, elemBytes);
+                        }
+                    }
+
+                    auto emitGatherLoads = [&](mlir::OpBuilder& gb, mlir::Location gloc) -> llvm::SmallVector<mlir::Value, 16> {
+                        llvm::SmallVector<mlir::Value, 16> gathered;
+                        gathered.reserve(activeComps.size());
+                        for (size_t i = 0; i < activeComps.size(); ++i) {
+                            unsigned c = activeComps[i];
+                            mlir::Value compBase = (c == 0)
+                                                       ? info.basePtr
+                                                       : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                             gb, gloc, ptrTy(), i8Ty(), info.basePtr,
+                                                             llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                            mlir::Value ptrs = mlir::LLVM::GEPOp::create(
+                                gb, gloc, vecTy(ptrTy()), i8Ty(), compBase, mlir::ValueRange{byteOffVec});
+                            gathered.push_back(mlir::LLVM::masked_gather::create(
+                                gb, gloc, vecTy(elemTy), ptrs, inBounds[i], mlir::ValueRange{zeroElemVec}, /*alignment=*/1));
+                        }
+                        return gathered;
+                    };
+
+                    bool canBeContig = !(W_ > 1 && ((hasElemOff && h.stride > elemBytes && isUniformElemOff) || activeComps.size() > 4));
+                    llvm::SmallVector<mlir::Value, 17> out;
+                    out.reserve(activeComps.size() + 1);
+                    if (canBeContig) {
+                        auto [isContig, lane0Off] = checkContiguousByteOffsets(nloc, nb, byteOffVec, elemBytes);
+                        auto loadIfContig = mlir::scf::IfOp::create(
+                            nb, nloc, isContig,
+                            [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                                mlir::Value baseLane0Ptr = mlir::LLVM::GEPOp::create(
+                                    cb, cloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{lane0Off});
+                                llvm::SmallVector<mlir::Value, 16> contigOut;
+                                contigOut.reserve(activeComps.size());
+                                for (size_t i = 0; i < activeComps.size(); ++i) {
+                                    unsigned c = activeComps[i];
+                                    mlir::Value ptr0 = (c == 0)
+                                                           ? baseLane0Ptr
+                                                           : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                                 cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
+                                                                 llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                                    contigOut.push_back(mlir::LLVM::MaskedLoadOp::create(
+                                        cb, cloc, vecTy(elemTy), ptr0, inBounds[i], zeroElemVec, /*alignment=*/1));
+                                }
+                                mlir::scf::YieldOp::create(cb, cloc, contigOut);
+                            },
+                            [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                                mlir::scf::YieldOp::create(cb, cloc, emitGatherLoads(cb, cloc));
+                            });
+                        out.assign(loadIfContig.getResults().begin(), loadIfContig.getResults().end());
+                    } else {
+                        out = emitGatherLoads(nb, nloc);
+                    }
+                    out.push_back(mlir::arith::ConstantOp::create(
+                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                    mlir::scf::YieldOp::create(nb, nloc, out);
+                });
+
+            llvm::SmallVector<mlir::Value, 16> compVecs(totalComps, zeroElemVec);
+            for (size_t i = 0; i < activeComps.size(); ++i) {
+                compVecs[activeComps[i]] = ifRes.getResult(i);
+            }
+            return {compVecs, ifRes.getResult(activeComps.size())};
+        }
+
+        llvm::SmallVector<BufferDescInfo, 16> descInfos(W_);
+        mlir::Value basePtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
+        mlir::Value byteSizeVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
+        mlir::Value okPtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
+        mlir::Value isReservedVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
+        mlir::Value stride64Vec = needsStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()))) : mlir::Value();
+        mlir::Value elemStrideVec = hasElemStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()))) : mlir::Value();
+
+        for (uint32_t l = 0; l < W_; ++l) {
+            mlir::Value descP = laneValue(loc, h, l);
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, descP, hasElemStride, needsStride);
+            descInfos[l] = info;
+            basePtrVec = mlir::vector::InsertOp::create(b_, loc, info.basePtr, basePtrVec, static_cast<int64_t>(l));
+            byteSizeVec = mlir::vector::InsertOp::create(b_, loc, info.byteSize, byteSizeVec, static_cast<int64_t>(l));
+            okPtrVec = mlir::vector::InsertOp::create(b_, loc, info.okPtr, okPtrVec, static_cast<int64_t>(l));
+            isReservedVec = mlir::vector::InsertOp::create(b_, loc, info.isReserved, isReservedVec, static_cast<int64_t>(l));
+            if (hasElemStride) {
+                elemStrideVec = mlir::vector::InsertOp::create(b_, loc, info.elemStride, elemStrideVec, static_cast<int64_t>(l));
+            }
+            if (needsStride) {
+                stride64Vec = mlir::vector::InsertOp::create(b_, loc, info.stride64, stride64Vec, static_cast<int64_t>(l));
+            }
+        }
+        mlir::Value anyReserved = orReduce(loc, isReservedVec);
+        auto ifRes = mlir::scf::IfOp::create(
+            b_, loc, anyReserved,
+            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                llvm::SmallVector<mlir::Value, 17> activeVecs(
+                    activeComps.size(), mlir::LLVM::PoisonOp::create(nb, nloc, vecTy(elemTy)));
+                mlir::Value statusVec = tmp.splatInt(nloc, i32Ty(), 1);
+                for (uint32_t l = 0; l < W_; ++l) {
+                    const BufferDescInfo& info = descInfos[l];
+                    mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
+                    mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
+                    mlir::Value byteOff = tmp.computeBufferByteOffsetScalar(
+                        nloc, nb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
+                    mlir::Value laneMapped = tmp.cInt(nloc, i1Ty(), 1);
+                    for (size_t i = 0; i < activeComps.size(); ++i) {
+                        unsigned c = activeComps[i];
+                        mlir::Value cOff = (c == 0)
+                                               ? byteOff
+                                               : mlir::Value(mlir::arith::AddIOp::create(
+                                                     nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), uint64_t(c) * elemBytes)));
+                        mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
+                        mlir::Value inBounds = mlir::arith::AndIOp::create(
+                            nb, nloc, info.okPtr,
+                            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                        if (info.elemStride) {
+                            mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
+                            mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                                nb, nloc, mlir::arith::CmpIPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
+                            mlir::Value inElem = mlir::arith::CmpIOp::create(
+                                nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
+                            inBounds = mlir::arith::AndIOp::create(
+                                nb, nloc, inBounds, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
+                        }
+                        auto [val, compMapped] = tmp.emitScalarBufferComponentLoad(
+                            nloc, elemTy, elemBytes, info.descP, info.basePtr, info.isReserved, inBounds, cOff);
+                        laneMapped = mlir::arith::AndIOp::create(nb, nloc, laneMapped, compMapped);
+                        activeVecs[i] = mlir::vector::InsertOp::create(nb, nloc, val, activeVecs[i], static_cast<int64_t>(l));
+                    }
+                    mlir::Value laneStatus = mlir::arith::ExtUIOp::create(nb, nloc, i32Ty(), laneMapped);
+                    statusVec = mlir::vector::InsertOp::create(nb, nloc, laneStatus, statusVec, static_cast<int64_t>(l));
+                }
+                activeVecs.push_back(statusVec);
+                mlir::scf::YieldOp::create(nb, nloc, activeVecs);
+            },
+            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                mlir::Value byteOffVec = computeBufferByteOffsetVec(
+                    nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
+                mlir::Value sharedMask;
+                if (nonStraddling) {
+                    mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, lastActiveComp, elemBytes);
+                    sharedMask = computeBufferBoundsMaskVec(
+                        nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, lastActiveComp, elemBytes);
+                }
+                llvm::SmallVector<mlir::Value, 17> out;
+                out.reserve(activeComps.size() + 1);
+                for (size_t i = 0; i < activeComps.size(); ++i) {
+                    unsigned c = activeComps[i];
+                    mlir::Value inBoundsVec = sharedMask;
+                    if (!inBoundsVec) {
+                        mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, c, elemBytes);
+                        inBoundsVec = computeBufferBoundsMaskVec(
+                            nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, c, elemBytes);
+                    }
+                    mlir::Value cOffVec =
+                        (c == 0)
+                            ? byteOffVec
+                            : mlir::Value(mlir::arith::AddIOp::create(
+                                  nb, nloc, byteOffVec,
+                                  mlir::arith::ConstantOp::create(
+                                      nb, nloc,
+                                      mlir::DenseElementsAttr::get(
+                                          vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes)))));
+                    mlir::Value ptrs = mlir::LLVM::GEPOp::create(
+                        nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
+                    out.push_back(mlir::LLVM::masked_gather::create(
+                        nb, nloc, vecTy(elemTy), ptrs, inBoundsVec, mlir::ValueRange{zeroElemVec}, /*alignment=*/1));
+                }
+                out.push_back(mlir::arith::ConstantOp::create(
+                    nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                mlir::scf::YieldOp::create(nb, nloc, out);
+            });
+
+        llvm::SmallVector<mlir::Value, 16> compVecs(totalComps, zeroElemVec);
+        for (size_t i = 0; i < activeComps.size(); ++i) {
+            compVecs[activeComps[i]] = ifRes.getResult(i);
+        }
+        return {compVecs, ifRes.getResult(activeComps.size())};
+    }
+
+    void emitPacketizedBufferStores(
+        mlir::Location loc,
+        const SimdVal& h,
+        mlir::Value idxArg,
+        mlir::Value elemOffArg,
+        bool hasElemOff,
+        bool isRawOp,
+        mlir::Value realMask,
+        mlir::Type elemTy,
+        llvm::ArrayRef<unsigned> activeComps,
+        llvm::ArrayRef<mlir::Value> activeValVecs) {
+        if (activeComps.empty()) return;
+        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+        bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
+        bool needsStride = hasElemOff || (!isRawOp && h.resourceKind != 11);
+        auto elemOffConst = hasElemOff ? getConstIntValue(elemOffArg) : std::optional<uint64_t>{};
+        unsigned lastActiveComp = activeComps.back();
+        bool nonStraddling = hasElemOff && h.resourceKind == 12 && h.stride > 0 && elemOffConst.has_value() &&
+                             (*elemOffConst + uint64_t(lastActiveComp + 1) * elemBytes <= h.stride);
+
+        mlir::Value dummyUniformElemOff;
+        bool isUniformElemOff = !hasElemOff || tryGetUniformScalar(loc, elemOffArg, dummyUniformElemOff);
+        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
+        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
+
+        if (h.isUniform()) {
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], hasElemStride, needsStride);
+            mlir::Value stride64Vec = needsStride
+                                          ? mlir::Value(mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), info.stride64))
+                                          : mlir::Value();
+
+            mlir::scf::IfOp::create(
+                b_, loc, info.isReserved,
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
+                    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
+                    mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                    mlir::scf::ForOp::create(
+                        nb, nloc, c0, cW, c1, mlir::ValueRange{},
+                        [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange) {
+                            mlir::Value mL = mlir::vector::ExtractOp::create(lb, lloc, realMask, mlir::OpFoldResult{lIdx});
+                            mlir::Value okPtr = mlir::arith::AndIOp::create(lb, lloc, mL, info.okPtr);
+                            mlir::Value idxL = mlir::vector::ExtractOp::create(lb, lloc, idxVec, mlir::OpFoldResult{lIdx});
+                            mlir::Value eL = hasElemOff
+                                                 ? mlir::Value(mlir::vector::ExtractOp::create(lb, lloc, elemOffVec, mlir::OpFoldResult{lIdx}))
+                                                 : mlir::Value(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                            mlir::Value byteOff = computeBufferByteOffsetScalar(
+                                lloc, lb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
+                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                unsigned c = activeComps[i];
+                                mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, activeValVecs[i], mlir::OpFoldResult{lIdx});
+                                mlir::Value cOff = (c == 0)
+                                                       ? byteOff
+                                                       : mlir::Value(mlir::arith::AddIOp::create(
+                                                             lb, lloc, byteOff,
+                                                             mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(c) * elemBytes)));
+                                mlir::Value cEnd = mlir::arith::AddIOp::create(
+                                    lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
+                                mlir::Value doStore = mlir::arith::AndIOp::create(
+                                    lb, lloc, okPtr,
+                                    mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                if (info.elemStride) {
+                                    mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), (c + 1) * elemBytes);
+                                    mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                                        lb, lloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
+                                        mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                                    mlir::Value inElem = mlir::arith::CmpIOp::create(
+                                        lb, lloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
+                                    doStore = mlir::arith::AndIOp::create(
+                                        lb, lloc, doStore, mlir::arith::OrIOp::create(lb, lloc, strideZero, inElem));
+                                }
+                                emitReservedElemStore(lb, lloc, elemBytes, info.descP, info.basePtr, doStore, cOff, vL);
+                            }
+                            mlir::scf::YieldOp::create(lb, lloc);
+                        });
+                    mlir::scf::YieldOp::create(nb, nloc);
+                },
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::Value byteOffVec = computeBufferByteOffsetVec(
+                        nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
+                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), info.byteSize);
+                    mlir::Value activeOkVec = mlir::arith::AndIOp::create(
+                        nb, nloc, realMask, mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), info.okPtr));
+
+                    llvm::SmallVector<mlir::Value, 16> doStores(activeComps.size());
+                    if (nonStraddling) {
+                        mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, info.elemStride, lastActiveComp, elemBytes);
+                        mlir::Value sharedMask = computeBufferBoundsMaskVec(
+                            nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, lastActiveComp, elemBytes);
+                        for (size_t i = 0; i < activeComps.size(); ++i) doStores[i] = sharedMask;
+                    } else {
+                        for (size_t i = 0; i < activeComps.size(); ++i) {
+                            unsigned c = activeComps[i];
+                            mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, info.elemStride, c, elemBytes);
+                            doStores[i] = computeBufferBoundsMaskVec(
+                                nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, c, elemBytes);
+                        }
+                    }
+
+                    auto emitScatterStores = [&](mlir::OpBuilder& sb, mlir::Location sloc) {
+                        for (size_t i = 0; i < activeComps.size(); ++i) {
+                            unsigned c = activeComps[i];
+                            mlir::Value compBase = (c == 0)
+                                                       ? info.basePtr
+                                                       : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                             sb, sloc, ptrTy(), i8Ty(), info.basePtr,
+                                                             llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                            mlir::Value ptrs = mlir::LLVM::GEPOp::create(
+                                sb, sloc, vecTy(ptrTy()), i8Ty(), compBase, mlir::ValueRange{byteOffVec});
+                            mlir::LLVM::masked_scatter::create(
+                                sb, sloc, activeValVecs[i], ptrs, doStores[i], /*alignment=*/1);
+                        }
+                    };
+
+                    bool canBeContig = !(W_ > 1 && ((hasElemOff && h.stride > elemBytes && isUniformElemOff) || activeComps.size() > 4));
+                    if (canBeContig) {
+                        auto [isContig, lane0Off] = checkContiguousByteOffsets(nloc, nb, byteOffVec, elemBytes);
+                        mlir::scf::IfOp::create(
+                            nb, nloc, isContig,
+                            [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                                mlir::Value baseLane0Ptr = mlir::LLVM::GEPOp::create(
+                                    cb, cloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{lane0Off});
+                                for (size_t i = 0; i < activeComps.size(); ++i) {
+                                    unsigned c = activeComps[i];
+                                    mlir::Value ptr0 = (c == 0)
+                                                           ? baseLane0Ptr
+                                                           : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                                 cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
+                                                                 llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                                    mlir::LLVM::MaskedStoreOp::create(
+                                        cb, cloc, activeValVecs[i], ptr0, doStores[i], /*alignment=*/1);
+                                }
+                                mlir::scf::YieldOp::create(cb, cloc);
+                            },
+                            [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                                emitScatterStores(cb, cloc);
+                                mlir::scf::YieldOp::create(cb, cloc);
+                            });
+                    } else {
+                        emitScatterStores(nb, nloc);
+                    }
+                    mlir::scf::YieldOp::create(nb, nloc);
+                });
+            return;
+        }
+
+        llvm::SmallVector<BufferDescInfo, 16> descInfos(W_);
+        mlir::Value basePtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
+        mlir::Value byteSizeVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
+        mlir::Value okPtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
+        mlir::Value isReservedVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
+        mlir::Value stride64Vec = needsStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()))) : mlir::Value();
+        mlir::Value elemStrideVec = hasElemStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()))) : mlir::Value();
+
+        for (uint32_t l = 0; l < W_; ++l) {
+            mlir::Value descP = laneValue(loc, h, l);
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, descP, hasElemStride, needsStride);
+            descInfos[l] = info;
+            basePtrVec = mlir::vector::InsertOp::create(b_, loc, info.basePtr, basePtrVec, static_cast<int64_t>(l));
+            byteSizeVec = mlir::vector::InsertOp::create(b_, loc, info.byteSize, byteSizeVec, static_cast<int64_t>(l));
+            okPtrVec = mlir::vector::InsertOp::create(b_, loc, info.okPtr, okPtrVec, static_cast<int64_t>(l));
+            isReservedVec = mlir::vector::InsertOp::create(b_, loc, info.isReserved, isReservedVec, static_cast<int64_t>(l));
+            if (hasElemStride) {
+                elemStrideVec = mlir::vector::InsertOp::create(b_, loc, info.elemStride, elemStrideVec, static_cast<int64_t>(l));
+            }
+            if (needsStride) {
+                stride64Vec = mlir::vector::InsertOp::create(b_, loc, info.stride64, stride64Vec, static_cast<int64_t>(l));
+            }
+        }
+        mlir::Value anyReserved = orReduce(loc, isReservedVec);
+        mlir::Value activeOkVec = mlir::arith::AndIOp::create(b_, loc, realMask, okPtrVec);
+
+        mlir::scf::IfOp::create(
+            b_, loc, anyReserved,
+            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                for (uint32_t l = 0; l < W_; ++l) {
+                    const BufferDescInfo& info = descInfos[l];
+                    mlir::Value mL = mlir::vector::ExtractOp::create(nb, nloc, realMask, static_cast<int64_t>(l));
+                    mlir::Value okPtr = mlir::arith::AndIOp::create(nb, nloc, mL, info.okPtr);
+                    mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
+                    mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
+                    mlir::Value byteOff = tmp.computeBufferByteOffsetScalar(
+                        nloc, nb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
+                    for (size_t i = 0; i < activeComps.size(); ++i) {
+                        unsigned c = activeComps[i];
+                        mlir::Value vL = mlir::vector::ExtractOp::create(nb, nloc, activeValVecs[i], static_cast<int64_t>(l));
+                        mlir::Value cOff = (c == 0)
+                                               ? byteOff
+                                               : mlir::Value(mlir::arith::AddIOp::create(
+                                                     nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), uint64_t(c) * elemBytes)));
+                        mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
+                        mlir::Value doStore = mlir::arith::AndIOp::create(
+                            nb, nloc, okPtr,
+                            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                        if (info.elemStride) {
+                            mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
+                            mlir::Value strideZero = mlir::arith::CmpIOp::create(
+                                nb, nloc, mlir::arith::CmpIPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
+                            mlir::Value inElem = mlir::arith::CmpIOp::create(
+                                nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
+                            doStore = mlir::arith::AndIOp::create(
+                                nb, nloc, doStore, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
+                        }
+                        tmp.emitScalarBufferComponentStore(
+                            nloc, elemBytes, info.descP, info.basePtr, info.isReserved, doStore, cOff, vL);
+                    }
+                }
+                mlir::scf::YieldOp::create(nb, nloc);
+            },
+            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                mlir::Value byteOffVec = computeBufferByteOffsetVec(
+                    nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
+                mlir::Value sharedMask;
+                if (nonStraddling) {
+                    mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, lastActiveComp, elemBytes);
+                    sharedMask = computeBufferBoundsMaskVec(
+                        nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, lastActiveComp, elemBytes);
+                }
+                for (size_t i = 0; i < activeComps.size(); ++i) {
+                    unsigned c = activeComps[i];
+                    mlir::Value doStoreVec = sharedMask;
+                    if (!doStoreVec) {
+                        mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, c, elemBytes);
+                        doStoreVec = computeBufferBoundsMaskVec(
+                            nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, c, elemBytes);
+                    }
+                    mlir::Value cOffVec =
+                        (c == 0)
+                            ? byteOffVec
+                            : mlir::Value(mlir::arith::AddIOp::create(
+                                  nb, nloc, byteOffVec,
+                                  mlir::arith::ConstantOp::create(
+                                      nb, nloc,
+                                      mlir::DenseElementsAttr::get(
+                                          vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes)))));
+                    mlir::Value ptrs = mlir::LLVM::GEPOp::create(
+                        nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
+                    mlir::LLVM::masked_scatter::create(
+                        nb, nloc, activeValVecs[i], ptrs, doStoreVec, /*alignment=*/1);
+                }
+                mlir::scf::YieldOp::create(nb, nloc);
+            });
+    }
+
     bool packetizeBufferLoad(mlir::LLVM::CallOp call, bool isRawOp, std::string& outError) {
         mlir::Location loc = call.getLoc();
         SimdVal h = getMapped(loc, call.getOperand(1));
@@ -2849,242 +3715,46 @@ private:
             return false;
         }
         mlir::Type elemTy = st.getBody()[0];
-        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
 
-        mlir::Value uniformIdx;
-        mlir::Value uniformElemOff;
-        if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx) &&
-            (!hasElemOff || tryGetUniformScalar(loc, elemOffArg, uniformElemOff))) {
-            if (!hasElemOff) uniformElemOff = cInt(loc, i32Ty(), 0);
-            mlir::Value descP = h.lanes[0];
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
-                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
-                                         : mlir::Value();
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, uniformIdx, uniformElemOff, isRawOp, hasElemOff);
-            mlir::Value allMapped = cInt(loc, i1Ty(), 1);
-
-            SimdVal outSt;
-            outSt.kind = SimdVal::Kind::Struct;
-            outSt.origType = st;
-            for (unsigned c = 0; c < 4; ++c) {
-                if ((mask & (1u << c)) == 0) {
-                    mlir::Value z = mlir::isa<mlir::FloatType>(elemTy) ? cFlt(loc, elemTy, 0.0) : cInt(loc, elemTy, 0);
-                    outSt.fields.push_back({SimdVal::Kind::Vector, elemTy,
-                                            mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), z), {}, {}});
-                    continue;
-                }
-                auto [bvec, compMapped] = emitUniformBufferComponentLoad(
-                    loc, elemTy, elemBytes, descP, basePtr, isReserved, byteSize, okPtr, byteOff, elemStride, c);
-                allMapped = mlir::arith::AndIOp::create(b_, loc, allMapped, compMapped);
-                outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
-            }
-            mlir::Value status32 = mlir::arith::ExtUIOp::create(b_, loc, i32Ty(), allMapped);
-            mlir::Value statusVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), status32);
-            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), statusVec, {}, {}});
-            setMapped(call.getResult(), outSt);
-            return true;
-        }
-
-        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
-        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
-        mlir::Value zeroElemVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
-        bool needsStride = hasElemOff || (!isRawOp && h.resourceKind != 11);
-
-        auto emitReservedPerLaneLoad = [&](mlir::OpBuilder& nb, mlir::Location nloc) -> llvm::SmallVector<mlir::Value, 5> {
-            SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
-            llvm::SmallVector<mlir::Value, 4> compVecs(4, mlir::LLVM::PoisonOp::create(nb, nloc, vecTy(elemTy)));
-            mlir::Value statusVec = tmp.splatInt(nloc, i32Ty(), 1);
-            for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value descP = tmp.laneValue(nloc, h, l);
-                mlir::Value basePtr = tmp.loadDescBasePtr(nloc, descP);
-                mlir::Value isReserved = tmp.isDescReservedBuffer(nloc, descP);
-                mlir::Value byteSize = tmp.loadDescU64Field(nloc, descP, offsetof(NacelleDescriptor, byte_size));
-                mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
-                                             ? tmp.loadDescU32Field(nloc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
-                                             : mlir::Value();
-                mlir::Value nullP = mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy());
-                mlir::Value okPtr = mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-                mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
-                mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
-                mlir::Value byteOff = tmp.computeBufferByteOffset(nloc, nb, h, descP, idxL, eL, isRawOp, hasElemOff);
-                mlir::Value laneMapped = tmp.cInt(nloc, i1Ty(), 1);
-
-                for (unsigned c = 0; c < 4; ++c) {
-                    if ((mask & (1u << c)) == 0) {
-                        mlir::Value z = mlir::isa<mlir::FloatType>(elemTy) ? tmp.cFlt(nloc, elemTy, 0.0) : tmp.cInt(nloc, elemTy, 0);
-                        compVecs[c] = mlir::vector::InsertOp::create(nb, nloc, z, compVecs[c], static_cast<int64_t>(l));
+        uint32_t usedCompMask = 0;
+        bool statusUsed = false;
+        bool allExtract = true;
+        for (mlir::Operation* user : call.getResult().getUsers()) {
+            if (auto ev = llvm::dyn_cast<mlir::LLVM::ExtractValueOp>(user)) {
+                auto pos = ev.getPosition();
+                if (!pos.empty()) {
+                    if (pos[0] >= 0 && pos[0] < 4) {
+                        usedCompMask |= (1u << static_cast<uint32_t>(pos[0]));
                         continue;
                     }
-                    mlir::Value cOff = mlir::arith::AddIOp::create(nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), c * elemBytes));
-                    mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
-                    mlir::Value inBounds = mlir::arith::AndIOp::create(
-                        nb, nloc, okPtr,
-                        mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-                    if (elemStride) {
-                        mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
-                        mlir::Value strideZero = mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::eq, elemStride, tmp.cInt(nloc, i32Ty(), 0));
-                        mlir::Value inElem = mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
-                        inBounds = mlir::arith::AndIOp::create(
-                            nb, nloc, inBounds, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
-                    }
-                    auto [val, compMapped] = tmp.emitScalarBufferComponentLoad(
-                        nloc, elemTy, elemBytes, descP, basePtr, isReserved, inBounds, cOff);
-                    laneMapped = mlir::arith::AndIOp::create(nb, nloc, laneMapped, compMapped);
-                    compVecs[c] = mlir::vector::InsertOp::create(nb, nloc, val, compVecs[c], static_cast<int64_t>(l));
-                }
-                mlir::Value laneStatus = mlir::arith::ExtUIOp::create(nb, nloc, i32Ty(), laneMapped);
-                statusVec = mlir::vector::InsertOp::create(nb, nloc, laneStatus, statusVec, static_cast<int64_t>(l));
-            }
-            llvm::SmallVector<mlir::Value, 5> results(compVecs.begin(), compVecs.end());
-            results.push_back(statusVec);
-            return results;
-        };
-
-        llvm::SmallVector<mlir::Value, 5> results;
-
-        if (h.isUniform()) {
-            mlir::Value descP = h.lanes[0];
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
-                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
-                                         : mlir::Value();
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            mlir::Value stride64Vec;
-            if (needsStride) {
-                mlir::Value stride64 = (h.stride > 0)
-                                           ? cInt(loc, i64Ty(), h.stride)
-                                           : mlir::Value(mlir::arith::ExtUIOp::create(
-                                                 b_, loc, i64Ty(), loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)));
-                stride64Vec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), stride64);
-            }
-
-            auto ifRes = mlir::scf::IfOp::create(
-                b_, loc, isReserved,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::scf::YieldOp::create(nb, nloc, emitReservedPerLaneLoad(nb, nloc));
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value byteOffVec = computeBufferByteOffsetVec(
-                        nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), byteSize);
-                    mlir::Value okPtrVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), okPtr);
-                    auto [isContig, lane0Off] = checkContiguousByteOffsets(nloc, nb, byteOffVec, elemBytes);
-
-                    llvm::SmallVector<mlir::Value, 4> cOffs(4), inBounds(4);
-                    for (unsigned c = 0; c < 4; ++c) {
-                        if ((mask & (1u << c)) == 0) continue;
-                        mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, elemStride, c, elemBytes);
-                        std::tie(cOffs[c], inBounds[c]) = computeBufferComponentBoundsVec(
-                            nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, c, elemBytes);
-                    }
-
-                    auto loadIfContig = mlir::scf::IfOp::create(
-                        nb, nloc, isContig,
-                        [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            llvm::SmallVector<mlir::Value, 4> out(4, zeroElemVec);
-                            for (unsigned c = 0; c < 4; ++c) {
-                                if ((mask & (1u << c)) == 0) continue;
-                                mlir::Value off0 = (c == 0)
-                                                       ? lane0Off
-                                                       : mlir::Value(mlir::arith::AddIOp::create(
-                                                             cb, cloc, lane0Off, mlir::arith::ConstantIntOp::create(cb, cloc, i64Ty(), uint64_t(c) * elemBytes)));
-                                mlir::Value ptr0 = mlir::LLVM::GEPOp::create(
-                                    cb, cloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{off0});
-                                out[c] = mlir::LLVM::MaskedLoadOp::create(
-                                    cb, cloc, vecTy(elemTy), ptr0, inBounds[c], zeroElemVec, /*alignment=*/1);
-                            }
-                            mlir::scf::YieldOp::create(cb, cloc, out);
-                        },
-                        [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            llvm::SmallVector<mlir::Value, 4> out(4, zeroElemVec);
-                            for (unsigned c = 0; c < 4; ++c) {
-                                if ((mask & (1u << c)) == 0) continue;
-                                mlir::Value ptrs = mlir::LLVM::GEPOp::create(
-                                    cb, cloc, vecTy(ptrTy()), i8Ty(), basePtr, mlir::ValueRange{cOffs[c]});
-                                out[c] = mlir::LLVM::masked_gather::create(
-                                    cb, cloc, vecTy(elemTy), ptrs, inBounds[c], mlir::ValueRange{zeroElemVec}, /*alignment=*/1);
-                            }
-                            mlir::scf::YieldOp::create(cb, cloc, out);
-                        });
-
-                    llvm::SmallVector<mlir::Value, 5> out(loadIfContig.getResults().begin(), loadIfContig.getResults().end());
-                    out.push_back(mlir::arith::ConstantOp::create(
-                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
-                    mlir::scf::YieldOp::create(nb, nloc, out);
-                });
-            results.assign(ifRes.getResults().begin(), ifRes.getResults().end());
-        } else {
-            mlir::Value basePtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
-            mlir::Value byteSizeVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
-            mlir::Value okPtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-            mlir::Value isReservedVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-            mlir::Value stride64Vec = needsStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()))) : mlir::Value();
-            bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
-            mlir::Value elemStrideVec = hasElemStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()))) : mlir::Value();
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-
-            for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value descP = laneValue(loc, h, l);
-                mlir::Value basePtr = loadDescBasePtr(loc, descP);
-                mlir::Value isRes = isDescReservedBuffer(loc, descP);
-                mlir::Value bSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-                mlir::Value ok = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-                basePtrVec = mlir::vector::InsertOp::create(b_, loc, basePtr, basePtrVec, static_cast<int64_t>(l));
-                byteSizeVec = mlir::vector::InsertOp::create(b_, loc, bSize, byteSizeVec, static_cast<int64_t>(l));
-                okPtrVec = mlir::vector::InsertOp::create(b_, loc, ok, okPtrVec, static_cast<int64_t>(l));
-                isReservedVec = mlir::vector::InsertOp::create(b_, loc, isRes, isReservedVec, static_cast<int64_t>(l));
-                if (hasElemStride || needsStride) {
-                    mlir::Value es = loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0);
-                    if (hasElemStride) {
-                        elemStrideVec = mlir::vector::InsertOp::create(b_, loc, es, elemStrideVec, static_cast<int64_t>(l));
-                    }
-                    if (needsStride) {
-                        mlir::Value s64 = (h.stride > 0) ? cInt(loc, i64Ty(), h.stride)
-                                                         : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), es));
-                        stride64Vec = mlir::vector::InsertOp::create(b_, loc, s64, stride64Vec, static_cast<int64_t>(l));
+                    if (pos[0] == 4) {
+                        statusUsed = true;
+                        continue;
                     }
                 }
             }
-            mlir::Value anyReserved = orReduce(loc, isReservedVec);
-            auto ifRes = mlir::scf::IfOp::create(
-                b_, loc, anyReserved,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::scf::YieldOp::create(nb, nloc, emitReservedPerLaneLoad(nb, nloc));
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value byteOffVec = computeBufferByteOffsetVec(
-                        nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                    llvm::SmallVector<mlir::Value, 5> out(4, zeroElemVec);
-                    for (unsigned c = 0; c < 4; ++c) {
-                        if ((mask & (1u << c)) == 0) continue;
-                        mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, c, elemBytes);
-                        auto [cOffVec, inBoundsVec] = computeBufferComponentBoundsVec(
-                            nloc, nb, byteOffVec, byteSizeVec, okPtrVec, esOk, c, elemBytes);
-                        mlir::Value ptrs = mlir::LLVM::GEPOp::create(
-                            nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
-                        out[c] = mlir::LLVM::masked_gather::create(
-                            nb, nloc, vecTy(elemTy), ptrs, inBoundsVec, mlir::ValueRange{zeroElemVec}, /*alignment=*/1);
-                    }
-                    out.push_back(mlir::arith::ConstantOp::create(
-                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
-                    mlir::scf::YieldOp::create(nb, nloc, out);
-                });
-            results.assign(ifRes.getResults().begin(), ifRes.getResults().end());
+            allExtract = false;
+            break;
         }
+        if (allExtract && !statusUsed) {
+            mask &= usedCompMask;
+        }
+
+        llvm::SmallVector<unsigned, 4> activeComps;
+        for (unsigned c = 0; c < 4; ++c) {
+            if (mask & (1u << c)) activeComps.push_back(c);
+        }
+
+        auto [compVecs, statusVec] = emitPacketizedBufferLoads(
+            loc, h, idxArg, elemOffArg, hasElemOff, isRawOp, elemTy, /*totalComps=*/4, activeComps);
 
         SimdVal outSt;
         outSt.kind = SimdVal::Kind::Struct;
         outSt.origType = st;
-        for (unsigned c = 0; c < 4; ++c) outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, results[c], {}, {}});
-        outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), results[4], {}, {}});
+        for (unsigned c = 0; c < 4; ++c) {
+            outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, compVecs[c], {}, {}});
+        }
+        outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), statusVec, {}, {}});
         setMapped(call.getResult(), outSt);
         return true;
     }
@@ -3097,185 +3767,19 @@ private:
         bool hasElemOff = !isUndefOrPoison(elemOffArg);
         uint32_t mask = static_cast<uint32_t>(getConstIntValue(call.getOperand(8)).value_or(15));
 
-        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
-        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
-        llvm::SmallVector<mlir::Value, 4> valVecs(4);
+        llvm::SmallVector<unsigned, 4> activeComps;
+        llvm::SmallVector<mlir::Value, 4> activeValVecs;
         mlir::Type elemTy = i32Ty();
-        uint32_t elemBytes = 4;
         for (unsigned c = 0; c < 4; ++c) {
             if (mask & (1u << c)) {
-                valVecs[c] = asVec(loc, getMapped(loc, call.getOperand(4 + c)));
-                elemTy = llvm::cast<mlir::VectorType>(valVecs[c].getType()).getElementType();
-                elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
+                mlir::Value v = asVec(loc, getMapped(loc, call.getOperand(4 + c)));
+                elemTy = llvm::cast<mlir::VectorType>(v.getType()).getElementType();
+                activeComps.push_back(c);
+                activeValVecs.push_back(v);
             }
         }
-        bool needsStride = hasElemOff || (!isRawOp && h.resourceKind != 11);
-
-        auto emitReservedPerLaneStore = [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-            SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
-            for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value mL = mlir::vector::ExtractOp::create(nb, nloc, realMask, static_cast<int64_t>(l));
-                mlir::Value descP = tmp.laneValue(nloc, h, l);
-                mlir::Value basePtr = tmp.loadDescBasePtr(nloc, descP);
-                mlir::Value isReserved = tmp.isDescReservedBuffer(nloc, descP);
-                mlir::Value byteSize = tmp.loadDescU64Field(nloc, descP, offsetof(NacelleDescriptor, byte_size));
-                mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
-                                             ? tmp.loadDescU32Field(nloc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
-                                             : mlir::Value();
-                mlir::Value nullP = mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy());
-                mlir::Value okPtr = mlir::arith::AndIOp::create(
-                    nb, nloc, mL, mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
-                mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
-                mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
-                mlir::Value byteOff = tmp.computeBufferByteOffset(nloc, nb, h, descP, idxL, eL, isRawOp, hasElemOff);
-
-                for (unsigned c = 0; c < 4; ++c) {
-                    if ((mask & (1u << c)) == 0) continue;
-                    mlir::Value vL = mlir::vector::ExtractOp::create(nb, nloc, valVecs[c], static_cast<int64_t>(l));
-                    mlir::Value cOff = mlir::arith::AddIOp::create(nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), c * elemBytes));
-                    mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
-                    mlir::Value doStore = mlir::arith::AndIOp::create(
-                        nb, nloc, okPtr,
-                        mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-                    if (elemStride) {
-                        mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
-                        mlir::Value strideZero = mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::eq, elemStride, tmp.cInt(nloc, i32Ty(), 0));
-                        mlir::Value inElem = mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
-                        doStore = mlir::arith::AndIOp::create(
-                            nb, nloc, doStore, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
-                    }
-                    tmp.emitScalarBufferComponentStore(nloc, elemBytes, descP, basePtr, isReserved, doStore, cOff, vL);
-                }
-            }
-        };
-
-        if (h.isUniform()) {
-            mlir::Value descP = h.lanes[0];
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
-                                         ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
-                                         : mlir::Value();
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            mlir::Value stride64Vec;
-            if (needsStride) {
-                mlir::Value stride64 = (h.stride > 0)
-                                           ? cInt(loc, i64Ty(), h.stride)
-                                           : mlir::Value(mlir::arith::ExtUIOp::create(
-                                                 b_, loc, i64Ty(), loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)));
-                stride64Vec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), stride64);
-            }
-
-            mlir::scf::IfOp::create(
-                b_, loc, isReserved,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    emitReservedPerLaneStore(nb, nloc);
-                    mlir::scf::YieldOp::create(nb, nloc);
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value byteOffVec = computeBufferByteOffsetVec(
-                        nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), byteSize);
-                    mlir::Value activeOkVec = mlir::arith::AndIOp::create(
-                        nb, nloc, realMask, mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), okPtr));
-                    auto [isContig, lane0Off] = checkContiguousByteOffsets(nloc, nb, byteOffVec, elemBytes);
-
-                    llvm::SmallVector<mlir::Value, 4> cOffs(4), doStores(4);
-                    for (unsigned c = 0; c < 4; ++c) {
-                        if ((mask & (1u << c)) == 0) continue;
-                        mlir::Value esOk = computeScalarElemStrideOkVec(nloc, nb, elemStride, c, elemBytes);
-                        std::tie(cOffs[c], doStores[c]) = computeBufferComponentBoundsVec(
-                            nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, c, elemBytes);
-                    }
-
-                    mlir::scf::IfOp::create(
-                        nb, nloc, isContig,
-                        [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            for (unsigned c = 0; c < 4; ++c) {
-                                if ((mask & (1u << c)) == 0) continue;
-                                mlir::Value off0 = (c == 0)
-                                                       ? lane0Off
-                                                       : mlir::Value(mlir::arith::AddIOp::create(
-                                                             cb, cloc, lane0Off, mlir::arith::ConstantIntOp::create(cb, cloc, i64Ty(), uint64_t(c) * elemBytes)));
-                                mlir::Value ptr0 = mlir::LLVM::GEPOp::create(
-                                    cb, cloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{off0});
-                                mlir::LLVM::MaskedStoreOp::create(
-                                    cb, cloc, valVecs[c], ptr0, doStores[c], /*alignment=*/1);
-                            }
-                            mlir::scf::YieldOp::create(cb, cloc);
-                        },
-                        [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            for (unsigned c = 0; c < 4; ++c) {
-                                if ((mask & (1u << c)) == 0) continue;
-                                mlir::Value ptrs = mlir::LLVM::GEPOp::create(
-                                    cb, cloc, vecTy(ptrTy()), i8Ty(), basePtr, mlir::ValueRange{cOffs[c]});
-                                mlir::LLVM::masked_scatter::create(
-                                    cb, cloc, valVecs[c], ptrs, doStores[c], /*alignment=*/1);
-                            }
-                            mlir::scf::YieldOp::create(cb, cloc);
-                        });
-                    mlir::scf::YieldOp::create(nb, nloc);
-                });
-            return true;
-        }
-
-        mlir::Value basePtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
-        mlir::Value byteSizeVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
-        mlir::Value okPtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-        mlir::Value isReservedVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-        mlir::Value stride64Vec = needsStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()))) : mlir::Value();
-        bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
-        mlir::Value elemStrideVec = hasElemStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()))) : mlir::Value();
-        mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-
-        for (uint32_t l = 0; l < W_; ++l) {
-            mlir::Value descP = laneValue(loc, h, l);
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isRes = isDescReservedBuffer(loc, descP);
-            mlir::Value bSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value ok = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            basePtrVec = mlir::vector::InsertOp::create(b_, loc, basePtr, basePtrVec, static_cast<int64_t>(l));
-            byteSizeVec = mlir::vector::InsertOp::create(b_, loc, bSize, byteSizeVec, static_cast<int64_t>(l));
-            okPtrVec = mlir::vector::InsertOp::create(b_, loc, ok, okPtrVec, static_cast<int64_t>(l));
-            isReservedVec = mlir::vector::InsertOp::create(b_, loc, isRes, isReservedVec, static_cast<int64_t>(l));
-            if (hasElemStride || needsStride) {
-                mlir::Value es = loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0);
-                if (hasElemStride) {
-                    elemStrideVec = mlir::vector::InsertOp::create(b_, loc, es, elemStrideVec, static_cast<int64_t>(l));
-                }
-                if (needsStride) {
-                    mlir::Value s64 = (h.stride > 0) ? cInt(loc, i64Ty(), h.stride)
-                                                     : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), es));
-                    stride64Vec = mlir::vector::InsertOp::create(b_, loc, s64, stride64Vec, static_cast<int64_t>(l));
-                }
-            }
-        }
-        mlir::Value anyReserved = orReduce(loc, isReservedVec);
-        mlir::Value activeOkVec = mlir::arith::AndIOp::create(b_, loc, realMask, okPtrVec);
-
-        mlir::scf::IfOp::create(
-            b_, loc, anyReserved,
-            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                emitReservedPerLaneStore(nb, nloc);
-                mlir::scf::YieldOp::create(nb, nloc);
-            },
-            [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                mlir::Value byteOffVec = computeBufferByteOffsetVec(
-                    nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                for (unsigned c = 0; c < 4; ++c) {
-                    if ((mask & (1u << c)) == 0) continue;
-                    mlir::Value esOk = computeVecElemStrideOkVec(nloc, nb, elemStrideVec, c, elemBytes);
-                    auto [cOffVec, doStoreVec] = computeBufferComponentBoundsVec(
-                        nloc, nb, byteOffVec, byteSizeVec, activeOkVec, esOk, c, elemBytes);
-                    mlir::Value ptrs = mlir::LLVM::GEPOp::create(
-                        nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
-                    mlir::LLVM::masked_scatter::create(
-                        nb, nloc, valVecs[c], ptrs, doStoreVec, /*alignment=*/1);
-                }
-                mlir::scf::YieldOp::create(nb, nloc);
-            });
+        emitPacketizedBufferStores(
+            loc, h, idxArg, elemOffArg, hasElemOff, isRawOp, realMask, elemTy, activeComps, activeValVecs);
         return true;
     }
 
@@ -3294,73 +3798,44 @@ private:
         }
         mlir::Type elemTy = vt.getElementType();
         unsigned numElems = static_cast<unsigned>(vt.getNumElements());
-        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
 
-        mlir::Value uniformIdx;
-        mlir::Value uniformElemOff;
-        if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx) &&
-            (!hasElemOff || tryGetUniformScalar(loc, elemOffArg, uniformElemOff))) {
-            if (!hasElemOff) uniformElemOff = cInt(loc, i32Ty(), 0);
-            mlir::Value descP = h.lanes[0];
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, uniformIdx, uniformElemOff, /*isRawOp=*/true, hasElemOff);
-            mlir::Value allMapped = cInt(loc, i1Ty(), 1);
-
-            SimdVal vecVal;
-            vecVal.kind = SimdVal::Kind::Struct;
-            vecVal.origType = vt;
-            for (unsigned c = 0; c < numElems; ++c) {
-                auto [bvec, compMapped] = emitUniformBufferComponentLoad(
-                    loc, elemTy, elemBytes, descP, basePtr, isReserved, byteSize, okPtr, byteOff, mlir::Value(), c);
-                allMapped = mlir::arith::AndIOp::create(b_, loc, allMapped, compMapped);
-                vecVal.fields.push_back({SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
+        llvm::SmallVector<bool, 16> elemUsed(numElems, false);
+        bool statusUsed = false;
+        bool canPrune = true;
+        for (mlir::Operation* user : call.getResult().getUsers()) {
+            auto ev = llvm::dyn_cast<mlir::LLVM::ExtractValueOp>(user);
+            if (!ev || ev.getPosition().empty()) {
+                canPrune = false;
+                break;
             }
-            mlir::Value status32 = mlir::arith::ExtUIOp::create(b_, loc, i32Ty(), allMapped);
-            mlir::Value statusVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), status32);
-            SimdVal outSt;
-            outSt.kind = SimdVal::Kind::Struct;
-            outSt.origType = st;
-            outSt.fields.push_back(std::move(vecVal));
-            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), statusVec, {}, {}});
-            setMapped(call.getResult(), outSt);
-            return true;
+            int64_t fieldIdx = ev.getPosition()[0];
+            if (fieldIdx == 1) {
+                statusUsed = true;
+            } else if (fieldIdx == 0) {
+                for (mlir::Operation* vUser : ev.getResult().getUsers()) {
+                    auto ee = llvm::dyn_cast<mlir::LLVM::ExtractElementOp>(vUser);
+                    auto idxC = ee ? getConstIntValue(ee.getPosition()) : std::optional<uint64_t>{};
+                    if (!idxC.has_value() || *idxC >= numElems) {
+                        canPrune = false;
+                        break;
+                    }
+                    elemUsed[*idxC] = true;
+                }
+                if (!canPrune) break;
+            } else {
+                canPrune = false;
+                break;
+            }
         }
 
-        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
-        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
-
-        llvm::SmallVector<mlir::Value, 16> compVecs(numElems, mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
-        mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
-        for (uint32_t l = 0; l < W_; ++l) {
-            mlir::Value descP = laneValue(loc, h, l);
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP);
-            mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-            mlir::Value eL = mlir::vector::ExtractOp::create(b_, loc, elemOffVec, static_cast<int64_t>(l));
-            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, idxL, eL, /*isRawOp=*/true, hasElemOff);
-            mlir::Value laneMapped = cInt(loc, i1Ty(), 1);
-
-            for (unsigned c = 0; c < numElems; ++c) {
-                mlir::Value cOff = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), c * elemBytes));
-                mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
-                mlir::Value inBounds = mlir::arith::AndIOp::create(
-                    b_, loc, okPtr,
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-                auto [val, compMapped] = emitScalarBufferComponentLoad(
-                    loc, elemTy, elemBytes, descP, basePtr, isReserved, inBounds, cOff);
-                laneMapped = mlir::arith::AndIOp::create(b_, loc, laneMapped, compMapped);
-                compVecs[c] = mlir::vector::InsertOp::create(b_, loc, val, compVecs[c], static_cast<int64_t>(l));
-            }
-            mlir::Value laneStatus = mlir::arith::ExtUIOp::create(b_, loc, i32Ty(), laneMapped);
-            statusVec = mlir::vector::InsertOp::create(b_, loc, laneStatus, statusVec, static_cast<int64_t>(l));
+        llvm::SmallVector<unsigned, 16> activeComps;
+        activeComps.reserve(numElems);
+        for (unsigned c = 0; c < numElems; ++c) {
+            if (!canPrune || statusUsed || elemUsed[c]) activeComps.push_back(c);
         }
+
+        auto [compVecs, statusVec] = emitPacketizedBufferLoads(
+            loc, h, idxArg, elemOffArg, hasElemOff, /*isRawOp=*/true, elemTy, numElems, activeComps);
 
         SimdVal vecVal;
         vecVal.kind = SimdVal::Kind::Struct;
@@ -3389,35 +3864,17 @@ private:
             return false;
         }
         unsigned numElems = static_cast<unsigned>(valSv.fields.size());
-        mlir::Value firstVec = asVec(loc, valSv.fields[0]);
-        mlir::Type elemTy = llvm::cast<mlir::VectorType>(firstVec.getType()).getElementType();
-        uint32_t elemBytes = std::max<uint32_t>(1, elemTy.getIntOrFloatBitWidth() / 8);
-        mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
-        mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
-
-        for (uint32_t l = 0; l < W_; ++l) {
-            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
-            mlir::Value descP = laneValue(loc, h, l);
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::arith::AndIOp::create(
-                b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
-            mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-            mlir::Value eL = mlir::vector::ExtractOp::create(b_, loc, elemOffVec, static_cast<int64_t>(l));
-            mlir::Value byteOff = computeBufferByteOffset(loc, b_, h, descP, idxL, eL, /*isRawOp=*/true, hasElemOff);
-
-            for (unsigned c = 0; c < numElems; ++c) {
-                mlir::Value vL = mlir::vector::ExtractOp::create(b_, loc, asVec(loc, valSv.fields[c]), static_cast<int64_t>(l));
-                mlir::Value cOff = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), c * elemBytes));
-                mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
-                mlir::Value doStore = mlir::arith::AndIOp::create(
-                    b_, loc, okPtr,
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-                emitScalarBufferComponentStore(loc, elemBytes, descP, basePtr, isReserved, doStore, cOff, vL);
-            }
+        llvm::SmallVector<unsigned, 16> activeComps;
+        llvm::SmallVector<mlir::Value, 16> activeValVecs;
+        activeComps.reserve(numElems);
+        activeValVecs.reserve(numElems);
+        for (unsigned c = 0; c < numElems; ++c) {
+            activeComps.push_back(c);
+            activeValVecs.push_back(asVec(loc, valSv.fields[c]));
         }
+        mlir::Type elemTy = llvm::cast<mlir::VectorType>(activeValVecs[0].getType()).getElementType();
+        emitPacketizedBufferStores(
+            loc, h, idxArg, elemOffArg, hasElemOff, /*isRawOp=*/true, realMask, elemTy, activeComps, activeValVecs);
         return true;
     }
 
@@ -3455,21 +3912,33 @@ private:
         bool isFloat = mlir::isa<mlir::FloatType>(resTy);
         mlir::Type intTy = b_.getIntegerType(bitWidth);
         const bool isTexAtomic = (h.resourceKind >= 1 && h.resourceKind <= 9);
+        const bool isRawBufAtomic = (h.resourceKind == 11 || h.resourceKind == 12);
+        const bool needAtomicStride = !isTexAtomic && (hasOff1 || !isRawBufAtomic);
+
+        std::optional<BufferDescInfo> uniformBufInfo;
+        if (!isTexAtomic && h.isUniform()) {
+            uniformBufInfo = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, needAtomicStride);
+        }
 
         mlir::Value outVec = isFloat ? splatFlt(loc, resTy, 0.0) : splatInt(loc, resTy, 0);
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
-            mlir::Value descP = laneValue(loc, h, l);
-            mlir::Value basePtr = loadDescBasePtr(loc, descP);
-            mlir::Value isReserved = isTexAtomic ? cInt(loc, i1Ty(), 0) : isDescReservedBuffer(loc, descP);
-            mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-            mlir::Value okPtr = mlir::arith::AndIOp::create(
-                b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
+            mlir::Value descP;
+            mlir::Value basePtr;
+            mlir::Value isReserved;
+            mlir::Value byteSize;
+            mlir::Value okPtr;
             mlir::Value o0L = mlir::vector::ExtractOp::create(b_, loc, off0, static_cast<int64_t>(l));
             mlir::Value o1L = mlir::vector::ExtractOp::create(b_, loc, off1, static_cast<int64_t>(l));
             mlir::Value byteOff;
             if (isTexAtomic) {
+                descP = laneValue(loc, h, l);
+                basePtr = loadDescBasePtr(loc, descP);
+                isReserved = cInt(loc, i1Ty(), 0);
+                byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
+                mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
+                okPtr = mlir::arith::AndIOp::create(
+                    b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
                 // RWTexture2D atomic: off0=x, off1=y
                 mlir::Value rp = loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, row_pitch), 0);
                 mlir::Value y64 = mlir::arith::MulIOp::create(
@@ -3479,7 +3948,15 @@ private:
                     b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o0L), cInt(loc, i64Ty(), elemBytes));
                 byteOff = mlir::arith::AddIOp::create(b_, loc, y64, x64);
             } else {
-                byteOff = computeBufferByteOffset(loc, b_, h, descP, o0L, o1L, h.resourceKind == 11 || h.resourceKind == 12, hasOff1);
+                BufferDescInfo info = uniformBufInfo.has_value()
+                                          ? *uniformBufInfo
+                                          : loadBufferDescInfo(loc, b_, h, laneValue(loc, h, l), /*needElemStride=*/false, needAtomicStride);
+                descP = info.descP;
+                basePtr = info.basePtr;
+                isReserved = info.isReserved;
+                byteSize = info.byteSize;
+                okPtr = mlir::arith::AndIOp::create(b_, loc, mL, info.okPtr);
+                byteOff = computeBufferByteOffsetScalar(loc, b_, h, info.stride64, o0L, o1L, isRawBufAtomic, hasOff1);
             }
             mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
             mlir::Value doOp = mlir::arith::AndIOp::create(
