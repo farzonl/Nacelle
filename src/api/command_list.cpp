@@ -924,15 +924,23 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
         ScopedFlushDenormals flushDenorms;
         thread_local std::vector<uint8_t> tlScratch;
         if (tlScratch.size() < scratchSize) tlScratch.resize(scratchSize);
+        if (begin >= end) return;
+        uint32_t x = static_cast<uint32_t>(begin % gx);
+        uint64_t yz = begin / gx;
+        uint32_t y = static_cast<uint32_t>(yz % gy);
+        uint32_t z = static_cast<uint32_t>(yz / gy);
         for (uint64_t idx = begin; idx < end; ++idx) {
-            uint32_t x = static_cast<uint32_t>(idx % gx);
-            uint32_t yz = static_cast<uint32_t>(idx / gx);
-            uint32_t y = yz % gy;
-            uint32_t z = yz / gy;
             if (cpso->groupSharedBytes > 0) {
                 std::memset(tlScratch.data(), 0, cpso->groupSharedBytes);
             }
             fn(&ctxSnapshot, tlScratch.data(), x, y, z, gx, gy, gz);
+            if (++x == gx) {
+                x = 0;
+                if (++y == gy) {
+                    y = 0;
+                    ++z;
+                }
+            }
         }
     };
 
