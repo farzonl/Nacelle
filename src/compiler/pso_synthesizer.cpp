@@ -1992,7 +1992,6 @@ bool synthesizeGraphicsPSOMLIR(
                 // Interpolate PS inputs
                 mlir::Value wVec = ph.splatFlt(1.0);
                 mlir::Value invWVec = ph.splatFlt(1.0);
-                mlir::Value triIw0, triIw1, triIw2;
                 bool needInvW = false;
                 for (const auto& pi : psLoaded.inputSigs) {
                     if (pi.systemValueType == 3 ||
@@ -2007,9 +2006,6 @@ bool synthesizeGraphicsPSOMLIR(
                     mlir::Value iw0 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, triInvWPtr));
                     mlir::Value diw1 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 4)));
                     mlir::Value diw2 = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 8)));
-                    triIw0 = iw0;
-                    triIw1 = mlir::arith::AddFOp::create(pb, ploc, iw0, diw1);
-                    triIw2 = mlir::arith::AddFOp::create(pb, ploc, iw0, diw2);
                     invWVec = mlir::arith::AddFOp::create(
                         pb, ploc, iw0,
                         mlir::arith::AddFOp::create(
@@ -2113,22 +2109,30 @@ bool synthesizeGraphicsPSOMLIR(
                         return true;
                     }
                     if (sig->systemValueType == 28) { // SV_Barycentrics
-                        mlir::Value b0 = mlir::arith::SubFOp::create(
-                            lb, lloc, lh.splatFlt(1.0),
-                            mlir::arith::AddFOp::create(lb, lloc, baryI, baryJ));
                         mlir::Value v = lh.splatFlt(0.0);
                         if (sig->interpMode == 4) { // noperspective
+                            mlir::Value b0 = mlir::arith::SubFOp::create(
+                                lb, lloc, lh.splatFlt(1.0),
+                                mlir::arith::AddFOp::create(lb, lloc, baryI, baryJ));
                             if (col == 0) v = b0;
                             else if (col == 1) v = baryI;
                             else if (col == 2) v = baryJ;
-                        } else { // perspective (linear)
-                            if (col == 0) {
-                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, b0, triIw0), wVec);
-                            } else if (col == 1) {
-                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, baryI, triIw1), wVec);
-                            } else if (col == 2) {
-                                v = mlir::arith::MulFOp::create(lb, lloc, mlir::arith::MulFOp::create(lb, lloc, baryJ, triIw2), wVec);
-                            }
+                        } else if (col < 3) { // perspective (linear) using original-primitive barycentrics
+                            mlir::Value triOrigBaryPtr = lh.loadScalar(
+                                ptrTy, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, triOrigBary)));
+                            int64_t baseOff = static_cast<int64_t>(col * 3 * 4);
+                            mlir::Value a0 = mlir::vector::BroadcastOp::create(
+                                lb, lloc, lh.vecTy(f32Ty), lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff)));
+                            mlir::Value da1 = mlir::vector::BroadcastOp::create(
+                                lb, lloc, lh.vecTy(f32Ty), lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 4)));
+                            mlir::Value da2 = mlir::vector::BroadcastOp::create(
+                                lb, lloc, lh.vecTy(f32Ty), lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 8)));
+                            mlir::Value lin = mlir::arith::AddFOp::create(
+                                lb, lloc, a0,
+                                mlir::arith::AddFOp::create(
+                                    lb, lloc, mlir::arith::MulFOp::create(lb, lloc, baryI, da1),
+                                    mlir::arith::MulFOp::create(lb, lloc, baryJ, da2)));
+                            v = mlir::arith::MulFOp::create(lb, lloc, lin, wVec);
                         }
                         if (scalarTy != f32Ty) {
                             v = mlir::arith::TruncFOp::create(lb, lloc, lh.vecTy(scalarTy), v);

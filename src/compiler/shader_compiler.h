@@ -94,6 +94,7 @@ struct PixelBatchArgs {
     const float* triAttrBase = nullptr; // [numPSInputRegs * 4 * 3]: for each scalar (a0/w0, a1/w1 - a0/w0, a2/w2 - a0/w0)
     const float* triAttrFlat = nullptr; // [numPSInputRegs * 4]: un-divided v0 attribute for flat/nointerpolation
     const float* triInvW = nullptr;     // [3]: (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
+    const float* triOrigBary = nullptr; // [9]: for k in 0..2, (b0/w0, b1/w1 - b0/w0, b2/w2 - b0/w0)
     const uint32_t* quadOffsets = nullptr; // [W/4]: pixel base index (quadIdx * 4) inside 64x64 tile SOA
     const float* pixelX = nullptr;      // [W]
     const float* pixelY = nullptr;      // [W]

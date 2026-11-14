@@ -426,6 +426,7 @@ void rasterizeTiles(
             emitter.args.triAttrBase = scene.numPSInputScalars > 0 ? (scene.attrBaseArena.data() + tri.attrBaseOffset) : nullptr;
             emitter.args.triAttrFlat = scene.numPSInputScalars > 0 ? (scene.attrFlatArena.data() + tri.attrFlatOffset) : nullptr;
             emitter.args.triInvW = tri.invW;
+            emitter.args.triOrigBary = tri.origBary;
             emitter.args.triDepth = tri.depth;
             emitter.args.isFrontFace = tri.isFrontFace;
             emitter.args.primitiveId = tri.primitiveId;
