@@ -164,6 +164,7 @@ jobs:
       - name: Run OffloadTest-d3d12 against Nacelle
         env:
           LD_LIBRARY_PATH: "${{ github.workspace }}/build:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+          NACELLE_DISABLE_TIER2: "1"
         run: |
           mv build-offload/bin/offloader build-offload/bin/offloader.bin
           printf '#!/bin/sh\nexec "%s/build-offload/bin/offloader.bin" --api=dx "$@"\n' "${{ github.workspace }}" > build-offload/bin/offloader
