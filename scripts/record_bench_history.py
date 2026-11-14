@@ -114,7 +114,10 @@ def main() -> None:
     }
 
     history = load_existing_history(args.pages_url, args.history_cache)
-    history = [h for h in history if h.get("sha") != args.sha]
+    history = [
+        h for h in history
+        if h.get("sha") != args.sha and (h.get("suites") or h.get("results"))
+    ]
     history.append(entry)
     history.sort(key=lambda h: h.get("timestamp", ""))
 
