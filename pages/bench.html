@@ -511,6 +511,14 @@
         <div class="controls-row">
           <label for="global-scope" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Scope &amp; Metric:</label>
           <select id="global-scope" class="meta-pill" aria-label="Select global benchmark scope and metric"></select>
+          <select id="commit-window" class="meta-pill" aria-label="Limit commits shown in trend charts">
+            <option value="all" selected>All Commits</option>
+            <option value="15">Last 15 Commits</option>
+            <option value="30">Last 30 Commits</option>
+            <option value="60">Last 60 Commits</option>
+            <option value="90">Last 90 Commits</option>
+            <option value="120">Last 120 Commits</option>
+          </select>
         </div>
         <span id="kpi-context" style="font-size: 0.82rem; color: var(--muted); font-family: var(--font-mono);">Commit —</span>
       </div>
@@ -1099,20 +1107,40 @@
         label: f.label,
       }));
 
-      let maxVal = 1;
-      const parsed = benchHistory.map((h, i) => {
-        const m = extractMetrics(h, trendKey);
-        for (const s of seriesDefs) {
-          if (m[s.key]) maxVal = Math.max(maxVal, m[s.key].val);
-        }
-        return { h, m, i };
-      });
-      maxVal *= 1.12;
+      const winVal = document.getElementById("commit-window")?.value || "all";
+      const winCount = winVal === "all" ? benchHistory.length : Math.max(1, Number(winVal));
+      const startWinIdx = Math.max(0, benchHistory.length - winCount);
 
+      const rawParsed = [];
+      for (let idx = startWinIdx; idx < benchHistory.length; idx++) {
+        const h = benchHistory[idx];
+        rawParsed.push({ h, m: extractMetrics(h, trendKey), i: idx });
+      }
+
+      const firstDataIdx = rawParsed.findIndex(p => seriesDefs.some(s => p.m[s.key]));
       const borderCol = cssVar("--border");
       const mutedCol = cssVar("--muted");
       const surfaceCol = cssVar("--surface");
       ctx.clearRect(0, 0, W, H);
+
+      if (firstDataIdx === -1) {
+        ctx.font = "12px " + cssVar("--font-mono");
+        ctx.fillStyle = mutedCol;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("No data recorded for this scope in the selected commit window.", W / 2, H / 2);
+        canvas._xs = [];
+        return;
+      }
+
+      const parsed = rawParsed.slice(firstDataIdx);
+      let maxVal = 1;
+      for (const p of parsed) {
+        for (const s of seriesDefs) {
+          if (p.m[s.key]) maxVal = Math.max(maxVal, p.m[s.key].val);
+        }
+      }
+      maxVal *= 1.12;
 
       ctx.font = "11px " + cssVar("--font-mono");
       ctx.textAlign = "right";
@@ -1129,14 +1157,17 @@
         ctx.fillText(val >= 100 ? Math.round(val).toString() : val.toFixed(1), pad.left - 8, y);
       }
 
-      const xFor = (i) => parsed.length === 1
+      const xFor = (localIdx) => parsed.length === 1
         ? pad.left + plotW / 2
-        : pad.left + (i / (parsed.length - 1)) * plotW;
+        : pad.left + (localIdx / (parsed.length - 1)) * plotW;
 
       for (const s of seriesDefs) {
-        const pts = parsed
-          .filter(p => p.m[s.key])
-          .map(p => ({ x: xFor(p.i), y: pad.top + plotH * (1 - p.m[s.key].val / maxVal), i: p.i }));
+        const pts = [];
+        parsed.forEach((p, localIdx) => {
+          if (p.m[s.key]) {
+            pts.push({ x: xFor(localIdx), y: pad.top + plotH * (1 - p.m[s.key].val / maxVal), i: p.i });
+          }
+        });
         if (pts.length > 1) {
           ctx.beginPath();
           ctx.moveTo(pts[0].x, pts[0].y);
@@ -1171,14 +1202,14 @@
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       const step = Math.max(1, Math.ceil(parsed.length / 8));
-      parsed.forEach((p, i) => {
-        if (i % step === 0 || i === parsed.length - 1) {
+      parsed.forEach((p, localIdx) => {
+        if (localIdx % step === 0 || localIdx === parsed.length - 1) {
           ctx.fillStyle = mutedCol;
-          ctx.fillText(p.h.shortSha, xFor(i), pad.top + plotH + 8);
+          ctx.fillText(p.h.shortSha, xFor(localIdx), pad.top + plotH + 8);
         }
       });
 
-      canvas._xs = parsed.map((p, i) => ({ x: xFor(i), p }));
+      canvas._xs = parsed.map((p, localIdx) => ({ x: xFor(localIdx), p }));
     }
 
     function drawTrendChart() {
@@ -1294,6 +1325,9 @@
         currentPage = 1;
         renderKPIs(selectedIndex);
         renderCommitData(benchHistory[selectedIndex]);
+        drawTrendChart();
+      });
+      document.getElementById("commit-window")?.addEventListener("change", () => {
         drawTrendChart();
       });
       document.getElementById("sort-metric")?.addEventListener("change", (e) => {
