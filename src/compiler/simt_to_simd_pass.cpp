@@ -3501,7 +3501,7 @@ private:
                 identity = isFloat ? splatFlt(loc, et, 1.0) : splatInt(loc, et, 1);
             } else if (kind == 2) { // MIN
                 if (isFloat) {
-                    ck = mlir::vector::CombiningKind::MINIMUMF;
+                    ck = mlir::vector::CombiningKind::MINNUMF;
                     identity = splatFlt(loc, et, std::numeric_limits<double>::infinity());
                 } else if (sop != 0) {
                     ck = mlir::vector::CombiningKind::MINUI;
@@ -3514,7 +3514,7 @@ private:
                 }
             } else { // MAX
                 if (isFloat) {
-                    ck = mlir::vector::CombiningKind::MAXIMUMF;
+                    ck = mlir::vector::CombiningKind::MAXNUMF;
                     identity = splatFlt(loc, et, -std::numeric_limits<double>::infinity());
                 } else if (sop != 0) {
                     ck = mlir::vector::CombiningKind::MAXUI;
