@@ -663,6 +663,31 @@ std::vector<BenchRunResult> runSingleBenchmarkBackend(
     return out;
 }
 
+std::vector<BenchRunResult> parseWorkerOutput(const std::string& rawOutput) {
+    std::vector<BenchRunResult> out;
+    std::istringstream iss(rawOutput);
+    std::string line;
+    bool inJson = false;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line == "<<<BENCH_JSON_BEGIN>>>") {
+            inJson = true;
+            continue;
+        }
+        if (line == "<<<BENCH_JSON_END>>>") {
+            inJson = false;
+            continue;
+        }
+        if (inJson && !line.empty()) {
+            BenchRunResult r;
+            if (parseWorkerJsonLine(line, r)) {
+                out.push_back(std::move(r));
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<BenchRunResult> runIsolatedWorker(
     const std::string& exePath,
     const std::string& benchId,
@@ -681,36 +706,66 @@ std::vector<BenchRunResult> runIsolatedWorker(
         << " --width " << width
         << " --height " << height
         << " --steps " << maxSteps
-        << " --iters " << iters
-        << " 2>&1";
+        << " --iters " << iters;
 
-    std::vector<BenchRunResult> out;
-    FILE* pipe = NACELLE_POPEN(cmd.str().c_str(), "r");
-    if (!pipe) return out;
+    std::string rawOutput;
+#if defined(_WIN32)
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr;
+    HANDLE hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        return {};
+    }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    std::string cmdLine = cmd.str();
+    BOOL ok = CreateProcessA(
+        nullptr,
+        cmdLine.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        0,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    CloseHandle(hWrite);
+    if (!ok) {
+        CloseHandle(hRead);
+        return {};
+    }
 
     char buf[4096];
-    std::string line;
-    bool inJson = false;
+    DWORD bytesRead = 0;
+    while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+        rawOutput.append(buf, bytesRead);
+    }
+    CloseHandle(hRead);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+#else
+    cmd << " 2>&1";
+    FILE* pipe = NACELLE_POPEN(cmd.str().c_str(), "r");
+    if (!pipe) return {};
+    char buf[4096];
     while (fgets(buf, sizeof(buf), pipe) != nullptr) {
-        line = buf;
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-        if (line == "<<<BENCH_JSON_BEGIN>>>") {
-            inJson = true;
-            continue;
-        }
-        if (line == "<<<BENCH_JSON_END>>>") {
-            inJson = false;
-            continue;
-        }
-        if (inJson && !line.empty()) {
-            BenchRunResult r;
-            if (parseWorkerJsonLine(line, r)) {
-                out.push_back(std::move(r));
-            }
-        }
+        rawOutput.append(buf);
     }
     NACELLE_PCLOSE(pipe);
-    return out;
+#endif
+    return parseWorkerOutput(rawOutput);
 }
 
 struct WinnerInfo {
@@ -896,6 +951,9 @@ int main(int argc, char** argv) {
                 res = runIsolatedWorker(exePath, spec.id, bt, shaderDir, width, height, maxSteps, iters);
             } else {
                 res = runSingleBenchmarkBackend(spec, bt, shaderDir, width, height, maxSteps, iters);
+            }
+            if (bt.rfind("nacelle-", 0) == 0 && res.empty()) {
+                anyNacelleFailed = true;
             }
             for (auto& r : res) {
                 if (bt.rfind("nacelle-", 0) == 0 && !r.ran) anyNacelleFailed = true;
