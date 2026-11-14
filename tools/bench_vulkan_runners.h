@@ -414,7 +414,10 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
     uint32_t width,
     uint32_t height,
     uint32_t iters,
-    int32_t targetDeviceIdx = -1) {
+    int32_t targetDeviceIdx = -1,
+    const std::vector<uint8_t>& gsSpv = {},
+    const std::vector<uint8_t>& hsSpv = {},
+    const std::vector<uint8_t>& dsSpv = {}) {
     std::vector<BenchRunResult> results;
     vkmin::Loader vk;
     vkmin::VkInstance inst = nullptr;
@@ -458,9 +461,30 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             continue;
         }
 
+        bool needGS = !gsSpv.empty();
+        bool needTess = !hsSpv.empty() && !dsSpv.empty();
+        vkmin::VkPhysicalDeviceFeatures supportedFeatures{};
+        if (vk.vkGetPhysicalDeviceFeatures) {
+            vk.vkGetPhysicalDeviceFeatures(pd, &supportedFeatures);
+        }
+        if (needGS && !supportedFeatures.geometryShader) {
+            r.status = "SKIPPED (geometryShader unsupported)";
+            results.push_back(r);
+            continue;
+        }
+        if (needTess && !supportedFeatures.tessellationShader) {
+            r.status = "SKIPPED (tessellationShader unsupported)";
+            results.push_back(r);
+            continue;
+        }
+
+        vkmin::VkPhysicalDeviceFeatures enabledFeatures{};
+        if (needGS) enabledFeatures.geometryShader = 1;
+        if (needTess) enabledFeatures.tessellationShader = 1;
+
         float prio = 1.0f;
         vkmin::VkDeviceQueueCreateInfo dqci{vkmin::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, gfxQF, 1, &prio};
-        vkmin::VkDeviceCreateInfo dci{vkmin::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, nullptr, 0, 1, &dqci, 0, nullptr, 0, nullptr, nullptr};
+        vkmin::VkDeviceCreateInfo dci{vkmin::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, nullptr, 0, 1, &dqci, 0, nullptr, 0, nullptr, (needGS || needTess) ? &enabledFeatures : nullptr};
         vkmin::VkDevice dev = nullptr;
         if (vk.vkCreateDevice(pd, &dci, nullptr, &dev) != vkmin::VK_SUCCESS) {
             r.status = "FAILED (vkCreateDevice)";
@@ -509,11 +533,24 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         auto t0 = std::chrono::steady_clock::now();
         vkmin::VkShaderModuleCreateInfo vsSmci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, vsSpv.size(), reinterpret_cast<const uint32_t*>(vsSpv.data())};
         vkmin::VkShaderModuleCreateInfo psSmci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, psSpv.size(), reinterpret_cast<const uint32_t*>(psSpv.data())};
-        vkmin::VkShaderModule vsMod = 0, psMod = 0;
+        vkmin::VkShaderModule vsMod = 0, psMod = 0, gsMod = 0, hsMod = 0, dsMod = 0;
         vk.vkCreateShaderModule(dev, &vsSmci, nullptr, &vsMod);
         vk.vkCreateShaderModule(dev, &psSmci, nullptr, &psMod);
+        if (needGS) {
+            vkmin::VkShaderModuleCreateInfo gsSmci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, gsSpv.size(), reinterpret_cast<const uint32_t*>(gsSpv.data())};
+            vk.vkCreateShaderModule(dev, &gsSmci, nullptr, &gsMod);
+        }
+        if (needTess) {
+            vkmin::VkShaderModuleCreateInfo hsSmci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, hsSpv.size(), reinterpret_cast<const uint32_t*>(hsSpv.data())};
+            vkmin::VkShaderModuleCreateInfo dsSmci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, dsSpv.size(), reinterpret_cast<const uint32_t*>(dsSpv.data())};
+            vk.vkCreateShaderModule(dev, &hsSmci, nullptr, &hsMod);
+            vk.vkCreateShaderModule(dev, &dsSmci, nullptr, &dsMod);
+        }
 
-        vkmin::VkDescriptorSetLayoutBinding uboBind{16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, vkmin::VK_SHADER_STAGE_VERTEX_BIT | vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        uint32_t uboStages = vkmin::VK_SHADER_STAGE_VERTEX_BIT | vkmin::VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (needGS) uboStages |= vkmin::VK_SHADER_STAGE_GEOMETRY_BIT;
+        if (needTess) uboStages |= vkmin::VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | vkmin::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        vkmin::VkDescriptorSetLayoutBinding uboBind{16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, uboStages, nullptr};
         vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 1, &uboBind};
         vkmin::VkDescriptorSetLayout dsl = 0;
         vk.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
@@ -522,15 +559,25 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vkmin::VkPipelineLayout pl = 0;
         vk.vkCreatePipelineLayout(dev, &plci, nullptr, &pl);
 
-        vkmin::VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = vkmin::VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = vsMod;
-        stages[0].pName = "VSMain";
-        stages[1].sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = vkmin::VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = psMod;
-        stages[1].pName = "PSMain";
+        vkmin::VkPipelineShaderStageCreateInfo stages[5]{};
+        uint32_t stageCount = 0;
+        auto addStage = [&](uint32_t stageBit, vkmin::VkShaderModule mod, const char* entry) {
+            stages[stageCount].sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[stageCount].stage = stageBit;
+            stages[stageCount].module = mod;
+            stages[stageCount].pName = entry;
+            ++stageCount;
+        };
+        const bool isTessPoint = (spec.id == "tess_point_gs");
+        addStage(vkmin::VK_SHADER_STAGE_VERTEX_BIT, vsMod, isTessPoint ? "TessPointVS" : "VSMain");
+        if (needTess) {
+            addStage(vkmin::VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, hsMod, isTessPoint ? "TessPointHS" : "HSMain");
+            addStage(vkmin::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, dsMod, isTessPoint ? "TessPointDS" : "DSMain");
+        }
+        if (needGS) {
+            addStage(vkmin::VK_SHADER_STAGE_GEOMETRY_BIT, gsMod, isTessPoint ? "TessPointGS" : "GSMain");
+        }
+        addStage(vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, psMod, isTessPoint ? "TessPointPS" : "PSMain");
 
         bool usesQuadVB = (spec.category == BenchCategory::Pixel);
         vkmin::VkVertexInputBindingDescription vbd{0, 12, 0};
@@ -544,7 +591,14 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             vi.pVertexAttributeDescriptions = &vad;
         }
 
-        vkmin::VkPipelineInputAssemblyStateCreateInfo ia{vkmin::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0, vkmin::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+        uint32_t topology = vkmin::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        if (spec.kind == PipelineKind::GraphicsTessGS) {
+            topology = vkmin::VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+        } else if (spec.kind == PipelineKind::GraphicsVSGSPS) {
+            topology = vkmin::VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        }
+        vkmin::VkPipelineInputAssemblyStateCreateInfo ia{vkmin::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, nullptr, 0, topology, 0};
+        vkmin::VkPipelineTessellationStateCreateInfo tessState{vkmin::VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, nullptr, 0, 3};
         vkmin::VkViewport vp{0.0f, 0.0f, static_cast<float>(maxW), static_cast<float>(maxH), 0.0f, 1.0f};
         vkmin::VkRect2D sc{{0, 0}, {maxW, maxH}};
         vkmin::VkPipelineViewportStateCreateInfo vps{vkmin::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, &vp, 1, &sc};
@@ -556,10 +610,11 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
 
         vkmin::VkGraphicsPipelineCreateInfo gpci{};
         gpci.sType = vkmin::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        gpci.stageCount = 2;
+        gpci.stageCount = stageCount;
         gpci.pStages = stages;
         gpci.pVertexInputState = &vi;
         gpci.pInputAssemblyState = &ia;
+        gpci.pTessellationState = needTess ? &tessState : nullptr;
         gpci.pViewportState = &vps;
         gpci.pRasterizationState = &rs;
         gpci.pMultisampleState = &ms;
@@ -578,6 +633,9 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             r.status = "FAILED (vkCreateGraphicsPipelines)";
             vk.vkDestroyPipelineLayout(dev, pl, nullptr);
             vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+            if (dsMod) vk.vkDestroyShaderModule(dev, dsMod, nullptr);
+            if (hsMod) vk.vkDestroyShaderModule(dev, hsMod, nullptr);
+            if (gsMod) vk.vkDestroyShaderModule(dev, gsMod, nullptr);
             vk.vkDestroyShaderModule(dev, psMod, nullptr);
             vk.vkDestroyShaderModule(dev, vsMod, nullptr);
             vk.vkDestroyRenderPass(dev, rp, nullptr);
@@ -653,12 +711,15 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             if (spec.category == BenchCategory::Pixel) {
                 float cbData[8] = {static_cast<float>(rw), static_cast<float>(rh), 1.0f, 1.25f, 0.0f, 0.0f, 0.0f, 0.0f};
                 std::memcpy(ptr, cbData, sizeof(cbData));
-            } else {
+            } else if (spec.category == BenchCategory::Vertex) {
                 struct { float mvp[16]; float time; uint32_t vc; float pad[2]; } vcb{};
                 vcb.mvp[0] = 1.0f; vcb.mvp[5] = 1.0f; vcb.mvp[10] = 1.0f; vcb.mvp[15] = 1.0f;
                 vcb.time = 0.5f;
                 vcb.vc = vc;
                 std::memcpy(ptr, &vcb, sizeof(vcb));
+            } else if (spec.category == BenchCategory::Geometry) {
+                struct { float scale; float time; uint32_t pc; float pad; } gcb{0.05f, 0.5f, vc, 0.0f};
+                std::memcpy(ptr, &gcb, sizeof(gcb));
             }
             vk.vkUnmapMemory(dev, cb.mem);
 
@@ -686,9 +747,25 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             return std::chrono::duration<double, std::milli>(s1 - s0).count();
         };
 
-        uint32_t rw = (spec.category == BenchCategory::Pixel) ? width : 128;
-        uint32_t rh = (spec.category == BenchCategory::Pixel) ? height : 128;
-        uint32_t vc = (spec.category == BenchCategory::Pixel) ? 6 : 24000;
+        auto getVkGfxParams = [&](int mode, uint32_t& rwOut, uint32_t& rhOut, uint32_t& vcOut) {
+            if (spec.category == BenchCategory::Pixel) {
+                rwOut = (mode == 0) ? 64 : (mode == 1 ? width : width * 2);
+                rhOut = (mode == 0) ? 64 : (mode == 1 ? height : height * 2);
+                vcOut = 6;
+            } else if (spec.category == BenchCategory::Vertex) {
+                rwOut = 128; rhOut = 128;
+                vcOut = (mode == 0) ? 3000 : (mode == 1 ? 24000 : 96000);
+            } else if (spec.category == BenchCategory::Geometry) {
+                rwOut = 128; rhOut = 128;
+                vcOut = (mode == 0) ? 512 : (mode == 1 ? 4096 : 16384);
+            } else {
+                rwOut = 128; rhOut = 128;
+                vcOut = (mode == 0) ? 64 * 3 : (mode == 1 ? 512 * 3 : 2048 * 3);
+            }
+        };
+
+        uint32_t rw = 128, rh = 128, vc = 6;
+        getVkGfxParams(1, rw, rh, vc);
 
         r.firstDispatchMs = drawVK(rw, rh, vc);
         std::vector<double> samples;
@@ -714,13 +791,10 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vk.vkUnmapMemory(dev, rb.mem);
         r.checksum = sum;
 
-        if (spec.category == BenchCategory::Pixel) {
-            r.shortJobMs = drawVK(64, 64, 6);
-            r.longJobMs = drawVK(width * 2, height * 2, 6);
-        } else {
-            r.shortJobMs = drawVK(128, 128, 3000);
-            r.longJobMs = drawVK(128, 128, 96000);
-        }
+        getVkGfxParams(0, rw, rh, vc);
+        r.shortJobMs = drawVK(rw, rh, vc);
+        getVkGfxParams(2, rw, rh, vc);
+        r.longJobMs = drawVK(rw, rh, vc);
 
         finalizeTimingAndMemory(r, memBefore, memAfterCompile, samples);
         results.push_back(r);
@@ -738,9 +812,471 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vk.vkDestroyPipeline(dev, pipe, nullptr);
         vk.vkDestroyPipelineLayout(dev, pl, nullptr);
         vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+        if (dsMod) vk.vkDestroyShaderModule(dev, dsMod, nullptr);
+        if (hsMod) vk.vkDestroyShaderModule(dev, hsMod, nullptr);
+        if (gsMod) vk.vkDestroyShaderModule(dev, gsMod, nullptr);
         vk.vkDestroyShaderModule(dev, psMod, nullptr);
         vk.vkDestroyShaderModule(dev, vsMod, nullptr);
         vk.vkDestroyRenderPass(dev, rp, nullptr);
+        vk.vkDestroyDevice(dev, nullptr);
+    }
+
+    vk.vkDestroyInstance(inst, nullptr);
+    return results;
+}
+
+inline std::vector<BenchRunResult> runVulkanRaytracingBench(
+    const BenchmarkSpec& spec,
+    const std::vector<uint8_t>& spv,
+    uint32_t width,
+    uint32_t height,
+    uint32_t iters,
+    int32_t targetDeviceIdx = -1) {
+    std::vector<BenchRunResult> results;
+    vkmin::Loader vk;
+    vkmin::VkInstance inst = nullptr;
+    std::string err;
+    if (!initVulkanInstance(vk, inst, err)) {
+        return results;
+    }
+
+    uint32_t physCount = 0;
+    vk.vkEnumeratePhysicalDevices(inst, &physCount, nullptr);
+    std::vector<vkmin::VkPhysicalDevice> physDevs(physCount);
+    if (physCount > 0) vk.vkEnumeratePhysicalDevices(inst, &physCount, physDevs.data());
+
+    for (uint32_t pdIdx = 0; pdIdx < physCount; ++pdIdx) {
+        if (targetDeviceIdx >= 0 && static_cast<int32_t>(pdIdx) != targetDeviceIdx) continue;
+        auto pd = physDevs[pdIdx];
+
+        BenchRunResult r;
+        r.benchId = spec.id;
+        r.benchName = spec.name;
+        r.category = categoryName(spec.category);
+        r.backend = queryVulkanBackendName(vk, pd);
+        r.shaderFormat = "SPIR-V";
+
+        MemorySnapshot memBefore = queryProcessMemory();
+
+        const bool isInline = (spec.kind == PipelineKind::RayTracingInline);
+        uint32_t extCount = 0;
+        if (vk.vkEnumerateDeviceExtensionProperties) {
+            vk.vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, nullptr);
+        }
+        std::vector<vkmin::VkExtensionProperties> exts(extCount);
+        if (extCount > 0) {
+            vk.vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, exts.data());
+        }
+        auto hasExt = [&](const char* name) {
+            for (const auto& e : exts) {
+                if (std::strcmp(e.extensionName, name) == 0) return true;
+            }
+            return false;
+        };
+
+        const char* stageExt = isInline ? "VK_KHR_ray_query" : "VK_KHR_ray_tracing_pipeline";
+        if (!hasExt("VK_KHR_acceleration_structure") ||
+            !hasExt("VK_KHR_deferred_host_operations") ||
+            !hasExt(stageExt)) {
+            r.status = std::string("SKIPPED (") + stageExt + " unsupported)";
+            results.push_back(r);
+            continue;
+        }
+
+        vkmin::VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeat{};
+        bdaFeat.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        vkmin::VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeat{};
+        asFeat.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+        vkmin::VkPhysicalDeviceRayQueryFeaturesKHR rqFeat{};
+        rqFeat.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+        vkmin::VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtpFeat{};
+        rtpFeat.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+
+        bdaFeat.pNext = &asFeat;
+        asFeat.pNext = isInline ? static_cast<void*>(&rqFeat) : static_cast<void*>(&rtpFeat);
+
+        if (vk.vkGetPhysicalDeviceFeatures2) {
+            vkmin::VkPhysicalDeviceFeatures2 feats2{};
+            feats2.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats2.pNext = &bdaFeat;
+            vk.vkGetPhysicalDeviceFeatures2(pd, &feats2);
+        }
+        if (!bdaFeat.bufferDeviceAddress || !asFeat.accelerationStructure ||
+            (isInline ? !rqFeat.rayQuery : !rtpFeat.rayTracingPipeline)) {
+            r.status = std::string("SKIPPED (") + stageExt + " feature unsupported)";
+            results.push_back(r);
+            continue;
+        }
+
+        uint32_t qfCount = 0;
+        vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, nullptr);
+        std::vector<vkmin::VkQueueFamilyProperties> qfs(qfCount);
+        vk.vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, qfs.data());
+        uint32_t compQF = UINT32_MAX;
+        for (uint32_t q = 0; q < qfCount; ++q) {
+            if (qfs[q].queueFlags & vkmin::VK_QUEUE_COMPUTE_BIT) {
+                compQF = q;
+                break;
+            }
+        }
+        if (compQF == UINT32_MAX) {
+            r.status = "SKIPPED (no compute queue)";
+            results.push_back(r);
+            continue;
+        }
+
+        std::vector<const char*> reqExts = {
+            "VK_KHR_acceleration_structure",
+            "VK_KHR_deferred_host_operations",
+            stageExt,
+        };
+        if (hasExt("VK_KHR_buffer_device_address")) reqExts.push_back("VK_KHR_buffer_device_address");
+        if (hasExt("VK_KHR_spirv_1_4")) reqExts.push_back("VK_KHR_spirv_1_4");
+        if (hasExt("VK_KHR_shader_float_controls")) reqExts.push_back("VK_KHR_shader_float_controls");
+        if (hasExt("VK_KHR_portability_subset")) reqExts.push_back("VK_KHR_portability_subset");
+
+        float prio = 1.0f;
+        vkmin::VkDeviceQueueCreateInfo dqci{vkmin::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, compQF, 1, &prio};
+        vkmin::VkDeviceCreateInfo dci{
+            vkmin::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &bdaFeat, 0, 1, &dqci,
+            0, nullptr, static_cast<uint32_t>(reqExts.size()), reqExts.data(), nullptr};
+        vkmin::VkDevice dev = nullptr;
+        if (vk.vkCreateDevice(pd, &dci, nullptr, &dev) != vkmin::VK_SUCCESS || !dev) {
+            r.status = "FAILED (vkCreateDevice RT)";
+            results.push_back(r);
+            continue;
+        }
+
+        auto loadDevProc = [&](auto& fn, const char* name) {
+            fn = reinterpret_cast<std::decay_t<decltype(fn)>>(vk.vkGetDeviceProcAddr(dev, name));
+        };
+        vkmin::VkDeviceAddress (VK_PTR* pGetBufAddr)(vkmin::VkDevice, const vkmin::VkBufferDeviceAddressInfo*) = nullptr;
+        vkmin::VkResult (VK_PTR* pCreateAS)(vkmin::VkDevice, const vkmin::VkAccelerationStructureCreateInfoKHR*, const void*, vkmin::VkAccelerationStructureKHR*) = nullptr;
+        void (VK_PTR* pDestroyAS)(vkmin::VkDevice, vkmin::VkAccelerationStructureKHR, const void*) = nullptr;
+        void (VK_PTR* pGetASBuildSizes)(vkmin::VkDevice, uint32_t, const vkmin::VkAccelerationStructureBuildGeometryInfoKHR*, const uint32_t*, vkmin::VkAccelerationStructureBuildSizesInfoKHR*) = nullptr;
+        vkmin::VkDeviceAddress (VK_PTR* pGetASAddr)(vkmin::VkDevice, const vkmin::VkAccelerationStructureDeviceAddressInfoKHR*) = nullptr;
+        void (VK_PTR* pCmdBuildAS)(vkmin::VkCommandBuffer, uint32_t, const vkmin::VkAccelerationStructureBuildGeometryInfoKHR*, const vkmin::VkAccelerationStructureBuildRangeInfoKHR* const*) = nullptr;
+        vkmin::VkResult (VK_PTR* pCreateRTPipe)(vkmin::VkDevice, uint64_t, vkmin::VkPipelineCache, uint32_t, const vkmin::VkRayTracingPipelineCreateInfoKHR*, const void*, vkmin::VkPipeline*) = nullptr;
+        vkmin::VkResult (VK_PTR* pGetRTHandles)(vkmin::VkDevice, vkmin::VkPipeline, uint32_t, uint32_t, size_t, void*) = nullptr;
+        void (VK_PTR* pCmdTraceRays)(vkmin::VkCommandBuffer, const vkmin::VkStridedDeviceAddressRegionKHR*, const vkmin::VkStridedDeviceAddressRegionKHR*, const vkmin::VkStridedDeviceAddressRegionKHR*, const vkmin::VkStridedDeviceAddressRegionKHR*, uint32_t, uint32_t, uint32_t) = nullptr;
+
+        loadDevProc(pGetBufAddr, "vkGetBufferDeviceAddress");
+        if (!pGetBufAddr) loadDevProc(pGetBufAddr, "vkGetBufferDeviceAddressKHR");
+        loadDevProc(pCreateAS, "vkCreateAccelerationStructureKHR");
+        loadDevProc(pDestroyAS, "vkDestroyAccelerationStructureKHR");
+        loadDevProc(pGetASBuildSizes, "vkGetAccelerationStructureBuildSizesKHR");
+        loadDevProc(pGetASAddr, "vkGetAccelerationStructureDeviceAddressKHR");
+        loadDevProc(pCmdBuildAS, "vkCmdBuildAccelerationStructuresKHR");
+        if (!isInline) {
+            loadDevProc(pCreateRTPipe, "vkCreateRayTracingPipelinesKHR");
+            loadDevProc(pGetRTHandles, "vkGetRayTracingShaderGroupHandlesKHR");
+            loadDevProc(pCmdTraceRays, "vkCmdTraceRaysKHR");
+        }
+
+        if (!pGetBufAddr || !pCreateAS || !pDestroyAS || !pGetASBuildSizes || !pGetASAddr || !pCmdBuildAS ||
+            (!isInline && (!pCreateRTPipe || !pGetRTHandles || !pCmdTraceRays))) {
+            r.status = "SKIPPED (RT device entry points missing)";
+            vk.vkDestroyDevice(dev, nullptr);
+            results.push_back(r);
+            continue;
+        }
+
+        vkmin::VkQueue queue = nullptr;
+        vk.vkGetDeviceQueue(dev, compQF, 0, &queue);
+
+        vkmin::VkPhysicalDeviceMemoryProperties memProps{};
+        vk.vkGetPhysicalDeviceMemoryProperties(pd, &memProps);
+        auto findMem = [&](uint32_t bits, vkmin::VkFlags req) -> uint32_t {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if ((bits & (1u << i)) && ((memProps.memoryTypes[i].propertyFlags & req) == req)) return i;
+            }
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if (bits & (1u << i)) return i;
+            }
+            return 0;
+        };
+
+        struct VkBufAlloc { vkmin::VkBuffer buf = 0; vkmin::VkDeviceMemory mem = 0; vkmin::VkDeviceAddress addr = 0; };
+        auto mkBuf = [&](size_t sz, vkmin::VkFlags usage, bool hostVisible) -> VkBufAlloc {
+            VkBufAlloc ba{};
+            vkmin::VkBufferCreateInfo bci{vkmin::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, sz, usage | vkmin::VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+            vk.vkCreateBuffer(dev, &bci, nullptr, &ba.buf);
+            vkmin::VkMemoryRequirements mr{};
+            vk.vkGetBufferMemoryRequirements(dev, ba.buf, &mr);
+            vkmin::VkFlags memReq = hostVisible ? (vkmin::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vkmin::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : vkmin::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            vkmin::VkMemoryAllocateFlagsInfo mafi{vkmin::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, vkmin::VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+            vkmin::VkMemoryAllocateInfo mai{vkmin::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &mafi, mr.size, findMem(mr.memoryTypeBits, memReq)};
+            vk.vkAllocateMemory(dev, &mai, nullptr, &ba.mem);
+            vk.vkBindBufferMemory(dev, ba.buf, ba.mem, 0);
+            vkmin::VkBufferDeviceAddressInfo bdai{vkmin::VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, ba.buf};
+            ba.addr = pGetBufAddr(dev, &bdai);
+            return ba;
+        };
+
+        vkmin::VkCommandPoolCreateInfo cpci{vkmin::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, vkmin::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, compQF};
+        vkmin::VkCommandPool cpool = nullptr;
+        vk.vkCreateCommandPool(dev, &cpci, nullptr, &cpool);
+        vkmin::VkCommandBufferAllocateInfo cbai{vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cpool, vkmin::VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        vkmin::VkCommandBuffer cmdBuf = nullptr;
+        vk.vkAllocateCommandBuffers(dev, &cbai, &cmdBuf);
+
+        // Build triangle BLAS + TLAS
+        const float triVerts[9] = {0.0f, 1.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f};
+        auto vb = mkBuf(sizeof(triVerts), vkmin::VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+        void* ptr = nullptr;
+        vk.vkMapMemory(dev, vb.mem, 0, sizeof(triVerts), 0, &ptr);
+        std::memcpy(ptr, triVerts, sizeof(triVerts));
+        vk.vkUnmapMemory(dev, vb.mem);
+
+        vkmin::VkAccelerationStructureGeometryKHR blasGeom{};
+        blasGeom.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        blasGeom.geometryType = vkmin::VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        blasGeom.flags = vkmin::VK_GEOMETRY_OPAQUE_BIT_KHR;
+        blasGeom.geometry.triangles.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        blasGeom.geometry.triangles.vertexFormat = vkmin::VK_FORMAT_R32G32B32_SFLOAT;
+        blasGeom.geometry.triangles.vertexData.deviceAddress = vb.addr;
+        blasGeom.geometry.triangles.vertexStride = 12;
+        blasGeom.geometry.triangles.maxVertex = 2;
+        blasGeom.geometry.triangles.indexType = vkmin::VK_INDEX_TYPE_NONE_KHR;
+
+        vkmin::VkAccelerationStructureBuildGeometryInfoKHR blasBuild{};
+        blasBuild.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        blasBuild.type = vkmin::VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        blasBuild.flags = vkmin::VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        blasBuild.mode = vkmin::VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        blasBuild.geometryCount = 1;
+        blasBuild.pGeometries = &blasGeom;
+
+        uint32_t primCount = 1;
+        vkmin::VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
+        blasSizes.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        pGetASBuildSizes(dev, vkmin::VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blasBuild, &primCount, &blasSizes);
+
+        auto blasBuf = mkBuf(blasSizes.accelerationStructureSize, vkmin::VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+        vkmin::VkAccelerationStructureCreateInfoKHR blasCi{vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR, nullptr, 0, blasBuf.buf, 0, blasSizes.accelerationStructureSize, vkmin::VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, 0};
+        vkmin::VkAccelerationStructureKHR blas = 0;
+        pCreateAS(dev, &blasCi, nullptr, &blas);
+        blasBuild.dstAccelerationStructure = blas;
+
+        vkmin::VkAccelerationStructureDeviceAddressInfoKHR blasAddrInfo{vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, nullptr, blas};
+        vkmin::VkDeviceAddress blasAddr = pGetASAddr(dev, &blasAddrInfo);
+
+        vkmin::VkAccelerationStructureInstanceKHR instData{};
+        instData.transform.matrix[0][0] = 1.0f;
+        instData.transform.matrix[1][1] = 1.0f;
+        instData.transform.matrix[2][2] = 1.0f;
+        instData.instanceCustomIndex = 42;
+        instData.mask = 0xFF;
+        instData.accelerationStructureReference = blasAddr;
+        auto instBuf = mkBuf(sizeof(instData), vkmin::VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+        vk.vkMapMemory(dev, instBuf.mem, 0, sizeof(instData), 0, &ptr);
+        std::memcpy(ptr, &instData, sizeof(instData));
+        vk.vkUnmapMemory(dev, instBuf.mem);
+
+        vkmin::VkAccelerationStructureGeometryKHR tlasGeom{};
+        tlasGeom.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        tlasGeom.geometryType = vkmin::VK_GEOMETRY_TYPE_INSTANCES_KHR;
+        tlasGeom.flags = vkmin::VK_GEOMETRY_OPAQUE_BIT_KHR;
+        tlasGeom.geometry.instances.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        tlasGeom.geometry.instances.data.deviceAddress = instBuf.addr;
+
+        vkmin::VkAccelerationStructureBuildGeometryInfoKHR tlasBuild{};
+        tlasBuild.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        tlasBuild.type = vkmin::VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        tlasBuild.flags = vkmin::VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        tlasBuild.mode = vkmin::VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        tlasBuild.geometryCount = 1;
+        tlasBuild.pGeometries = &tlasGeom;
+
+        vkmin::VkAccelerationStructureBuildSizesInfoKHR tlasSizes{};
+        tlasSizes.sType = vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        pGetASBuildSizes(dev, vkmin::VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlasBuild, &primCount, &tlasSizes);
+
+        auto tlasBuf = mkBuf(tlasSizes.accelerationStructureSize, vkmin::VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+        vkmin::VkAccelerationStructureCreateInfoKHR tlasCi{vkmin::VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR, nullptr, 0, tlasBuf.buf, 0, tlasSizes.accelerationStructureSize, vkmin::VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, 0};
+        vkmin::VkAccelerationStructureKHR tlas = 0;
+        pCreateAS(dev, &tlasCi, nullptr, &tlas);
+        tlasBuild.dstAccelerationStructure = tlas;
+
+        auto scratch = mkBuf(std::max<size_t>(4096, std::max(blasSizes.buildScratchSize, tlasSizes.buildScratchSize)), vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+        blasBuild.scratchData.deviceAddress = scratch.addr;
+        tlasBuild.scratchData.deviceAddress = scratch.addr;
+
+        vkmin::VkAccelerationStructureBuildRangeInfoKHR rangeInfo{1, 0, 0, 0};
+        const vkmin::VkAccelerationStructureBuildRangeInfoKHR* pRange = &rangeInfo;
+
+        vkmin::VkCommandBufferBeginInfo cbbi{vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, vkmin::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+        vk.vkBeginCommandBuffer(cmdBuf, &cbbi);
+        pCmdBuildAS(cmdBuf, 1, &blasBuild, &pRange);
+        if (vk.vkCmdPipelineBarrier) {
+            vkmin::VkMemoryBarrier mb{vkmin::VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, vkmin::VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR, vkmin::VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR};
+            vk.vkCmdPipelineBarrier(cmdBuf, vkmin::VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, vkmin::VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        pCmdBuildAS(cmdBuf, 1, &tlasBuild, &pRange);
+        vk.vkEndCommandBuffer(cmdBuf);
+        vkmin::VkSubmitInfo si{vkmin::VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmdBuf, 0, nullptr};
+        vk.vkQueueSubmit(queue, 1, &si, 0);
+        vk.vkQueueWaitIdle(queue);
+
+        auto t0 = std::chrono::steady_clock::now();
+        vkmin::VkShaderModuleCreateInfo smci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, spv.size(), reinterpret_cast<const uint32_t*>(spv.data())};
+        vkmin::VkShaderModule sm = 0;
+        vk.vkCreateShaderModule(dev, &smci, nullptr, &sm);
+
+        uint32_t rtStages = isInline ? vkmin::VK_SHADER_STAGE_COMPUTE_BIT : (vkmin::VK_SHADER_STAGE_RAYGEN_BIT_KHR | vkmin::VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | vkmin::VK_SHADER_STAGE_MISS_BIT_KHR);
+        vkmin::VkDescriptorSetLayoutBinding binds[2] = {
+            {0, vkmin::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr},
+            {8, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr},
+        };
+        vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 2, binds};
+        vkmin::VkDescriptorSetLayout dsl = 0;
+        vk.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
+
+        vkmin::VkPipelineLayoutCreateInfo plci{vkmin::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &dsl, 0, nullptr};
+        vkmin::VkPipelineLayout pl = 0;
+        vk.vkCreatePipelineLayout(dev, &plci, nullptr, &pl);
+
+        vkmin::VkPipeline pipe = 0;
+        vkmin::VkResult pipeRes = -1;
+        VkBufAlloc sbt{};
+        vkmin::VkStridedDeviceAddressRegionKHR rgenReg{}, missReg{}, hitReg{}, callReg{};
+
+        if (isInline) {
+            vkmin::VkPipelineShaderStageCreateInfo stage{vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, sm, "RayQueryMain", nullptr};
+            vkmin::VkComputePipelineCreateInfo cpci{vkmin::VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, nullptr, 0, stage, pl, 0, 0};
+            pipeRes = vk.vkCreateComputePipelines(dev, 0, 1, &cpci, nullptr, &pipe);
+        } else {
+            vkmin::VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
+            rtProps.sType = vkmin::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+            if (vk.vkGetPhysicalDeviceProperties2) {
+                vkmin::VkPhysicalDeviceProperties2 props2{};
+                props2.sType = 1000059001u;
+                props2.pNext = &rtProps;
+                vk.vkGetPhysicalDeviceProperties2(pd, &props2);
+            }
+            vkmin::VkPipelineShaderStageCreateInfo stages[3]{};
+            stages[0] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_RAYGEN_BIT_KHR, sm, "RayGen", nullptr};
+            stages[1] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_MISS_BIT_KHR, sm, "MissMain", nullptr};
+            stages[2] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, sm, "ClosestHitMain", nullptr};
+            vkmin::VkRayTracingShaderGroupCreateInfoKHR groups[3]{};
+            groups[0] = {vkmin::VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, nullptr, vkmin::VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0, vkmin::VK_SHADER_UNUSED_KHR, vkmin::VK_SHADER_UNUSED_KHR, vkmin::VK_SHADER_UNUSED_KHR, nullptr};
+            groups[1] = {vkmin::VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, nullptr, vkmin::VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1, vkmin::VK_SHADER_UNUSED_KHR, vkmin::VK_SHADER_UNUSED_KHR, vkmin::VK_SHADER_UNUSED_KHR, nullptr};
+            groups[2] = {vkmin::VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, nullptr, vkmin::VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, vkmin::VK_SHADER_UNUSED_KHR, 2, vkmin::VK_SHADER_UNUSED_KHR, vkmin::VK_SHADER_UNUSED_KHR, nullptr};
+            vkmin::VkRayTracingPipelineCreateInfoKHR rtpci{vkmin::VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR, nullptr, 0, 3, stages, 3, groups, 1, nullptr, nullptr, nullptr, pl, 0, 0};
+            pipeRes = pCreateRTPipe(dev, 0, 0, 1, &rtpci, nullptr, &pipe);
+            if (pipeRes == vkmin::VK_SUCCESS && pipe) {
+                uint32_t handleSz = rtProps.shaderGroupHandleSize ? rtProps.shaderGroupHandleSize : 32;
+                uint32_t baseAlign = rtProps.shaderGroupBaseAlignment ? rtProps.shaderGroupBaseAlignment : 64;
+                uint32_t stride = (handleSz + baseAlign - 1) & ~(baseAlign - 1);
+                std::vector<uint8_t> handles(3 * handleSz);
+                pGetRTHandles(dev, pipe, 0, 3, handles.size(), handles.data());
+                sbt = mkBuf(3 * stride, vkmin::VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true);
+                vk.vkMapMemory(dev, sbt.mem, 0, 3 * stride, 0, &ptr);
+                std::memset(ptr, 0, 3 * stride);
+                for (uint32_t g = 0; g < 3; ++g) {
+                    std::memcpy(static_cast<uint8_t*>(ptr) + g * stride, handles.data() + g * handleSz, handleSz);
+                }
+                vk.vkUnmapMemory(dev, sbt.mem);
+                rgenReg = {sbt.addr + 0 * stride, stride, stride};
+                missReg = {sbt.addr + 1 * stride, stride, stride};
+                hitReg = {sbt.addr + 2 * stride, stride, stride};
+            }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        r.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        MemorySnapshot memAfterCompile = queryProcessMemory();
+
+        if (pipeRes != vkmin::VK_SUCCESS || !pipe) {
+            r.status = "FAILED (Vulkan RT Pipeline)";
+            if (sbt.buf) { vk.vkDestroyBuffer(dev, sbt.buf, nullptr); vk.vkFreeMemory(dev, sbt.mem, nullptr); }
+            vk.vkDestroyPipelineLayout(dev, pl, nullptr);
+            vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+            vk.vkDestroyShaderModule(dev, sm, nullptr);
+            pDestroyAS(dev, tlas, nullptr);
+            pDestroyAS(dev, blas, nullptr);
+            for (auto& b : {scratch, tlasBuf, instBuf, blasBuf, vb}) {
+                vk.vkDestroyBuffer(dev, b.buf, nullptr);
+                vk.vkFreeMemory(dev, b.mem, nullptr);
+            }
+            vk.vkDestroyCommandPool(dev, cpool, nullptr);
+            vk.vkDestroyDevice(dev, nullptr);
+            results.push_back(r);
+            continue;
+        }
+
+        auto outBuf = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        vkmin::VkDescriptorPoolSize psz[2] = {
+            {vkmin::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+            {vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        };
+        vkmin::VkDescriptorPoolCreateInfo dpci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1, 2, psz};
+        vkmin::VkDescriptorPool dp = 0;
+        vk.vkCreateDescriptorPool(dev, &dpci, nullptr, &dp);
+        vkmin::VkDescriptorSetAllocateInfo dsai{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, dp, 1, &dsl};
+        vkmin::VkDescriptorSet ds = 0;
+        vk.vkAllocateDescriptorSets(dev, &dsai, &ds);
+        vkmin::VkWriteDescriptorSetAccelerationStructureKHR wdsAs{vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR, nullptr, 1, &tlas};
+        vkmin::VkDescriptorBufferInfo outBi{outBuf.buf, 0, 4 * 1024 * 1024};
+        vkmin::VkWriteDescriptorSet wds[2] = {
+            {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &wdsAs, ds, 0, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr},
+            {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 8, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &outBi, nullptr},
+        };
+        vk.vkUpdateDescriptorSets(dev, 2, wds, 0, nullptr);
+
+        auto dispatchRT = [&](uint32_t w, uint32_t h) -> double {
+            auto s0 = std::chrono::steady_clock::now();
+            vk.vkResetCommandBuffer(cmdBuf, 0);
+            vk.vkBeginCommandBuffer(cmdBuf, &cbbi);
+            uint32_t bp = isInline ? vkmin::VK_PIPELINE_BIND_POINT_COMPUTE : vkmin::VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR;
+            vk.vkCmdBindPipeline(cmdBuf, bp, pipe);
+            vk.vkCmdBindDescriptorSets(cmdBuf, bp, pl, 0, 1, &ds, 0, nullptr);
+            if (isInline) {
+                vk.vkCmdDispatch(cmdBuf, (w + 3) / 4, h, 1);
+            } else {
+                pCmdTraceRays(cmdBuf, &rgenReg, &missReg, &hitReg, &callReg, w, h, 1);
+            }
+            vk.vkEndCommandBuffer(cmdBuf);
+            vk.vkQueueSubmit(queue, 1, &si, 0);
+            vk.vkQueueWaitIdle(queue);
+            auto s1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(s1 - s0).count();
+        };
+
+        r.firstDispatchMs = dispatchRT(width, height);
+        std::vector<double> samples;
+        samples.reserve(iters);
+        for (uint32_t i = 0; i < iters; ++i) {
+            samples.push_back(dispatchRT(width, height));
+        }
+
+        vk.vkMapMemory(dev, outBuf.mem, 0, 4096, 0, &ptr);
+        const uint32_t* up = static_cast<const uint32_t*>(ptr);
+        double sum = 0.0;
+        for (size_t i = 0; i < 1024; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+        vk.vkUnmapMemory(dev, outBuf.mem);
+        r.checksum = sum;
+
+        r.shortJobMs = dispatchRT(64, 64);
+        r.longJobMs = dispatchRT(width * 2, height * 2);
+
+        finalizeTimingAndMemory(r, memBefore, memAfterCompile, samples);
+        results.push_back(r);
+
+        vk.vkDestroyDescriptorPool(dev, dp, nullptr);
+        vk.vkDestroyBuffer(dev, outBuf.buf, nullptr);
+        vk.vkFreeMemory(dev, outBuf.mem, nullptr);
+        if (sbt.buf) { vk.vkDestroyBuffer(dev, sbt.buf, nullptr); vk.vkFreeMemory(dev, sbt.mem, nullptr); }
+        vk.vkDestroyPipeline(dev, pipe, nullptr);
+        vk.vkDestroyPipelineLayout(dev, pl, nullptr);
+        vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+        vk.vkDestroyShaderModule(dev, sm, nullptr);
+        pDestroyAS(dev, tlas, nullptr);
+        pDestroyAS(dev, blas, nullptr);
+        for (auto& b : {scratch, tlasBuf, instBuf, blasBuf, vb}) {
+            vk.vkDestroyBuffer(dev, b.buf, nullptr);
+            vk.vkFreeMemory(dev, b.mem, nullptr);
+        }
+        vk.vkDestroyCommandPool(dev, cpool, nullptr);
         vk.vkDestroyDevice(dev, nullptr);
     }
 

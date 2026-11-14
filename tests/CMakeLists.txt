@@ -50,6 +50,38 @@ function(add_hlsl_spirv hlsl_name profile entry out_name)
     set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
 endfunction()
 
+function(add_hlsl_spirv_vk12 hlsl_name profile entry out_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
+    set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
+    add_custom_command(
+        OUTPUT "${dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fspv-target-env=vulkan1.2
+                -fvk-t-shift 0 0 -fvk-u-shift 8 0 -fvk-b-shift 16 0
+                -T ${profile} -E ${entry} -O3 -Fo "${dst}" "${src}"
+        DEPENDS "${src}"
+        COMMENT "Compiling HLSL -> SPIR-V (vk1.2): ${hlsl_name} (${profile}, ${entry}) -> ${out_name}"
+    )
+    list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
+    set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
+endfunction()
+
+function(add_hlsl_spirv_lib_vk12 hlsl_name profile out_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
+    set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
+    add_custom_command(
+        OUTPUT "${dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fspv-target-env=vulkan1.2
+                -fvk-t-shift 0 0 -fvk-u-shift 8 0 -fvk-b-shift 16 0
+                -T ${profile} -O3 -Fo "${dst}" "${src}"
+        DEPENDS "${src}"
+        COMMENT "Compiling HLSL Library -> SPIR-V (vk1.2): ${hlsl_name} (${profile}) -> ${out_name}"
+    )
+    list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
+    set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
+endfunction()
+
 function(add_hlsl_dxil_lib hlsl_name profile out_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
     set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
@@ -102,6 +134,9 @@ add_hlsl_spirv(bench_vertex_stress.hlsl ps_6_0 PSMain bench_vertex_stress_ps.spv
 add_hlsl_dxil(bench_geometry_stress.hlsl vs_6_0 VSMain bench_geometry_stress_vs.dxil)
 add_hlsl_dxil(bench_geometry_stress.hlsl gs_6_0 GSMain bench_geometry_stress_gs.dxil)
 add_hlsl_dxil(bench_geometry_stress.hlsl ps_6_0 PSMain bench_geometry_stress_ps.dxil)
+add_hlsl_spirv(bench_geometry_stress.hlsl vs_6_0 VSMain bench_geometry_stress_vs.spv)
+add_hlsl_spirv(bench_geometry_stress.hlsl gs_6_0 GSMain bench_geometry_stress_gs.spv)
+add_hlsl_spirv(bench_geometry_stress.hlsl ps_6_0 PSMain bench_geometry_stress_ps.spv)
 
 # Fullscreen quad & Shadertoy pixel shaders (SPIR-V for Vulkan comparison)
 add_hlsl_spirv(fullscreen_quad.hlsl vs_6_0 VSMain fullscreen_quad_vs.spv)
@@ -132,12 +167,27 @@ add_hlsl_dxil(graphics_features.hlsl hs_6_4 TessPointHS gfx_tess_point_hs.dxil)
 add_hlsl_dxil(graphics_features.hlsl ds_6_4 TessPointDS gfx_tess_point_ds.dxil)
 add_hlsl_dxil(graphics_features.hlsl gs_6_4 TessPointGS gfx_tess_point_gs.dxil)
 add_hlsl_dxil(graphics_features.hlsl ps_6_4 TessPointPS gfx_tess_point_ps.dxil)
+add_hlsl_spirv(graphics_features.hlsl vs_6_4 TessPointVS gfx_tess_point_vs.spv)
+add_hlsl_spirv(graphics_features.hlsl hs_6_4 TessPointHS gfx_tess_point_hs.spv)
+add_hlsl_spirv(graphics_features.hlsl ds_6_4 TessPointDS gfx_tess_point_ds.spv)
+add_hlsl_spirv(graphics_features.hlsl gs_6_4 TessPointGS gfx_tess_point_gs.spv)
+add_hlsl_spirv(graphics_features.hlsl ps_6_4 TessPointPS gfx_tess_point_ps.spv)
 add_hlsl_dxil(graphics_features.hlsl vs_6_4 BabLoad4VS gfx_bab_load4_vs.dxil)
 add_hlsl_dxil(graphics_features.hlsl ps_6_4 BabLoad4PS gfx_bab_load4_ps.dxil)
 add_hlsl_dxil(graphics_features.hlsl vs_6_4 MsaaDiagVS gfx_msaa_diag_vs.dxil)
 add_hlsl_dxil(graphics_features.hlsl ps_6_4 MsaaDiagPS gfx_msaa_diag_ps.dxil)
 add_hlsl_dxil(raytracing_inline.hlsl cs_6_5 RayQueryMain raytracing_inline_cs.dxil)
 add_hlsl_dxil_lib(raytracing_pipeline.hlsl lib_6_5 raytracing_pipeline.dxil)
+add_hlsl_spirv_vk12(raytracing_inline.hlsl cs_6_5 RayQueryMain raytracing_inline_cs.spv)
+add_hlsl_spirv_lib_vk12(raytracing_pipeline.hlsl lib_6_5 raytracing_pipeline.spv)
+add_hlsl_dxil(bench_tess_tri.hlsl vs_6_0 VSMain bench_tess_tri_vs.dxil)
+add_hlsl_dxil(bench_tess_tri.hlsl hs_6_0 HSMain bench_tess_tri_hs.dxil)
+add_hlsl_dxil(bench_tess_tri.hlsl ds_6_0 DSMain bench_tess_tri_ds.dxil)
+add_hlsl_dxil(bench_tess_tri.hlsl ps_6_0 PSMain bench_tess_tri_ps.dxil)
+add_hlsl_spirv(bench_tess_tri.hlsl vs_6_0 VSMain bench_tess_tri_vs.spv)
+add_hlsl_spirv(bench_tess_tri.hlsl hs_6_0 HSMain bench_tess_tri_hs.spv)
+add_hlsl_spirv(bench_tess_tri.hlsl ds_6_0 DSMain bench_tess_tri_ds.spv)
+add_hlsl_spirv(bench_tess_tri.hlsl ps_6_0 PSMain bench_tess_tri_ps.spv)
 
 # Converted Shadertoy pixel shaders (DXIL)
 add_hlsl_dxil(light_cycle.hlsl ps_6_0 PSMain light_cycle.dxil)
