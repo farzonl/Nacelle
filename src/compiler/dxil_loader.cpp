@@ -112,6 +112,11 @@ void parseResourcesNode(const llvm::MDNode* resRoot, std::vector<DxilResourceRec
             DxilResourceRecord r;
             r.resClass = resClass;
             r.rangeId = mdAsUInt(recMd->getOperand(0).get());
+            if (auto* vm = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(recMd->getOperand(1).get())) {
+                if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(vm->getValue())) {
+                    r.symbolName = gv->getName().str();
+                }
+            }
             r.space = mdAsUInt(recMd->getOperand(3).get());
             r.lowerBound = mdAsUInt(recMd->getOperand(4).get());
             r.rangeSize = mdAsUInt(recMd->getOperand(5).get(), 1);
@@ -138,7 +143,18 @@ void parseResourcesNode(const llvm::MDNode* resRoot, std::vector<DxilResourceRec
     }
 }
 
-void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
+llvm::StringRef demangleDxilExportName(llvm::StringRef name) {
+    if (name.starts_with("\01?")) {
+        name = name.drop_front(2);
+        auto atPos = name.find("@@");
+        if (atPos != llvm::StringRef::npos) {
+            name = name.take_front(atPos);
+        }
+    }
+    return name;
+}
+
+void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out, llvm::StringRef targetExport = {}) {
     if (auto* sm = mod.getNamedMetadata("dx.shaderModel")) {
         if (sm->getNumOperands() > 0) {
             auto* n = sm->getOperand(0);
@@ -160,10 +176,21 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
         for (unsigned e = 0; e < eps->getNumOperands(); ++e) {
             auto* ep = eps->getOperand(e);
             if (!ep || ep->getNumOperands() < 5) continue;
+            llvm::Function* epFn = nullptr;
             if (auto* fnVal = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(ep->getOperand(0).get())) {
-                if (auto* fn = llvm::dyn_cast<llvm::Function>(fnVal->getValue())) {
-                    out.entryName = fn->getName().str();
+                epFn = llvm::dyn_cast<llvm::Function>(fnVal->getValue());
+            }
+            if (!targetExport.empty()) {
+                if (!epFn) continue;
+                llvm::StringRef rawName = epFn->getName();
+                llvm::StringRef altName = mdAsString(ep->getOperand(1).get());
+                if (rawName != targetExport && demangleDxilExportName(rawName) != targetExport &&
+                    altName != targetExport && demangleDxilExportName(altName) != targetExport) {
+                    continue;
                 }
+            }
+            if (epFn) {
+                out.entryName = epFn->getName().str();
             } else if (out.entryName.empty()) {
                 out.entryName = mdAsString(ep->getOperand(1).get());
             }
@@ -547,8 +574,9 @@ const std::string& getHostTargetTripleString() {
     return gHostTripleStr;
 }
 
-bool loadAndUpgradeDXIL(
+bool loadAndUpgradeDXILImpl(
     const D3D12_SHADER_BYTECODE& bytecode,
+    llvm::StringRef targetExport,
     llvm::LLVMContext& llvmCtx,
     DxilLoadedShader& outShader,
     std::string& outError) {
@@ -605,7 +633,7 @@ bool loadAndUpgradeDXIL(
     std::unique_ptr<llvm::Module> mod = std::move(*modOrErr);
     mod->setTargetTriple(llvm::Triple(getHostTargetTripleString()));
 
-    extractDxilMetadata(*mod, outShader);
+    extractDxilMetadata(*mod, outShader, targetExport);
 
     // Strip target-specific DXIL metadata/attributes that interfere with LLVM/MLIR import, while
     // running DXILUpgradePass first to convert legacy DXIL constructs and typed pointers.
@@ -705,6 +733,92 @@ bool loadAndUpgradeDXIL(
     for (auto* nmd : mdToDrop) mod->eraseNamedMetadata(nmd);
 
     outShader.module = std::move(mod);
+    return true;
+}
+
+bool loadAndUpgradeDXIL(
+    const D3D12_SHADER_BYTECODE& bytecode,
+    llvm::LLVMContext& llvmCtx,
+    DxilLoadedShader& outShader,
+    std::string& outError) {
+    return loadAndUpgradeDXILImpl(bytecode, {}, llvmCtx, outShader, outError);
+}
+
+bool loadAndUpgradeDXILLibraryExport(
+    const D3D12_SHADER_BYTECODE& bytecode,
+    const std::string& exportName,
+    llvm::LLVMContext& llvmCtx,
+    DxilLoadedShader& outShader,
+    std::string& outError) {
+    return loadAndUpgradeDXILImpl(bytecode, exportName, llvmCtx, outShader, outError);
+}
+
+bool listDxilLibraryExports(
+    const D3D12_SHADER_BYTECODE& bytecode,
+    llvm::LLVMContext& llvmCtx,
+    std::vector<DxilLibraryExport>& outExports,
+    std::string& outError) {
+    outExports.clear();
+    if (!bytecode.pShaderBytecode || bytecode.BytecodeLength < 4) {
+        outError = "Empty DXIL library bytecode";
+        return false;
+    }
+    const char* rawBytes = static_cast<const char*>(bytecode.pShaderBytecode);
+    size_t rawLen = bytecode.BytecodeLength;
+    llvm::StringRef bitcodeSlice;
+    if (rawLen >= 4 && std::memcmp(rawBytes, "DXBC", 4) == 0) {
+        llvm::MemoryBufferRef bufRef(llvm::StringRef(rawBytes, rawLen), "dxbc");
+        auto containerOrErr = llvm::object::DXContainer::create(bufRef);
+        if (!containerOrErr) {
+            outError = llvm::toString(containerOrErr.takeError());
+            return false;
+        }
+#if LLVM_VERSION_MAJOR >= 23
+        auto dxilOpt = containerOrErr->getDXIL(false);
+#else
+        auto dxilOpt = containerOrErr->getDXIL();
+#endif
+        if (!dxilOpt.has_value()) {
+            outError = "DXBC container missing DXIL part";
+            return false;
+        }
+        bitcodeSlice = llvm::StringRef(dxilOpt->second, dxilOpt->first.Bitcode.Size);
+    } else {
+        bitcodeSlice = llvm::StringRef(rawBytes, rawLen);
+    }
+
+    const std::string& hostDL = getHostDataLayoutString();
+    llvm::ParserCallbacks callbacks;
+    callbacks.DataLayout = [&hostDL](llvm::StringRef, llvm::StringRef) -> std::optional<std::string> {
+        return hostDL;
+    };
+
+    auto modOrErr = llvm::parseBitcodeFile(llvm::MemoryBufferRef(bitcodeSlice, "dxil.bc"), llvmCtx, callbacks);
+    if (!modOrErr) {
+        outError = llvm::toString(modOrErr.takeError());
+        return false;
+    }
+    const llvm::Module& mod = **modOrErr;
+    if (auto* eps = mod.getNamedMetadata("dx.entryPoints")) {
+        for (unsigned e = 0; e < eps->getNumOperands(); ++e) {
+            auto* ep = eps->getOperand(e);
+            if (!ep || ep->getNumOperands() < 5) continue;
+            auto* fnVal = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(ep->getOperand(0).get());
+            auto* fn = fnVal ? llvm::dyn_cast<llvm::Function>(fnVal->getValue()) : nullptr;
+            if (!fn) continue;
+            DxilLibraryExport exp;
+            exp.mangledName = fn->getName().str();
+            exp.exportName = demangleDxilExportName(fn->getName()).str();
+            if (auto* props = llvm::dyn_cast_or_null<llvm::MDNode>(ep->getOperand(4).get())) {
+                for (unsigned p = 0; p + 1 < props->getNumOperands(); p += 2) {
+                    if (mdAsUInt(props->getOperand(p).get()) == 8) { // kDxilShaderKindTag
+                        exp.shaderKind = mdAsUInt(props->getOperand(p + 1).get(), 0);
+                    }
+                }
+            }
+            outExports.push_back(std::move(exp));
+        }
+    }
     return true;
 }
 

@@ -752,4 +752,38 @@ HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(
 
 } // extern "C"
 
+NacelleStateObject::NacelleStateObject(ID3D12Device* device, CompiledDxrStateObject compiled)
+    : D3D12PageableBase<ID3D12StateObject>(device), compiled_(std::move(compiled)) {
+    const uint64_t selfPtr = reinterpret_cast<uint64_t>(this);
+    for (auto& kv : compiled_.identifiers) {
+        kv.second.stateObjPtr = selfPtr;
+    }
+}
+
+HRESULT STDMETHODCALLTYPE NacelleStateObject::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12StateObject))) {
+        *ppvObject = static_cast<ID3D12StateObject*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (InlineIsEqualGUID(riid, __uuidof(ID3D12StateObjectProperties))) {
+        *ppvObject = static_cast<ID3D12StateObjectProperties*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return D3D12PageableBase::QueryInterface(riid, ppvObject);
+}
+
+void* STDMETHODCALLTYPE NacelleStateObject::GetShaderIdentifier(LPCWSTR pExportName) {
+    if (!pExportName) return nullptr;
+    std::string name;
+    for (const wchar_t* p = pExportName; *p; ++p) {
+        name.push_back(static_cast<char>(*p & 0x7F));
+    }
+    auto it = compiled_.identifiers.find(name);
+    if (it == compiled_.identifiers.end()) return nullptr;
+    return &it->second;
+}
+
 } // namespace nacelle

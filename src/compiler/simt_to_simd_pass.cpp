@@ -2059,6 +2059,54 @@ private:
             setMapped(call.getResult(), h);
             return true;
         }
+        if (op == 160) {
+            // createHandleForLib(op, Resource) -> trace Resource load/GEP back to global symbol
+            mlir::Value ptrVal = arg(1);
+            if (auto loadOp = ptrVal.getDefiningOp<mlir::LLVM::LoadOp>()) {
+                ptrVal = loadOp.getAddr();
+            }
+            mlir::Value indexVal;
+            if (auto gepOp = ptrVal.getDefiningOp<mlir::LLVM::GEPOp>()) {
+                auto dynIdx = gepOp.getDynamicIndices();
+                if (!dynIdx.empty()) {
+                    indexVal = dynIdx.back();
+                } else {
+                    auto rawIdx = gepOp.getRawConstantIndices();
+                    if (!rawIdx.empty() && rawIdx.back() != mlir::LLVM::GEPOp::kDynamicIndex) {
+                        indexVal = cInt(loc, i32Ty(), static_cast<uint64_t>(rawIdx.back()));
+                    }
+                }
+                ptrVal = gepOp.getBase();
+            }
+            std::string symName;
+            if (auto addrOf = ptrVal.getDefiningOp<mlir::LLVM::AddressOfOp>()) {
+                symName = addrOf.getGlobalName().str();
+            }
+            const DxilResourceRecord* rec = nullptr;
+            for (const auto& r : shader_.resources) {
+                if (!symName.empty() && r.symbolName == symName) {
+                    rec = &r;
+                    break;
+                }
+            }
+            if (!rec) {
+                outError = "createHandleForLib: unresolved resource symbol '" + symName + "'";
+                return false;
+            }
+            mlir::Value regIdx = indexVal;
+            if (!regIdx) {
+                regIdx = cInt(loc, i32Ty(), rec->lowerBound);
+            } else {
+                // GEP offset is relative to lowerBound
+                if (auto cIdx = getConstIntValue(regIdx)) {
+                    regIdx = cInt(loc, i32Ty(), rec->lowerBound + static_cast<uint32_t>(*cIdx));
+                }
+            }
+            setMapped(call.getResult(),
+                      resolveStaticBinding(loc, rec->resClass, rec->space, rec->lowerBound,
+                                           rec->resourceKind, rec->structuredStride, regIdx, resTy()));
+            return true;
+        }
         if (op == 216) {
             // annotateHandle(op, handle, ResourceProperties{i32 kindFlags, i32 strideOrFmt})
             SimdVal h = getMapped(loc, arg(1));
@@ -2291,6 +2339,11 @@ private:
         // 8. Wave & Quad Intrinsics (110..121, 123, 135, 136, 166)
         if ((op >= 110 && op <= 121) || op == 123 || op == 135 || op == 136 || op == 166) {
             return packetizeWaveOp(call, op, realMask, outError);
+        }
+
+        // 8a. DXR Raytracing Pipeline (141..159, 161, 213)
+        if ((op >= 141 && op <= 159) || op == 161 || op == 213) {
+            return packetizeDxrOp(call, op, execMask, outError);
         }
 
         // 8b. Inline Raytracing (RayQuery) (178..215, 258)
@@ -3725,6 +3778,234 @@ private:
         return false;
     }
 
+    bool packetizeDxrOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask, std::string& outError) {
+        mlir::Location loc = call.getLoc();
+        auto arg = [&](unsigned i) -> mlir::Value {
+            return i < call.getNumOperands() ? call.getOperand(i) : mlir::Value();
+        };
+        auto laneVec = [&](mlir::Value v) -> mlir::Value {
+            return asVec(loc, getMapped(loc, v));
+        };
+        auto activeAt = [&](uint32_t l) -> mlir::Value {
+            return mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+        };
+
+        auto runPerActiveLaneVoid = [&](auto&& emitCall) {
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value act = activeAt(l);
+                mlir::scf::IfOp::create(b_, loc, act, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    emitCall(nb, nloc, l);
+                    mlir::scf::YieldOp::create(nb, nloc);
+                });
+            }
+        };
+
+        auto runPerActiveLaneScalar = [&](mlir::Type elemTy, mlir::Value fallbackVal, auto&& emitCall) {
+            mlir::Value outVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), fallbackVal);
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value act = activeAt(l);
+                auto ifOp = mlir::scf::IfOp::create(
+                    b_, loc, act,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value val = emitCall(nb, nloc, l);
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
+                    },
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{fallbackVal});
+                    });
+                outVec = mlir::vector::InsertOp::create(
+                    b_, loc, ifOp.getResult(0), outVec, static_cast<int64_t>(l));
+            }
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, elemTy, outVec, {}, {}});
+        };
+
+        // DispatchRaysIndex (145) & DispatchRaysDimensions (146)
+        if (op == 145 || op == 146) {
+            const auto& arr = (op == 145) ? hooks_.threadId : hooks_.dispatchRaysDim;
+            auto bcastI32 = [&](mlir::Value scalar) -> mlir::Value {
+                return mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), scalar);
+            };
+            if (auto comp = getConstIntValue(arg(1))) {
+                const uint32_t c = static_cast<uint32_t>(*comp);
+                mlir::Value v = (c < 3 && arr[c]) ? arr[c] : bcastI32(cInt(loc, i32Ty(), 0));
+                setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), v, {}, {}});
+                return true;
+            }
+            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
+            mlir::Value v0 = arr[0] ? arr[0] : bcastI32(cInt(loc, i32Ty(), 0));
+            mlir::Value v1 = arr[1] ? arr[1] : bcastI32(cInt(loc, i32Ty(), 0));
+            mlir::Value v2 = arr[2] ? arr[2] : bcastI32(cInt(loc, i32Ty(), 0));
+            mlir::Value is1 = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 1)));
+            mlir::Value is2 = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 2)));
+            mlir::Value sel01 = mlir::arith::SelectOp::create(b_, loc, is1, v1, v0);
+            mlir::Value res = mlir::arith::SelectOp::create(b_, loc, is2, v2, sel01);
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), res, {}, {}});
+            return true;
+        }
+
+        // TraceRay (157)
+        if (op == 157) {
+            SimdVal tlasHandle = getMapped(loc, arg(1));
+            mlir::Value uniformTlasPtr;
+            if (tlasHandle.lanes.size() == 1) {
+                uniformTlasPtr = loadDescBasePtr(loc, tlasHandle.lanes[0]);
+            }
+            mlir::Value flagsVec = laneVec(arg(2));
+            mlir::Value maskVec = laneVec(arg(3));
+            mlir::Value rayContribVec = laneVec(arg(4));
+            mlir::Value geomMultVec = laneVec(arg(5));
+            mlir::Value missIdxVec = laneVec(arg(6));
+            mlir::Value oxVec = laneVec(arg(7));
+            mlir::Value oyVec = laneVec(arg(8));
+            mlir::Value ozVec = laneVec(arg(9));
+            mlir::Value tMinVec = laneVec(arg(10));
+            mlir::Value dxVec = laneVec(arg(11));
+            mlir::Value dyVec = laneVec(arg(12));
+            mlir::Value dzVec = laneVec(arg(13));
+            mlir::Value tMaxVec = laneVec(arg(14));
+            SimdVal payloadVal = getMapped(loc, arg(15));
+
+            auto fn = getOrDeclareRuntimeFn(
+                loc, "nacelle_dxr_trace_ray", nullptr,
+                {ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), i32Ty(),
+                 f32Ty(), f32Ty(), f32Ty(), f32Ty(),
+                 f32Ty(), f32Ty(), f32Ty(), f32Ty(), ptrTy()});
+
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value tlasPtr = uniformTlasPtr;
+                if (!tlasPtr) {
+                    mlir::Value descPtr = l < tlasHandle.lanes.size()
+                                              ? tlasHandle.lanes[l]
+                                              : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult();
+                    tlasPtr = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr).getResult();
+                }
+                mlir::Value pPtr = l < payloadVal.lanes.size()
+                                       ? payloadVal.lanes[l]
+                                       : (!payloadVal.lanes.empty()
+                                              ? payloadVal.lanes[0]
+                                              : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult());
+                auto ext = [&](mlir::Value v) -> mlir::Value {
+                    return mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
+                };
+                mlir::LLVM::CallOp::create(
+                    nb, nloc, fn,
+                    mlir::ValueRange{tlasPtr, ext(flagsVec), ext(maskVec), ext(rayContribVec),
+                                     ext(geomMultVec), ext(missIdxVec), ext(oxVec), ext(oyVec),
+                                     ext(ozVec), ext(tMinVec), ext(dxVec), ext(dyVec),
+                                     ext(dzVec), ext(tMaxVec), pPtr});
+            });
+            return true;
+        }
+
+        // ReportHit (158)
+        if (op == 158) {
+            mlir::Value tHitVec = laneVec(arg(1));
+            mlir::Value hitKindVec = laneVec(arg(2));
+            SimdVal attrVal = getMapped(loc, arg(3));
+            int32_t attrBytes = 8;
+            if (auto allocaOp = arg(3).getDefiningOp<mlir::LLVM::AllocaOp>()) {
+                mlir::DataLayout dl(mod_);
+                attrBytes = static_cast<int32_t>(dl.getTypeSize(allocaOp.getElemType()));
+            }
+            mlir::Value attrBytesConst = cInt(loc, i32Ty(), static_cast<int64_t>(attrBytes));
+            auto fn = getOrDeclareRuntimeFn(
+                loc, "nacelle_dxr_report_hit", i32Ty(), {f32Ty(), i32Ty(), ptrTy(), i32Ty()});
+            runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value t = mlir::vector::ExtractOp::create(nb, nloc, tHitVec, static_cast<int64_t>(l));
+                mlir::Value k = mlir::vector::ExtractOp::create(nb, nloc, hitKindVec, static_cast<int64_t>(l));
+                mlir::Value aPtr = l < attrVal.lanes.size()
+                                       ? attrVal.lanes[l]
+                                       : (!attrVal.lanes.empty()
+                                              ? attrVal.lanes[0]
+                                              : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult());
+                mlir::Value r = mlir::LLVM::CallOp::create(
+                    nb, nloc, fn, mlir::ValueRange{t, k, aPtr, attrBytesConst}).getResult();
+                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+            });
+            return true;
+        }
+
+        // CallShader (159)
+        if (op == 159) {
+            mlir::Value idxVec = laneVec(arg(1));
+            SimdVal paramVal = getMapped(loc, arg(2));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_call_shader", nullptr, {i32Ty(), ptrTy()});
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value idx = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
+                mlir::Value pPtr = l < paramVal.lanes.size()
+                                       ? paramVal.lanes[l]
+                                       : (!paramVal.lanes.empty()
+                                              ? paramVal.lanes[0]
+                                              : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult());
+                mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{idx, pPtr});
+            });
+            return true;
+        }
+
+        // IgnoreHit (155) & AcceptHitAndEndSearch (156)
+        if (op == 155 || op == 156) {
+            const char* fnName = (op == 155) ? "nacelle_dxr_ignore_hit" : "nacelle_dxr_accept_hit_and_end_search";
+            auto fn = getOrDeclareRuntimeFn(loc, fnName, nullptr, {});
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t) {
+                mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{});
+            });
+            return true;
+        }
+
+        // Scalar float state queries: RayTMin (153), RayTCurrent (154)
+        if (op == 153 || op == 154) {
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_f32", f32Ty(), {i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t) {
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst}).getResult();
+            });
+            return true;
+        }
+
+        // Vector float state queries: WorldRayOrigin (147), WorldRayDirection (148),
+        // ObjectRayOrigin (149), ObjectRayDirection (150)
+        if (op >= 147 && op <= 150) {
+            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_vec", f32Ty(), {i32Ty(), i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, compVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, c}).getResult();
+            });
+            return true;
+        }
+
+        // Matrix float state queries: ObjectToWorld (151), WorldToObject (152)
+        if (op == 151 || op == 152) {
+            mlir::Value rowVec = laneVec(arg(1));
+            mlir::Value colVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value r = mlir::vector::ExtractOp::create(nb, nloc, rowVec, static_cast<int64_t>(l));
+                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, colVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, r, c}).getResult();
+            });
+            return true;
+        }
+
+        // Scalar i32 state queries: InstanceID (141), InstanceIndex (142), HitKind (143),
+        // RayFlags (144), PrimitiveIndex (161), GeometryIndex (213)
+        if (op == 141 || op == 142 || op == 143 || op == 144 || op == 161 || op == 213) {
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_i32", i32Ty(), {i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t) {
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst}).getResult();
+            });
+            return true;
+        }
+
+        outError = "Unsupported DXR opcode: " + std::to_string(op);
+        return false;
+    }
+
     bool packetizeRayQueryOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask) {
         mlir::Location loc = call.getLoc();
         auto arg = [&](unsigned i) -> mlir::Value {
@@ -4896,6 +5177,99 @@ bool packetizeRegionWithHooks(
     if (srcRegion.empty()) return true;
     SimdPacketizer pkt(builder, mod, shader, rootLayout, simdWidth, rootCtxPtr, hooks);
     return pkt.packetizeBlock(srcRegion.front(), initExecMask, inoutRealMask, outError);
+}
+
+bool packetizeDxrEntry(
+    mlir::ModuleOp mod,
+    const DxilLoadedShader& shader,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    const std::string& symbolName,
+    std::string& outError) {
+    auto srcFunc = mod.lookupSymbol<mlir::func::FuncOp>(shader.entryName);
+    if (!srcFunc || srcFunc.getBody().empty()) {
+        outError = "Source DXR func.func not found: " + shader.entryName;
+        return false;
+    }
+
+    mlir::MLIRContext* ctx = mod.getContext();
+    mlir::OpBuilder b(mod.getBody(), mod.getBody()->end());
+    mlir::Location loc = srcFunc.getLoc();
+    mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
+    mlir::Type i32Ty = b.getI32Type();
+    mlir::Type i1Ty = b.getI1Type();
+    mlir::VectorType vecI32Ty = mlir::VectorType::get({simdWidth}, i32Ty);
+    mlir::VectorType vecI1Ty = mlir::VectorType::get({simdWidth}, i1Ty);
+
+    // void fn(ptr rootCtx, i32 activeMask, ptr rxPtr, ptr ryPtr, ptr rzPtr,
+    //         i32 dimX, i32 dimY, i32 dimZ, ptr payloadPtr, ptr attrPtr)
+    auto fnTy = b.getFunctionType(
+        {ptrTy, i32Ty, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, ptrTy, ptrTy}, {});
+    auto dstFunc = mlir::func::FuncOp::create(b, loc, symbolName, fnTy);
+    mlir::Block* entry = dstFunc.addEntryBlock();
+    b.setInsertionPointToStart(entry);
+
+    mlir::Value rootCtx = entry->getArgument(0);
+    mlir::Value activeMaskArg = entry->getArgument(1);
+    mlir::Value rxPtr = entry->getArgument(2);
+    mlir::Value ryPtr = entry->getArgument(3);
+    mlir::Value rzPtr = entry->getArgument(4);
+    mlir::Value dimX = entry->getArgument(5);
+    mlir::Value dimY = entry->getArgument(6);
+    mlir::Value dimZ = entry->getArgument(7);
+    mlir::Value payloadPtr = entry->getArgument(8);
+    mlir::Value attrPtr = entry->getArgument(9);
+
+    mlir::Value c0 = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, 0);
+    mlir::Value c1 = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, 1);
+    mlir::Value initExecMask = mlir::arith::ConstantOp::create(
+        b, loc, mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false)));
+    for (uint32_t l = 0; l < simdWidth; ++l) {
+        mlir::Value shift = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, l);
+        mlir::Value shifted = mlir::arith::ShRUIOp::create(b, loc, activeMaskArg, shift);
+        mlir::Value bit = mlir::arith::AndIOp::create(b, loc, shifted, c1);
+        mlir::Value cond = mlir::arith::CmpIOp::create(
+            b, loc, mlir::arith::CmpIPredicate::ne, bit, c0);
+        initExecMask = mlir::vector::InsertOp::create(b, loc, cond, initExecMask, static_cast<int64_t>(l));
+    }
+
+    StageHooks hooks;
+    hooks.entryBlock = entry;
+    hooks.threadId[0] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rxPtr, 4u);
+    hooks.threadId[1] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, ryPtr, 4u);
+    hooks.threadId[2] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rzPtr, 4u);
+    hooks.dispatchRaysDim[0] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimX);
+    hooks.dispatchRaysDim[1] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimY);
+    hooks.dispatchRaysDim[2] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimZ);
+
+    SimdPacketizer pkt(b, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
+    for (unsigned a = 0; a < srcFunc.getNumArguments() && a < 2; ++a) {
+        mlir::Value ptrArg = (a == 0) ? payloadPtr : attrPtr;
+        llvm::SmallVector<mlir::Value, 8> lanes(simdWidth, ptrArg);
+        pkt.setMapped(srcFunc.getArgument(a), {SimdVal::Kind::Lanes, ptrTy, mlir::Value(), std::move(lanes), {}});
+    }
+
+    mlir::Value realMask = initExecMask;
+    if (!pkt.packetizeBlock(srcFunc.getBody().front(), initExecMask, realMask, outError)) {
+        return false;
+    }
+
+    mlir::func::ReturnOp::create(b, loc);
+    srcFunc.erase();
+
+    llvm::SmallVector<mlir::LLVM::LLVMFuncOp, 16> deadDxOps;
+    for (auto fnOp : mod.getOps<mlir::LLVM::LLVMFuncOp>()) {
+        if (fnOp.isDeclaration() && fnOp.getName().starts_with("dx.op.") && fnOp.use_empty()) {
+            deadDxOps.push_back(fnOp);
+        }
+    }
+    for (auto fnOp : deadDxOps) fnOp.erase();
+
+    if (mlir::failed(mlir::verify(mod))) {
+        outError = "MLIR verification failed after DXR SIMT-to-SIMD packetization";
+        return false;
+    }
+    return true;
 }
 
 } // namespace nacelle

@@ -17,6 +17,52 @@ void copyRaytracingAccelerationStructure(
     D3D12_GPU_VIRTUAL_ADDRESS srcAddr,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode);
 
+struct PipelineHitResult {
+    bool hit = false;
+    bool isProcedural = false;
+    float t = 0.0f;
+    float baryU = 0.0f;
+    float baryV = 0.0f;
+    uint32_t hitKind = 254;
+    uint32_t instanceIndex = 0;
+    uint32_t instanceID = 0;
+    uint32_t geometryIndex = 0;
+    uint32_t primitiveIndex = 0;
+    uint32_t instanceContributionToHitGroupIndex = 0;
+    float objOrigin[3]{};
+    float objDir[3]{};
+    float objToWorld[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    float worldToObj[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+};
+
+// Return values for DxrAnyHitFn: 0 = accept hit, 1 = ignore hit, 2 = accept and end search
+using DxrAnyHitFn = int32_t (*)(void* userData, const PipelineHitResult& candidate);
+using DxrIntersectionFn = void (*)(
+    void* userData,
+    const PipelineHitResult& candidate,
+    float& inOutCommittedT,
+    bool& outAccepted,
+    bool& outEndSearch,
+    uint32_t& outHitKind,
+    float& outBaryU,
+    float& outBaryV);
+
+PipelineHitResult traceRayForPipeline(
+    const void* tlasPtr,
+    uint32_t rayFlags,
+    uint32_t instanceMask,
+    float ox,
+    float oy,
+    float oz,
+    float tMin,
+    float dx,
+    float dy,
+    float dz,
+    float tMax,
+    DxrAnyHitFn onAnyHit,
+    DxrIntersectionFn onIntersection,
+    void* userData);
+
 } // namespace nacelle
 
 extern "C" {
