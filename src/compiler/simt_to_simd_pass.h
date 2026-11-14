@@ -48,6 +48,7 @@ struct StageHooks {
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
     mlir::Value flatGroupId;                           // vector<W x i32>
     mlir::Value groupSharedBase;                       // !llvm.ptr
+    mlir::Block* entryBlock = nullptr;                 // function entry block for hoisted allocas
     mlir::Value waveIdx;                               // index (optional, set in multi-wave compute)
     uint32_t numWaves = 1;
 
