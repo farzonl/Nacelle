@@ -194,6 +194,70 @@ public:
     mlir::Value allTrueMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 1); }
     mlir::Value allFalseMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 0); }
 
+    bool isLaneMaskConstFalse(mlir::Value maskVec, uint32_t lane, uint32_t depth = 0) const {
+        if (!maskVec || depth > 8) return false;
+        if (auto cst = maskVec.getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto dense = llvm::dyn_cast<mlir::DenseElementsAttr>(cst.getValue())) {
+                if (!dense.getElementType().isInteger(1)) return false;
+                if (dense.isSplat()) return !dense.getSplatValue<bool>();
+                if (static_cast<int64_t>(lane) < dense.getNumElements()) {
+                    auto it = dense.value_begin<bool>();
+                    std::advance(it, lane);
+                    return !(*it);
+                }
+            }
+            return false;
+        }
+        if (auto andOp = maskVec.getDefiningOp<mlir::arith::AndIOp>()) {
+            return isLaneMaskConstFalse(andOp.getLhs(), lane, depth + 1) ||
+                   isLaneMaskConstFalse(andOp.getRhs(), lane, depth + 1);
+        }
+        if (auto orOp = maskVec.getDefiningOp<mlir::arith::OrIOp>()) {
+            return isLaneMaskConstFalse(orOp.getLhs(), lane, depth + 1) &&
+                   isLaneMaskConstFalse(orOp.getRhs(), lane, depth + 1);
+        }
+        if (auto res = llvm::dyn_cast<mlir::OpResult>(maskVec)) {
+            if (auto w = llvm::dyn_cast<mlir::scf::WhileOp>(res.getOwner())) {
+                if (res.getResultNumber() == 1 && w.getInits().size() >= 2) {
+                    return isLaneMaskConstFalse(w.getInits()[1], lane, depth + 1);
+                }
+            }
+            if (auto ifOp = llvm::dyn_cast<mlir::scf::IfOp>(res.getOwner())) {
+                if (!ifOp.getThenRegion().empty() && !ifOp.getElseRegion().empty()) {
+                    auto ty = llvm::dyn_cast_or_null<mlir::scf::YieldOp>(ifOp.getThenRegion().front().getTerminator());
+                    auto ey = llvm::dyn_cast_or_null<mlir::scf::YieldOp>(ifOp.getElseRegion().front().getTerminator());
+                    unsigned rn = res.getResultNumber();
+                    if (ty && ey && rn < ty.getNumOperands() && rn < ey.getNumOperands()) {
+                        return isLaneMaskConstFalse(ty.getOperand(rn), lane, depth + 1) &&
+                               isLaneMaskConstFalse(ey.getOperand(rn), lane, depth + 1);
+                    }
+                }
+            }
+        }
+        if (auto barg = llvm::dyn_cast<mlir::BlockArgument>(maskVec)) {
+            if (mlir::Block* blk = barg.getOwner()) {
+                if (auto w = llvm::dyn_cast_or_null<mlir::scf::WhileOp>(blk->getParentOp())) {
+                    if (w.getInits().size() >= 2) {
+                        if (barg.getArgNumber() == 1) {
+                            return isLaneMaskConstFalse(w.getInits()[1], lane, depth + 1);
+                        }
+                        if (barg.getArgNumber() == 0) {
+                            if (hooks_.isPixelShader && shader_.hasDerivativesOrImplicitSample) {
+                                uint32_t qBase = lane & ~3u;
+                                return isLaneMaskConstFalse(w.getInits()[0], qBase, depth + 1) &&
+                                       isLaneMaskConstFalse(w.getInits()[0], qBase + 1, depth + 1) &&
+                                       isLaneMaskConstFalse(w.getInits()[0], qBase + 2, depth + 1) &&
+                                       isLaneMaskConstFalse(w.getInits()[0], qBase + 3, depth + 1);
+                            }
+                            return isLaneMaskConstFalse(w.getInits()[0], lane, depth + 1);
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     mlir::Value expandMaskQuads(mlir::Location loc, mlir::Value mask) {
         // For quad q (4 lanes: 4q..4q+3), any active lane makes all 4 lanes execute in execMask.
         llvm::SmallVector<int64_t, 16> s1, s2;
@@ -870,8 +934,9 @@ private:
                     }
                 } else {
                     for (int64_t i = 0; i < n; ++i) {
-                        mlir::Value v = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(scalarTy));
+                        mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(scalarTy));
                         for (uint32_t l = 0; l < W_; ++l) {
+                            if (isLaneMaskConstFalse(execMask, l)) continue;
                             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                             mlir::Value pL = laneValue(loc, addr, l);
                             auto ifL = mlir::scf::IfOp::create(
@@ -928,6 +993,7 @@ private:
                     }
                     for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                         for (uint32_t l = 0; l < W_; ++l) {
+                            if (isLaneMaskConstFalse(execMask, l)) continue;
                             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                             mlir::Value pL = laneValue(loc, addr, l);
                             mlir::Value vL = laneValue(loc, val.fields[static_cast<size_t>(i)], l);
@@ -952,6 +1018,7 @@ private:
                 }
             }
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value vL = laneValue(loc, val, l);
@@ -966,8 +1033,9 @@ private:
             SimdVal addr = getMapped(loc, rmw.getPtr());
             SimdVal val = getMapped(loc, rmw.getVal());
             mlir::Type ty = rmw.getRes().getType();
-            mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ty));
+            mlir::Value outVec = mlir::isa<mlir::FloatType>(ty) ? splatFlt(loc, ty, 0.0) : splatInt(loc, ty, 0);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(realMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value vL = laneValue(loc, val, l);
@@ -1000,9 +1068,10 @@ private:
             SimdVal cmp = getMapped(loc, cx.getCmp());
             SimdVal val = getMapped(loc, cx.getVal());
             mlir::Type elemTy = cmp.origType;
-            mlir::Value outValVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy));
+            mlir::Value outValVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
             mlir::Value outOkVec = splatInt(loc, i1Ty(), 0);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(realMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value cL = laneValue(loc, cmp, l);
@@ -2204,6 +2273,7 @@ private:
             int32_t inc = static_cast<int32_t>(static_cast<int8_t>(getConstIntValue(arg(2)).value_or(1)));
             mlir::Value outVec = splatInt(loc, i32Ty(), 0);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(realMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
                 mlir::Value descP = laneValue(loc, h, l);
                 mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
@@ -3114,6 +3184,7 @@ private:
         auto emitReservedPerLaneStore = [&](mlir::OpBuilder& nb, mlir::Location nloc) {
             SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (tmp.isLaneMaskConstFalse(realMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(nb, nloc, realMask, static_cast<int64_t>(l));
                 mlir::Value descP = tmp.laneValue(nloc, h, l);
                 mlir::Value basePtr = tmp.loadDescBasePtr(nloc, descP);
@@ -3221,16 +3292,17 @@ private:
             return true;
         }
 
-        mlir::Value basePtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
-        mlir::Value byteSizeVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()));
-        mlir::Value okPtrVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-        mlir::Value isReservedVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i1Ty()));
-        mlir::Value stride64Vec = needsStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i64Ty()))) : mlir::Value();
-        bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
-        mlir::Value elemStrideVec = hasElemStride ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()))) : mlir::Value();
         mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
+        mlir::Value basePtrVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(ptrTy()), nullP);
+        mlir::Value byteSizeVec = splatInt(loc, i64Ty(), 0);
+        mlir::Value okPtrVec = allFalseMask(loc);
+        mlir::Value isReservedVec = allFalseMask(loc);
+        mlir::Value stride64Vec = needsStride ? splatInt(loc, i64Ty(), 0) : mlir::Value();
+        bool hasElemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11);
+        mlir::Value elemStrideVec = hasElemStride ? splatInt(loc, i32Ty(), 0) : mlir::Value();
 
         for (uint32_t l = 0; l < W_; ++l) {
+            if (isLaneMaskConstFalse(realMask, l)) continue;
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value isRes = isDescReservedBuffer(loc, descP);
@@ -3396,6 +3468,7 @@ private:
         mlir::Value elemOffVec = hasElemOff ? asVec(loc, getMapped(loc, elemOffArg)) : splatInt(loc, i32Ty(), 0);
 
         for (uint32_t l = 0; l < W_; ++l) {
+            if (isLaneMaskConstFalse(realMask, l)) continue;
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
@@ -3458,6 +3531,7 @@ private:
 
         mlir::Value outVec = isFloat ? splatFlt(loc, resTy, 0.0) : splatInt(loc, resTy, 0);
         for (uint32_t l = 0; l < W_; ++l) {
+            if (isLaneMaskConstFalse(realMask, l)) continue;
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
@@ -3596,6 +3670,7 @@ private:
             mlir::Value tmp4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(i32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> dims(4, splatInt(loc, i32Ty(), 0));
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value m = mlir::vector::ExtractOp::create(b_, loc, mipVec, static_cast<int64_t>(l));
                 mlir::LLVM::CallOp::create(b_, loc, fn, mlir::ValueRange{laneValue(loc, h, l), m, tmp4});
                 for (unsigned c = 0; c < 4; ++c) {
@@ -3624,6 +3699,7 @@ private:
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_tex_store", nullptr,
                                             {ptrTy(), i32Ty(), i32Ty(), i32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty()});
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(realMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
                 mlir::Value dp = laneValue(loc, h, l);
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -3664,6 +3740,7 @@ private:
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value dp = laneValue(loc, h, l);
                 auto stIf = mlir::scf::IfOp::create(
@@ -3733,6 +3810,7 @@ private:
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
@@ -3787,6 +3865,7 @@ private:
             mlir::Value sv = su;
             mlir::Value sw = su;
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -3819,6 +3898,7 @@ private:
                 {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), i32Ty()});
             mlir::Value resVec = splatFlt(loc, f32Ty(), 0.0);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
@@ -3880,6 +3960,7 @@ private:
             mlir::Value resVec = splatFlt(loc, f32Ty(), 0.0);
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (isLaneMaskConstFalse(execMask, l)) continue;
                 mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
@@ -3974,6 +4055,7 @@ private:
         llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
         mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
         for (uint32_t l = 0; l < W_; ++l) {
+            if (isLaneMaskConstFalse(execMask, l)) continue;
             mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
             mlir::Value tp = laneValue(loc, texH, l);
             mlir::Value sp = laneValue(loc, sampH, l);
@@ -5178,6 +5260,25 @@ static mlir::Value buildFlatTidAndMask(
     mlir::Value waveIdx, mlir::Value totalThreads, mlir::Value& outActiveMask) {
     mlir::Type i32Ty = b.getI32Type();
     mlir::VectorType vI32 = mlir::VectorType::get({W}, i32Ty);
+    if (auto wConst = getConstIntValue(waveIdx)) {
+        if (auto totConst = getConstIntValue(totalThreads)) {
+            uint64_t baseVal = (*wConst) * W;
+            llvm::SmallVector<int32_t, 16> tids;
+            llvm::SmallVector<bool, 16> maskBits;
+            tids.reserve(W);
+            maskBits.reserve(W);
+            for (uint32_t i = 0; i < W; ++i) {
+                uint64_t tid = baseVal + i;
+                tids.push_back(static_cast<int32_t>(tid));
+                maskBits.push_back(tid < *totConst);
+            }
+            mlir::VectorType vI1 = mlir::VectorType::get({W}, b.getI1Type());
+            outActiveMask = mlir::arith::ConstantOp::create(
+                b, loc, mlir::DenseElementsAttr::get(vI1, llvm::ArrayRef<bool>(maskBits)));
+            return mlir::arith::ConstantOp::create(
+                b, loc, mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(tids)));
+        }
+    }
     llvm::SmallVector<int32_t, 16> iota;
     for (uint32_t i = 0; i < W; ++i) iota.push_back(static_cast<int32_t>(i));
     mlir::Value iotaVec = mlir::arith::ConstantOp::create(
@@ -5203,13 +5304,14 @@ static void setupComputeThreadIds(
         return mlir::arith::ConstantOp::create(
             b, loc, mlir::DenseElementsAttr::get(vI32, b.getIntegerAttr(i32Ty, val)));
     };
+    mlir::Value zeroVec = splat(0);
     mlir::Value tgsX = splat(tgs[0]), tgsY = splat(tgs[1]), tgsZ = splat(tgs[2]);
     mlir::Value xy = splat(tgs[0] * tgs[1]);
 
-    mlir::Value lx = mlir::arith::RemUIOp::create(b, loc, flatTid, tgsX);
-    mlir::Value qx = mlir::arith::DivUIOp::create(b, loc, flatTid, tgsX);
-    mlir::Value ly = mlir::arith::RemUIOp::create(b, loc, qx, tgsY);
-    mlir::Value lz = mlir::arith::DivUIOp::create(b, loc, flatTid, xy);
+    mlir::Value lx = (tgs[0] == 1) ? zeroVec : mlir::Value(mlir::arith::RemUIOp::create(b, loc, flatTid, tgsX));
+    mlir::Value qx = (tgs[0] == 1) ? flatTid : mlir::Value(mlir::arith::DivUIOp::create(b, loc, flatTid, tgsX));
+    mlir::Value ly = (tgs[1] == 1) ? zeroVec : mlir::Value(mlir::arith::RemUIOp::create(b, loc, qx, tgsY));
+    mlir::Value lz = (tgs[2] == 1) ? zeroVec : mlir::Value(mlir::arith::DivUIOp::create(b, loc, flatTid, xy));
 
     mlir::Value gxVec = mlir::vector::BroadcastOp::create(b, loc, vI32, gx);
     mlir::Value gyVec = mlir::vector::BroadcastOp::create(b, loc, vI32, gy);
@@ -5217,11 +5319,14 @@ static void setupComputeThreadIds(
 
     hooks.groupId = {gxVec, gyVec, gzVec};
     hooks.threadIdInGroup = {lx, ly, lz};
-    hooks.flatGroupId = flatTid;
+    hooks.flatGroupId = (tgs[0] == 1 && tgs[1] == 1 && tgs[2] == 1) ? zeroVec : flatTid;
     hooks.threadId = {
-        mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gxVec, tgsX), lx),
-        mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gyVec, tgsY), ly),
-        mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gzVec, tgsZ), lz)};
+        (tgs[0] == 1) ? gxVec
+                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gxVec, tgsX), lx)),
+        (tgs[1] == 1) ? gyVec
+                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gyVec, tgsY), ly)),
+        (tgs[2] == 1) ? gzVec
+                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gzVec, tgsZ), lz))};
 }
 
 // Collects all SSA values used inside `[segBegin, segEnd)` that are already tracked in `spills`,
@@ -5713,20 +5818,28 @@ bool packetizeComputeEntry(
     mlir::Value numWaves = mlir::arith::ConstantIndexOp::create(b, loc, numWavesVal);
 
     if (!regionContainsBarrier(srcFunc.getBody())) {
-        mlir::scf::ForOp::create(
-            b, loc, c0, numWaves, c1, mlir::ValueRange{},
-            [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
-                mlir::Value activeMask;
-                mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
-                StageHooks hooks;
-                hooks.entryBlock = entry;
-                hooks.groupSharedBase = gsBase;
-                setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
-                SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
-                mlir::Value realMask = activeMask;
-                (void)pkt.packetizeBlock(srcFunc.getBody().front(), activeMask, realMask, outError);
-                mlir::scf::YieldOp::create(wb, wloc);
-            });
+        auto emitWaveBody = [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx) {
+            mlir::Value activeMask;
+            mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
+            StageHooks hooks;
+            hooks.entryBlock = entry;
+            hooks.groupSharedBase = gsBase;
+            setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
+            SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
+            mlir::Value realMask = activeMask;
+            (void)pkt.packetizeBlock(srcFunc.getBody().front(), activeMask, realMask, outError);
+        };
+        if (numWavesVal == 1) {
+            emitWaveBody(b, loc, c0);
+            b.setInsertionPointToEnd(entry);
+        } else {
+            mlir::scf::ForOp::create(
+                b, loc, c0, numWaves, c1, mlir::ValueRange{},
+                [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
+                    emitWaveBody(wb, wloc, waveIdx);
+                    mlir::scf::YieldOp::create(wb, wloc);
+                });
+        }
     } else {
         mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
         mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
