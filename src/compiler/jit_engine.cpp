@@ -1,4 +1,5 @@
 #include "jit_engine.h"
+#include "../rasterizer/raytracing_bvh.h"
 
 #include <atomic>
 #include <chrono>
@@ -253,6 +254,30 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         emitObjectBytesO3(initMod, dummyObj, dummyErr);
         std::atexit([]() { getJitRuntime().tier2Pool.wait(); });
     });
+
+    {
+        auto& es = rt.jit->getExecutionSession();
+        llvm::orc::SymbolMap syms;
+        auto addSym = [&](const char* name, auto* fn) {
+            syms[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(fn), llvm::JITSymbolFlags::Exported);
+        };
+        addSym("nacelle_rayquery_alloc", &nacelle_rayquery_alloc);
+        addSym("nacelle_rayquery_trace_inline", &nacelle_rayquery_trace_inline);
+        addSym("nacelle_rayquery_proceed", &nacelle_rayquery_proceed);
+        addSym("nacelle_rayquery_abort", &nacelle_rayquery_abort);
+        addSym("nacelle_rayquery_commit_triangle", &nacelle_rayquery_commit_triangle);
+        addSym("nacelle_rayquery_commit_procedural", &nacelle_rayquery_commit_procedural);
+        addSym("nacelle_rayquery_state_i32", &nacelle_rayquery_state_i32);
+        addSym("nacelle_rayquery_state_f32", &nacelle_rayquery_state_f32);
+        addSym("nacelle_rayquery_state_vec", &nacelle_rayquery_state_vec);
+        addSym("nacelle_rayquery_state_mat", &nacelle_rayquery_state_mat);
+        if (auto err = rt.jit->getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(syms)))) {
+            outError = llvm::toString(std::move(err));
+            rt.jit.reset();
+            return;
+        }
+    }
 
 #if defined(__APPLE__)
     if (const char* prof = std::getenv("NACELLE_JIT_PROFILING")) {

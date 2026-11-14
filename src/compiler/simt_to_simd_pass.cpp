@@ -2293,6 +2293,11 @@ private:
             return packetizeWaveOp(call, op, realMask, outError);
         }
 
+        // 8b. Inline Raytracing (RayQuery) (178..215, 258)
+        if (op == 258 || (op >= 178 && op <= 215)) {
+            return packetizeRayQueryOp(call, op, execMask);
+        }
+
         // 9. Math, Bitwise & Quad Derivatives (6..56, 83..86)
         return packetizeMathOp(call, op, outError);
     }
@@ -3718,6 +3723,206 @@ private:
             return true;
         }
         return false;
+    }
+
+    bool packetizeRayQueryOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask) {
+        mlir::Location loc = call.getLoc();
+        auto arg = [&](unsigned i) -> mlir::Value {
+            return i < call.getNumOperands() ? call.getOperand(i) : mlir::Value();
+        };
+        auto laneVec = [&](mlir::Value v) -> mlir::Value {
+            return asVec(loc, getMapped(loc, v));
+        };
+        auto laneAt = [&](mlir::Value vec, uint32_t l) -> mlir::Value {
+            return mlir::vector::ExtractOp::create(b_, loc, vec, static_cast<int64_t>(l));
+        };
+        auto activeAt = [&](uint32_t l) -> mlir::Value {
+            return mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+        };
+
+        auto runPerActiveLaneVoid = [&](auto&& emitCall) {
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value act = activeAt(l);
+                mlir::scf::IfOp::create(b_, loc, act, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    emitCall(nb, nloc, l);
+                    mlir::scf::YieldOp::create(nb, nloc);
+                });
+            }
+        };
+
+        auto runPerActiveLaneScalar = [&](mlir::Type elemTy, mlir::Value fallbackVal, auto&& emitCall) {
+            mlir::Value outVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), fallbackVal);
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value act = activeAt(l);
+                auto ifOp = mlir::scf::IfOp::create(
+                    b_, loc, act,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value val = emitCall(nb, nloc, l);
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
+                    },
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{fallbackVal});
+                    });
+                outVec = mlir::vector::InsertOp::create(
+                    b_, loc, ifOp.getResult(0), outVec, static_cast<int64_t>(l));
+            }
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, elemTy, outVec, {}, {}});
+        };
+
+        // AllocateRayQuery (178, 258)
+        if (op == 178 || op == 258) {
+            mlir::Value flagsVec = laneVec(arg(1));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_alloc", i32Ty(), {i32Ty()});
+            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value fl = mlir::vector::ExtractOp::create(nb, nloc, flagsVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{fl}).getResult();
+            });
+            return true;
+        }
+
+        // RayQuery_TraceRayInline (179)
+        if (op == 179) {
+            mlir::Value qVec = laneVec(arg(1));
+            SimdVal tlasHandle = getMapped(loc, arg(2));
+            mlir::Value uniformTlasPtr;
+            if (tlasHandle.lanes.size() == 1) {
+                uniformTlasPtr = loadDescBasePtr(loc, tlasHandle.lanes[0]);
+            }
+            mlir::Value flagsVec = laneVec(arg(3));
+            mlir::Value maskVec = laneVec(arg(4));
+            mlir::Value oxVec = laneVec(arg(5));
+            mlir::Value oyVec = laneVec(arg(6));
+            mlir::Value ozVec = laneVec(arg(7));
+            mlir::Value tMinVec = laneVec(arg(8));
+            mlir::Value dxVec = laneVec(arg(9));
+            mlir::Value dyVec = laneVec(arg(10));
+            mlir::Value dzVec = laneVec(arg(11));
+            mlir::Value tMaxVec = laneVec(arg(12));
+
+            auto fn = getOrDeclareRuntimeFn(
+                loc, "nacelle_rayquery_trace_inline", nullptr,
+                {i32Ty(), ptrTy(), i32Ty(), i32Ty(),
+                 f32Ty(), f32Ty(), f32Ty(), f32Ty(),
+                 f32Ty(), f32Ty(), f32Ty(), f32Ty()});
+
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value tlasPtr = uniformTlasPtr;
+                if (!tlasPtr) {
+                    mlir::Value descPtr = l < tlasHandle.lanes.size()
+                                              ? tlasHandle.lanes[l]
+                                              : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult();
+                    tlasPtr = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr).getResult();
+                }
+                auto ext = [&](mlir::Value v) -> mlir::Value {
+                    return mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
+                };
+                mlir::LLVM::CallOp::create(
+                    nb, nloc, fn,
+                    mlir::ValueRange{ext(qVec), tlasPtr, ext(flagsVec), ext(maskVec),
+                                     ext(oxVec), ext(oyVec), ext(ozVec), ext(tMinVec),
+                                     ext(dxVec), ext(dyVec), ext(dzVec), ext(tMaxVec)});
+            });
+            return true;
+        }
+
+        // RayQuery_Proceed (180)
+        if (op == 180) {
+            mlir::Value qVec = laneVec(arg(1));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_proceed", i32Ty(), {i32Ty()});
+            runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q}).getResult();
+                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+            });
+            return true;
+        }
+
+        // RayQuery_Abort (181) & RayQuery_CommitNonOpaqueTriangleHit (182)
+        if (op == 181 || op == 182) {
+            mlir::Value qVec = laneVec(arg(1));
+            const char* fnName = (op == 181) ? "nacelle_rayquery_abort" : "nacelle_rayquery_commit_triangle";
+            auto fn = getOrDeclareRuntimeFn(loc, fnName, nullptr, {i32Ty()});
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q});
+            });
+            return true;
+        }
+
+        // RayQuery_CommitProceduralPrimitiveHit (183)
+        if (op == 183) {
+            mlir::Value qVec = laneVec(arg(1));
+            mlir::Value tVec = laneVec(arg(2));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_commit_procedural", nullptr, {i32Ty(), f32Ty()});
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value t = mlir::vector::ExtractOp::create(nb, nloc, tVec, static_cast<int64_t>(l));
+                mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q, t});
+            });
+            return true;
+        }
+
+        // Scalar float state queries: RayTMin (198), CandidateTriangleRayT (199), CommittedRayT (200)
+        if (op == 198 || op == 199 || op == 200) {
+            mlir::Value qVec = laneVec(arg(1));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_f32", f32Ty(), {i32Ty(), i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
+            });
+            return true;
+        }
+
+        // Vector float state queries: Barycentrics (193, 194), WorldRay* (196, 197), ObjectRay* (205, 206, 211, 212)
+        if (op == 193 || op == 194 || op == 196 || op == 197 ||
+            op == 205 || op == 206 || op == 211 || op == 212) {
+            mlir::Value qVec = laneVec(arg(1));
+            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_vec", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, compVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q, c}).getResult();
+            });
+            return true;
+        }
+
+        // Matrix float state queries: ObjectToWorld3x4 / WorldToObject3x4 (186..189)
+        if (op >= 186 && op <= 189) {
+            mlir::Value qVec = laneVec(arg(1));
+            mlir::Value rowVec = laneVec(arg(2));
+            mlir::Value colVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(3)));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty(), i32Ty()});
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value r = mlir::vector::ExtractOp::create(nb, nloc, rowVec, static_cast<int64_t>(l));
+                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, colVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q, r, c}).getResult();
+            });
+            return true;
+        }
+
+        // Scalar i32 / i1 state queries (184, 185, 190..192, 195, 201..204, 207..210, 214, 215)
+        mlir::Value qVec = laneVec(arg(1));
+        auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_i32", i32Ty(), {i32Ty(), i32Ty()});
+        mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+        const bool isBool = call.getResult().getType().isInteger(1);
+        if (isBool) {
+            runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
+                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+            });
+        } else {
+            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
+            });
+        }
+        return true;
     }
 
     bool packetizeMathOp(mlir::LLVM::CallOp call, uint32_t op, std::string& outError) {

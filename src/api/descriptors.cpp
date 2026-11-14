@@ -64,6 +64,11 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
     if (!dest.ptr) return;
     auto* sd = reinterpret_cast<NacelleDescriptor*>(dest.ptr);
     *sd = NacelleDescriptor{};
+    if (pDesc && pDesc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
+        sd->base_ptr = reinterpret_cast<void*>(pDesc->RaytracingAccelerationStructure.Location);
+        sd->view_flags = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        return;
+    }
     if (!pResource) return;
 
     auto* res = static_cast<NacelleResource*>(pResource);
