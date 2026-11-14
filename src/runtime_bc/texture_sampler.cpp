@@ -748,6 +748,7 @@ static inline __attribute__((always_inline)) float eval_cmp(uint32_t func, float
     }
 }
 
+__attribute__((noinline))
 float nacelle_tex_sample_cmp(
     const BC_Descriptor* tex,
     const BC_Descriptor* samp,
