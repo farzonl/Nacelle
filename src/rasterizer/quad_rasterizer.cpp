@@ -387,6 +387,137 @@ struct QuadBatchEmitter {
         args.coverageMask = 0;
     }
 
+    static bool pointInDiamond(float x, float y, int32_t px, int32_t py, bool isYMajor) {
+        float qx = x - (static_cast<float>(px) + 0.5f);
+        float qy = y - (static_cast<float>(py) + 0.5f);
+        float d = std::fabs(qx) + std::fabs(qy);
+        if (d < 0.5f - 1e-5f) return true;
+        if (std::fabs(d - 0.5f) <= 1e-5f) {
+            if (qy > 0.0f) return true;
+            if (isYMajor && qx > 0.0f && std::fabs(qy) <= 1e-5f) return true;
+        }
+        return false;
+    }
+
+    void emitLinePixel(
+        const SetupTriangle& tri,
+        uint32_t tileOriginX,
+        uint32_t tileOriginY,
+        int32_t px,
+        int32_t py,
+        float t) {
+        int32_t gx = px & ~1;
+        int32_t gy = py & ~1;
+        uint32_t subHit = static_cast<uint32_t>(((py & 1) << 1) | (px & 1));
+        uint32_t tx = static_cast<uint32_t>(gx - static_cast<int32_t>(tileOriginX));
+        uint32_t ty = static_cast<uint32_t>(gy - static_cast<int32_t>(tileOriginY));
+        uint32_t quadOffset = ((ty >> 1) * 32u + (tx >> 1)) * 4u;
+
+        for (uint32_t q = 0; q < qCount; ++q) {
+            if (quadOffsets[q] == quadOffset) {
+                uint32_t bit = 1u << (q * 4u + subHit);
+                if ((args.coverageMask & bit) == 0) {
+                    uint32_t lane = q * 4u + subHit;
+                    pixelX[lane] = static_cast<float>(px) + 0.5f + sampleOffsetX;
+                    pixelY[lane] = static_cast<float>(py) + 0.5f + sampleOffsetY;
+                    baryI[lane] = t;
+                    baryJ[lane] = 0.0f;
+                    args.coverageMask |= bit;
+                    return;
+                }
+                flush();
+                break;
+            }
+        }
+
+        float dx = tri.lineX1 - tri.lineX0;
+        float dy = tri.lineY1 - tri.lineY0;
+        float lenSq = dx * dx + dy * dy;
+
+        quadOffsets[qCount] = quadOffset;
+        for (uint32_t sub = 0; sub < 4; ++sub) {
+            int32_t spx = gx + static_cast<int32_t>(sub & 1u);
+            int32_t spy = gy + static_cast<int32_t>(sub >> 1);
+            float fx = static_cast<float>(spx) + 0.5f + sampleOffsetX;
+            float fy = static_cast<float>(spy) + 0.5f + sampleOffsetY;
+            float st = (sub == subHit)
+                           ? t
+                           : ((lenSq > 0.0f)
+                                  ? std::clamp(((fx - tri.lineX0) * dx + (fy - tri.lineY0) * dy) / lenSq, 0.0f, 1.0f)
+                                  : t);
+            uint32_t lane = qCount * 4u + sub;
+            pixelX[lane] = fx;
+            pixelY[lane] = fy;
+            baryI[lane] = st;
+            baryJ[lane] = 0.0f;
+        }
+        args.coverageMask |= ((1u << subHit) << (qCount * 4u));
+        ++qCount;
+        if (qCount == quadsPerBatch) {
+            flush();
+        }
+    }
+
+    void rasterizeLineInTile(
+        const SetupTriangle& tri,
+        const D3D12_RECT& tileScissor,
+        uint32_t tileOriginX,
+        uint32_t tileOriginY) {
+        const double x0 = tri.lineX0;
+        const double y0 = tri.lineY0;
+        const double x1 = tri.lineX1;
+        const double y1 = tri.lineY1;
+        const double dx = x1 - x0;
+        const double dy = y1 - y0;
+        const double adx = std::fabs(dx);
+        const double ady = std::fabs(dy);
+        if (adx == 0.0 && ady == 0.0) return;
+
+        const int32_t clipMinX = std::max<int32_t>(tri.minX, tileScissor.left);
+        const int32_t clipMaxX = std::min<int32_t>(tri.maxX, tileScissor.right);
+        const int32_t clipMinY = std::max<int32_t>(tri.minY, tileScissor.top);
+        const int32_t clipMaxY = std::min<int32_t>(tri.maxY, tileScissor.bottom);
+        if (clipMinX >= clipMaxX || clipMinY >= clipMaxY) return;
+
+        if (adx >= ady) {
+            int32_t pxStart = std::max<int32_t>(clipMinX, static_cast<int32_t>(std::floor(std::min(x0, x1))) - 1);
+            int32_t pxEnd = std::min<int32_t>(clipMaxX, static_cast<int32_t>(std::ceil(std::max(x0, x1))) + 1);
+            double slope = dy / dx;
+            for (int32_t px = pxStart; px < pxEnd; ++px) {
+                double cx = static_cast<double>(px) + 0.5;
+                double yc = y0 + slope * (cx - x0);
+                int32_t py = static_cast<int32_t>(std::ceil(yc - 1.0));
+                if (py < clipMinY || py >= clipMaxY) continue;
+                bool in0 = pointInDiamond(tri.lineX0, tri.lineY0, px, py, false);
+                bool in1 = pointInDiamond(tri.lineX1, tri.lineY1, px, py, false);
+                bool lit = (dx > 0.0)
+                               ? (((x0 < cx) || in0) && (x1 > cx) && !in1)
+                               : (((x0 > cx) || in0) && (x1 < cx) && !in1);
+                if (!lit) continue;
+                float t = static_cast<float>(std::clamp((cx - x0) / dx, 0.0, 1.0));
+                emitLinePixel(tri, tileOriginX, tileOriginY, px, py, t);
+            }
+        } else {
+            int32_t pyStart = std::max<int32_t>(clipMinY, static_cast<int32_t>(std::floor(std::min(y0, y1))) - 1);
+            int32_t pyEnd = std::min<int32_t>(clipMaxY, static_cast<int32_t>(std::ceil(std::max(y0, y1))) + 1);
+            double invSlope = dx / dy;
+            for (int32_t py = pyStart; py < pyEnd; ++py) {
+                double cy = static_cast<double>(py) + 0.5;
+                double xc = x0 + invSlope * (cy - y0);
+                int32_t px = static_cast<int32_t>(std::ceil(xc - 1.0));
+                if (px < clipMinX || px >= clipMaxX) continue;
+                bool in0 = pointInDiamond(tri.lineX0, tri.lineY0, px, py, true);
+                bool in1 = pointInDiamond(tri.lineX1, tri.lineY1, px, py, true);
+                bool lit = (dy > 0.0)
+                               ? (((y0 < cy) || in0) && (y1 > cy) && !in1)
+                               : (((y0 > cy) || in0) && (y1 < cy) && !in1);
+                if (!lit) continue;
+                float t = static_cast<float>(std::clamp((cy - y0) / dy, 0.0, 1.0));
+                emitLinePixel(tri, tileOriginX, tileOriginY, px, py, t);
+            }
+        }
+    }
+
     void testAndEmitQuad(
         const SetupTriangle& tri,
         const D3D12_RECT& scissor,
@@ -580,6 +711,12 @@ void rasterizeTiles(
                 emitter.args.viewportArrayIndex = sampleTri.viewportIndex;
                 emitter.args.shadingRate = sampleTri.shadingRate;
 
+                if (sampleTri.isLine) {
+                    emitter.rasterizeLineInTile(sampleTri, tileScissor, tileOriginX, tileOriginY);
+                    emitter.flush();
+                    continue;
+                }
+
                 int32_t qMinX = minX & ~1;
                 int32_t qMaxX = (maxX + 1) & ~1;
                 int32_t qMinY = minY & ~1;
@@ -650,6 +787,18 @@ void executeRasterDrawCall(
     const DrawCallParams& draw) {
     RasterScene scene;
     if (!buildRasterScene(pool, state, draw, scene)) return;
+
+    std::vector<TileBin> bins;
+    binTrianglesToTiles(scene, bins);
+    rasterizeTiles(pool, state, scene, bins);
+}
+
+void executeRasterMeshDispatch(
+    BS::thread_pool<>& pool,
+    const GraphicsExecutionState& state,
+    const MeshDispatchParams& dispatch) {
+    RasterScene scene;
+    if (!buildMeshRasterScene(pool, state, dispatch, scene)) return;
 
     std::vector<TileBin> bins;
     binTrianglesToTiles(scene, bins);
