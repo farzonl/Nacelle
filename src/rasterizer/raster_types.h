@@ -46,6 +46,12 @@ struct SetupTriangle {
 
     uint32_t attrBaseOffset = 0; // offset into RasterScene::attrBaseArena (numScalars * 3)
     uint32_t attrFlatOffset = 0; // offset into RasterScene::attrFlatArena (numScalars)
+
+    bool isLine = false;
+    float lineX0 = 0.0f;
+    float lineY0 = 0.0f;
+    float lineX1 = 0.0f;
+    float lineY1 = 0.0f;
 };
 
 struct RasterScene {
@@ -82,6 +88,12 @@ bool buildRasterScene(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const DrawCallParams& draw,
+    RasterScene& outScene);
+
+bool buildMeshRasterScene(
+    BS::thread_pool<>& pool,
+    const GraphicsExecutionState& state,
+    const MeshDispatchParams& dispatch,
     RasterScene& outScene);
 
 void binTrianglesToTiles(
