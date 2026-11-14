@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
     }
     uint32_t effectiveW = nacelle::getTargetSimdWidth();
 
-    mlir::MLIRContext mlirCtx;
+    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
     nacelle::configureNacelleMLIRContext(mlirCtx);
 
     if (!vsPath.empty()) {

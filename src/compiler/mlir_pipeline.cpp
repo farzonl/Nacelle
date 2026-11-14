@@ -23,6 +23,7 @@
 namespace nacelle {
 
 void configureNacelleMLIRContext(mlir::MLIRContext& ctx) {
+    ctx.disableMultithreading();
     if (ctx.getLoadedDialect<mlir::scf::SCFDialect>()) {
         return;
     }

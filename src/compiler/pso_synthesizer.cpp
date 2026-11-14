@@ -2433,7 +2433,7 @@ bool compileGraphicsPSO(
         return true;
     }
 
-    mlir::MLIRContext mlirCtx;
+    thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
     mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
     CachedPSOMeta meta;
     if (!synthesizeGraphicsPSOMLIR(
