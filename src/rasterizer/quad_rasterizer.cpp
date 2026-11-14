@@ -34,7 +34,26 @@ void loadTileRTV(
     uint32_t tileW,
     uint32_t tileH,
     float* dstSOA) {
-    if (!rtv.resource || !rtv.resource->basePtr()) return;
+    if (!rtv.resource) return;
+    if (rtv.resource->isReserved()) {
+        const uint32_t mipLevels = std::max<uint32_t>(1, rtv.resource->resourceDesc().MipLevels);
+        const uint32_t subIdx = rtv.mip_slice + rtv.first_array_slice * mipLevels;
+        for (uint32_t ty = 0; ty < tileH; ++ty) {
+            for (uint32_t tx = 0; tx < tileW; ++tx) {
+                uint32_t pixIdx = quadSwizzlePixel(tx, ty);
+                float rgba[4]{};
+                if (const uint8_t* p = rtv.resource->texBlockPtr(subIdx, tileOriginX + tx, tileOriginY + ty, 0)) {
+                    unpackPixelRGBA32F(rtv.format, p, rgba);
+                }
+                dstSOA[0 * kTilePixels + pixIdx] = rgba[0];
+                dstSOA[1 * kTilePixels + pixIdx] = rgba[1];
+                dstSOA[2 * kTilePixels + pixIdx] = rgba[2];
+                dstSOA[3 * kTilePixels + pixIdx] = rgba[3];
+            }
+        }
+        return;
+    }
+    if (!rtv.resource->basePtr()) return;
     const auto& sub = rtv.resource->subresourceLayout(rtv.mip_slice);
     const uint8_t* base = rtv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
@@ -94,7 +113,27 @@ void storeTileRTV(
     uint32_t tileW,
     uint32_t tileH,
     const float* srcSOA) {
-    if (!rtv.resource || !rtv.resource->basePtr()) return;
+    if (!rtv.resource) return;
+    if (rtv.resource->isReserved()) {
+        const uint32_t mipLevels = std::max<uint32_t>(1, rtv.resource->resourceDesc().MipLevels);
+        const uint32_t subIdx = rtv.mip_slice + rtv.first_array_slice * mipLevels;
+        for (uint32_t ty = 0; ty < tileH; ++ty) {
+            for (uint32_t tx = 0; tx < tileW; ++tx) {
+                uint8_t* p = rtv.resource->texBlockPtr(subIdx, tileOriginX + tx, tileOriginY + ty, 0);
+                if (!p) continue;
+                uint32_t pixIdx = quadSwizzlePixel(tx, ty);
+                float rgba[4] = {
+                    srcSOA[0 * kTilePixels + pixIdx],
+                    srcSOA[1 * kTilePixels + pixIdx],
+                    srcSOA[2 * kTilePixels + pixIdx],
+                    srcSOA[3 * kTilePixels + pixIdx],
+                };
+                packPixelRGBA32F(rtv.format, rgba, p);
+            }
+        }
+        return;
+    }
+    if (!rtv.resource->basePtr()) return;
     const auto& sub = rtv.resource->subresourceLayout(rtv.mip_slice);
     uint8_t* base = rtv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
@@ -154,7 +193,40 @@ void loadTileDSV(
     uint32_t tileH,
     float* depthSOA,
     uint8_t* stencilSOA) {
-    if (!dsv.resource || !dsv.resource->basePtr()) return;
+    if (!dsv.resource) return;
+    if (dsv.resource->isReserved()) {
+        const uint32_t mipLevels = std::max<uint32_t>(1, dsv.resource->resourceDesc().MipLevels);
+        const uint32_t subIdx = dsv.mip_slice + dsv.first_array_slice * mipLevels;
+        static constexpr uint8_t kZeroPx[16]{};
+        for (uint32_t ty = 0; ty < tileH; ++ty) {
+            for (uint32_t tx = 0; tx < tileW; ++tx) {
+                uint32_t pixIdx = quadSwizzlePixel(tx, ty);
+                const uint8_t* p = dsv.resource->texBlockPtr(subIdx, tileOriginX + tx, tileOriginY + ty, 0);
+                if (!p) p = kZeroPx;
+                if (dsv.format == DXGI_FORMAT_D32_FLOAT) {
+                    std::memcpy(&depthSOA[pixIdx], p, 4);
+                } else if (dsv.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, p, 4);
+                    depthSOA[pixIdx] = static_cast<float>(v & 0x00FFFFFFu) / 16777215.0f;
+                    stencilSOA[pixIdx] = static_cast<uint8_t>(v >> 24);
+                } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                    std::memcpy(&depthSOA[pixIdx], p, 4);
+                    stencilSOA[pixIdx] = p[4];
+                } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
+                    uint16_t v = 0;
+                    std::memcpy(&v, p, 2);
+                    depthSOA[pixIdx] = static_cast<float>(v) / 65535.0f;
+                } else {
+                    float rgba[4]{};
+                    unpackPixelRGBA32F(dsv.format, p, rgba);
+                    depthSOA[pixIdx] = rgba[0];
+                }
+            }
+        }
+        return;
+    }
+    if (!dsv.resource->basePtr()) return;
     const auto& sub = dsv.resource->subresourceLayout(dsv.mip_slice);
     const uint8_t* base = dsv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
@@ -187,11 +259,6 @@ void loadTileDSV(
                 uint16_t v = 0;
                 std::memcpy(&v, p, 2);
                 depthSOA[pixIdx] = static_cast<float>(v) / 65535.0f;
-            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
-                float d = 1.0f;
-                std::memcpy(&d, p, 4);
-                depthSOA[pixIdx] = d;
-                stencilSOA[pixIdx] = p[4];
             } else {
                 float rgba[4]{};
                 unpackPixelRGBA32F(dsv.format, p, rgba);
@@ -210,7 +277,36 @@ void storeTileDSV(
     uint32_t tileH,
     const float* depthSOA,
     const uint8_t* stencilSOA) {
-    if (!dsv.resource || !dsv.resource->basePtr()) return;
+    if (!dsv.resource) return;
+    if (dsv.resource->isReserved()) {
+        const uint32_t mipLevels = std::max<uint32_t>(1, dsv.resource->resourceDesc().MipLevels);
+        const uint32_t subIdx = dsv.mip_slice + dsv.first_array_slice * mipLevels;
+        for (uint32_t ty = 0; ty < tileH; ++ty) {
+            for (uint32_t tx = 0; tx < tileW; ++tx) {
+                uint8_t* p = dsv.resource->texBlockPtr(subIdx, tileOriginX + tx, tileOriginY + ty, 0);
+                if (!p) continue;
+                uint32_t pixIdx = quadSwizzlePixel(tx, ty);
+                if (dsv.format == DXGI_FORMAT_D32_FLOAT) {
+                    std::memcpy(p, &depthSOA[pixIdx], 4);
+                } else if (dsv.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+                    uint32_t d24 = static_cast<uint32_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 16777215.0f + 0.5f);
+                    uint32_t v = (d24 & 0x00FFFFFFu) | (static_cast<uint32_t>(stencilSOA[pixIdx]) << 24);
+                    std::memcpy(p, &v, 4);
+                } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                    std::memcpy(p, &depthSOA[pixIdx], 4);
+                    p[4] = stencilSOA[pixIdx];
+                } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
+                    uint16_t d16 = static_cast<uint16_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 65535.0f + 0.5f);
+                    std::memcpy(p, &d16, 2);
+                } else {
+                    float rgba[4] = {depthSOA[pixIdx], 0.0f, 0.0f, 0.0f};
+                    packPixelRGBA32F(dsv.format, rgba, p);
+                }
+            }
+        }
+        return;
+    }
+    if (!dsv.resource->basePtr()) return;
     const auto& sub = dsv.resource->subresourceLayout(dsv.mip_slice);
     uint8_t* base = dsv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
@@ -241,9 +337,6 @@ void storeTileDSV(
             } else if (dsv.format == DXGI_FORMAT_D16_UNORM) {
                 uint16_t d16 = static_cast<uint16_t>(std::clamp(depthSOA[pixIdx], 0.0f, 1.0f) * 65535.0f + 0.5f);
                 std::memcpy(p, &d16, 2);
-            } else if (dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
-                std::memcpy(p, &depthSOA[pixIdx], 4);
-                p[4] = stencilSOA[pixIdx];
             } else {
                 float rgba[4] = {depthSOA[pixIdx], 0.0f, 0.0f, 0.0f};
                 packPixelRGBA32F(dsv.format, rgba, p);

@@ -52,6 +52,21 @@ void DescriptorOps::createCBV(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
     if (!dest.ptr || !pDesc) return;
     auto* sd = reinterpret_cast<NacelleDescriptor*>(dest.ptr);
     *sd = NacelleDescriptor{};
+
+    uint64_t reservedOff = 0;
+    if (NacelleResource* reservedRes =
+            NacelleResource::resolveReservedGpuVA(pDesc->BufferLocation, &reservedOff)) {
+        sd->base_ptr = const_cast<uint8_t**>(reservedRes->tileTablePtr());
+        sd->width = pDesc->SizeInBytes;
+        sd->height = reservedRes->totalTileCount();
+        sd->row_pitch = static_cast<uint32_t>(reservedOff & 0xFFFFFFFFu);
+        sd->depth_or_array = static_cast<uint32_t>(reservedOff >> 32);
+        sd->byte_size = pDesc->SizeInBytes;
+        sd->elem_stride = 16;
+        sd->view_flags = D3D12_SRV_DIMENSION_BUFFER | kDescViewFlagReservedBuffer;
+        return;
+    }
+
     sd->base_ptr = reinterpret_cast<void*>(pDesc->BufferLocation);
     sd->width = pDesc->SizeInBytes;
     sd->byte_size = pDesc->SizeInBytes;
@@ -76,7 +91,9 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
     const DXGI_FORMAT fmt = (pDesc && pDesc->Format != DXGI_FORMAT_UNKNOWN) ? pDesc->Format : rdesc.Format;
 
     sd->format = static_cast<uint32_t>(fmt);
-    sd->base_ptr = res->basePtr();
+    sd->base_ptr = res->isReserved()
+                       ? static_cast<void*>(const_cast<uint8_t**>(res->tileTablePtr()))
+                       : static_cast<void*>(res->basePtr());
 
     if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         uint64_t firstElem = pDesc ? pDesc->Buffer.FirstElement : 0;
@@ -89,11 +106,20 @@ void DescriptorOps::createSRV(ID3D12Resource* pResource,
             stride = 4;
             isRaw = 1;
         }
-        sd->base_ptr = res->basePtr() + firstElem * stride;
+        const uint64_t viewByteOffset = firstElem * stride;
         sd->width = numElems;
         sd->elem_stride = stride;
         sd->byte_size = uint64_t(numElems) * stride;
-        sd->view_flags = D3D12_SRV_DIMENSION_BUFFER | (isRaw << 8);
+        if (res->isReserved()) {
+            sd->base_ptr = const_cast<uint8_t**>(res->tileTablePtr());
+            sd->height = res->totalTileCount();
+            sd->row_pitch = static_cast<uint32_t>(viewByteOffset & 0xFFFFFFFFu);
+            sd->depth_or_array = static_cast<uint32_t>(viewByteOffset >> 32);
+            sd->view_flags = D3D12_SRV_DIMENSION_BUFFER | (isRaw << 8) | kDescViewFlagReservedBuffer;
+        } else {
+            sd->base_ptr = res->basePtr() + viewByteOffset;
+            sd->view_flags = D3D12_SRV_DIMENSION_BUFFER | (isRaw << 8);
+        }
     } else {
         if (res->textureMetadata()->is_compressed) {
             res->ensureDecodedBC();
@@ -199,7 +225,9 @@ void DescriptorOps::createUAV(ID3D12Resource* pResource,
     const DXGI_FORMAT fmt = (pDesc && pDesc->Format != DXGI_FORMAT_UNKNOWN) ? pDesc->Format : rdesc.Format;
 
     sd->format = static_cast<uint32_t>(fmt);
-    sd->base_ptr = res->basePtr();
+    sd->base_ptr = res->isReserved()
+                       ? static_cast<void*>(const_cast<uint8_t**>(res->tileTablePtr()))
+                       : static_cast<void*>(res->basePtr());
 
     if (rdesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         uint64_t firstElem = pDesc ? pDesc->Buffer.FirstElement : 0;
@@ -212,14 +240,26 @@ void DescriptorOps::createUAV(ID3D12Resource* pResource,
             stride = 4;
             isRaw = 1;
         }
-        sd->base_ptr = res->basePtr() + firstElem * stride;
+        const uint64_t viewByteOffset = firstElem * stride;
         sd->width = numElems;
         sd->elem_stride = stride;
         sd->byte_size = uint64_t(numElems) * stride;
-        sd->view_flags = D3D12_UAV_DIMENSION_BUFFER | (isRaw << 8);
+        if (res->isReserved()) {
+            sd->base_ptr = const_cast<uint8_t**>(res->tileTablePtr());
+            sd->height = res->totalTileCount();
+            sd->row_pitch = static_cast<uint32_t>(viewByteOffset & 0xFFFFFFFFu);
+            sd->depth_or_array = static_cast<uint32_t>(viewByteOffset >> 32);
+            sd->view_flags = D3D12_UAV_DIMENSION_BUFFER | (isRaw << 8) | kDescViewFlagReservedBuffer;
+        } else {
+            sd->base_ptr = res->basePtr() + viewByteOffset;
+            sd->view_flags = D3D12_UAV_DIMENSION_BUFFER | (isRaw << 8);
+        }
         if (pCounterResource) {
             auto* counterRes = static_cast<NacelleResource*>(pCounterResource);
-            sd->extra_ptr = counterRes->basePtr() + pDesc->Buffer.CounterOffsetInBytes;
+            const uint64_t counterOff = pDesc ? pDesc->Buffer.CounterOffsetInBytes : 0;
+            sd->extra_ptr = counterRes->isReserved()
+                                ? counterRes->bufferBytePtr(counterOff)
+                                : (counterRes->basePtr() + counterOff);
         }
     } else {
         uint32_t mipSlice = 0;
@@ -279,7 +319,9 @@ void DescriptorOps::createUAV(ID3D12Resource* pResource,
         if (dim == D3D12_UAV_DIMENSION_TEXTURE3D && (!pDesc || pDesc->Texture3D.WSize == UINT32_MAX || pDesc->Texture3D.WSize == 0)) {
             sliceCount = (mip.depth > firstSlice) ? (mip.depth - firstSlice) : 1;
         }
-        sd->base_ptr = res->basePtr();
+        sd->base_ptr = res->isReserved()
+                           ? static_cast<void*>(const_cast<uint8_t**>(res->tileTablePtr()))
+                           : static_cast<void*>(res->basePtr());
         sd->width = mip.width;
         sd->height = mip.height;
         sd->depth_or_array = sliceCount;

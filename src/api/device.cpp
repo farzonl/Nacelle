@@ -108,7 +108,7 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         std::memset(o, 0, sizeof(*o));
         o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;
-        o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_2;
+        o->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_3;
         o->DoublePrecisionFloatShaderOps = TRUE;
         o->OutputMergerLogicOp = TRUE;
         o->PSSpecifiedStencilRefSupported = TRUE;
@@ -393,6 +393,81 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreatePlacedResource(
     HRESULT hr = res->QueryInterface(riid, ppvResource);
     res->Release();
     return hr;
+}
+
+HRESULT STDMETHODCALLTYPE NacelleDevice::CreateReservedResource(
+    const D3D12_RESOURCE_DESC* pDesc,
+    D3D12_RESOURCE_STATES,
+    const D3D12_CLEAR_VALUE*,
+    REFIID riid,
+    void** ppvResource) {
+    if (!pDesc) return E_INVALIDARG;
+    if (pDesc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        pDesc->Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) {
+        return E_INVALIDARG;
+    }
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    auto* res = new NacelleResource(this, hp, *pDesc, nullptr, 0, /*isReserved=*/true);
+    if (!ppvResource) { res->Release(); return S_FALSE; }
+    HRESULT hr = res->QueryInterface(riid, ppvResource);
+    res->Release();
+    return hr;
+}
+
+void STDMETHODCALLTYPE NacelleDevice::GetResourceTiling(
+    ID3D12Resource* pTiledResource,
+    UINT* pNumTilesForEntireResource,
+    D3D12_PACKED_MIP_INFO* pPackedMipDesc,
+    D3D12_TILE_SHAPE* pStandardTileShapeForNonPackedMips,
+    UINT* pNumSubresourceTilings,
+    UINT FirstSubresourceTilingToGet,
+    D3D12_SUBRESOURCE_TILING* pSubresourceTilingsForNonPackedMips) {
+    auto zeroOutputs = [&]() {
+        if (pNumTilesForEntireResource) *pNumTilesForEntireResource = 0;
+        if (pPackedMipDesc) *pPackedMipDesc = {};
+        if (pStandardTileShapeForNonPackedMips) *pStandardTileShapeForNonPackedMips = {};
+        if (pNumSubresourceTilings) *pNumSubresourceTilings = 0;
+    };
+    if (!pTiledResource) {
+        zeroOutputs();
+        return;
+    }
+    auto* res = static_cast<NacelleResource*>(pTiledResource);
+    if (!res->isReserved()) {
+        zeroOutputs();
+        return;
+    }
+
+    if (pNumTilesForEntireResource) {
+        *pNumTilesForEntireResource = res->totalTileCount();
+    }
+    if (pPackedMipDesc) {
+        pPackedMipDesc->NumStandardMips =
+            static_cast<UINT8>(std::min<UINT>(255, std::max<UINT>(1, res->resourceDesc().MipLevels)));
+        pPackedMipDesc->NumPackedMips = 0;
+        pPackedMipDesc->NumTilesForPackedMips = 0;
+        pPackedMipDesc->StartTileIndexInOverallResource = 0;
+    }
+    if (pStandardTileShapeForNonPackedMips) {
+        *pStandardTileShapeForNonPackedMips = res->tileShape();
+    }
+
+    const auto& tilings = res->subresourceTilings();
+    const UINT avail = (FirstSubresourceTilingToGet < tilings.size())
+                           ? static_cast<UINT>(tilings.size() - FirstSubresourceTilingToGet)
+                           : 0u;
+    if (pNumSubresourceTilings) {
+        if (pSubresourceTilingsForNonPackedMips) {
+            const UINT toCopy = std::min<UINT>(*pNumSubresourceTilings, avail);
+            for (UINT i = 0; i < toCopy; ++i) {
+                pSubresourceTilingsForNonPackedMips[i] = tilings[FirstSubresourceTilingToGet + i];
+            }
+            *pNumSubresourceTilings = toCopy;
+        } else {
+            *pNumSubresourceTilings = avail;
+        }
+    }
 }
 
 HRESULT STDMETHODCALLTYPE NacelleDevice::CreateFence(
