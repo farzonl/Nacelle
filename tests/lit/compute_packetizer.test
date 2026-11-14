@@ -2,6 +2,7 @@
 // RUN: %nacelle_compile --simd-width=4 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W4
 // RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W8
 // RUN: %nacelle_compile --simd-width=16 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W16
+// RUN: %nacelle_compile --simd-width=4 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM
 
 // W4: func.func @nacelle_cs_test
 // W4: vector<4x
@@ -26,3 +27,6 @@
 // W16: arith.addf{{.*}}vector<16xf32>
 // W16: llvm.intr.masked.store{{.*}}vector<16xf32>
 // W16: llvm.intr.masked.scatter{{.*}}vector<16xf32>
+
+// LLVM: define void @nacelle_cs_test(ptr noalias readonly %0, ptr %1,
+// LLVM: load {{.*}}, !invariant.load !

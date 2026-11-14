@@ -561,6 +561,11 @@ private:
     mlir::Value loadScalar(mlir::Location loc, mlir::Type ty, mlir::Value ptr) {
         return mlir::LLVM::LoadOp::create(b_, loc, ty, ptr);
     }
+    mlir::Value loadInvariantScalar(mlir::Location loc, mlir::Type ty, mlir::Value ptr) {
+        auto op = mlir::LLVM::LoadOp::create(b_, loc, ty, ptr);
+        op.setInvariant(true);
+        return op;
+    }
 
     void storeScalar(mlir::Location loc, mlir::Value val, mlir::Value ptr) {
         mlir::LLVM::StoreOp::create(b_, loc, val, ptr);
@@ -1897,7 +1902,7 @@ private:
         if (tgt.kind == RootBindingTarget::DescriptorTableOffset) {
             int64_t slotOff = static_cast<int64_t>(offsetof(DriverRootContext, root_slots)) +
                               static_cast<int64_t>(tgt.rootParamIndex) * 8;
-            mlir::Value tblBase = loadScalar(loc, ptrTy(), gepByteOffset(loc, rootCtxPtr_, slotOff));
+            mlir::Value tblBase = loadInvariantScalar(loc, ptrTy(), gepByteOffset(loc, rootCtxPtr_, slotOff));
             auto idxConst = getConstIntValue(indexVal);
             if (idxConst.has_value()) {
                 int64_t regIdx = static_cast<int64_t>(*idxConst);
@@ -1934,7 +1939,8 @@ private:
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy())});
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                       mlir::Value p = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr);
+                       auto p = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr);
+                       p.setInvariant(true);
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{p});
                    })
             .getResult(0);
@@ -1950,7 +1956,9 @@ private:
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                        mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
-                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(nb, nloc, i32Ty(), fp)});
+                       auto val = mlir::LLVM::LoadOp::create(nb, nloc, i32Ty(), fp);
+                       val.setInvariant(true);
+                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
                    })
             .getResult(0);
     }
@@ -1965,7 +1973,9 @@ private:
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                        mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
-                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(nb, nloc, i64Ty(), fp)});
+                       auto val = mlir::LLVM::LoadOp::create(nb, nloc, i64Ty(), fp);
+                       val.setInvariant(true);
+                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
                    })
             .getResult(0);
     }
@@ -2039,8 +2049,8 @@ private:
                                      : static_cast<int64_t>(offsetof(DriverRootContext, resource_heap_base));
             int64_t cntOff = isSamp ? static_cast<int64_t>(offsetof(DriverRootContext, sampler_heap_count))
                                     : static_cast<int64_t>(offsetof(DriverRootContext, resource_heap_count));
-            mlir::Value heapBase = loadScalar(loc, ptrTy(), gepByteOffset(loc, rootCtxPtr_, baseOff));
-            mlir::Value heapCnt = loadScalar(loc, i32Ty(), gepByteOffset(loc, rootCtxPtr_, cntOff));
+            mlir::Value heapBase = loadInvariantScalar(loc, ptrTy(), gepByteOffset(loc, rootCtxPtr_, baseOff));
+            mlir::Value heapCnt = loadInvariantScalar(loc, i32Ty(), gepByteOffset(loc, rootCtxPtr_, cntOff));
 
             SimdVal h;
             h.kind = SimdVal::Kind::Handle;
@@ -2651,8 +2661,9 @@ private:
                                       mlir::Value sp = mlir::LLVM::GEPOp::create(
                                           ib, iloc, ptrTy(), i8Ty(), descPtr,
                                           llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(offsetof(NacelleDescriptor, elem_stride))});
-                                      mlir::scf::YieldOp::create(
-                                          ib, iloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), sp)});
+                                      auto strideVal = mlir::LLVM::LoadOp::create(ib, iloc, i32Ty(), sp);
+                                      strideVal.setInvariant(true);
+                                      mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{strideVal});
                                   })
                                   .getResult(0);
             return mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), s32);
@@ -5683,6 +5694,8 @@ bool packetizeComputeEntry(
     // void fn(ptr rootCtx, ptr gsBase, i32 gx, i32 gy, i32 gz, i32 ngx, i32 ngy, i32 ngz)
     auto fnTy = b.getFunctionType({ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty}, {});
     auto dstFunc = mlir::func::FuncOp::create(b, loc, symbolName, fnTy);
+    dstFunc.setArgAttr(0, "llvm.noalias", b.getUnitAttr());
+    dstFunc.setArgAttr(0, "llvm.readonly", b.getUnitAttr());
     mlir::Block* entry = dstFunc.addEntryBlock();
     b.setInsertionPointToStart(entry);
 
