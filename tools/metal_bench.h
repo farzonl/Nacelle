@@ -36,6 +36,17 @@ MetalBenchResult runMetalGraphicsBench(
     const std::vector<uint8_t>& psDxil,
     uint32_t width,
     uint32_t height,
+    uint32_t iters,
+    const std::vector<uint8_t>& hsDxil = {},
+    const std::vector<uint8_t>& dsDxil = {},
+    const std::vector<uint8_t>& gsDxil = {});
+
+MetalBenchResult runMetalRaytracingBench(
+    const std::string& benchId,
+    bool isInline,
+    const std::vector<uint8_t>& dxil,
+    uint32_t width,
+    uint32_t height,
     uint32_t iters);
 
 } // namespace nacelle_bench

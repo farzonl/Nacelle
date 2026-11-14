@@ -43,6 +43,8 @@ using VkImage = uint64_t;
 using VkImageView = uint64_t;
 using VkRenderPass = uint64_t;
 using VkFramebuffer = uint64_t;
+using VkAccelerationStructureKHR = uint64_t;
+using VkDeviceAddress = uint64_t;
 
 constexpr VkResult VK_SUCCESS = 0;
 constexpr uint64_t VK_NULL_HANDLE = 0;
@@ -71,6 +73,7 @@ constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14;
 constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO = 15;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO = 19;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO = 20;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO = 21;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO = 22;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO = 23;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO = 24;
@@ -92,6 +95,9 @@ constexpr VkFlags VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002;
 constexpr VkFlags VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x00000004;
 constexpr uint32_t VK_SHARING_MODE_EXCLUSIVE = 0;
 constexpr uint32_t VK_SHADER_STAGE_VERTEX_BIT = 0x00000001;
+constexpr uint32_t VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT = 0x00000002;
+constexpr uint32_t VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT = 0x00000004;
+constexpr uint32_t VK_SHADER_STAGE_GEOMETRY_BIT = 0x00000008;
 constexpr uint32_t VK_SHADER_STAGE_FRAGMENT_BIT = 0x00000010;
 constexpr uint32_t VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020;
 constexpr uint32_t VK_PIPELINE_BIND_POINT_GRAPHICS = 0;
@@ -109,7 +115,9 @@ constexpr uint32_t VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6;
 constexpr uint32_t VK_IMAGE_VIEW_TYPE_2D = 1;
 constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 0x00000001;
 constexpr uint32_t VK_SAMPLE_COUNT_1_BIT = 0x00000001;
+constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_POINT_LIST = 0;
 constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3;
+constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_PATCH_LIST = 10;
 constexpr uint32_t VK_POLYGON_MODE_FILL = 0;
 constexpr uint32_t VK_CULL_MODE_NONE = 0;
 constexpr uint32_t VK_FRONT_FACE_COUNTER_CLOCKWISE = 0;
@@ -123,6 +131,56 @@ constexpr uint32_t VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
 constexpr uint32_t VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
 constexpr uint32_t VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 0x00000001;
 constexpr uint32_t VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 0x00000002;
+
+constexpr uint32_t VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000u;
+constexpr uint32_t VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO = 1000060000u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR = 1000150000u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR = 1000150005u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR = 1000150004u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR = 1000150006u;
+constexpr uint32_t VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR = 1000150007u;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR = 1000150013u;
+constexpr uint32_t VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR = 1000150015u;
+constexpr uint32_t VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR = 1000150016u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR = 1000150017u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR = 1000150019u;
+constexpr uint32_t VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR = 1000150020u;
+constexpr uint32_t VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO = 1000244001u;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES = 1000257000u;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR = 1000347000u;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR = 1000347001u;
+constexpr uint32_t VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR = 1000348013u;
+
+constexpr VkFlags VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR = 0x00000400u;
+constexpr VkFlags VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT = 0x00020000u;
+constexpr VkFlags VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR = 0x00080000u;
+constexpr VkFlags VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR = 0x00100000u;
+constexpr VkFlags VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT = 0x00000002u;
+constexpr uint32_t VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR = 1000150000u;
+constexpr uint32_t VK_SHADER_STAGE_RAYGEN_BIT_KHR = 0x00000100u;
+constexpr uint32_t VK_SHADER_STAGE_ANY_HIT_BIT_KHR = 0x00000200u;
+constexpr uint32_t VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR = 0x00000400u;
+constexpr uint32_t VK_SHADER_STAGE_MISS_BIT_KHR = 0x00000800u;
+constexpr uint32_t VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR = 1000165000u;
+constexpr VkFlags VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800u;
+constexpr VkFlags VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR = 0x00200000u;
+constexpr VkFlags VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR = 0x02000000u;
+constexpr VkFlags VK_ACCESS_SHADER_READ_BIT = 0x00000020u;
+constexpr VkFlags VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR = 0x00200000u;
+constexpr VkFlags VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR = 0x00400000u;
+constexpr uint32_t VK_INDEX_TYPE_NONE_KHR = 1000165000u;
+constexpr uint32_t VK_GEOMETRY_TYPE_TRIANGLES_KHR = 0;
+constexpr uint32_t VK_GEOMETRY_TYPE_INSTANCES_KHR = 2;
+constexpr VkFlags VK_GEOMETRY_OPAQUE_BIT_KHR = 0x00000001u;
+constexpr uint32_t VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR = 0;
+constexpr uint32_t VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR = 1;
+constexpr uint32_t VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR = 0;
+constexpr uint32_t VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR = 1;
+constexpr VkFlags VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR = 0x00000004u;
+constexpr uint32_t VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR = 0;
+constexpr uint32_t VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR = 1;
+constexpr uint32_t VK_SHADER_UNUSED_KHR = ~0u;
 
 struct VkApplicationInfo {
     uint32_t sType;
@@ -618,6 +676,299 @@ struct VkPipelineColorBlendStateCreateInfo {
     float blendConstants[4];
 };
 
+struct VkPhysicalDeviceFeatures {
+    VkBool32 robustBufferAccess;
+    VkBool32 fullDrawIndexUint32;
+    VkBool32 imageCubeArray;
+    VkBool32 independentBlend;
+    VkBool32 geometryShader;
+    VkBool32 tessellationShader;
+    VkBool32 sampleRateShading;
+    VkBool32 dualSrcBlend;
+    VkBool32 logicOp;
+    VkBool32 multiDrawIndirect;
+    VkBool32 drawIndirectFirstInstance;
+    VkBool32 depthClamp;
+    VkBool32 depthBiasClamp;
+    VkBool32 fillModeNonSolid;
+    VkBool32 depthBounds;
+    VkBool32 wideLines;
+    VkBool32 largePoints;
+    VkBool32 alphaToOne;
+    VkBool32 multiViewport;
+    VkBool32 samplerAnisotropy;
+    VkBool32 textureCompressionETC2;
+    VkBool32 textureCompressionASTC_LDR;
+    VkBool32 textureCompressionBC;
+    VkBool32 occlusionQueryPrecise;
+    VkBool32 pipelineStatisticsQuery;
+    VkBool32 vertexPipelineStoresAndAtomics;
+    VkBool32 fragmentStoresAndAtomics;
+    VkBool32 shaderTessellationAndGeometryPointSize;
+    VkBool32 shaderImageGatherExtended;
+    VkBool32 shaderStorageImageExtendedFormats;
+    VkBool32 shaderStorageImageMultisample;
+    VkBool32 shaderStorageImageReadWithoutFormat;
+    VkBool32 shaderStorageImageWriteWithoutFormat;
+    VkBool32 shaderUniformBufferArrayDynamicIndexing;
+    VkBool32 shaderSampledImageArrayDynamicIndexing;
+    VkBool32 shaderStorageBufferArrayDynamicIndexing;
+    VkBool32 shaderStorageImageArrayDynamicIndexing;
+    VkBool32 shaderClipDistance;
+    VkBool32 shaderCullDistance;
+    VkBool32 shaderFloat64;
+    VkBool32 shaderInt64;
+    VkBool32 shaderInt16;
+    VkBool32 shaderResourceResidency;
+    VkBool32 shaderResourceMinLod;
+    VkBool32 sparseBinding;
+    VkBool32 sparseResidencyBuffer;
+    VkBool32 sparseResidencyImage2D;
+    VkBool32 sparseResidencyImage3D;
+    VkBool32 sparseResidency2Samples;
+    VkBool32 sparseResidency4Samples;
+    VkBool32 sparseResidency8Samples;
+    VkBool32 sparseResidency16Samples;
+    VkBool32 sparseResidencyAliased;
+    VkBool32 variableMultisampleRate;
+    VkBool32 inheritedQueries;
+};
+
+struct VkPhysicalDeviceFeatures2 {
+    uint32_t sType;
+    void* pNext;
+    VkPhysicalDeviceFeatures features;
+};
+
+struct VkExtensionProperties {
+    char extensionName[256];
+    uint32_t specVersion;
+};
+
+struct VkPhysicalDeviceBufferDeviceAddressFeatures {
+    uint32_t sType;
+    void* pNext;
+    VkBool32 bufferDeviceAddress;
+    VkBool32 bufferDeviceAddressCaptureReplay;
+    VkBool32 bufferDeviceAddressMultiDevice;
+};
+
+struct VkPhysicalDeviceAccelerationStructureFeaturesKHR {
+    uint32_t sType;
+    void* pNext;
+    VkBool32 accelerationStructure;
+    VkBool32 accelerationStructureCaptureReplay;
+    VkBool32 accelerationStructureIndirectBuild;
+    VkBool32 accelerationStructureHostCommands;
+    VkBool32 descriptorBindingAccelerationStructureUpdateAfterBind;
+};
+
+struct VkPhysicalDeviceRayQueryFeaturesKHR {
+    uint32_t sType;
+    void* pNext;
+    VkBool32 rayQuery;
+};
+
+struct VkPhysicalDeviceRayTracingPipelineFeaturesKHR {
+    uint32_t sType;
+    void* pNext;
+    VkBool32 rayTracingPipeline;
+    VkBool32 rayTracingPipelineShaderGroupHandleCaptureReplay;
+    VkBool32 rayTracingPipelineShaderGroupHandleCaptureReplayMixed;
+    VkBool32 rayTracingPipelineTraceRaysIndirect;
+    VkBool32 rayTraversalPrimitiveCulling;
+};
+
+struct VkPhysicalDeviceRayTracingPipelinePropertiesKHR {
+    uint32_t sType;
+    void* pNext;
+    uint32_t shaderGroupHandleSize;
+    uint32_t maxRayRecursionDepth;
+    uint32_t maxShaderGroupStride;
+    uint32_t shaderGroupBaseAlignment;
+    uint32_t shaderGroupHandleCaptureReplaySize;
+    uint32_t maxRayDispatchInvocationCount;
+    uint32_t shaderGroupHandleAlignment;
+    uint32_t maxRayHitAttributeSize;
+};
+
+struct VkMemoryAllocateFlagsInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t deviceMask;
+};
+
+struct VkBufferDeviceAddressInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkBuffer buffer;
+};
+
+struct VkMemoryBarrier {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags srcAccessMask;
+    VkFlags dstAccessMask;
+};
+
+struct VkWriteDescriptorSetAccelerationStructureKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t accelerationStructureCount;
+    const VkAccelerationStructureKHR* pAccelerationStructures;
+};
+
+union VkDeviceOrHostAddressConstKHR {
+    VkDeviceAddress deviceAddress;
+    const void* hostAddress;
+};
+
+union VkDeviceOrHostAddressKHR {
+    VkDeviceAddress deviceAddress;
+    void* hostAddress;
+};
+
+struct VkAccelerationStructureGeometryTrianglesDataKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t vertexFormat;
+    VkDeviceOrHostAddressConstKHR vertexData;
+    VkDeviceSize vertexStride;
+    uint32_t maxVertex;
+    uint32_t indexType;
+    VkDeviceOrHostAddressConstKHR indexData;
+    VkDeviceOrHostAddressConstKHR transformData;
+};
+
+struct VkAccelerationStructureGeometryAabbsDataKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkDeviceOrHostAddressConstKHR data;
+    VkDeviceSize stride;
+};
+
+struct VkAccelerationStructureGeometryInstancesDataKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkBool32 arrayOfPointers;
+    VkDeviceOrHostAddressConstKHR data;
+};
+
+union VkAccelerationStructureGeometryDataKHR {
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles;
+    VkAccelerationStructureGeometryAabbsDataKHR aabbs;
+    VkAccelerationStructureGeometryInstancesDataKHR instances;
+};
+
+struct VkAccelerationStructureGeometryKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t geometryType;
+    VkAccelerationStructureGeometryDataKHR geometry;
+    VkFlags flags;
+};
+
+struct VkAccelerationStructureBuildRangeInfoKHR {
+    uint32_t primitiveCount;
+    uint32_t primitiveOffset;
+    uint32_t firstVertex;
+    uint32_t transformOffset;
+};
+
+struct VkAccelerationStructureBuildGeometryInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t type;
+    VkFlags flags;
+    uint32_t mode;
+    VkAccelerationStructureKHR srcAccelerationStructure;
+    VkAccelerationStructureKHR dstAccelerationStructure;
+    uint32_t geometryCount;
+    const VkAccelerationStructureGeometryKHR* pGeometries;
+    const VkAccelerationStructureGeometryKHR* const* ppGeometries;
+    VkDeviceOrHostAddressKHR scratchData;
+};
+
+struct VkAccelerationStructureBuildSizesInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkDeviceSize accelerationStructureSize;
+    VkDeviceSize updateScratchSize;
+    VkDeviceSize buildScratchSize;
+};
+
+struct VkAccelerationStructureCreateInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags createFlags;
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t type;
+    VkDeviceAddress deviceAddress;
+};
+
+struct VkAccelerationStructureDeviceAddressInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkAccelerationStructureKHR accelerationStructure;
+};
+
+struct VkTransformMatrixKHR {
+    float matrix[3][4];
+};
+
+struct VkAccelerationStructureInstanceKHR {
+    VkTransformMatrixKHR transform;
+    uint32_t instanceCustomIndex : 24;
+    uint32_t mask : 8;
+    uint32_t instanceShaderBindingTableRecordOffset : 24;
+    uint32_t flags : 8;
+    uint64_t accelerationStructureReference;
+};
+
+struct VkStridedDeviceAddressRegionKHR {
+    VkDeviceAddress deviceAddress;
+    VkDeviceSize stride;
+    VkDeviceSize size;
+};
+
+struct VkRayTracingShaderGroupCreateInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t type;
+    uint32_t generalShader;
+    uint32_t closestHitShader;
+    uint32_t anyHitShader;
+    uint32_t intersectionShader;
+    const void* pShaderGroupCaptureReplayHandle;
+};
+
+struct VkRayTracingPipelineCreateInfoKHR {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t stageCount;
+    const VkPipelineShaderStageCreateInfo* pStages;
+    uint32_t groupCount;
+    const VkRayTracingShaderGroupCreateInfoKHR* pGroups;
+    uint32_t maxPipelineRayRecursionDepth;
+    const void* pLibraryInfo;
+    const void* pLibraryInterface;
+    const void* pDynamicState;
+    VkPipelineLayout layout;
+    VkPipeline basePipelineHandle;
+    int32_t basePipelineIndex;
+};
+
+struct VkPipelineTessellationStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t patchControlPoints;
+};
+
 struct VkGraphicsPipelineCreateInfo {
     uint32_t sType;
     const void* pNext;
@@ -686,6 +1037,11 @@ struct Loader {
     VkResult (VK_PTR* vkEnumeratePhysicalDevices)(VkInstance, uint32_t*, VkPhysicalDevice*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceProperties)(VkPhysicalDevice, VkPhysicalDeviceProperties*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceProperties2)(VkPhysicalDevice, VkPhysicalDeviceProperties2*) = nullptr;
+    void (VK_PTR* vkGetPhysicalDeviceFeatures)(VkPhysicalDevice, VkPhysicalDeviceFeatures*) = nullptr;
+    void (VK_PTR* vkGetPhysicalDeviceFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*) = nullptr;
+    VkResult (VK_PTR* vkEnumerateDeviceExtensionProperties)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*) = nullptr;
+    void* (VK_PTR* vkGetDeviceProcAddr)(VkDevice, const char*) = nullptr;
+    void (VK_PTR* vkCmdPipelineBarrier)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const void*, uint32_t, const void*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceQueueFamilyProperties)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*) = nullptr;
     VkResult (VK_PTR* vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*) = nullptr;
@@ -784,6 +1140,14 @@ struct Loader {
         loadSym(inst, vkEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices");
         loadSym(inst, vkGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
         loadSym(inst, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2");
+        loadSym(inst, vkGetPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures");
+        loadSym(inst, vkGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2");
+        if (!vkGetPhysicalDeviceFeatures2) {
+            loadSym(inst, vkGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2KHR");
+        }
+        loadSym(inst, vkEnumerateDeviceExtensionProperties, "vkEnumerateDeviceExtensionProperties");
+        loadSym(inst, vkGetDeviceProcAddr, "vkGetDeviceProcAddr");
+        loadSym(inst, vkCmdPipelineBarrier, "vkCmdPipelineBarrier");
         if (!vkGetPhysicalDeviceProperties2) {
             loadSym(inst, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2KHR");
         }

@@ -34,6 +34,7 @@
 #include "bench_nacelle_runners.h"
 #include "bench_types.h"
 #include "bench_vulkan_runners.h"
+#include "bench_warp_runners.h"
 
 #if defined(__APPLE__)
 #include "metal_bench.h"
@@ -129,8 +130,28 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.category = BenchCategory::Geometry;
         s.kind = PipelineKind::GraphicsVSGSPS;
         s.vsDxil = "bench_geometry_stress_vs.dxil";
+        s.vsSpv = "bench_geometry_stress_vs.spv";
         s.gsDxil = "bench_geometry_stress_gs.dxil";
+        s.gsSpv = "bench_geometry_stress_gs.spv";
         s.psDxil = "bench_geometry_stress_ps.dxil";
+        s.psSpv = "bench_geometry_stress_ps.spv";
+        cat.push_back(std::move(s));
+    }
+
+    {
+        BenchmarkSpec s;
+        s.id = "bench_tess_tri";
+        s.name = "Tessellation (VS+HS+DS+PS)";
+        s.category = BenchCategory::Tessellation;
+        s.kind = PipelineKind::GraphicsTessGS;
+        s.vsDxil = "bench_tess_tri_vs.dxil";
+        s.vsSpv = "bench_tess_tri_vs.spv";
+        s.hsDxil = "bench_tess_tri_hs.dxil";
+        s.hsSpv = "bench_tess_tri_hs.spv";
+        s.dsDxil = "bench_tess_tri_ds.dxil";
+        s.dsSpv = "bench_tess_tri_ds.spv";
+        s.psDxil = "bench_tess_tri_ps.dxil";
+        s.psSpv = "bench_tess_tri_ps.spv";
         cat.push_back(std::move(s));
     }
 
@@ -141,10 +162,15 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.category = BenchCategory::Tessellation;
         s.kind = PipelineKind::GraphicsTessGS;
         s.vsDxil = "gfx_tess_point_vs.dxil";
+        s.vsSpv = "gfx_tess_point_vs.spv";
         s.hsDxil = "gfx_tess_point_hs.dxil";
+        s.hsSpv = "gfx_tess_point_hs.spv";
         s.dsDxil = "gfx_tess_point_ds.dxil";
+        s.dsSpv = "gfx_tess_point_ds.spv";
         s.gsDxil = "gfx_tess_point_gs.dxil";
+        s.gsSpv = "gfx_tess_point_gs.spv";
         s.psDxil = "gfx_tess_point_ps.dxil";
+        s.psSpv = "gfx_tess_point_ps.spv";
         cat.push_back(std::move(s));
     }
 
@@ -155,6 +181,7 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.category = BenchCategory::RayTracing;
         s.kind = PipelineKind::RayTracingInline;
         s.rtDxil = "raytracing_inline_cs.dxil";
+        s.csSpv = "raytracing_inline_cs.spv";
         cat.push_back(std::move(s));
     }
 
@@ -165,6 +192,7 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.category = BenchCategory::RayTracing;
         s.kind = PipelineKind::RayTracingPipeline;
         s.rtDxil = "raytracing_pipeline.dxil";
+        s.csSpv = "raytracing_pipeline.spv";
         cat.push_back(std::move(s));
     }
 
@@ -570,6 +598,22 @@ std::vector<BenchRunResult> runSingleBenchmarkBackend(
             if (readBinary(shaderDir + "/" + spec.csDxil, dxil)) {
                 out.push_back(runWarpComputeBench(spec, dxil, width, height, maxSteps, iters));
             }
+        } else if (spec.kind == PipelineKind::GraphicsVSPS ||
+                   spec.kind == PipelineKind::GraphicsVSGSPS ||
+                   spec.kind == PipelineKind::GraphicsTessGS) {
+            std::vector<uint8_t> vs, hs, ds, gs, ps;
+            if (!readBinary(shaderDir + "/" + spec.vsDxil, vs)) return out;
+            if (!readBinary(shaderDir + "/" + spec.psDxil, ps)) return out;
+            if (!spec.hsDxil.empty() && !readBinary(shaderDir + "/" + spec.hsDxil, hs)) return out;
+            if (!spec.dsDxil.empty() && !readBinary(shaderDir + "/" + spec.dsDxil, ds)) return out;
+            if (!spec.gsDxil.empty() && !readBinary(shaderDir + "/" + spec.gsDxil, gs)) return out;
+            out.push_back(runWarpGraphicsBench(spec, vs, hs, ds, gs, ps, width, height, iters));
+        } else if (spec.kind == PipelineKind::RayTracingInline ||
+                   spec.kind == PipelineKind::RayTracingPipeline) {
+            std::vector<uint8_t> rt;
+            if (readBinary(shaderDir + "/" + spec.rtDxil, rt)) {
+                out.push_back(runWarpRaytracingBench(spec, rt, width, height, iters));
+            }
         }
 #else
         if (spec.id == "bench_raymarch") {
@@ -604,6 +648,32 @@ std::vector<BenchRunResult> runSingleBenchmarkBackend(
             if (readBinary(shaderDir + "/" + spec.vsSpv, vsSpv) && validateSpirvBinary(vsSpv, err) &&
                 readBinary(shaderDir + "/" + spec.psSpv, psSpv) && validateSpirvBinary(psSpv, err)) {
                 auto vkRes = runVulkanGraphicsBench(spec, vsSpv, psSpv, width, height, iters, devIdx);
+                out.insert(out.end(), vkRes.begin(), vkRes.end());
+            }
+        } else if ((spec.kind == PipelineKind::GraphicsVSGSPS || spec.kind == PipelineKind::GraphicsTessGS) &&
+                   !spec.vsSpv.empty() && !spec.psSpv.empty()) {
+            std::vector<uint8_t> vsSpv, psSpv, gsSpv, hsSpv, dsSpv;
+            std::string err;
+            bool ok = readBinary(shaderDir + "/" + spec.vsSpv, vsSpv) && validateSpirvBinary(vsSpv, err) &&
+                      readBinary(shaderDir + "/" + spec.psSpv, psSpv) && validateSpirvBinary(psSpv, err);
+            if (ok && !spec.gsSpv.empty()) {
+                ok = readBinary(shaderDir + "/" + spec.gsSpv, gsSpv) && validateSpirvBinary(gsSpv, err);
+            }
+            if (ok && spec.kind == PipelineKind::GraphicsTessGS) {
+                ok = !spec.hsSpv.empty() && !spec.dsSpv.empty() &&
+                     readBinary(shaderDir + "/" + spec.hsSpv, hsSpv) && validateSpirvBinary(hsSpv, err) &&
+                     readBinary(shaderDir + "/" + spec.dsSpv, dsSpv) && validateSpirvBinary(dsSpv, err);
+            }
+            if (ok) {
+                auto vkRes = runVulkanGraphicsBench(spec, vsSpv, psSpv, width, height, iters, devIdx, gsSpv, hsSpv, dsSpv);
+                out.insert(out.end(), vkRes.begin(), vkRes.end());
+            }
+        } else if ((spec.kind == PipelineKind::RayTracingInline || spec.kind == PipelineKind::RayTracingPipeline) &&
+                   !spec.csSpv.empty()) {
+            std::vector<uint8_t> rtSpv;
+            std::string err;
+            if (readBinary(shaderDir + "/" + spec.csSpv, rtSpv) && validateSpirvBinary(rtSpv, err)) {
+                auto vkRes = runVulkanRaytracingBench(spec, rtSpv, width, height, iters, devIdx);
                 out.insert(out.end(), vkRes.begin(), vkRes.end());
             }
         }
@@ -645,13 +715,32 @@ std::vector<BenchRunResult> runSingleBenchmarkBackend(
                 MemorySnapshot memAfter = queryProcessMemory();
                 recordMetal(mr, memBefore, memAfter);
             }
-        } else if (spec.kind == PipelineKind::GraphicsVSPS && !spec.vsDxil.empty() && !spec.psDxil.empty()) {
-            std::vector<uint8_t> vsDxil, psDxil;
-            if (readBinary(shaderDir + "/" + spec.vsDxil, vsDxil) &&
-                readBinary(shaderDir + "/" + spec.psDxil, psDxil)) {
+        } else if ((spec.kind == PipelineKind::GraphicsVSPS ||
+                    spec.kind == PipelineKind::GraphicsVSGSPS ||
+                    spec.kind == PipelineKind::GraphicsTessGS) &&
+                   !spec.vsDxil.empty() && !spec.psDxil.empty()) {
+            std::vector<uint8_t> vsDxil, psDxil, hsDxil, dsDxil, gsDxil;
+            bool ok = readBinary(shaderDir + "/" + spec.vsDxil, vsDxil) &&
+                      readBinary(shaderDir + "/" + spec.psDxil, psDxil);
+            if (ok && !spec.hsDxil.empty()) ok = readBinary(shaderDir + "/" + spec.hsDxil, hsDxil);
+            if (ok && !spec.dsDxil.empty()) ok = readBinary(shaderDir + "/" + spec.dsDxil, dsDxil);
+            if (ok && !spec.gsDxil.empty()) ok = readBinary(shaderDir + "/" + spec.gsDxil, gsDxil);
+            if (ok) {
                 MemorySnapshot memBefore = queryProcessMemory();
                 auto mr = nacelle_bench::runMetalGraphicsBench(
-                    spec.id, categoryName(spec.category), vsDxil, psDxil, width, height, iters);
+                    spec.id, categoryName(spec.category), vsDxil, psDxil, width, height, iters,
+                    hsDxil, dsDxil, gsDxil);
+                MemorySnapshot memAfter = queryProcessMemory();
+                recordMetal(mr, memBefore, memAfter);
+            }
+        } else if ((spec.kind == PipelineKind::RayTracingInline ||
+                    spec.kind == PipelineKind::RayTracingPipeline) &&
+                   !spec.rtDxil.empty()) {
+            std::vector<uint8_t> rtDxil;
+            if (readBinary(shaderDir + "/" + spec.rtDxil, rtDxil)) {
+                MemorySnapshot memBefore = queryProcessMemory();
+                auto mr = nacelle_bench::runMetalRaytracingBench(
+                    spec.id, spec.kind == PipelineKind::RayTracingInline, rtDxil, width, height, iters);
                 MemorySnapshot memAfter = queryProcessMemory();
                 recordMetal(mr, memBefore, memAfter);
             }
