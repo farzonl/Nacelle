@@ -624,9 +624,9 @@ void execClearRTV(const CmdClearRTV& c) {
     const FormatInfo fi = getFormatInfo(c.rtv.format);
     uint8_t encoded[16]{};
     packPixelRGBA32F(c.rtv.format, c.rgba, encoded);
-    uint8_t* base = c.rtv.resource->basePtr() + sub.offset;
+    const UINT sampleCount = std::max<UINT>(1, c.rtv.resource->resourceDesc().SampleDesc.Count);
 
-    auto clearRect = [&](LONG x0, LONG y0, LONG x1, LONG y1) {
+    auto clearRect = [&](uint8_t* base, LONG x0, LONG y0, LONG x1, LONG y1) {
         x0 = std::max<LONG>(0, x0);
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
@@ -639,10 +639,13 @@ void execClearRTV(const CmdClearRTV& c) {
         }
     };
 
-    if (c.rects.empty()) {
-        clearRect(0, 0, sub.width, sub.height);
-    } else {
-        for (const auto& r : c.rects) clearRect(r.left, r.top, r.right, r.bottom);
+    for (UINT s = 0; s < sampleCount; ++s) {
+        uint8_t* base = c.rtv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch;
+        if (c.rects.empty()) {
+            clearRect(base, 0, 0, sub.width, sub.height);
+        } else {
+            for (const auto& r : c.rects) clearRect(base, r.left, r.top, r.right, r.bottom);
+        }
     }
 }
 
@@ -650,9 +653,9 @@ void execClearDSV(const CmdClearDSV& c) {
     if (!c.dsv.resource) return;
     const auto& sub = c.dsv.resource->subresourceLayout(c.dsv.mip_slice);
     const FormatInfo fi = getFormatInfo(c.dsv.format);
-    uint8_t* base = c.dsv.resource->basePtr() + sub.offset;
+    const UINT sampleCount = std::max<UINT>(1, c.dsv.resource->resourceDesc().SampleDesc.Count);
 
-    auto clearRect = [&](LONG x0, LONG y0, LONG x1, LONG y1) {
+    auto clearRect = [&](uint8_t* base, LONG x0, LONG y0, LONG x1, LONG y1) {
         x0 = std::max<LONG>(0, x0);
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
@@ -687,8 +690,11 @@ void execClearDSV(const CmdClearDSV& c) {
         }
     };
 
-    if (c.rects.empty()) clearRect(0, 0, sub.width, sub.height);
-    else for (const auto& r : c.rects) clearRect(r.left, r.top, r.right, r.bottom);
+    for (UINT s = 0; s < sampleCount; ++s) {
+        uint8_t* base = c.dsv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch;
+        if (c.rects.empty()) clearRect(base, 0, 0, sub.width, sub.height);
+        else for (const auto& r : c.rects) clearRect(base, r.left, r.top, r.right, r.bottom);
+    }
 }
 
 void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx, UINT gy, UINT gz) {
@@ -804,8 +810,34 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 if (c.dst && c.src) {
                     const auto& dSub = c.dst->subresourceLayout(c.dstSub);
                     const auto& sSub = c.src->subresourceLayout(c.srcSub);
-                    size_t n = std::min<size_t>(dSub.slice_pitch, sSub.slice_pitch);
-                    std::memcpy(c.dst->basePtr() + dSub.offset, c.src->basePtr() + sSub.offset, n);
+                    const UINT sampleCount = std::max<UINT>(1, c.src->resourceDesc().SampleDesc.Count);
+                    const DXGI_FORMAT fmt = (c.fmt != DXGI_FORMAT_UNKNOWN) ? c.fmt : c.dst->resourceDesc().Format;
+                    if (sampleCount <= 1) {
+                        size_t n = std::min<size_t>(dSub.slice_pitch, sSub.slice_pitch);
+                        std::memcpy(c.dst->basePtr() + dSub.offset, c.src->basePtr() + sSub.offset, n);
+                    } else {
+                        const FormatInfo fi = getFormatInfo(fmt);
+                        const uint32_t w = std::min(dSub.width, sSub.width);
+                        const uint32_t h = std::min(dSub.height, sSub.height);
+                        const float invSamples = 1.0f / static_cast<float>(sampleCount);
+                        for (uint32_t y = 0; y < h; ++y) {
+                            uint8_t* dstRow = c.dst->basePtr() + dSub.offset + static_cast<size_t>(y) * dSub.row_pitch;
+                            for (uint32_t x = 0; x < w; ++x) {
+                                float sum[4]{0.0f, 0.0f, 0.0f, 0.0f};
+                                for (UINT s = 0; s < sampleCount; ++s) {
+                                    const uint8_t* srcPx = c.src->basePtr() + sSub.offset +
+                                                           static_cast<size_t>(s) * sSub.slice_pitch +
+                                                           static_cast<size_t>(y) * sSub.row_pitch +
+                                                           static_cast<size_t>(x) * fi.bytesPerBlock;
+                                    float rgba[4]{};
+                                    unpackPixelRGBA32F(fmt, srcPx, rgba);
+                                    for (int ch = 0; ch < 4; ++ch) sum[ch] += rgba[ch];
+                                }
+                                for (int ch = 0; ch < 4; ++ch) sum[ch] *= invSamples;
+                                packPixelRGBA32F(fmt, sum, dstRow + static_cast<size_t>(x) * fi.bytesPerBlock);
+                            }
+                        }
+                    }
                     c.dst->invalidateDecodedCache();
                 }
             } else if constexpr (std::is_same_v<T, CmdIASetTopology>) {

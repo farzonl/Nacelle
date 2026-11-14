@@ -28,6 +28,7 @@ inline uint32_t quadSwizzlePixel(uint32_t tx, uint32_t ty) {
 
 void loadTileRTV(
     const NacelleRenderTargetDescriptor& rtv,
+    uint32_t sampleIdx,
     uint32_t tileOriginX,
     uint32_t tileOriginY,
     uint32_t tileW,
@@ -35,7 +36,7 @@ void loadTileRTV(
     float* dstSOA) {
     if (!rtv.resource || !rtv.resource->basePtr()) return;
     const auto& sub = rtv.resource->subresourceLayout(rtv.mip_slice);
-    const uint8_t* base = rtv.resource->basePtr() + sub.offset;
+    const uint8_t* base = rtv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
 
     if (rtv.format == DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -87,6 +88,7 @@ void loadTileRTV(
 
 void storeTileRTV(
     const NacelleRenderTargetDescriptor& rtv,
+    uint32_t sampleIdx,
     uint32_t tileOriginX,
     uint32_t tileOriginY,
     uint32_t tileW,
@@ -94,7 +96,7 @@ void storeTileRTV(
     const float* srcSOA) {
     if (!rtv.resource || !rtv.resource->basePtr()) return;
     const auto& sub = rtv.resource->subresourceLayout(rtv.mip_slice);
-    uint8_t* base = rtv.resource->basePtr() + sub.offset;
+    uint8_t* base = rtv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
 
     if (rtv.format == DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -145,6 +147,7 @@ void storeTileRTV(
 
 void loadTileDSV(
     const NacelleRenderTargetDescriptor& dsv,
+    uint32_t sampleIdx,
     uint32_t tileOriginX,
     uint32_t tileOriginY,
     uint32_t tileW,
@@ -153,7 +156,7 @@ void loadTileDSV(
     uint8_t* stencilSOA) {
     if (!dsv.resource || !dsv.resource->basePtr()) return;
     const auto& sub = dsv.resource->subresourceLayout(dsv.mip_slice);
-    const uint8_t* base = dsv.resource->basePtr() + sub.offset;
+    const uint8_t* base = dsv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
 
     if (dsv.format == DXGI_FORMAT_D32_FLOAT) {
@@ -200,6 +203,7 @@ void loadTileDSV(
 
 void storeTileDSV(
     const NacelleRenderTargetDescriptor& dsv,
+    uint32_t sampleIdx,
     uint32_t tileOriginX,
     uint32_t tileOriginY,
     uint32_t tileW,
@@ -208,7 +212,7 @@ void storeTileDSV(
     const uint8_t* stencilSOA) {
     if (!dsv.resource || !dsv.resource->basePtr()) return;
     const auto& sub = dsv.resource->subresourceLayout(dsv.mip_slice);
-    uint8_t* base = dsv.resource->basePtr() + sub.offset;
+    uint8_t* base = dsv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
 
     if (dsv.format == DXGI_FORMAT_D32_FLOAT) {
@@ -265,6 +269,8 @@ struct QuadBatchEmitter {
     PixelBatchArgs args{};
     uint32_t quadsPerBatch = 1;
     uint32_t qCount = 0;
+    float sampleOffsetX = 0.0f;
+    float sampleOffsetY = 0.0f;
     alignas(64) uint32_t quadOffsets[kMaxSimdWidth / 4]{};
     alignas(64) float pixelX[kMaxSimdWidth]{};
     alignas(64) float pixelY[kMaxSimdWidth]{};
@@ -310,8 +316,8 @@ struct QuadBatchEmitter {
             int64_t e1 = tri.stepX[1] * px + tri.stepY[1] * py + tri.base[1];
             int64_t e2 = tri.stepX[2] * px + tri.stepY[2] * py + tri.base[2];
 
-            qPixX[sub] = static_cast<float>(px) + 0.5f;
-            qPixY[sub] = static_cast<float>(py) + 0.5f;
+            qPixX[sub] = static_cast<float>(px) + 0.5f + sampleOffsetX;
+            qPixY[sub] = static_cast<float>(py) + 0.5f + sampleOffsetY;
             qBaryI[sub] = static_cast<float>(e1) * tri.invArea;
             qBaryJ[sub] = static_cast<float>(e2) * tri.invArea;
 
@@ -346,6 +352,26 @@ struct QuadBatchEmitter {
     }
 };
 
+void msaaSampleOffset16ths(uint32_t sampleCount, uint32_t sampleIdx, int32_t& dx16, int32_t& dy16) {
+    static constexpr int32_t kOffsets2x[2][2] = {{4, 4}, {-4, -4}};
+    static constexpr int32_t kOffsets4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+    static constexpr int32_t kOffsets8x[8][2] = {
+        {1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+    if (sampleCount == 2 && sampleIdx < 2) {
+        dx16 = kOffsets2x[sampleIdx][0];
+        dy16 = kOffsets2x[sampleIdx][1];
+    } else if (sampleCount == 4 && sampleIdx < 4) {
+        dx16 = kOffsets4x[sampleIdx][0];
+        dy16 = kOffsets4x[sampleIdx][1];
+    } else if (sampleCount == 8 && sampleIdx < 8) {
+        dx16 = kOffsets8x[sampleIdx][0];
+        dy16 = kOffsets8x[sampleIdx][1];
+    } else {
+        dx16 = 0;
+        dy16 = 0;
+    }
+}
+
 } // namespace
 
 void rasterizeTiles(
@@ -374,6 +400,13 @@ void rasterizeTiles(
     const uint32_t W = std::clamp<uint32_t>(compiled->simdWidth, 4, kMaxSimdWidth);
     const uint32_t quadsPerBatch = std::max<uint32_t>(1, W / 4);
 
+    uint32_t sampleCount = 1;
+    if (state.numRTVs > 0 && state.rtvs[0].resource) {
+        sampleCount = std::max<uint32_t>(1, state.rtvs[0].resource->resourceDesc().SampleDesc.Count);
+    } else if (state.hasDSV && state.dsv.resource) {
+        sampleCount = std::max<uint32_t>(1, state.dsv.resource->resourceDesc().SampleDesc.Count);
+    }
+
     auto processTile = [&](size_t idx) {
         ScopedFlushDenormals flushDenorms;
         thread_local TileScratch scratch;
@@ -385,98 +418,128 @@ void rasterizeTiles(
         uint32_t tileW = std::min<uint32_t>(kTileSize, scene.fbWidth - tileOriginX);
         uint32_t tileH = std::min<uint32_t>(kTileSize, scene.fbHeight - tileOriginY);
 
-        for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
-            loadTileRTV(state.rtvs[rt], tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
-        }
-        if (state.hasDSV) {
-            loadTileDSV(state.dsv, tileOriginX, tileOriginY, tileW, tileH, scratch.depthSOA, scratch.stencilSOA);
-        }
+        for (uint32_t sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
+            int32_t dx16 = 0;
+            int32_t dy16 = 0;
+            msaaSampleOffset16ths(sampleCount, sampleIdx, dx16, dy16);
 
-        QuadBatchEmitter emitter;
-        emitter.psFn = psFn;
-        emitter.quadsPerBatch = quadsPerBatch;
-        emitter.args.rootCtx = &state.rootCtx;
-        emitter.args.quadOffsets = emitter.quadOffsets;
-        emitter.args.pixelX = emitter.pixelX;
-        emitter.args.pixelY = emitter.pixelY;
-        emitter.args.baryI = emitter.baryI;
-        emitter.args.baryJ = emitter.baryJ;
-        for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
-            emitter.args.tileColorSOA[rt] = scratch.colorSOA[rt];
-        }
-        emitter.args.tileDepthSOA = state.hasDSV ? scratch.depthSOA : nullptr;
-        emitter.args.tileStencilSOA = state.hasDSV ? scratch.stencilSOA : nullptr;
+            for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                uint32_t rtSample = (state.rtvs[rt].resource &&
+                                     state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
+                                        ? sampleIdx
+                                        : 0u;
+                loadTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
+            }
+            if (state.hasDSV) {
+                uint32_t dsSample = (state.dsv.resource &&
+                                     state.dsv.resource->resourceDesc().SampleDesc.Count > 1)
+                                        ? sampleIdx
+                                        : 0u;
+                loadTileDSV(state.dsv, dsSample, tileOriginX, tileOriginY, tileW, tileH, scratch.depthSOA, scratch.stencilSOA);
+            }
 
-        for (uint32_t triIdx : bins[tileIdx].triIndices) {
-            const SetupTriangle& tri = scene.triangles[triIdx];
-            const uint32_t scIdx = (tri.viewportIndex < scene.numScissors) ? tri.viewportIndex : 0u;
-            const D3D12_RECT& vpScissor = scene.scissors[scIdx];
-            const D3D12_RECT tileScissor{
-                std::max<LONG>(vpScissor.left, static_cast<LONG>(tileOriginX)),
-                std::max<LONG>(vpScissor.top, static_cast<LONG>(tileOriginY)),
-                std::min<LONG>(vpScissor.right, static_cast<LONG>(tileOriginX + tileW)),
-                std::min<LONG>(vpScissor.bottom, static_cast<LONG>(tileOriginY + tileH)),
-            };
-            int32_t minX = std::max<int32_t>(tri.minX, tileScissor.left);
-            int32_t maxX = std::min<int32_t>(tri.maxX, tileScissor.right);
-            int32_t minY = std::max<int32_t>(tri.minY, tileScissor.top);
-            int32_t maxY = std::min<int32_t>(tri.maxY, tileScissor.bottom);
-            if (minX >= maxX || minY >= maxY) continue;
+            QuadBatchEmitter emitter;
+            emitter.psFn = psFn;
+            emitter.quadsPerBatch = quadsPerBatch;
+            emitter.sampleOffsetX = static_cast<float>(dx16) / 16.0f;
+            emitter.sampleOffsetY = static_cast<float>(dy16) / 16.0f;
+            emitter.args.rootCtx = &state.rootCtx;
+            emitter.args.quadOffsets = emitter.quadOffsets;
+            emitter.args.pixelX = emitter.pixelX;
+            emitter.args.pixelY = emitter.pixelY;
+            emitter.args.baryI = emitter.baryI;
+            emitter.args.baryJ = emitter.baryJ;
+            for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                emitter.args.tileColorSOA[rt] = scratch.colorSOA[rt];
+            }
+            emitter.args.tileDepthSOA = state.hasDSV ? scratch.depthSOA : nullptr;
+            emitter.args.tileStencilSOA = state.hasDSV ? scratch.stencilSOA : nullptr;
 
-            emitter.args.triAttrBase = scene.numPSInputScalars > 0 ? (scene.attrBaseArena.data() + tri.attrBaseOffset) : nullptr;
-            emitter.args.triAttrFlat = scene.numPSInputScalars > 0 ? (scene.attrFlatArena.data() + tri.attrFlatOffset) : nullptr;
-            emitter.args.triInvW = tri.invW;
-            emitter.args.triOrigBary = tri.origBary;
-            emitter.args.triDepth = tri.depth;
-            emitter.args.isFrontFace = tri.isFrontFace;
-            emitter.args.primitiveId = tri.primitiveId;
-            emitter.args.viewportArrayIndex = tri.viewportIndex;
-            emitter.args.shadingRate = tri.shadingRate;
-
-            int32_t qMinX = minX & ~1;
-            int32_t qMaxX = (maxX + 1) & ~1;
-            int32_t qMinY = minY & ~1;
-            int32_t qMaxY = (maxY + 1) & ~1;
-
-            if ((qMaxX - qMinX) <= 8 && (qMaxY - qMinY) <= 8) {
-                for (int32_t gy = qMinY; gy < qMaxY; gy += 2) {
-                    for (int32_t gx = qMinX; gx < qMaxX; gx += 2) {
-                        emitter.testAndEmitQuad(tri, tileScissor, tileOriginX, tileOriginY, gx, gy);
+            for (uint32_t triIdx : bins[tileIdx].triIndices) {
+                const SetupTriangle& baseTri = scene.triangles[triIdx];
+                SetupTriangle sampleTri = baseTri;
+                if (dx16 != 0 || dy16 != 0) {
+                    for (int k = 0; k < 3; ++k) {
+                        sampleTri.base[k] += (baseTri.stepX[k] * dx16 + baseTri.stepY[k] * dy16) / 16;
                     }
                 }
-            } else {
-                int32_t b16MinX = qMinX & ~15;
-                int32_t b16MaxX = (qMaxX + 15) & ~15;
-                int32_t b16MinY = qMinY & ~15;
-                int32_t b16MaxY = (qMaxY + 15) & ~15;
+                const uint32_t scIdx = (sampleTri.viewportIndex < scene.numScissors) ? sampleTri.viewportIndex : 0u;
+                const D3D12_RECT& vpScissor = scene.scissors[scIdx];
+                const D3D12_RECT tileScissor{
+                    std::max<LONG>(vpScissor.left, static_cast<LONG>(tileOriginX)),
+                    std::max<LONG>(vpScissor.top, static_cast<LONG>(tileOriginY)),
+                    std::min<LONG>(vpScissor.right, static_cast<LONG>(tileOriginX + tileW)),
+                    std::min<LONG>(vpScissor.bottom, static_cast<LONG>(tileOriginY + tileH)),
+                };
+                int32_t minX = std::max<int32_t>(sampleTri.minX, tileScissor.left);
+                int32_t maxX = std::min<int32_t>(sampleTri.maxX, tileScissor.right);
+                int32_t minY = std::max<int32_t>(sampleTri.minY, tileScissor.top);
+                int32_t maxY = std::min<int32_t>(sampleTri.maxY, tileScissor.bottom);
+                if (minX >= maxX || minY >= maxY) continue;
 
-                for (int32_t by16 = b16MinY; by16 < b16MaxY; by16 += 16) {
-                    for (int32_t bx16 = b16MinX; bx16 < b16MaxX; bx16 += 16) {
-                        if (!blockOverlapsTriangle(tri, bx16, by16, 16)) continue;
+                emitter.args.triAttrBase = scene.numPSInputScalars > 0 ? (scene.attrBaseArena.data() + sampleTri.attrBaseOffset) : nullptr;
+                emitter.args.triAttrFlat = scene.numPSInputScalars > 0 ? (scene.attrFlatArena.data() + sampleTri.attrFlatOffset) : nullptr;
+                emitter.args.triInvW = sampleTri.invW;
+                emitter.args.triOrigBary = sampleTri.origBary;
+                emitter.args.triDepth = sampleTri.depth;
+                emitter.args.isFrontFace = sampleTri.isFrontFace;
+                emitter.args.primitiveId = sampleTri.primitiveId;
+                emitter.args.viewportArrayIndex = sampleTri.viewportIndex;
+                emitter.args.shadingRate = sampleTri.shadingRate;
 
-                        for (int32_t by4 = by16; by4 < by16 + 16; by4 += 4) {
-                            if (by4 + 4 <= qMinY || by4 >= qMaxY) continue;
-                            for (int32_t bx4 = bx16; bx4 < bx16 + 16; bx4 += 4) {
-                                if (bx4 + 4 <= qMinX || bx4 >= qMaxX) continue;
-                                if (!blockOverlapsTriangle(tri, bx4, by4, 4)) continue;
+                int32_t qMinX = minX & ~1;
+                int32_t qMaxX = (maxX + 1) & ~1;
+                int32_t qMinY = minY & ~1;
+                int32_t qMaxY = (maxY + 1) & ~1;
 
-                                emitter.testAndEmitQuad(tri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 0);
-                                emitter.testAndEmitQuad(tri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 0);
-                                emitter.testAndEmitQuad(tri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 2);
-                                emitter.testAndEmitQuad(tri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 2);
+                if ((qMaxX - qMinX) <= 8 && (qMaxY - qMinY) <= 8) {
+                    for (int32_t gy = qMinY; gy < qMaxY; gy += 2) {
+                        for (int32_t gx = qMinX; gx < qMaxX; gx += 2) {
+                            emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, gx, gy);
+                        }
+                    }
+                } else {
+                    int32_t b16MinX = qMinX & ~15;
+                    int32_t b16MaxX = (qMaxX + 15) & ~15;
+                    int32_t b16MinY = qMinY & ~15;
+                    int32_t b16MaxY = (qMaxY + 15) & ~15;
+
+                    for (int32_t by16 = b16MinY; by16 < b16MaxY; by16 += 16) {
+                        for (int32_t bx16 = b16MinX; bx16 < b16MaxX; bx16 += 16) {
+                            if (!blockOverlapsTriangle(sampleTri, bx16, by16, 16)) continue;
+
+                            for (int32_t by4 = by16; by4 < by16 + 16; by4 += 4) {
+                                if (by4 + 4 <= qMinY || by4 >= qMaxY) continue;
+                                for (int32_t bx4 = bx16; bx4 < bx16 + 16; bx4 += 4) {
+                                    if (bx4 + 4 <= qMinX || bx4 >= qMaxX) continue;
+                                    if (!blockOverlapsTriangle(sampleTri, bx4, by4, 4)) continue;
+
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 0);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 0);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 2);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 2);
+                                }
                             }
                         }
                     }
                 }
+                emitter.flush();
             }
-            emitter.flush();
-        }
 
-        for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
-            storeTileRTV(state.rtvs[rt], tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
-        }
-        if (state.hasDSV) {
-            storeTileDSV(state.dsv, tileOriginX, tileOriginY, tileW, tileH, scratch.depthSOA, scratch.stencilSOA);
+            for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                uint32_t rtSample = (state.rtvs[rt].resource &&
+                                     state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
+                                        ? sampleIdx
+                                        : 0u;
+                storeTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
+            }
+            if (state.hasDSV) {
+                uint32_t dsSample = (state.dsv.resource &&
+                                     state.dsv.resource->resourceDesc().SampleDesc.Count > 1)
+                                        ? sampleIdx
+                                        : 0u;
+                storeTileDSV(state.dsv, dsSample, tileOriginX, tileOriginY, tileW, tileH, scratch.depthSOA, scratch.stencilSOA);
+            }
         }
     };
 
@@ -498,6 +561,26 @@ void executeRasterDrawCall(
     std::vector<TileBin> bins;
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
+}
+
+void msaaSampleOffset16ths(uint32_t sampleCount, uint32_t sampleIdx, int32_t& dx16, int32_t& dy16) {
+    static constexpr int32_t kOffsets2x[2][2] = {{4, 4}, {-4, -4}};
+    static constexpr int32_t kOffsets4x[4][2] = {{-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+    static constexpr int32_t kOffsets8x[8][2] = {
+        {1, -3}, {-1, 3}, {5, 1}, {-3, -5}, {-5, 5}, {-7, -1}, {3, 7}, {7, -7}};
+    if (sampleCount == 2 && sampleIdx < 2) {
+        dx16 = kOffsets2x[sampleIdx][0];
+        dy16 = kOffsets2x[sampleIdx][1];
+    } else if (sampleCount == 4 && sampleIdx < 4) {
+        dx16 = kOffsets4x[sampleIdx][0];
+        dy16 = kOffsets4x[sampleIdx][1];
+    } else if (sampleCount == 8 && sampleIdx < 8) {
+        dx16 = kOffsets8x[sampleIdx][0];
+        dy16 = kOffsets8x[sampleIdx][1];
+    } else {
+        dx16 = 0;
+        dy16 = 0;
+    }
 }
 
 } // namespace nacelle

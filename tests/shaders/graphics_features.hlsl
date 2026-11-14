@@ -73,3 +73,95 @@ float4 LodClampPS(float4 pos : SV_Position) : SV_Target0 {
     float2 uv = pos.xy / 32.0;
     return gTex.SampleBias(gSamp, uv, 0.0, 2.0);
 }
+
+// 6. Tessellation point topology with GS expansion
+struct TessCtrlPt {
+    float4 pos : POSITION;
+};
+struct TessPatchConst {
+    float edges[3] : SV_TessFactor;
+    float inside   : SV_InsideTessFactor;
+};
+struct TessDsOut {
+    float4 pos : SV_Position;
+};
+struct TessGsOut {
+    float4 pos : SV_Position;
+};
+
+TessCtrlPt TessPointVS(uint vid : SV_VertexID) {
+    TessCtrlPt o;
+    float2 p = (vid == 0u) ? float2(-0.5, -0.5) : (vid == 1u) ? float2(0.5, -0.5) : float2(0.0, 0.5);
+    o.pos = float4(p, 0.0, 1.0);
+    return o;
+}
+
+TessPatchConst TessPointHSConst(InputPatch<TessCtrlPt, 3> patch) {
+    TessPatchConst pc;
+    pc.edges[0] = 1.0;
+    pc.edges[1] = 1.0;
+    pc.edges[2] = 1.0;
+    pc.inside = 1.0;
+    return pc;
+}
+
+[domain("tri")]
+[partitioning("integer")]
+[outputtopology("point")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("TessPointHSConst")]
+TessCtrlPt TessPointHS(InputPatch<TessCtrlPt, 3> patch, uint i : SV_OutputControlPointID) {
+    return patch[i];
+}
+
+[domain("tri")]
+TessDsOut TessPointDS(TessPatchConst pc, float3 bary : SV_DomainLocation, const OutputPatch<TessCtrlPt, 3> patch) {
+    TessDsOut o;
+    o.pos = patch[0].pos * bary.x + patch[1].pos * bary.y + patch[2].pos * bary.z;
+    return o;
+}
+
+[maxvertexcount(3)]
+void TessPointGS(point TessDsOut input[1], inout TriangleStream<TessGsOut> stream) {
+    float2 c = input[0].pos.xy;
+    TessGsOut v0, v1, v2;
+    v0.pos = float4(c + float2(-0.25, -0.25), 0.0, 1.0);
+    v1.pos = float4(c + float2( 0.25, -0.25), 0.0, 1.0);
+    v2.pos = float4(c + float2( 0.00,  0.25), 0.0, 1.0);
+    stream.Append(v0);
+    stream.Append(v1);
+    stream.Append(v2);
+}
+
+float4 TessPointPS(TessGsOut input) : SV_Target0 {
+    return float4(0.0, 1.0, 0.0, 1.0);
+}
+
+// 7. ByteAddressBuffer multi-component Load4 in Vertex Shader
+ByteAddressBuffer gRawSrc : register(t0);
+struct BabLoad4VSOut {
+    float4 pos : SV_Position;
+    float4 col : COLOR;
+};
+
+BabLoad4VSOut BabLoad4VS(uint vid : SV_VertexID) {
+    BabLoad4VSOut o;
+    float2 p = (vid == 0u) ? float2(-1.0, -1.0) : (vid == 1u) ? float2(3.0, -1.0) : float2(-1.0, 3.0);
+    o.pos = float4(p, 0.0, 1.0);
+    o.col = asfloat(gRawSrc.Load4(0));
+    return o;
+}
+
+float4 BabLoad4PS(BabLoad4VSOut input) : SV_Target0 {
+    return input.col;
+}
+
+// 8. 4x MSAA diagonal triangle
+float4 MsaaDiagVS(uint vid : SV_VertexID) : SV_Position {
+    float2 p = (vid == 0u) ? float2(-1.0, 1.0) : (vid == 1u) ? float2(1.0, 1.0) : float2(1.0, -1.0);
+    return float4(p, 0.0, 1.0);
+}
+
+float4 MsaaDiagPS(float4 pos : SV_Position) : SV_Target0 {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}

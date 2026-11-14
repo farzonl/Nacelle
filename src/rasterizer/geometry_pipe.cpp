@@ -766,6 +766,12 @@ bool buildRasterScene(
                         processTriangle(a, b, c, p, vp, rast, outScene, polyA, polyB);
                     }
                 };
+                auto emitPoint = [&](const ShadedVertex& v) {
+                    if (hasGS && gsFn) {
+                        runGSOnPrim(&v, 1, p, dsOutScalars);
+                    }
+                };
+                const bool pointOut = (compiled->tessOutputPrimitive == 1);
 
                 if (compiled->tessDomain == 1) { // Isoline
                     if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f)) continue;
@@ -775,7 +781,8 @@ bool buildRasterScene(
                         float v = static_cast<float>(li) / static_cast<float>(numLines);
                         for (uint32_t si = 0; si <= numSegs; ++si) {
                             float u = static_cast<float>(si) / static_cast<float>(numSegs);
-                            (void)evalDS(u, v, 0.0f);
+                            ShadedVertex sv = evalDS(u, v, 0.0f);
+                            if (pointOut) emitPoint(sv);
                         }
                     }
                 } else if (compiled->tessDomain == 2) { // Tri
@@ -792,19 +799,27 @@ bool buildRasterScene(
                             rows[i][j] = evalDS(u, v, w);
                         }
                     }
-                    bool cw = (compiled->tessOutputPrimitive == 3);
-                    for (uint32_t i = 0; i < n; ++i) {
-                        for (uint32_t j = 0; j < n - i; ++j) {
-                            if (cw) {
-                                emitTri(rows[i][j], rows[i][j + 1], rows[i + 1][j]);
-                            } else {
-                                emitTri(rows[i][j], rows[i + 1][j], rows[i][j + 1]);
+                    if (pointOut) {
+                        for (const auto& row : rows) {
+                            for (const auto& sv : row) {
+                                emitPoint(sv);
                             }
-                            if (i + j + 1 < n) {
+                        }
+                    } else {
+                        bool cw = (compiled->tessOutputPrimitive == 3);
+                        for (uint32_t i = 0; i < n; ++i) {
+                            for (uint32_t j = 0; j < n - i; ++j) {
                                 if (cw) {
-                                    emitTri(rows[i + 1][j], rows[i][j + 1], rows[i + 1][j + 1]);
+                                    emitTri(rows[i][j], rows[i][j + 1], rows[i + 1][j]);
                                 } else {
-                                    emitTri(rows[i + 1][j], rows[i + 1][j + 1], rows[i][j + 1]);
+                                    emitTri(rows[i][j], rows[i + 1][j], rows[i][j + 1]);
+                                }
+                                if (i + j + 1 < n) {
+                                    if (cw) {
+                                        emitTri(rows[i + 1][j], rows[i][j + 1], rows[i + 1][j + 1]);
+                                    } else {
+                                        emitTri(rows[i + 1][j], rows[i + 1][j + 1], rows[i][j + 1]);
+                                    }
                                 }
                             }
                         }
@@ -824,19 +839,25 @@ bool buildRasterScene(
                             grid[j * (nu + 1) + i] = evalDS(u, v, 0.0f);
                         }
                     }
-                    bool cw = (compiled->tessOutputPrimitive == 3);
-                    for (uint32_t j = 0; j < nv; ++j) {
-                        for (uint32_t i = 0; i < nu; ++i) {
-                            const ShadedVertex& v00 = grid[j * (nu + 1) + i];
-                            const ShadedVertex& v10 = grid[j * (nu + 1) + (i + 1)];
-                            const ShadedVertex& v01 = grid[(j + 1) * (nu + 1) + i];
-                            const ShadedVertex& v11 = grid[(j + 1) * (nu + 1) + (i + 1)];
-                            if (cw) {
-                                emitTri(v00, v11, v10);
-                                emitTri(v00, v01, v11);
-                            } else {
-                                emitTri(v00, v10, v11);
-                                emitTri(v00, v11, v01);
+                    if (pointOut) {
+                        for (const auto& sv : grid) {
+                            emitPoint(sv);
+                        }
+                    } else {
+                        bool cw = (compiled->tessOutputPrimitive == 3);
+                        for (uint32_t j = 0; j < nv; ++j) {
+                            for (uint32_t i = 0; i < nu; ++i) {
+                                const ShadedVertex& v00 = grid[j * (nu + 1) + i];
+                                const ShadedVertex& v10 = grid[j * (nu + 1) + (i + 1)];
+                                const ShadedVertex& v01 = grid[(j + 1) * (nu + 1) + i];
+                                const ShadedVertex& v11 = grid[(j + 1) * (nu + 1) + (i + 1)];
+                                if (cw) {
+                                    emitTri(v00, v11, v10);
+                                    emitTri(v00, v01, v11);
+                                } else {
+                                    emitTri(v00, v10, v11);
+                                    emitTri(v00, v11, v01);
+                                }
                             }
                         }
                     }

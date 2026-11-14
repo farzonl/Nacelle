@@ -93,7 +93,10 @@ uint64_t NacelleResource::computeResourceFootprints(
         const UINT64 pitchAlign = alignPlacement ? D3D12_TEXTURE_DATA_PITCH_ALIGNMENT : 64;
         const UINT64 rowPitch = alignUp(rowSize, pitchAlign);
         const UINT64 slicePitch = rowPitch * blocksY;
-        const UINT64 subSize = slicePitch * d;
+        const UINT sampleCount = (!alignPlacement && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+                                     ? std::max<UINT>(1, desc.SampleDesc.Count)
+                                     : 1u;
+        const UINT64 subSize = slicePitch * d * sampleCount;
 
         if (i > 0 && alignPlacement) {
             curOffset = alignUp(curOffset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
