@@ -1,0 +1,32 @@
+// RUN: %split_file %s %t
+// RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %t/shader.hlsl
+// RUN: %nacelle_compile --simd-width=4 --emit-llvm %t.dxil | %FileCheck %s
+
+// Verify that matrix allocas in non-barrier compute shaders are hoisted to the
+// function entry block (before the wave-loop branch) and sized per-wave (i32 4)
+// rather than per-thread-group (i32 128).
+// CHECK-LABEL: define void @nacelle_cs_test(
+// CHECK-NEXT: alloca [{{[0-9]+}} x i64], i32 4, align 64
+// CHECK: br label
+// CHECK-NOT: alloca
+
+//--- shader.hlsl
+StructuredBuffer<int4> Inputs : register(t0);
+RWStructuredBuffer<uint> Out : register(u0);
+
+[numthreads(128, 1, 1)]
+void main(uint3 TID : SV_GroupThreadID) {
+    uint Lane = WaveGetLaneIndex();
+    uint64_t4 Val = uint64_t4(int64_t4(Inputs[Lane % 4]));
+    matrix<uint64_t, 4, 4> M;
+    for (uint r = 0; r < 4; ++r)
+        for (uint c = 0; c < 4; ++c)
+            M[r][c] = Val[(r * 4 + c) % 4];
+    uint4 Mask = WaveActiveBallot(true);
+    matrix<uint64_t, 4, 4> Res = WaveMultiPrefixBitAnd(M, Mask);
+    uint64_t acc = 0;
+    for (uint r = 0; r < 4; ++r)
+        for (uint c = 0; c < 4; ++c)
+            acc ^= Res[r][c];
+    Out[TID.x] = (uint)(acc ^ (acc >> 32));
+}

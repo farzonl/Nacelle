@@ -567,14 +567,19 @@ private:
     }
 
     mlir::Value createEntryAlloca(mlir::Location loc, mlir::Type elemTy, uint64_t count, unsigned align = 64) {
-        mlir::Block* curBlk = b_.getInsertionBlock();
-        mlir::Operation* parentOp = curBlk ? curBlk->getParentOp() : nullptr;
-        while (parentOp && !llvm::isa<mlir::func::FuncOp>(parentOp)) {
-            parentOp = parentOp->getParentOp();
+        mlir::Block* entryBlk = hooks_.entryBlock;
+        if (!entryBlk) {
+            mlir::Block* curBlk = b_.getInsertionBlock();
+            mlir::Operation* parentOp = curBlk ? curBlk->getParentOp() : nullptr;
+            while (parentOp && !llvm::isa<mlir::func::FuncOp>(parentOp)) {
+                parentOp = parentOp->getParentOp();
+            }
+            if (auto fnOp = llvm::dyn_cast_or_null<mlir::func::FuncOp>(parentOp)) {
+                entryBlk = &fnOp.getBody().front();
+            }
         }
-        if (auto fnOp = llvm::dyn_cast_or_null<mlir::func::FuncOp>(parentOp)) {
-            mlir::Block& entryBlk = fnOp.getBody().front();
-            mlir::OpBuilder eb(&entryBlk, entryBlk.begin());
+        if (entryBlk) {
+            mlir::OpBuilder eb(entryBlk, entryBlk->begin());
             mlir::Value sz = mlir::arith::ConstantIntOp::create(eb, loc, eb.getI32Type(), count);
             return mlir::LLVM::AllocaOp::create(eb, loc, ptrTy(), elemTy, sz, align);
         }
@@ -4261,6 +4266,7 @@ static bool packetizeComputeBlockWithBarriers(
                     wb, wloc, mlir::VectorType::get({W}, wb.getI1Type()), mp, 1u);
 
                 StageHooks hooks;
+                hooks.entryBlock = entryAllocaAnchor ? entryAllocaAnchor->getBlock() : nullptr;
                 hooks.groupSharedBase = gsBase;
                 hooks.waveIdx = waveIdx;
                 hooks.numWaves = numWavesVal;
@@ -4473,6 +4479,7 @@ static bool packetizeComputeBlockWithBarriers(
                                 mlir::Value curMask = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
 
                                 StageHooks hooks;
+                                hooks.entryBlock = entryAllocaAnchor ? entryAllocaAnchor->getBlock() : nullptr;
                                 hooks.groupSharedBase = gsBase;
                                 hooks.waveIdx = waveIdx;
                                 hooks.numWaves = numWavesVal;
@@ -4613,9 +4620,8 @@ bool packetizeComputeEntry(
                 mlir::Value activeMask;
                 mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
                 StageHooks hooks;
+                hooks.entryBlock = entry;
                 hooks.groupSharedBase = gsBase;
-                hooks.waveIdx = waveIdx;
-                hooks.numWaves = numWavesVal;
                 setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
                 SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
                 mlir::Value realMask = activeMask;
