@@ -16,6 +16,7 @@ struct ShadedVertex {
     float clipY = 0.0f;
     float clipZ = 0.0f;
     float clipW = 1.0f;
+    float origBary[3]{1.0f, 0.0f, 0.0f}; // Clip-space barycentric weights in original unclipped triangle
     float attrs[kMaxPSInputScalars]{};
 };
 
@@ -41,6 +42,7 @@ struct SetupTriangle {
     uint32_t shadingRate = 0;
     float invW[3]{};   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
     float depth[3]{};  // (z0, z1 - z0, z2 - z0)
+    float origBary[9]{}; // [3 * 3]: for each original vertex k, (b0/w0, b1/w1 - b0/w0, b2/w2 - b0/w0)
 
     uint32_t attrBaseOffset = 0; // offset into RasterScene::attrBaseArena (numScalars * 3)
     uint32_t attrFlatOffset = 0; // offset into RasterScene::attrFlatArena (numScalars)

@@ -61,6 +61,9 @@ void clipPolygonPlane(
             interp.clipY = prev.clipY + t * (curr.clipY - prev.clipY);
             interp.clipZ = prev.clipZ + t * (curr.clipZ - prev.clipZ);
             interp.clipW = prev.clipW + t * (curr.clipW - prev.clipW);
+            for (int k = 0; k < 3; ++k) {
+                interp.origBary[k] = prev.origBary[k] + t * (curr.origBary[k] - prev.origBary[k]);
+            }
             for (uint32_t s = 0; s < numScalars; ++s) {
                 interp.attrs[s] = prev.attrs[s] + t * (curr.attrs[s] - prev.attrs[s]);
             }
@@ -109,7 +112,8 @@ void setupClippedTriangle(
     const D3D12_VIEWPORT& vp,
     const D3D12_RECT& scissor,
     const D3D12_RASTERIZER_DESC& rast,
-    RasterScene& scene) {
+    RasterScene& scene,
+    bool unclipped = false) {
     if (v0.clipW <= 1e-7f || v1.clipW <= 1e-7f || v2.clipW <= 1e-7f) return;
 
     float iw0 = 1.0f / v0.clipW;
@@ -221,6 +225,18 @@ void setupClippedTriangle(
     tri.invW[1] = iw1 - iw0;
     tri.invW[2] = iw2 - iw0;
 
+    for (int k = 0; k < 3; ++k) {
+        float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
+        float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
+        float b2 = unclipped ? (k == 2 ? 1.0f : 0.0f) : v2.origBary[k];
+        float b0w = b0 * iw0;
+        float b1w = b1 * iw1;
+        float b2w = b2 * iw2;
+        tri.origBary[k * 3 + 0] = b0w;
+        tri.origBary[k * 3 + 1] = b1w - b0w;
+        tri.origBary[k * 3 + 2] = b2w - b0w;
+    }
+
     float z0 = sz0 + depthBiasVal;
     float z1 = sz1 + depthBiasVal;
     float z2 = sz2 + depthBiasVal;
@@ -303,12 +319,16 @@ void processTriangle(
         return;
     }
 
-    // Fast trivial accept (only if no user clip planes are negative)
-    auto inside = [&](const ShadedVertex& v) {
-        if (!(v.clipW > 1e-6f &&
-              v.clipX >= -v.clipW && v.clipX <= v.clipW &&
-              v.clipY >= -v.clipW && v.clipY <= v.clipW &&
-              v.clipZ >= 0.0f && v.clipZ <= v.clipW)) {
+    // Guard-band trivial accept: skip X/Y clipping when all vertices are in front of near/far
+    // and within 24.8 fixed-point guard band (matches hardware subpixel snapping).
+    auto insideGuardBand = [&](const ShadedVertex& v) {
+        if (!(v.clipW > 1e-6f && v.clipZ >= 0.0f && v.clipZ <= v.clipW)) {
+            return false;
+        }
+        float iw = 1.0f / v.clipW;
+        float sx = vp.TopLeftX + (v.clipX * iw * 0.5f + 0.5f) * vp.Width;
+        float sy = vp.TopLeftY + (-v.clipY * iw * 0.5f + 0.5f) * vp.Height;
+        if (!(sx >= -16384.0f && sx <= 16384.0f && sy >= -16384.0f && sy <= 16384.0f)) {
             return false;
         }
         if (scene.clipDistMask != 0) {
@@ -320,8 +340,8 @@ void processTriangle(
         }
         return true;
     };
-    if (inside(v0) && inside(v1) && inside(v2)) {
-        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene);
+    if (insideGuardBand(v0) && insideGuardBand(v1) && insideGuardBand(v2)) {
+        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene, /*unclipped=*/true);
         return;
     }
 
@@ -330,6 +350,9 @@ void processTriangle(
     polyA.push_back(v0);
     polyA.push_back(v1);
     polyA.push_back(v2);
+    polyA[0].origBary[0] = 1.0f; polyA[0].origBary[1] = 0.0f; polyA[0].origBary[2] = 0.0f;
+    polyA[1].origBary[0] = 0.0f; polyA[1].origBary[1] = 1.0f; polyA[1].origBary[2] = 0.0f;
+    polyA[2].origBary[0] = 0.0f; polyA[2].origBary[1] = 0.0f; polyA[2].origBary[2] = 1.0f;
 
     clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - 1e-6f; });
     if (polyB.size() < 3) return;
