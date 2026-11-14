@@ -79,6 +79,7 @@ void finalizeSamples(MetalBenchResult& res, const std::vector<double>& samples) 
 #if defined(NACELLE_HAS_METAL_IRCONVERTER)
 struct CompiledIRStage {
     id<MTLLibrary> lib = nil;
+    id<MTLLibrary> stageInLib = nil;
     id<MTLFunction> fn = nil;
     std::string entryName = "main";
     std::vector<IRResourceLocation> resLocs;
@@ -162,6 +163,19 @@ bool compileDxilToMetalStage(
     NSError* mtlErr = nil;
     out.lib = [device newLibraryWithData:libData error:&mtlErr];
     out.fn = out.lib ? [out.lib newFunctionWithName:entryName] : nil;
+
+    if (enableGeomTessEmulation && stage == IRShaderStageVertex) {
+        IRVersionedInputLayoutDescriptor emptyLayout{};
+        emptyLayout.version = IRInputLayoutDescriptorVersion_1;
+        emptyLayout.desc_1_0.numElements = 0;
+        IRMetalLibBinary* stageInBin = IRMetalLibBinaryCreate();
+        if (IRMetalLibSynthesizeStageInFunction(compiler, refl, &emptyLayout, stageInBin)) {
+            dispatch_data_t siData = IRMetalLibGetBytecodeData(stageInBin);
+            NSError* siErr = nil;
+            out.stageInLib = [device newLibraryWithData:siData error:&siErr];
+        }
+        IRMetalLibBinaryDestroy(stageInBin);
+    }
 
     IRShaderReflectionDestroy(refl);
     IRMetalLibBinaryDestroy(libBin);
@@ -529,6 +543,7 @@ MetalBenchResult runMetalGraphicsBench(
             geomCfg.gsMaxInputPrimitivesPerMeshThreadgroup = gsStage.hasGSInfo ? gsStage.gsInfo.info_1_0.max_input_primitives_per_mesh_threadgroup : 32;
 
             IRGeometryEmulationPipelineDescriptor geoDesc{};
+            geoDesc.stageInLibrary = vsStage.stageInLib;
             geoDesc.vertexLibrary = vsStage.lib;
             geoDesc.vertexFunctionName = vsStage.entryName.c_str();
             geoDesc.geometryLibrary = gsStage.lib;
@@ -570,6 +585,7 @@ MetalBenchResult runMetalGraphicsBench(
                     : kIRTrianglePassthroughGeometryShader);
 
             IRGeometryTessellationEmulationPipelineDescriptor tessDesc{};
+            tessDesc.stageInLibrary = vsStage.stageInLib;
             tessDesc.vertexLibrary = vsStage.lib;
             tessDesc.vertexFunctionName = vsStage.entryName.c_str();
             tessDesc.hullLibrary = hsStage.lib;
