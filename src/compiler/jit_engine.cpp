@@ -218,6 +218,11 @@ llvm::Expected<llvm::orc::JITTargetMachineBuilder> createHostJTMB(llvm::CodeGenO
     return jtmbOrErr;
 }
 
+bool emitObjectBytesO3(
+    llvm::Module& mod,
+    llvm::SmallVectorImpl<char>& outObjBytes,
+    std::string& outError);
+
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
@@ -235,6 +240,19 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         return;
     }
     rt.jit = std::move(*jitOrErr);
+    static std::once_flag atexitOnce;
+    std::call_once(atexitOnce, []() {
+        llvm::LLVMContext initCtx;
+        llvm::Module initMod("__nacelle_warmup", initCtx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(initCtx), false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, "__nacelle_warmup", initMod);
+        auto* bb = llvm::BasicBlock::Create(initCtx, "entry", fn);
+        llvm::ReturnInst::Create(initCtx, bb);
+        llvm::SmallVector<char, 0> dummyObj;
+        std::string dummyErr;
+        emitObjectBytesO3(initMod, dummyObj, dummyErr);
+        std::atexit([]() { getJitRuntime().tier2Pool.wait(); });
+    });
 
 #if defined(__APPLE__)
     if (const char* prof = std::getenv("NACELLE_JIT_PROFILING")) {
