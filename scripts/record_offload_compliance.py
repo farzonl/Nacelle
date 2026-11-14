@@ -168,6 +168,17 @@ def main() -> None:
         json.dump(history, f, indent=2)
     with open(data_dir / "latest.json", "w", encoding="utf-8") as f:
         json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
+    with open(data_dir / "badge.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schemaVersion": 1,
+                "label": "Offload D3D12 Suite",
+                "message": f"{entry['passed']} Passed ({entry['passRate']}%)",
+                "color": "brightgreen" if entry["passRate"] >= 85.0 else "green",
+            },
+            f,
+            indent=2,
+        )
 
     # Preserve Windows benchmark history if already deployed on Pages
     if args.pages_url and not (data_dir / "bench-history.json").exists():
