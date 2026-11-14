@@ -156,6 +156,49 @@ using CompiledDomainFn = void (*)(
     float* outPosXYZW,          // [4]
     float* outAttrs);           // [numDSOutScalars]
 
+/// Amplification shader threadgroup kernel arguments.
+struct AmplificationThreadGroupArgs {
+    const DriverRootContext* rootCtx = nullptr;
+    uint8_t* groupSharedScratch = nullptr;
+    uint32_t gx = 0;
+    uint32_t gy = 0;
+    uint32_t gz = 0;
+    uint32_t ngx = 1;
+    uint32_t ngy = 1;
+    uint32_t ngz = 1;
+    uint32_t* outDispatchDims = nullptr; // [4]: countX, countY, countZ, dispatchedFlag
+    void* outPayload = nullptr;
+};
+
+/// Mesh shader threadgroup kernel arguments.
+struct MeshThreadGroupArgs {
+    const DriverRootContext* rootCtx = nullptr;
+    uint8_t* groupSharedScratch = nullptr;
+    const void* payloadPtr = nullptr;
+    uint32_t gx = 0;
+    uint32_t gy = 0;
+    uint32_t gz = 0;
+    uint32_t ngx = 1;
+    uint32_t ngy = 1;
+    uint32_t ngz = 1;
+    uint32_t* outCounts = nullptr;      // [2]: numVertices, numPrimitives
+    float* outVertPosXYZW = nullptr;    // [maxVerts * 4]
+    float* outVertAttrs = nullptr;      // [maxVerts * totalVSScalarAttrs]
+    uint32_t* outPrimIndices = nullptr; // [maxPrims * 3]
+    float* outPrimAttrs = nullptr;      // [maxPrims * totalVSScalarAttrs]
+    uint8_t* outPrimCull = nullptr;     // [maxPrims]
+    uint32_t* outPrimId = nullptr;      // [maxPrims]
+};
+
+using CompiledAmplificationFn = void (*)(const AmplificationThreadGroupArgs* args);
+using CompiledMeshFn = void (*)(const MeshThreadGroupArgs* args);
+
+/// Optional Amplification & Mesh shader bytecodes for pipeline state stream PSOs.
+struct MeshShaderStages {
+    D3D12_SHADER_BYTECODE AS{};
+    D3D12_SHADER_BYTECODE MS{};
+};
+
 struct PsoUpdateBox;
 
 /// Compiled Compute PSO artifact.
@@ -192,6 +235,8 @@ struct CompiledGraphicsPSO {
     std::atomic<CompiledHullCPFn> hsFn{nullptr};
     std::atomic<CompiledHullPCFn> hsPcFn{nullptr};
     std::atomic<CompiledDomainFn> dsFn{nullptr};
+    std::atomic<CompiledAmplificationFn> asFn{nullptr};
+    std::atomic<CompiledMeshFn> msFn{nullptr};
     bool hasGS = false;
     uint32_t gsMaxVertexCount = 0;
     uint32_t gsOutputTopology = 5;
@@ -207,6 +252,18 @@ struct CompiledGraphicsPSO {
     uint32_t numHSInputScalars = 0;
     uint32_t numHSOutputScalars = 0;
     uint32_t numPatchConstScalars = 0;
+    bool hasMS = false;
+    bool hasAS = false;
+    uint32_t msThreadGroupSize[3]{1, 1, 1};
+    uint32_t msGroupSharedBytes = 0;
+    uint32_t msMaxVertexCount = 0;
+    uint32_t msMaxPrimitiveCount = 0;
+    uint32_t msOutputTopology = 2;     // 1=line, 2=triangle
+    uint32_t msPayloadBytes = 0;
+    uint64_t msPrimAttrMask = 0;       // Bitmask of scalar slots (0..63) written per-primitive
+    uint32_t asThreadGroupSize[3]{1, 1, 1};
+    uint32_t asGroupSharedBytes = 0;
+    uint32_t asPayloadBytes = 0;
     std::string gsSymbolName;
     uint32_t simdWidth = 4;
     uint32_t numVSOutputRegs = 0;      // Including SV_Position
@@ -247,12 +304,13 @@ bool compileComputePSO(
     CompiledComputePSO& outPSO,
     std::string& outError);
 
-/// Compiles a Graphics PSO (VS SIMD batch + Pixel Uber-PSO).
+/// Compiles a Graphics or Mesh PSO (VS SIMD batch or AS/MS threadgroups + Pixel Uber-PSO).
 bool compileGraphicsPSO(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     CompiledGraphicsPSO& outPSO,
-    std::string& outError);
+    std::string& outError,
+    const MeshShaderStages& meshStages = {});
 
 /// Waits for any pending background Tier-2 (-O3) JIT optimizations (useful for deterministic teardown/testing).
 void waitForAllAsyncJITTasks();

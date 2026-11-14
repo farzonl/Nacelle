@@ -26,7 +26,7 @@ struct PsoUpdateBox {
 };
 
 struct CachedPSOMeta {
-    uint32_t magic = 0x4E434C32; // 'NCL2'
+    uint32_t magic = 0x4E434C33; // 'NCL3'
     uint32_t simdWidth = 4;
     // Compute
     uint32_t threadGroupSize[3]{1, 1, 1};
@@ -60,6 +60,18 @@ struct CachedPSOMeta {
     uint32_t numHSInputScalars = 0;
     uint32_t numHSOutputScalars = 0;
     uint32_t numPatchConstScalars = 0;
+    uint8_t hasMS = 0;
+    uint8_t hasAS = 0;
+    uint32_t msThreadGroupSize[3]{1, 1, 1};
+    uint32_t msGroupSharedBytes = 0;
+    uint32_t msMaxVertexCount = 0;
+    uint32_t msMaxPrimitiveCount = 0;
+    uint32_t msOutputTopology = 2;
+    uint32_t msPayloadBytes = 0;
+    uint64_t msPrimAttrMask = 0;
+    uint32_t asThreadGroupSize[3]{1, 1, 1};
+    uint32_t asGroupSharedBytes = 0;
+    uint32_t asPayloadBytes = 0;
     uint8_t psWritesDepth = 0;
     uint8_t psUsesDiscard = 0;
     uint8_t psHasSideEffects = 0;
@@ -80,7 +92,8 @@ void computeGraphicsPSOHash(
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     uint64_t& outLo,
-    uint64_t& outHi);
+    uint64_t& outHi,
+    const MeshShaderStages& meshStages = {});
 
 /// Converts lowered MLIR (SCF/Vector/Arith/Math/Func/LLVM) into LLVM IR and links texture_sampler.bc if referenced.
 std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(

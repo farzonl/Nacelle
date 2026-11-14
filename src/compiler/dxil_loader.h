@@ -70,6 +70,13 @@ struct DxilLoadedShader {
     float hsMaxTessFactor = 64.0f;
     uint32_t dsInputControlPointCount = 0;
 
+    // Mesh / Amplification shader state (stage == "ms" / "as")
+    uint32_t msMaxVertexCount = 0;
+    uint32_t msMaxPrimitiveCount = 0;
+    uint32_t msOutputTopology = 0;   // 1=line, 2=triangle
+    uint32_t msPayloadBytes = 0;
+    uint32_t asPayloadBytes = 0;
+
     bool hasBarrier = false;
     bool hasDerivativesOrImplicitSample = false;
     bool usesDiscard = false;

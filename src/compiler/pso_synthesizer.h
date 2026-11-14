@@ -12,7 +12,7 @@
 
 namespace nacelle {
 
-/// Synthesizes combined Vertex + Pixel Uber-PSO MLIR (`@<vsSym>` and `@<psSym>`) for a graphics PSO.
+/// Synthesizes combined Vertex/Mesh + Pixel Uber-PSO MLIR (`@<vsSym>` / `@<vsSym>_ms` / `@<vsSym>_as` and `@<psSym>`) for a graphics PSO.
 bool synthesizeGraphicsPSOMLIR(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
@@ -26,6 +26,7 @@ bool synthesizeGraphicsPSOMLIR(
     std::vector<ShaderSigElement>& outVSOutputs,
     std::vector<ShaderSigElement>& outPSInputs,
     std::vector<ShaderSigElement>& outPSOutputs,
-    std::string& outError);
+    std::string& outError,
+    const MeshShaderStages& meshStages = {});
 
 } // namespace nacelle

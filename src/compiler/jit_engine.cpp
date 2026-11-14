@@ -158,6 +158,8 @@ struct InMemCacheEntry {
     uint64_t hsAddr = 0;
     uint64_t hsPcAddr = 0;
     uint64_t dsAddr = 0;
+    uint64_t msAddr = 0;
+    uint64_t asAddr = 0;
     std::vector<uint8_t> objBytes;
 };
 
@@ -476,6 +478,7 @@ void applyGraphicsMeta(
     const CachedPSOMeta& meta, const std::string& vsSym, const std::string& psSym,
     uint64_t vsAddr, uint64_t psAddr, uint64_t gsAddr,
     uint64_t hsAddr, uint64_t hsPcAddr, uint64_t dsAddr,
+    uint64_t msAddr, uint64_t asAddr,
     CompiledGraphicsPSO& outPSO) {
     outPSO.simdWidth = meta.simdWidth;
     outPSO.numVSOutputRegs = meta.numVSOutputRegs;
@@ -506,6 +509,20 @@ void applyGraphicsMeta(
     outPSO.numHSInputScalars = meta.numHSInputScalars;
     outPSO.numHSOutputScalars = meta.numHSOutputScalars;
     outPSO.numPatchConstScalars = meta.numPatchConstScalars;
+    outPSO.hasMS = meta.hasMS != 0;
+    outPSO.hasAS = meta.hasAS != 0;
+    for (int k = 0; k < 3; ++k) {
+        outPSO.msThreadGroupSize[k] = meta.msThreadGroupSize[k];
+        outPSO.asThreadGroupSize[k] = meta.asThreadGroupSize[k];
+    }
+    outPSO.msGroupSharedBytes = meta.msGroupSharedBytes;
+    outPSO.msMaxVertexCount = meta.msMaxVertexCount;
+    outPSO.msMaxPrimitiveCount = meta.msMaxPrimitiveCount;
+    outPSO.msOutputTopology = meta.msOutputTopology;
+    outPSO.msPayloadBytes = meta.msPayloadBytes;
+    outPSO.msPrimAttrMask = meta.msPrimAttrMask;
+    outPSO.asGroupSharedBytes = meta.asGroupSharedBytes;
+    outPSO.asPayloadBytes = meta.asPayloadBytes;
     outPSO.psWritesDepth = meta.psWritesDepth != 0;
     outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
     outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
@@ -518,6 +535,8 @@ void applyGraphicsMeta(
     outPSO.hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr), std::memory_order_release);
     outPSO.hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr), std::memory_order_release);
     outPSO.dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr), std::memory_order_release);
+    outPSO.msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr), std::memory_order_release);
+    outPSO.asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr), std::memory_order_release);
 }
 
 bool loadObjectIntoJitLocked(
@@ -628,7 +647,8 @@ void computeGraphicsPSOHash(
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     uint64_t& outLo,
-    uint64_t& outHi) {
+    uint64_t& outHi,
+    const MeshShaderStages& meshStages) {
     HashFeed feed;
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -646,6 +666,8 @@ void computeGraphicsPSOHash(
     addShader(desc.GS);
     addShader(desc.DS);
     addShader(desc.HS);
+    addShader(meshStages.AS);
+    addShader(meshStages.MS);
 
     feed.add(desc.BlendState);
     feed.add(desc.SampleMask);
@@ -833,7 +855,7 @@ bool tryLoadComputePSOFromCache(
         return false;
     }
 
-    rt.memCache[key] = InMemCacheEntry{meta, addr0, 0, 0, 0, 0, 0, std::move(objBytes)};
+    rt.memCache[key] = InMemCacheEntry{meta, addr0, 0, 0, 0, 0, 0, 0, 0, std::move(objBytes)};
     applyComputeMeta(meta, symbolName, addr0, outPSO);
     return true;
 }
@@ -851,10 +873,13 @@ bool tryLoadGraphicsPSOFromCache(
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         auto it = rt.memCache.find(key);
-        if (it != rt.memCache.end() && it->second.addr0 != 0 && (psSym.empty() || it->second.addr1 != 0) &&
+        if (it != rt.memCache.end() &&
+            (it->second.meta.hasMS ? (it->second.msAddr != 0) : (it->second.addr0 != 0)) &&
+            (psSym.empty() || it->second.addr1 != 0) &&
             it->second.meta.simdWidth == targetW) {
             applyGraphicsMeta(it->second.meta, vsSym, psSym, it->second.addr0, it->second.addr1, it->second.gsAddr,
-                              it->second.hsAddr, it->second.hsPcAddr, it->second.dsAddr, outPSO);
+                              it->second.hsAddr, it->second.hsPcAddr, it->second.dsAddr,
+                              it->second.msAddr, it->second.asAddr, outPSO);
             return true;
         }
     }
@@ -870,26 +895,40 @@ bool tryLoadGraphicsPSOFromCache(
 
     std::lock_guard<std::mutex> lock(rt.mu);
     auto it = rt.memCache.find(key);
-    if (it != rt.memCache.end() && it->second.addr0 != 0 && (psSym.empty() || it->second.addr1 != 0) &&
+    if (it != rt.memCache.end() &&
+        (it->second.meta.hasMS ? (it->second.msAddr != 0) : (it->second.addr0 != 0)) &&
+        (psSym.empty() || it->second.addr1 != 0) &&
         it->second.meta.simdWidth == targetW) {
         applyGraphicsMeta(it->second.meta, vsSym, psSym, it->second.addr0, it->second.addr1, it->second.gsAddr,
-                          it->second.hsAddr, it->second.hsPcAddr, it->second.dsAddr, outPSO);
+                          it->second.hsAddr, it->second.hsPcAddr, it->second.dsAddr,
+                          it->second.msAddr, it->second.asAddr, outPSO);
         return true;
     }
 
-    uint64_t addr0 = 0, addr1 = 0, gsAddr = 0, hsAddr = 0, hsPcAddr = 0, dsAddr = 0;
+    uint64_t primaryAddr = 0, addr1 = 0, gsAddr = 0, hsAddr = 0, hsPcAddr = 0, dsAddr = 0, msAddr = 0, asAddr = 0;
+    std::string primarySym = meta.hasMS ? (vsSym + "_ms") : vsSym;
     std::string gsSym = meta.hasGS ? (vsSym + "_gs") : std::string{};
     std::string hsSym = meta.hasTess ? (vsSym + "_hs") : std::string{};
     std::string hsPcSym = meta.hasTess ? (vsSym + "_hspc") : std::string{};
     std::string dsSym = meta.hasTess ? (vsSym + "_ds") : std::string{};
+    std::string asSym = meta.hasAS ? (vsSym + "_as") : std::string{};
     std::string err;
-    if (!loadObjectIntoJitLocked(rt, objBytes.data(), objBytes.size(), key + ".o", vsSym, psSym, addr0, addr1, err,
-                                 gsSym, &gsAddr, hsSym, &hsAddr, hsPcSym, &hsPcAddr, dsSym, &dsAddr)) {
-        return false;
+    if (meta.hasMS) {
+        if (!loadObjectIntoJitLocked(rt, objBytes.data(), objBytes.size(), key + ".o", primarySym, psSym, primaryAddr, addr1, err,
+                                     asSym, &asAddr)) {
+            return false;
+        }
+        msAddr = primaryAddr;
+    } else {
+        if (!loadObjectIntoJitLocked(rt, objBytes.data(), objBytes.size(), key + ".o", primarySym, psSym, primaryAddr, addr1, err,
+                                     gsSym, &gsAddr, hsSym, &hsAddr, hsPcSym, &hsPcAddr, dsSym, &dsAddr)) {
+            return false;
+        }
     }
+    uint64_t addr0 = meta.hasMS ? 0 : primaryAddr;
 
-    rt.memCache[key] = InMemCacheEntry{meta, addr0, addr1, gsAddr, hsAddr, hsPcAddr, dsAddr, std::move(objBytes)};
-    applyGraphicsMeta(meta, vsSym, psSym, addr0, addr1, gsAddr, hsAddr, hsPcAddr, dsAddr, outPSO);
+    rt.memCache[key] = InMemCacheEntry{meta, addr0, addr1, gsAddr, hsAddr, hsPcAddr, dsAddr, msAddr, asAddr, std::move(objBytes)};
+    applyGraphicsMeta(meta, vsSym, psSym, addr0, addr1, gsAddr, hsAddr, hsPcAddr, dsAddr, msAddr, asAddr, outPSO);
     return true;
 }
 
@@ -978,7 +1017,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
                 return;
             }
             rt.memCache[key] = InMemCacheEntry{
-                meta, addr0, 0, 0, 0, 0, 0,
+                meta, addr0, 0, 0, 0, 0, 0, 0, 0,
                 std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(objBytes.begin()),
                                      reinterpret_cast<const uint8_t*>(objBytes.end()))};
         }
@@ -1010,11 +1049,13 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
 
     runTier1Optimize(*llvmMod);
 
-    uint64_t vsAddr = 0, psAddr = 0, gsAddr = 0, hsAddr = 0, hsPcAddr = 0, dsAddr = 0;
+    uint64_t vsAddr = 0, psAddr = 0, gsAddr = 0, hsAddr = 0, hsPcAddr = 0, dsAddr = 0, msAddr = 0, asAddr = 0;
     std::string gsSym = meta.hasGS ? (vsSym + "_gs") : std::string{};
     std::string hsSym = meta.hasTess ? (vsSym + "_hs") : std::string{};
     std::string hsPcSym = meta.hasTess ? (vsSym + "_hspc") : std::string{};
     std::string dsSym = meta.hasTess ? (vsSym + "_ds") : std::string{};
+    std::string msSym = meta.hasMS ? (vsSym + "_ms") : std::string{};
+    std::string asSym = meta.hasAS ? (vsSym + "_as") : std::string{};
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         ensureLLJITLocked(rt, outError);
@@ -1038,10 +1079,15 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
             outAddr = r->getValue();
             return true;
         };
-        if (!lookupSym(vsSym, vsAddr) || !lookupSym(psSym, psAddr)) return false;
-        if (!gsSym.empty() && !lookupSym(gsSym, gsAddr)) return false;
-        if (!hsSym.empty() && (!lookupSym(hsSym, hsAddr) || !lookupSym(hsPcSym, hsPcAddr) || !lookupSym(dsSym, dsAddr))) {
-            return false;
+        if (meta.hasMS) {
+            if (!lookupSym(msSym, msAddr) || !lookupSym(psSym, psAddr)) return false;
+            if (!asSym.empty() && !lookupSym(asSym, asAddr)) return false;
+        } else {
+            if (!lookupSym(vsSym, vsAddr) || !lookupSym(psSym, psAddr)) return false;
+            if (!gsSym.empty() && !lookupSym(gsSym, gsAddr)) return false;
+            if (!hsSym.empty() && (!lookupSym(hsSym, hsAddr) || !lookupSym(hsPcSym, hsPcAddr) || !lookupSym(dsSym, dsAddr))) {
+                return false;
+            }
         }
     }
 
@@ -1054,6 +1100,8 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     outPSO.hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr), std::memory_order_release);
     outPSO.hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr), std::memory_order_release);
     outPSO.dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr), std::memory_order_release);
+    outPSO.msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr), std::memory_order_release);
+    outPSO.asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr), std::memory_order_release);
 
     if (const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2"); noT2 && noT2[0] == '1') {
         return true;
@@ -1085,33 +1133,47 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
         writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
         writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
 
-        uint64_t addr0 = 0, addr1 = 0, gsAddr2 = 0, hsAddr2 = 0, hsPcAddr2 = 0, dsAddr2 = 0;
+        uint64_t primaryAddr2 = 0, addr1 = 0, gsAddr2 = 0, hsAddr2 = 0, hsPcAddr2 = 0, dsAddr2 = 0, msAddr2 = 0, asAddr2 = 0;
+        std::string primarySym2 = meta.hasMS ? (vsSym + "_ms") : vsSym;
         std::string gsSym2 = meta.hasGS ? (vsSym + "_gs") : std::string{};
         std::string hsSym2 = meta.hasTess ? (vsSym + "_hs") : std::string{};
         std::string hsPcSym2 = meta.hasTess ? (vsSym + "_hspc") : std::string{};
         std::string dsSym2 = meta.hasTess ? (vsSym + "_ds") : std::string{};
+        std::string asSym2 = meta.hasAS ? (vsSym + "_as") : std::string{};
         {
             std::lock_guard<std::mutex> lock(rt.mu);
             std::string key = (cacheDir / hex).string();
-            if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
-                                         objBytes.size(), key + ".o", vsSym, psSym, addr0, addr1, err,
-                                         gsSym2, &gsAddr2, hsSym2, &hsAddr2, hsPcSym2, &hsPcAddr2, dsSym2, &dsAddr2)) {
-                return;
+            if (meta.hasMS) {
+                if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
+                                             objBytes.size(), key + ".o", primarySym2, psSym, primaryAddr2, addr1, err,
+                                             asSym2, &asAddr2)) {
+                    return;
+                }
+                msAddr2 = primaryAddr2;
+            } else {
+                if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
+                                             objBytes.size(), key + ".o", primarySym2, psSym, primaryAddr2, addr1, err,
+                                             gsSym2, &gsAddr2, hsSym2, &hsAddr2, hsPcSym2, &hsPcAddr2, dsSym2, &dsAddr2)) {
+                    return;
+                }
             }
+            uint64_t addr0 = meta.hasMS ? 0 : primaryAddr2;
             rt.memCache[key] = InMemCacheEntry{
-                meta, addr0, addr1, gsAddr2, hsAddr2, hsPcAddr2, dsAddr2,
+                meta, addr0, addr1, gsAddr2, hsAddr2, hsPcAddr2, dsAddr2, msAddr2, asAddr2,
                 std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(objBytes.begin()),
                                      reinterpret_cast<const uint8_t*>(objBytes.end()))};
         }
 
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->gs) {
-            box->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(addr0), std::memory_order_release);
+            box->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(meta.hasMS ? 0 : primaryAddr2), std::memory_order_release);
             box->gs->psFn.store(reinterpret_cast<CompiledPixelQuadFn>(addr1), std::memory_order_release);
             box->gs->gsFn.store(reinterpret_cast<CompiledGeometryFn>(gsAddr2), std::memory_order_release);
             box->gs->hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr2), std::memory_order_release);
             box->gs->hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr2), std::memory_order_release);
             box->gs->dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr2), std::memory_order_release);
+            box->gs->msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr2), std::memory_order_release);
+            box->gs->asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr2), std::memory_order_release);
         }
     });
 

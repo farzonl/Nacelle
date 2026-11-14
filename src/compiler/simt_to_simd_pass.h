@@ -48,8 +48,9 @@ struct StageHooks {
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
     mlir::Value flatGroupId;                           // vector<W x i32>
     mlir::Value groupSharedBase;                       // !llvm.ptr
+    mlir::Value meshPayloadBase;                       // !llvm.ptr (for Mesh Shader GetMeshPayload)
     mlir::Block* entryBlock = nullptr;                 // function entry block for hoisted allocas
-    mlir::Value waveIdx;                               // index (optional, set in multi-wave compute)
+    mlir::Value waveIdx;                               // index (optional, set in multi-wave compute/MS/AS)
     uint32_t numWaves = 1;
 
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
@@ -74,7 +75,36 @@ struct StageHooks {
                        const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadPatchConstant;
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
                        const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value realMask)> storePatchConstant;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& countX, const SimdVal& countY,
+                       const SimdVal& countZ, const SimdVal& payloadPtr, mlir::Value realMask)> dispatchMesh;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& numVerts, const SimdVal& numPrims,
+                       mlir::Value realMask)> setMeshOutputCounts;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& primIdx, const SimdVal& v0,
+                       const SimdVal& v1, const SimdVal& v2, mlir::Value realMask)> emitIndices;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId, const SimdVal& row, uint32_t col,
+                       const SimdVal& val, const SimdVal& vertIdx, mlir::Value realMask)> storeVertexOutput;
+    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId, const SimdVal& row, uint32_t col,
+                       const SimdVal& val, const SimdVal& primIdx, mlir::Value realMask)> storePrimitiveOutput;
 };
+
+/// Packetizes a threadgroup-based shader body (Compute, Amplification, or Mesh) across all waves in
+/// the threadgroup, supporting barriers, groupshared memory, and stage-specific `baseHooks`.
+bool packetizeThreadGroupRegion(
+    mlir::OpBuilder& builder,
+    mlir::Location loc,
+    mlir::ModuleOp mod,
+    mlir::Region& srcRegion,
+    const DxilLoadedShader& shader,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    mlir::Value rootCtxPtr,
+    mlir::Value gsBase,
+    mlir::Value gx,
+    mlir::Value gy,
+    mlir::Value gz,
+    mlir::Block* entryBlock,
+    const StageHooks& baseHooks,
+    std::string& outError);
 
 /// Packetizes a lifted Compute entry function (`func.func @entryName`) into
 /// `func.func @nacelle_cs_entry(ptr %rootCtx, ptr %gsBase, i32 %gx, i32 %gy, i32 %gz, i32 %ngx, i32 %ngy, i32 %ngz)`.

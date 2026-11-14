@@ -13,6 +13,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
@@ -229,6 +230,31 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out) {
                                 out.threadGroupSize[k] = std::max(1u, mdAsUInt(tgs->getOperand(k).get(), 1));
                             }
                         }
+                    } else if (tag == 9) { // kDxilMSStateTag
+                        if (auto* ms = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (ms->getNumOperands() >= 5) {
+                                if (auto* tgs = llvm::dyn_cast_or_null<llvm::MDNode>(ms->getOperand(0).get())) {
+                                    for (unsigned k = 0; k < 3 && k < tgs->getNumOperands(); ++k) {
+                                        out.threadGroupSize[k] = std::max(1u, mdAsUInt(tgs->getOperand(k).get(), 1));
+                                    }
+                                }
+                                out.msMaxVertexCount = mdAsUInt(ms->getOperand(1).get(), 0);
+                                out.msMaxPrimitiveCount = mdAsUInt(ms->getOperand(2).get(), 0);
+                                out.msOutputTopology = mdAsUInt(ms->getOperand(3).get(), 2);
+                                out.msPayloadBytes = mdAsUInt(ms->getOperand(4).get(), 0);
+                            }
+                        }
+                    } else if (tag == 10) { // kDxilASStateTag
+                        if (auto* as = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
+                            if (as->getNumOperands() >= 2) {
+                                if (auto* tgs = llvm::dyn_cast_or_null<llvm::MDNode>(as->getOperand(0).get())) {
+                                    for (unsigned k = 0; k < 3 && k < tgs->getNumOperands(); ++k) {
+                                        out.threadGroupSize[k] = std::max(1u, mdAsUInt(tgs->getOperand(k).get(), 1));
+                                    }
+                                }
+                                out.asPayloadBytes = mdAsUInt(as->getOperand(1).get(), 0);
+                            }
+                        }
                     } else if (tag == 11) { // kDxilWaveSizeTag
                         if (auto* ws = llvm::dyn_cast_or_null<llvm::MDNode>(props->getOperand(p + 1).get())) {
                             if (ws->getNumOperands() >= 1) {
@@ -385,7 +411,7 @@ uint32_t lowerGroupSharedGlobals(llvm::Module& mod, llvm::Function* entryFn) {
                     if (mapped != cur && mapped->getType() == cur->getType()) {
                         inst.setOperand(op, mapped);
                     } else if (mapped != cur) {
-                        // Load/Store/Atomic directly consuming addrspace(3) pointer
+                        // Load/Store/Atomic/MemIntrinsic/DispatchMesh directly consuming addrspace(3) pointer
                         if (auto* li = llvm::dyn_cast<llvm::LoadInst>(&inst); li && op == 0) {
                             li->setOperand(0, mapped);
                         } else if (auto* si = llvm::dyn_cast<llvm::StoreInst>(&inst); si && op == 1) {
@@ -394,6 +420,38 @@ uint32_t lowerGroupSharedGlobals(llvm::Module& mod, llvm::Function* entryFn) {
                             rmw->setOperand(0, mapped);
                         } else if (auto* cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&inst); cx && op == 0) {
                             cx->setOperand(0, mapped);
+                        } else if (auto* mset = llvm::dyn_cast<llvm::MemSetInst>(&inst); mset && op == 0) {
+                            llvm::IRBuilder<> b(mset);
+                            b.CreateMemSet(mapped, mset->getValue(), mset->getLength(), mset->getDestAlign(), mset->isVolatile());
+                            toErase.push_back(mset);
+                            break;
+                        } else if (auto* mcpy = llvm::dyn_cast<llvm::MemTransferInst>(&inst); mcpy && (op == 0 || op == 1)) {
+                            llvm::IRBuilder<> b(mcpy);
+                            llvm::Value* dstP = mapVal(mcpy->getRawDest());
+                            llvm::Value* srcP = mapVal(mcpy->getRawSource());
+                            if (llvm::isa<llvm::MemCpyInst>(mcpy)) {
+                                b.CreateMemCpy(dstP, mcpy->getDestAlign(), srcP, mcpy->getSourceAlign(), mcpy->getLength(), mcpy->isVolatile());
+                            } else {
+                                b.CreateMemMove(dstP, mcpy->getDestAlign(), srcP, mcpy->getSourceAlign(), mcpy->getLength(), mcpy->isVolatile());
+                            }
+                            toErase.push_back(mcpy);
+                            break;
+                        } else if (auto* ci = llvm::dyn_cast<llvm::CallInst>(&inst); ci && op == 4) {
+                            if (auto* callee = ci->getCalledFunction();
+                                callee && callee->getName().starts_with("dx.op.dispatchMesh") && ci->arg_size() >= 5) {
+                                llvm::IRBuilder<> b(ci);
+                                llvm::Type* i32Ty = llvm::Type::getInt32Ty(ctx);
+                                llvm::FunctionCallee newCallee = mod.getOrInsertFunction(
+                                    "dx.op.dispatchMesh.ptr",
+                                    llvm::FunctionType::get(
+                                        llvm::Type::getVoidTy(ctx),
+                                        {i32Ty, i32Ty, i32Ty, i32Ty, ptrTy},
+                                        false));
+                                b.CreateCall(newCallee, {ci->getArgOperand(0), ci->getArgOperand(1),
+                                                         ci->getArgOperand(2), ci->getArgOperand(3), mapped});
+                                toErase.push_back(ci);
+                                break;
+                            }
                         }
                     }
                 }
@@ -414,6 +472,14 @@ uint32_t lowerGroupSharedGlobals(llvm::Module& mod, llvm::Function* entryFn) {
     for (auto* gv : gsGlobals) {
         if (gv->use_empty()) gv->eraseFromParent();
     }
+    llvm::SmallVector<llvm::Function*, 4> deadDecls;
+    for (auto& fn : mod) {
+        if (fn.isDeclaration() && fn.use_empty() &&
+            (fn.getName().starts_with("dx.op.dispatchMesh") || fn.getName().starts_with("llvm.mem"))) {
+            deadDecls.push_back(&fn);
+        }
+    }
+    for (auto* fn : deadDecls) fn->eraseFromParent();
 
     return (totalBytes + 63) & ~63u;
 }
@@ -484,6 +550,11 @@ void scanDxilFlags(llvm::Function& fn, DxilLoadedShader& out) {
             case 78:  // AtomicBinOp
             case 79:  // AtomicCompareExchange
             case 140: // RawBufferStore
+            case 168: // SetMeshOutputCounts
+            case 169: // EmitIndices
+            case 171: // StoreVertexOutput
+            case 172: // StorePrimitiveOutput
+            case 173: // DispatchMesh
                 out.hasSideEffects = true;
                 break;
             case 5: { // StoreOutput
@@ -663,6 +734,32 @@ bool loadAndUpgradeDXIL(
     for (auto* df : deadFns) df->eraseFromParent();
 
     outShader.groupSharedBytes = lowerGroupSharedGlobals(*mod, entryFn);
+    if (outShader.stage == "as" && outShader.groupSharedBytes > 0 &&
+        (outShader.threadGroupSize[0] * outShader.threadGroupSize[1] * outShader.threadGroupSize[2]) > 1) {
+        // Per D3D12 Mesh Shader spec, DispatchMesh implies a group sync so all threads finish
+        // writing groupshared payload fields before the payload is dispatched to Mesh Shaders.
+        llvm::SmallVector<llvm::CallInst*, 4> dmCalls;
+        for (auto& bb : *entryFn) {
+            for (auto& inst : bb) {
+                if (auto* ci = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+                    if (auto* callee = ci->getCalledFunction();
+                        callee && callee->getName().starts_with("dx.op.dispatchMesh")) {
+                        dmCalls.push_back(ci);
+                    }
+                }
+            }
+        }
+        if (!dmCalls.empty()) {
+            llvm::Type* i32Ty = llvm::Type::getInt32Ty(llvmCtx);
+            llvm::FunctionCallee barrierCallee = mod->getOrInsertFunction(
+                "dx.op.barrier",
+                llvm::FunctionType::get(llvm::Type::getVoidTy(llvmCtx), {i32Ty, i32Ty}, false));
+            for (auto* ci : dmCalls) {
+                llvm::IRBuilder<> b(ci);
+                b.CreateCall(barrierCallee, {llvm::ConstantInt::get(i32Ty, 80), llvm::ConstantInt::get(i32Ty, 9)});
+            }
+        }
+    }
     unifyExitBlocks(*entryFn);
     scanDxilFlags(*entryFn, outShader);
     if (pcFn && !pcFn->isDeclaration()) {

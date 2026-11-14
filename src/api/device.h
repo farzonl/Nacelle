@@ -72,7 +72,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT, ID3D12Pageable* const*, const D3D12_RESIDENCY_PRIORITY*) override { return S_OK; }
 
     // ID3D12Device2
-    HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) override;
 
     // ID3D12Device3
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void*, REFIID, void**) override { return E_NOTIMPL; }

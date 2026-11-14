@@ -2300,7 +2300,68 @@ private:
             return packetizeWaveOp(call, op, realMask, outError);
         }
 
-        // 8b. Inline Raytracing (RayQuery) (178..215, 258)
+        // 8b. Mesh & Amplification Shader Intrinsics (168..173)
+        if (op == 168) { // SetMeshOutputCounts(op, numVertices, numPrimitives)
+            SimdVal nv = getMapped(loc, arg(1));
+            SimdVal np = getMapped(loc, arg(2));
+            if (hooks_.setMeshOutputCounts) {
+                if (!hooks_.setMeshOutputCounts(b_, loc, nv, np, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 169) { // EmitIndices(op, primIdx, v0, v1, v2)
+            SimdVal pIdx = getMapped(loc, arg(1));
+            SimdVal v0 = getMapped(loc, arg(2));
+            SimdVal v1 = getMapped(loc, arg(3));
+            SimdVal v2 = (call.getNumOperands() > 4) ? getMapped(loc, arg(4)) : makeZeroSimd(loc, i32Ty());
+            if (hooks_.emitIndices) {
+                if (!hooks_.emitIndices(b_, loc, pIdx, v0, v1, v2, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 170) { // GetMeshPayload(op) -> ptr
+            SimdVal sv;
+            sv.kind = SimdVal::Kind::Lanes;
+            sv.origType = ptrTy();
+            sv.lanes.push_back(hooks_.meshPayloadBase ? hooks_.meshPayloadBase
+                                                      : mlir::Value(mlir::LLVM::ZeroOp::create(b_, loc, ptrTy())));
+            setMapped(call.getResult(), sv);
+            return true;
+        }
+        if (op == 171) { // StoreVertexOutput(op, sigId, row, col, val, vertIdx)
+            uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal row = getMapped(loc, arg(2));
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
+            SimdVal val = getMapped(loc, arg(4));
+            SimdVal vIdx = getMapped(loc, arg(5));
+            if (hooks_.storeVertexOutput) {
+                if (!hooks_.storeVertexOutput(b_, loc, sigId, row, col, val, vIdx, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 172) { // StorePrimitiveOutput(op, sigId, row, col, val, primIdx)
+            uint32_t sigId = static_cast<uint32_t>(getConstIntValue(arg(1)).value_or(0));
+            SimdVal row = getMapped(loc, arg(2));
+            uint32_t col = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(0));
+            SimdVal val = getMapped(loc, arg(4));
+            SimdVal pIdx = getMapped(loc, arg(5));
+            if (hooks_.storePrimitiveOutput) {
+                if (!hooks_.storePrimitiveOutput(b_, loc, sigId, row, col, val, pIdx, realMask)) return false;
+            }
+            return true;
+        }
+        if (op == 173) { // DispatchMesh(op, countX, countY, countZ, payloadPtr)
+            SimdVal cx = getMapped(loc, arg(1));
+            SimdVal cy = getMapped(loc, arg(2));
+            SimdVal cz = getMapped(loc, arg(3));
+            SimdVal pp = (call.getNumOperands() > 4) ? getMapped(loc, arg(4)) : makeZeroSimd(loc, ptrTy());
+            if (hooks_.dispatchMesh) {
+                if (!hooks_.dispatchMesh(b_, loc, cx, cy, cz, pp, realMask)) return false;
+            }
+            return true;
+        }
+
+        // 8c. Inline Raytracing (RayQuery) (178..215, 258)
         if (op == 258 || (op >= 178 && op <= 215)) {
             return packetizeRayQueryOp(call, op, execMask);
         }
@@ -4600,6 +4661,7 @@ static bool packetizeComputeBlockWithBarriers(
     mlir::Value waveMaskArr, // [numWaves x vector<W x i1>] current active mask per wave
     llvm::DenseMap<mlir::Value, SpillSlot>& spills,
     mlir::Operation* entryAllocaAnchor,
+    const StageHooks& baseHooks,
     std::string& outError) {
     mlir::Type i32Ty = b.getI32Type();
     mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(b.getContext());
@@ -4685,8 +4747,8 @@ static bool packetizeComputeBlockWithBarriers(
                 mlir::Value activeMask = mlir::LLVM::LoadOp::create(
                     wb, wloc, mlir::VectorType::get({W}, wb.getI1Type()), mp, 1u);
 
-                StageHooks hooks;
-                hooks.entryBlock = entryAllocaAnchor ? entryAllocaAnchor->getBlock() : nullptr;
+                StageHooks hooks = baseHooks;
+                hooks.entryBlock = entryAllocaAnchor ? entryAllocaAnchor->getBlock() : baseHooks.entryBlock;
                 hooks.groupSharedBase = gsBase;
                 hooks.waveIdx = waveIdx;
                 hooks.numWaves = numWavesVal;
@@ -4744,7 +4806,7 @@ static bool packetizeComputeBlockWithBarriers(
                         if (!packetizeComputeBlockWithBarriers(
                                 ib, iloc, mod, ifOp.getThenRegion().front(), shader, rootLayout, W, numWavesVal,
                                 rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
-                                entryAllocaAnchor, outError)) {
+                                entryAllocaAnchor, baseHooks, outError)) {
                             mlir::scf::YieldOp::create(ib, iloc);
                             return;
                         }
@@ -4775,7 +4837,7 @@ static bool packetizeComputeBlockWithBarriers(
                             if (!packetizeComputeBlockWithBarriers(
                                     ib, iloc, mod, ifOp.getElseRegion().front(), shader, rootLayout, W, numWavesVal,
                                     rootCtxPtr, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
-                                    entryAllocaAnchor, outError)) {
+                                    entryAllocaAnchor, baseHooks, outError)) {
                                 mlir::scf::YieldOp::create(ib, iloc);
                                 return;
                             }
@@ -4871,7 +4933,7 @@ static bool packetizeComputeBlockWithBarriers(
                     [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange) {
                         if (!packetizeComputeBlockWithBarriers(
                                 nb, nloc, mod, srcBefore, shader, rootLayout, W, numWavesVal, rootCtxPtr, gsBase,
-                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError)) {
+                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, baseHooks, outError)) {
                             mlir::Value cFalse = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 0);
                             mlir::scf::ConditionOp::create(nb, nloc, cFalse, mlir::ValueRange{});
                             return;
@@ -4898,7 +4960,7 @@ static bool packetizeComputeBlockWithBarriers(
                                 mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                                 mlir::Value curMask = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
 
-                                StageHooks hooks;
+                                StageHooks hooks = baseHooks;
                                 hooks.entryBlock = entryAllocaAnchor ? entryAllocaAnchor->getBlock() : nullptr;
                                 hooks.groupSharedBase = gsBase;
                                 hooks.waveIdx = waveIdx;
@@ -4937,7 +4999,7 @@ static bool packetizeComputeBlockWithBarriers(
                     [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange) {
                         if (!packetizeComputeBlockWithBarriers(
                                 nb, nloc, mod, srcAfter, shader, rootLayout, W, numWavesVal, rootCtxPtr, gsBase,
-                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError)) {
+                                gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, baseHooks, outError)) {
                             mlir::scf::YieldOp::create(nb, nloc);
                             return;
                         }
@@ -4995,6 +5057,79 @@ static bool packetizeComputeBlockWithBarriers(
 
 } // namespace
 
+bool packetizeThreadGroupRegion(
+    mlir::OpBuilder& b,
+    mlir::Location loc,
+    mlir::ModuleOp mod,
+    mlir::Region& srcRegion,
+    const DxilLoadedShader& shader,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    mlir::Value rootCtx,
+    mlir::Value gsBase,
+    mlir::Value gx,
+    mlir::Value gy,
+    mlir::Value gz,
+    mlir::Block* entry,
+    const StageHooks& baseHooks,
+    std::string& outError) {
+    if (srcRegion.empty()) return true;
+    mlir::MLIRContext* ctx = mod.getContext();
+    mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
+    mlir::Type i32Ty = b.getI32Type();
+
+    const uint32_t totalThreadsVal =
+        std::max(1u, shader.threadGroupSize[0] * shader.threadGroupSize[1] * shader.threadGroupSize[2]);
+    const uint32_t numWavesVal = (totalThreadsVal + simdWidth - 1) / simdWidth;
+    mlir::Value totalThreads = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, totalThreadsVal);
+    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b, loc, 0);
+    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b, loc, 1);
+    mlir::Value numWaves = mlir::arith::ConstantIndexOp::create(b, loc, numWavesVal);
+
+    if (!regionContainsBarrier(srcRegion)) {
+        mlir::scf::ForOp::create(
+            b, loc, c0, numWaves, c1, mlir::ValueRange{},
+            [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
+                mlir::Value activeMask;
+                mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
+                StageHooks hooks = baseHooks;
+                hooks.entryBlock = entry;
+                hooks.groupSharedBase = gsBase;
+                hooks.waveIdx = mlir::Value();
+                hooks.numWaves = 1;
+                setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
+                SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
+                mlir::Value realMask = activeMask;
+                (void)pkt.packetizeBlock(srcRegion.front(), activeMask, realMask, outError);
+                mlir::scf::YieldOp::create(wb, wloc);
+            });
+    } else {
+        mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
+        mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
+            b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal),
+            std::max<uint32_t>(64, simdWidth * 8));
+        mlir::Operation* entryAllocaAnchor = waveMaskArr.getDefiningOp();
+        // Initialize per-wave active masks
+        mlir::scf::ForOp::create(
+            b, loc, c0, numWaves, c1, mlir::ValueRange{},
+            [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
+                mlir::Value activeMask;
+                (void)buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
+                mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
+                mlir::LLVM::StoreOp::create(wb, wloc, activeMask, mp, 1u);
+                mlir::scf::YieldOp::create(wb, wloc);
+            });
+
+        llvm::DenseMap<mlir::Value, SpillSlot> spills;
+        (void)packetizeComputeBlockWithBarriers(
+            b, loc, mod, srcRegion.front(), shader, rootLayout, simdWidth, numWavesVal,
+            rootCtx, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills,
+            entryAllocaAnchor, baseHooks, outError);
+    }
+    return outError.empty();
+}
+
 bool packetizeComputeEntry(
     mlir::ModuleOp mod,
     const DxilLoadedShader& shader,
@@ -5026,53 +5161,11 @@ bool packetizeComputeEntry(
     mlir::Value gy = entry->getArgument(3);
     mlir::Value gz = entry->getArgument(4);
 
-    const uint32_t totalThreadsVal = shader.threadGroupSize[0] * shader.threadGroupSize[1] * shader.threadGroupSize[2];
-    const uint32_t numWavesVal = (totalThreadsVal + simdWidth - 1) / simdWidth;
-    mlir::Value totalThreads = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, totalThreadsVal);
-    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b, loc, 0);
-    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b, loc, 1);
-    mlir::Value numWaves = mlir::arith::ConstantIndexOp::create(b, loc, numWavesVal);
-
-    if (!regionContainsBarrier(srcFunc.getBody())) {
-        mlir::scf::ForOp::create(
-            b, loc, c0, numWaves, c1, mlir::ValueRange{},
-            [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
-                mlir::Value activeMask;
-                mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
-                StageHooks hooks;
-                hooks.entryBlock = entry;
-                hooks.groupSharedBase = gsBase;
-                setupComputeThreadIds(wb, wloc, simdWidth, shader.threadGroupSize, flatTid, gx, gy, gz, hooks);
-                SimdPacketizer pkt(wb, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
-                mlir::Value realMask = activeMask;
-                (void)pkt.packetizeBlock(srcFunc.getBody().front(), activeMask, realMask, outError);
-                mlir::scf::YieldOp::create(wb, wloc);
-            });
-    } else {
-        mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
-        mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
-            b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal),
-            std::max<uint32_t>(64, simdWidth * 8));
-        mlir::Operation* entryAllocaAnchor = waveMaskArr.getDefiningOp();
-        // Initialize per-wave active masks
-        mlir::scf::ForOp::create(
-            b, loc, c0, numWaves, c1, mlir::ValueRange{},
-            [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
-                mlir::Value activeMask;
-                (void)buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
-                mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
-                mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
-                mlir::LLVM::StoreOp::create(wb, wloc, activeMask, mp, 1u);
-                mlir::scf::YieldOp::create(wb, wloc);
-            });
-
-        llvm::DenseMap<mlir::Value, SpillSlot> spills;
-        (void)packetizeComputeBlockWithBarriers(
-            b, loc, mod, srcFunc.getBody().front(), shader, rootLayout, simdWidth, numWavesVal,
-            rootCtx, gsBase, gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, outError);
+    StageHooks baseHooks;
+    if (!packetizeThreadGroupRegion(b, loc, mod, srcFunc.getBody(), shader, rootLayout,
+                                    simdWidth, rootCtx, gsBase, gx, gy, gz, entry, baseHooks, outError)) {
+        return false;
     }
-
-    if (!outError.empty()) return false;
     mlir::func::ReturnOp::create(b, loc);
 
     srcFunc.erase();

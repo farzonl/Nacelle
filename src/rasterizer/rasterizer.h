@@ -50,4 +50,16 @@ void executeRasterDrawCall(
     const GraphicsExecutionState& state,
     const DrawCallParams& draw);
 
+struct MeshDispatchParams {
+    uint32_t groupCountX = 0;
+    uint32_t groupCountY = 0;
+    uint32_t groupCountZ = 0;
+};
+
+/// Executes an Amplification + Mesh shader dispatch via SIMD threadgroup execution + tile rasterization.
+void executeRasterMeshDispatch(
+    BS::thread_pool<>& pool,
+    const GraphicsExecutionState& state,
+    const MeshDispatchParams& dispatch);
+
 } // namespace nacelle

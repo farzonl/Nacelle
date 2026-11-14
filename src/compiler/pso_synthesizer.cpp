@@ -529,27 +529,67 @@ bool synthesizeGraphicsPSOMLIR(
     std::vector<ShaderSigElement>& outVSOutputs,
     std::vector<ShaderSigElement>& outPSInputs,
     std::vector<ShaderSigElement>& outPSOutputs,
-    std::string& outError) {
-    if (!desc.VS.pShaderBytecode || desc.VS.BytecodeLength == 0) {
-        outError = "Graphics PSO requires a valid Vertex Shader bytecode";
+    std::string& outError,
+    const MeshShaderStages& meshStages) {
+    const bool hasMS = (meshStages.MS.pShaderBytecode && meshStages.MS.BytecodeLength > 0);
+    const bool hasAS = hasMS && (meshStages.AS.pShaderBytecode && meshStages.AS.BytecodeLength > 0);
+    if (!hasMS && (!desc.VS.pShaderBytecode || desc.VS.BytecodeLength == 0)) {
+        outError = "Graphics PSO requires a valid Vertex or Mesh Shader bytecode";
         return false;
     }
 
     auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader vsLoaded;
-    if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+    mlir::OwningOpRef<mlir::ModuleOp> vsMlirMod;
+    if (!hasMS) {
+        if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+            return false;
+        }
+        vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
+        if (!vsMlirMod) return false;
+    }
+
+    auto msLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    DxilLoadedShader msLoaded;
+    mlir::OwningOpRef<mlir::ModuleOp> msMlirMod;
+    auto asLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    DxilLoadedShader asLoaded;
+    mlir::OwningOpRef<mlir::ModuleOp> asMlirMod;
+    if (hasMS) {
+        if (!loadAndUpgradeDXIL(meshStages.MS, *msLlvmCtx, msLoaded, outError)) {
+            return false;
+        }
+        msMlirMod = importAndLiftDXILToSCF(std::move(msLoaded.module), msLoaded.entryName, mlirCtx, outError);
+        if (!msMlirMod) return false;
+        if (hasAS) {
+            if (!loadAndUpgradeDXIL(meshStages.AS, *asLlvmCtx, asLoaded, outError)) {
+                return false;
+            }
+            asMlirMod = importAndLiftDXILToSCF(std::move(asLoaded.module), asLoaded.entryName, mlirCtx, outError);
+            if (!asMlirMod) return false;
+        }
+    }
+
+    const bool emptyRoot = rootLayout.params.empty() && rootLayout.staticSamplers.empty();
+    const RootSignatureLayout& msEffectiveLayout =
+        (hasMS && emptyRoot && msLoaded.hasEmbeddedRootSig)
+            ? msLoaded.embeddedRootSig
+            : ((hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : rootLayout);
+    const RootSignatureLayout& asEffectiveLayout =
+        (hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : msEffectiveLayout;
+    if (false) {
         return false;
     }
 
     const RootSignatureLayout& vsEffectiveLayout =
         (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && vsLoaded.hasEmbeddedRootSig)
             ? vsLoaded.embeddedRootSig
-            : rootLayout;
+            : (hasMS ? msEffectiveLayout : rootLayout);
 
-    auto vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
-    if (!vsMlirMod) return false;
 
-    bool hasTess = (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
+
+
+    bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
                     desc.DS.pShaderBytecode && desc.DS.BytecodeLength > 0);
     auto hsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader hsLoaded;
@@ -581,7 +621,7 @@ bool synthesizeGraphicsPSOMLIR(
             ? dsLoaded.embeddedRootSig
             : vsEffectiveLayout;
 
-    bool hasGS = (desc.GS.pShaderBytecode && desc.GS.BytecodeLength > 0);
+    bool hasGS = !hasMS && (desc.GS.pShaderBytecode && desc.GS.BytecodeLength > 0);
     auto gsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader gsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> gsMlirMod;
@@ -620,7 +660,12 @@ bool synthesizeGraphicsPSOMLIR(
     outCombinedMod = mlir::ModuleOp::create(loc);
     mlir::ModuleOp combinedMod = *outCombinedMod;
 
-    cloneGlobalsIntoModule(*vsMlirMod, combinedMod);
+    if (!hasMS) {
+        cloneGlobalsIntoModule(*vsMlirMod, combinedMod);
+    } else {
+        cloneGlobalsIntoModule(*msMlirMod, combinedMod);
+        if (hasAS) cloneGlobalsIntoModule(*asMlirMod, combinedMod);
+    }
     if (hasTess) {
         cloneGlobalsIntoModule(*hsMlirMod, combinedMod);
         cloneGlobalsIntoModule(*dsMlirMod, combinedMod);
@@ -632,8 +677,8 @@ bool synthesizeGraphicsPSOMLIR(
         cloneGlobalsIntoModule(*psMlirMod, combinedMod);
     }
 
-    outVSInputs = convertSigElements(vsLoaded.inputSigs);
-    outVSOutputs = convertSigElements(vsLoaded.outputSigs);
+    outVSInputs = hasMS ? std::vector<ShaderSigElement>{} : convertSigElements(vsLoaded.inputSigs);
+    outVSOutputs = convertSigElements(hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs);
     bool psWritesDepth = false;
     bool psUsesDiscard = false;
     bool psHasSideEffects = false;
@@ -651,7 +696,8 @@ bool synthesizeGraphicsPSOMLIR(
     // Link VS output signatures -> PS input signatures by (semanticName, semanticIndex)
     int32_t posOutputReg = 0;
     uint32_t numVSOutputRegs = 0;
-    for (const auto& vo : vsLoaded.outputSigs) {
+    for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
+        if (vo.startRow == UINT32_MAX) continue;
         numVSOutputRegs = std::max(numVSOutputRegs, vo.startRow + vo.rows);
         if (vo.systemValueType == 3) posOutputReg = static_cast<int32_t>(vo.startRow);
     }
@@ -713,7 +759,8 @@ bool synthesizeGraphicsPSOMLIR(
 
     std::unordered_map<uint32_t, LinkedVSSigSlot> vsToPsMap;
     if (hasTess) {
-        for (const auto& vo : vsLoaded.outputSigs) {
+        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
+        if (vo.startRow == UINT32_MAX) continue;
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& hi : hsLoaded.inputSigs) {
                 if (toLowerAscii(hi.semanticName) == vn && hi.semanticIndex == vo.semanticIndex) {
@@ -723,7 +770,8 @@ bool synthesizeGraphicsPSOMLIR(
             }
         }
     } else if (hasGS) {
-        for (const auto& vo : vsLoaded.outputSigs) {
+        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
+        if (vo.startRow == UINT32_MAX) continue;
             if (vo.systemValueType == 3) continue; // SV_Position goes to outPosXYZW
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& gi : gsLoaded.inputSigs) {
@@ -735,7 +783,8 @@ bool synthesizeGraphicsPSOMLIR(
             }
         }
     } else if (hasPS) {
-        for (const auto& vo : vsLoaded.outputSigs) {
+        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
+        if (vo.startRow == UINT32_MAX) continue;
             if (vo.systemValueType == 3) continue; // SV_Position
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& pi : psLoaded.inputSigs) {
@@ -816,7 +865,30 @@ bool synthesizeGraphicsPSOMLIR(
 
     // Allocate scalar attribute slots for SV_ClipDistance (systemValueType == 6) and
     // SV_CullDistance (systemValueType == 7) after the PS input attribute registers.
-    const auto& preRastOutputs = hasGS ? gsLoaded.outputSigs : (hasTess ? dsLoaded.outputSigs : vsLoaded.outputSigs);
+    std::unordered_map<uint32_t, LinkedVSSigSlot> msPrimToPsMap;
+    uint64_t msPrimAttrMask = 0;
+    if (hasMS && hasPS) {
+        for (const auto& po : msLoaded.patchConstSigs) {
+            if (po.systemValueType != 0) continue;
+            std::string pn = toLowerAscii(po.semanticName);
+            for (const auto& pi : psLoaded.inputSigs) {
+                if (pi.systemValueType != 0) continue;
+                if (toLowerAscii(pi.semanticName) == pn && pi.semanticIndex == po.semanticIndex) {
+                    msPrimToPsMap[po.sigId] = {static_cast<int32_t>(pi.startRow), pi.startCol};
+                    for (uint32_t r = 0; r < po.rows; ++r) {
+                        for (uint32_t c = 0; c < po.cols && (pi.startCol + c) < 4; ++c) {
+                            uint32_t slot = (pi.startRow + r) * 4 + (pi.startCol + c);
+                            if (slot < 64) msPrimAttrMask |= (1ull << slot);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    const auto& preRastOutputs = hasMS ? msLoaded.outputSigs
+                                       : (hasGS ? gsLoaded.outputSigs : (hasTess ? dsLoaded.outputSigs : vsLoaded.outputSigs));
     uint32_t nextExtraAttr = numPSInputRegs * 4;
     uint32_t clipDistMask = 0;
     uint32_t cullDistMask = 0;
@@ -862,6 +934,23 @@ bool synthesizeGraphicsPSOMLIR(
             shadingRateAttrOffset = nextExtraAttr++;
         }
     }
+    if (hasMS) {
+        for (const auto& po : msLoaded.patchConstSigs) {
+            if (po.systemValueType == 5) {
+                if (!hasViewportArrayIndex) {
+                    hasViewportArrayIndex = true;
+                    vpIndexAttrOffset = nextExtraAttr++;
+                }
+                if (vpIndexAttrOffset < 64) msPrimAttrMask |= (1ull << vpIndexAttrOffset);
+            } else if (po.systemValueType == 29) {
+                if (!hasPerPrimShadingRate) {
+                    hasPerPrimShadingRate = true;
+                    shadingRateAttrOffset = nextExtraAttr++;
+                }
+                if (shadingRateAttrOffset < 64) msPrimAttrMask |= (1ull << shadingRateAttrOffset);
+            }
+        }
+    }
     uint32_t totalVSScalarAttrs = hasTess ? numHSInputScalars : (hasGS ? (numGSInputRegs * 4) : nextExtraAttr);
     uint32_t totalPostDSVertexAttrs = hasGS ? (numGSInputRegs * 4) : nextExtraAttr;
     uint32_t totalPostGSVertexAttrs = nextExtraAttr;
@@ -880,6 +969,7 @@ bool synthesizeGraphicsPSOMLIR(
     }
 
     // --- 1. Emit @<vsSym>(ptr %rootCtx, ptr %vertexIds, ptr %instanceIds, i32 %activeCount, ptr %outPosXYZW, ptr %outAttrs) ---
+    if (!hasMS)
     {
         auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
         if (!vsSrcFunc || vsSrcFunc.getBody().empty()) {
@@ -1110,6 +1200,431 @@ bool synthesizeGraphicsPSOMLIR(
             return false;
         }
         mlir::func::ReturnOp::create(b, loc);
+    }
+
+    // --- 1-mesh. Emit @<vsSym>_as (optional) and @<vsSym>_ms ---
+    if (hasMS) {
+        auto extractLaneI32 = [](mlir::OpBuilder& lb, mlir::Location lloc, const SimdVal& sv, uint32_t lane) -> mlir::Value {
+            mlir::Type i32 = lb.getI32Type();
+            mlir::Value v = (sv.kind == SimdVal::Kind::Vector)
+                                ? mlir::vector::ExtractOp::create(lb, lloc, sv.vec, static_cast<int64_t>(lane)).getResult()
+                                : (sv.isUniform() ? sv.lanes[0] : sv.lanes[lane]);
+            if (v.getType() != i32) {
+                if (mlir::isa<mlir::FloatType>(v.getType())) {
+                    if (v.getType().getIntOrFloatBitWidth() != 32) {
+                        v = mlir::arith::ExtFOp::create(lb, lloc, lb.getF32Type(), v);
+                    }
+                    v = mlir::arith::BitcastOp::create(lb, lloc, i32, v);
+                } else if (v.getType().getIntOrFloatBitWidth() < 32) {
+                    v = mlir::arith::ExtUIOp::create(lb, lloc, i32, v);
+                } else {
+                    v = mlir::arith::TruncIOp::create(lb, lloc, i32, v);
+                }
+            }
+            return v;
+        };
+
+        auto convertSimdValToF32Vec = [&](mlir::OpBuilder& lb, mlir::Location lloc, const SimdVal& val) -> mlir::Value {
+            IRHelpers lh{lb, lloc, simdWidth};
+            mlir::Value vVec = val.vec;
+            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+            if (elemTy != lh.f32Ty()) {
+                if (mlir::isa<mlir::IntegerType>(elemTy)) {
+                    if (elemTy.getIntOrFloatBitWidth() < 32) {
+                        vVec = mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(lh.i32Ty()), vVec);
+                    }
+                    vVec = mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(lh.f32Ty()), vVec);
+                } else {
+                    vVec = mlir::arith::ExtFOp::create(lb, lloc, lh.vecTy(lh.f32Ty()), vVec);
+                }
+            }
+            return vVec;
+        };
+
+        if (hasAS) {
+            auto asSrcFunc = asMlirMod->lookupSymbol<mlir::func::FuncOp>(asLoaded.entryName);
+            if (!asSrcFunc || asSrcFunc.getBody().empty()) {
+                outError = "Amplification shader entry function missing after MLIR SCF lift";
+                return false;
+            }
+
+            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
+            IRHelpers h{b, loc, simdWidth};
+            auto ptrTy = h.ptrTy();
+            auto i32Ty = h.i32Ty();
+            auto fnTy = b.getFunctionType({ptrTy}, {});
+            auto asFn = mlir::func::FuncOp::create(b, loc, vsSym + "_as", fnTy);
+            mlir::Block* entry = asFn.addEntryBlock();
+            b.setInsertionPointToEnd(entry);
+
+            mlir::Value argsPtr = entry->getArgument(0);
+            mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, rootCtx)));
+            mlir::Value gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, groupSharedScratch)));
+            mlir::Value gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gx)));
+            mlir::Value gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gy)));
+            mlir::Value gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gz)));
+            mlir::Value outDispatchDims = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outDispatchDims)));
+            mlir::Value outPayload = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outPayload)));
+
+            StageHooks asHooks;
+            asHooks.dispatchMesh = [&](mlir::OpBuilder& db, mlir::Location dloc,
+                                       const SimdVal& countX, const SimdVal& countY, const SimdVal& countZ,
+                                       const SimdVal& payloadArg, mlir::Value realMask) -> bool {
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value actL = mlir::vector::ExtractOp::create(db, dloc, realMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(db, dloc, actL, [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                        IRHelpers lh{lb, lloc, simdWidth};
+                        mlir::Value already = lh.loadScalar(i32Ty, lh.gepBytes(outDispatchDims, 12));
+                        mlir::Value notYet = mlir::arith::CmpIOp::create(
+                            lb, lloc, mlir::arith::CmpIPredicate::eq, already, lh.cInt(i32Ty, 0));
+                        mlir::scf::IfOp::create(lb, lloc, notYet, [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                            IRHelpers ch{cb, cloc, simdWidth};
+                            ch.storeScalar(ch.cInt(i32Ty, 1), ch.gepBytes(outDispatchDims, 12));
+                            ch.storeScalar(extractLaneI32(cb, cloc, countX, l), ch.gepBytes(outDispatchDims, 0));
+                            ch.storeScalar(extractLaneI32(cb, cloc, countY, l), ch.gepBytes(outDispatchDims, 4));
+                            ch.storeScalar(extractLaneI32(cb, cloc, countZ, l), ch.gepBytes(outDispatchDims, 8));
+                            if (asLoaded.asPayloadBytes > 0 && payloadArg.kind == SimdVal::Kind::Lanes && !payloadArg.lanes.empty()) {
+                                mlir::Value srcPtr = payloadArg.isUniform() ? payloadArg.lanes[0] : payloadArg.lanes[l];
+                                mlir::Value nullP = mlir::LLVM::ZeroOp::create(cb, cloc, ptrTy);
+                                mlir::Value srcOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, srcPtr, nullP);
+                                mlir::Value dstOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, outPayload, nullP);
+                                mlir::scf::IfOp::create(cb, cloc, mlir::arith::AndIOp::create(cb, cloc, srcOk, dstOk),
+                                                        [&](mlir::OpBuilder& mb, mlir::Location mloc) {
+                                                            mlir::Value c0 = mlir::arith::ConstantIndexOp::create(mb, mloc, 0);
+                                                            mlir::Value c1 = mlir::arith::ConstantIndexOp::create(mb, mloc, 1);
+                                                            mlir::Value cN = mlir::arith::ConstantIndexOp::create(mb, mloc, asLoaded.asPayloadBytes);
+                                                            mlir::scf::ForOp::create(
+                                                                mb, mloc, c0, cN, c1, mlir::ValueRange{},
+                                                                [&](mlir::OpBuilder& fb, mlir::Location floc, mlir::Value bi, mlir::ValueRange) {
+                                                                    mlir::Value bi64 = mlir::arith::IndexCastOp::create(fb, floc, fb.getI64Type(), bi);
+                                                                    mlir::Value sp = mlir::LLVM::GEPOp::create(fb, floc, ptrTy, fb.getI8Type(), srcPtr, mlir::ValueRange{bi64});
+                                                                    mlir::Value dp = mlir::LLVM::GEPOp::create(fb, floc, ptrTy, fb.getI8Type(), outPayload, mlir::ValueRange{bi64});
+                                                                    mlir::Value bv = mlir::LLVM::LoadOp::create(fb, floc, fb.getI8Type(), sp);
+                                                                    mlir::LLVM::StoreOp::create(fb, floc, bv, dp);
+                                                                    mlir::scf::YieldOp::create(fb, floc);
+                                                                });
+                                                            mlir::scf::YieldOp::create(mb, mloc);
+                                                        });
+                            }
+                            mlir::scf::YieldOp::create(cb, cloc);
+                        });
+                        mlir::scf::YieldOp::create(lb, lloc);
+                    });
+                }
+                return true;
+            };
+
+            if (!packetizeThreadGroupRegion(b, loc, combinedMod, asSrcFunc.getBody(), asLoaded, asEffectiveLayout,
+                                            simdWidth, rootCtx, gsBase, gx, gy, gz, entry, asHooks, outError)) {
+                return false;
+            }
+            mlir::func::ReturnOp::create(b, loc);
+        }
+
+        // Emit @<vsSym>_ms(const MeshThreadGroupArgs* args)
+        {
+            auto msSrcFunc = msMlirMod->lookupSymbol<mlir::func::FuncOp>(msLoaded.entryName);
+            if (!msSrcFunc || msSrcFunc.getBody().empty()) {
+                outError = "Mesh shader entry function missing after MLIR SCF lift";
+                return false;
+            }
+
+            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
+            IRHelpers h{b, loc, simdWidth};
+            auto ptrTy = h.ptrTy();
+            auto i32Ty = h.i32Ty();
+            auto f32Ty = h.f32Ty();
+            auto i8Ty = h.i8Ty();
+            auto fnTy = b.getFunctionType({ptrTy}, {});
+            auto msFn = mlir::func::FuncOp::create(b, loc, vsSym + "_ms", fnTy);
+            mlir::Block* entry = msFn.addEntryBlock();
+            b.setInsertionPointToEnd(entry);
+
+            mlir::Value argsPtr = entry->getArgument(0);
+            mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, rootCtx)));
+            mlir::Value gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, groupSharedScratch)));
+            mlir::Value payloadPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, payloadPtr)));
+            mlir::Value gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gx)));
+            mlir::Value gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gy)));
+            mlir::Value gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gz)));
+            mlir::Value outCounts = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outCounts)));
+            mlir::Value outVertPosXYZW = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertPosXYZW)));
+            mlir::Value outVertAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertAttrs)));
+            mlir::Value outPrimIndices = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimIndices)));
+            mlir::Value outPrimAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimAttrs)));
+            mlir::Value outPrimCull = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimCull)));
+            mlir::Value outPrimId = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimId)));
+
+            mlir::Value countsSetPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, i32Ty, h.cInt(i32Ty, 1), 4);
+            h.storeScalar(h.cInt(i32Ty, 0), countsSetPtr);
+
+            const uint32_t maxVerts = msLoaded.msMaxVertexCount;
+            const uint32_t maxPrims = msLoaded.msMaxPrimitiveCount;
+
+            StageHooks msHooks;
+            msHooks.meshPayloadBase = payloadPtr;
+
+            msHooks.setMeshOutputCounts = [&](mlir::OpBuilder& sb, mlir::Location sloc,
+                                              const SimdVal& numVerts, const SimdVal& numPrims,
+                                              mlir::Value realMask) -> bool {
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(sb, sloc, actL, [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                        IRHelpers lh{lb, lloc, simdWidth};
+                        mlir::Value already = lh.loadScalar(i32Ty, countsSetPtr);
+                        mlir::Value notYet = mlir::arith::CmpIOp::create(
+                            lb, lloc, mlir::arith::CmpIPredicate::eq, already, lh.cInt(i32Ty, 0));
+                        mlir::scf::IfOp::create(lb, lloc, notYet, [&](mlir::OpBuilder& cb, mlir::Location cloc) {
+                            IRHelpers ch{cb, cloc, simdWidth};
+                            ch.storeScalar(ch.cInt(i32Ty, 1), countsSetPtr);
+                            ch.storeScalar(extractLaneI32(cb, cloc, numVerts, l), ch.gepBytes(outCounts, 0));
+                            ch.storeScalar(extractLaneI32(cb, cloc, numPrims, l), ch.gepBytes(outCounts, 4));
+                            mlir::scf::YieldOp::create(cb, cloc);
+                        });
+                        mlir::scf::YieldOp::create(lb, lloc);
+                    });
+                }
+                return true;
+            };
+
+            msHooks.emitIndices = [&](mlir::OpBuilder& sb, mlir::Location sloc,
+                                      const SimdVal& primIdx, const SimdVal& v0,
+                                      const SimdVal& v1, const SimdVal& v2,
+                                      mlir::Value realMask) -> bool {
+                if (maxPrims == 0) return true;
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                    mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
+                    mlir::Value inB = mlir::arith::CmpIOp::create(
+                        sb, sloc, mlir::arith::CmpIPredicate::ult, pIdx,
+                        mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxPrims));
+                    mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                            [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                IRHelpers lh{lb, lloc, simdWidth};
+                                                mlir::Value base3 = mlir::arith::MulIOp::create(lb, lloc, pIdx, lh.cInt(i32Ty, 3));
+                                                lh.storeScalar(extractLaneI32(lb, lloc, v0, l), lh.gepArray(outPrimIndices, i32Ty, base3));
+                                                lh.storeScalar(extractLaneI32(lb, lloc, v1, l),
+                                                               lh.gepArray(outPrimIndices, i32Ty, mlir::arith::AddIOp::create(lb, lloc, base3, lh.cInt(i32Ty, 1))));
+                                                lh.storeScalar(extractLaneI32(lb, lloc, v2, l),
+                                                               lh.gepArray(outPrimIndices, i32Ty, mlir::arith::AddIOp::create(lb, lloc, base3, lh.cInt(i32Ty, 2))));
+                                                mlir::scf::YieldOp::create(lb, lloc);
+                                            });
+                }
+                return true;
+            };
+
+            msHooks.storeVertexOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
+                                            const SimdVal& row, uint32_t col, const SimdVal& val,
+                                            const SimdVal& vertIdx, mlir::Value realMask) -> bool {
+                const DxilSigRecord* sig = msLoaded.findOutputSig(sigId);
+                if (!sig || val.kind != SimdVal::Kind::Vector || maxVerts == 0) return true;
+                mlir::Value vVec = convertSimdValToF32Vec(sb, sloc, val);
+
+                if (sig->systemValueType == 3) { // SV_Position
+                    if (col < 4) {
+                        for (uint32_t l = 0; l < simdWidth; ++l) {
+                            mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                            mlir::Value vIdx = extractLaneI32(sb, sloc, vertIdx, l);
+                            mlir::Value inB = mlir::arith::CmpIOp::create(
+                                sb, sloc, mlir::arith::CmpIPredicate::ult, vIdx,
+                                mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxVerts));
+                            mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                                    [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                        IRHelpers lh{lb, lloc, simdWidth};
+                                                        mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                                                            lb, lloc, mlir::arith::MulIOp::create(lb, lloc, vIdx, lh.cInt(i32Ty, 4)),
+                                                            lh.cInt(i32Ty, static_cast<int64_t>(col)));
+                                                        mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, vVec, static_cast<int64_t>(l));
+                                                        lh.storeScalar(vL, lh.gepArray(outVertPosXYZW, f32Ty, elemIdx));
+                                                        mlir::scf::YieldOp::create(lb, lloc);
+                                                    });
+                        }
+                    }
+                    return true;
+                }
+
+                bool hasTarget = false;
+                uint32_t baseSlot = 0;
+                bool useDynRow = false;
+                if (sig->systemValueType == 6) {
+                    auto cit = clipSigBaseIdx.find(sigId);
+                    if (cit != clipSigBaseIdx.end()) {
+                        uint32_t r = tryGetUniformConstUInt(row).value_or(0);
+                        uint32_t idx = cit->second + r * sig->cols + col;
+                        if (idx < 8 && (clipDistMask & (1u << idx))) {
+                            hasTarget = true;
+                            baseSlot = clipAttrOffset + idx;
+                        }
+                    }
+                } else if (sig->systemValueType == 7) {
+                    auto cit = cullSigBaseIdx.find(sigId);
+                    if (cit != cullSigBaseIdx.end()) {
+                        uint32_t r = tryGetUniformConstUInt(row).value_or(0);
+                        uint32_t idx = cit->second + r * sig->cols + col;
+                        if (idx < 8 && (cullDistMask & (1u << idx))) {
+                            hasTarget = true;
+                            baseSlot = cullAttrOffset + idx;
+                        }
+                    }
+                } else if (sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
+                    hasTarget = true;
+                    baseSlot = vpIndexAttrOffset;
+                } else if (sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
+                    hasTarget = true;
+                    baseSlot = shadingRateAttrOffset;
+                } else {
+                    auto it = vsToPsMap.find(sigId);
+                    if (it != vsToPsMap.end() && it->second.psTargetRow >= 0) {
+                        hasTarget = true;
+                        baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
+                        useDynRow = true;
+                    }
+                }
+
+                if (hasTarget && totalVSScalarAttrs > 0) {
+                    for (uint32_t l = 0; l < simdWidth; ++l) {
+                        mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                        mlir::Value vIdx = extractLaneI32(sb, sloc, vertIdx, l);
+                        mlir::Value inB = mlir::arith::CmpIOp::create(
+                            sb, sloc, mlir::arith::CmpIPredicate::ult, vIdx,
+                            mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxVerts));
+                        mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                    IRHelpers lh{lb, lloc, simdWidth};
+                                                    mlir::Value slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
+                                                    if (useDynRow) {
+                                                        if (auto rc = tryGetUniformConstUInt(row)) {
+                                                            if (*rc != 0) {
+                                                                slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot + (*rc) * 4));
+                                                            }
+                                                        } else {
+                                                            mlir::Value r32 = extractLaneI32(lb, lloc, row, l);
+                                                            slot32 = mlir::arith::AddIOp::create(
+                                                                lb, lloc, slot32, mlir::arith::MulIOp::create(lb, lloc, r32, lh.cInt(i32Ty, 4)));
+                                                        }
+                                                    }
+                                                    mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                                                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, vIdx, lh.cInt(i32Ty, totalVSScalarAttrs)),
+                                                        slot32);
+                                                    mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, vVec, static_cast<int64_t>(l));
+                                                    lh.storeScalar(vL, lh.gepArray(outVertAttrs, f32Ty, elemIdx));
+                                                    mlir::scf::YieldOp::create(lb, lloc);
+                                                });
+                    }
+                }
+                return true;
+            };
+
+            msHooks.storePrimitiveOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
+                                               const SimdVal& row, uint32_t col, const SimdVal& val,
+                                               const SimdVal& primIdx, mlir::Value realMask) -> bool {
+                const DxilSigRecord* sig = msLoaded.findPatchConstSig(sigId);
+                if (!sig || val.kind != SimdVal::Kind::Vector || maxPrims == 0) return true;
+
+                if (sig->systemValueType == 30) { // SV_CullPrimitive
+                    for (uint32_t l = 0; l < simdWidth; ++l) {
+                        mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
+                        mlir::Value inB = mlir::arith::CmpIOp::create(
+                            sb, sloc, mlir::arith::CmpIPredicate::ult, pIdx,
+                            mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxPrims));
+                        mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                    IRHelpers lh{lb, lloc, simdWidth};
+                                                    mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, val.vec, static_cast<int64_t>(l));
+                                                    mlir::Value nz;
+                                                    if (mlir::isa<mlir::IntegerType>(vL.getType())) {
+                                                        nz = mlir::arith::CmpIOp::create(
+                                                            lb, lloc, mlir::arith::CmpIPredicate::ne, vL, lh.cInt(vL.getType(), 0));
+                                                    } else {
+                                                        nz = mlir::arith::CmpFOp::create(
+                                                            lb, lloc, mlir::arith::CmpFPredicate::ONE, vL, lh.cFlt(0.0));
+                                                    }
+                                                    mlir::Value cByte = mlir::arith::SelectOp::create(
+                                                        lb, lloc, nz, lh.cInt(i8Ty, 1), lh.cInt(i8Ty, 0));
+                                                    lh.storeScalar(cByte, lh.gepArray(outPrimCull, i8Ty, pIdx));
+                                                    mlir::scf::YieldOp::create(lb, lloc);
+                                                });
+                    }
+                    return true;
+                }
+
+                if (sig->systemValueType == 10) { // SV_PrimitiveID
+                    for (uint32_t l = 0; l < simdWidth; ++l) {
+                        mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
+                        mlir::Value inB = mlir::arith::CmpIOp::create(
+                            sb, sloc, mlir::arith::CmpIPredicate::ult, pIdx,
+                            mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxPrims));
+                        mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                    IRHelpers lh{lb, lloc, simdWidth};
+                                                    lh.storeScalar(extractLaneI32(lb, lloc, val, l), lh.gepArray(outPrimId, i32Ty, pIdx));
+                                                    mlir::scf::YieldOp::create(lb, lloc);
+                                                });
+                    }
+                    return true;
+                }
+
+                mlir::Value vVec = convertSimdValToF32Vec(sb, sloc, val);
+                bool hasTarget = false;
+                uint32_t baseSlot = 0;
+                bool useDynRow = false;
+                if (sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
+                    hasTarget = true;
+                    baseSlot = vpIndexAttrOffset;
+                } else if (sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
+                    hasTarget = true;
+                    baseSlot = shadingRateAttrOffset;
+                } else {
+                    auto it = msPrimToPsMap.find(sigId);
+                    if (it != msPrimToPsMap.end() && it->second.psTargetRow >= 0) {
+                        hasTarget = true;
+                        baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
+                        useDynRow = true;
+                    }
+                }
+
+                if (hasTarget && totalVSScalarAttrs > 0) {
+                    for (uint32_t l = 0; l < simdWidth; ++l) {
+                        mlir::Value actL = mlir::vector::ExtractOp::create(sb, sloc, realMask, static_cast<int64_t>(l));
+                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
+                        mlir::Value inB = mlir::arith::CmpIOp::create(
+                            sb, sloc, mlir::arith::CmpIPredicate::ult, pIdx,
+                            mlir::arith::ConstantIntOp::create(sb, sloc, i32Ty, maxPrims));
+                        mlir::scf::IfOp::create(sb, sloc, mlir::arith::AndIOp::create(sb, sloc, actL, inB),
+                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                                    IRHelpers lh{lb, lloc, simdWidth};
+                                                    mlir::Value slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
+                                                    if (useDynRow) {
+                                                        if (auto rc = tryGetUniformConstUInt(row)) {
+                                                            if (*rc != 0) {
+                                                                slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot + (*rc) * 4));
+                                                            }
+                                                        } else {
+                                                            mlir::Value r32 = extractLaneI32(lb, lloc, row, l);
+                                                            slot32 = mlir::arith::AddIOp::create(
+                                                                lb, lloc, slot32, mlir::arith::MulIOp::create(lb, lloc, r32, lh.cInt(i32Ty, 4)));
+                                                        }
+                                                    }
+                                                    mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                                                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, pIdx, lh.cInt(i32Ty, totalVSScalarAttrs)),
+                                                        slot32);
+                                                    mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, vVec, static_cast<int64_t>(l));
+                                                    lh.storeScalar(vL, lh.gepArray(outPrimAttrs, f32Ty, elemIdx));
+                                                    mlir::scf::YieldOp::create(lb, lloc);
+                                                });
+                    }
+                }
+                return true;
+            };
+
+            if (!packetizeThreadGroupRegion(b, loc, combinedMod, msSrcFunc.getBody(), msLoaded, msEffectiveLayout,
+                                            simdWidth, rootCtx, gsBase, gx, gy, gz, entry, msHooks, outError)) {
+                return false;
+            }
+            mlir::func::ReturnOp::create(b, loc);
+        }
     }
 
     // --- 1a-tess. Emit @<vsSym>_hs, @<vsSym>_hspc, and @<vsSym>_ds ---
@@ -2030,7 +2545,7 @@ bool synthesizeGraphicsPSOMLIR(
                         for (uint32_t c = 0; c < pi.cols && (pi.startCol + c) < 4; ++c) {
                             uint32_t slot = (pi.startRow + r) * 4 + (pi.startCol + c);
                             if (slot >= 64) continue;
-                            if (pi.interpMode == 1) { // nointerpolation
+                            if (pi.interpMode == 1 || (msPrimAttrMask & (1ull << slot)) != 0) { // nointerpolation or MS per-primitive
                                 mlir::Value fv = ph.loadScalar(f32Ty, ph.gepBytes(triAttrFlatPtr, static_cast<int64_t>(slot * 4)));
                                 interpScalars[slot] = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), fv);
                             } else {
@@ -2408,6 +2923,26 @@ bool synthesizeGraphicsPSOMLIR(
     outMeta.numHSInputScalars = hasTess ? numHSInputScalars : 0;
     outMeta.numHSOutputScalars = hasTess ? numHSOutputScalars : 0;
     outMeta.numPatchConstScalars = hasTess ? numPatchConstScalars : 0;
+    outMeta.hasMS = hasMS ? 1 : 0;
+    outMeta.hasAS = hasAS ? 1 : 0;
+    if (hasMS) {
+        outMeta.msThreadGroupSize[0] = msLoaded.threadGroupSize[0];
+        outMeta.msThreadGroupSize[1] = msLoaded.threadGroupSize[1];
+        outMeta.msThreadGroupSize[2] = msLoaded.threadGroupSize[2];
+        outMeta.msGroupSharedBytes = msLoaded.groupSharedBytes;
+        outMeta.msMaxVertexCount = msLoaded.msMaxVertexCount;
+        outMeta.msMaxPrimitiveCount = msLoaded.msMaxPrimitiveCount;
+        outMeta.msOutputTopology = msLoaded.msOutputTopology;
+        outMeta.msPayloadBytes = msLoaded.msPayloadBytes;
+        outMeta.msPrimAttrMask = msPrimAttrMask;
+    }
+    if (hasAS) {
+        outMeta.asThreadGroupSize[0] = asLoaded.threadGroupSize[0];
+        outMeta.asThreadGroupSize[1] = asLoaded.threadGroupSize[1];
+        outMeta.asThreadGroupSize[2] = asLoaded.threadGroupSize[2];
+        outMeta.asGroupSharedBytes = asLoaded.groupSharedBytes;
+        outMeta.asPayloadBytes = asLoaded.asPayloadBytes;
+    }
     outMeta.psWritesDepth = psWritesDepth ? 1 : 0;
     outMeta.psUsesDiscard = psUsesDiscard ? 1 : 0;
     outMeta.psHasSideEffects = psHasSideEffects ? 1 : 0;
@@ -2418,10 +2953,11 @@ bool compileGraphicsPSO(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     CompiledGraphicsPSO& outPSO,
-    std::string& outError) {
+    std::string& outError,
+    const MeshShaderStages& meshStages) {
     uint32_t simdWidth = getTargetSimdWidth();
     uint64_t lo = 0, hi = 0;
-    computeGraphicsPSOHash(desc, rootLayout, simdWidth, lo, hi);
+    computeGraphicsPSOHash(desc, rootLayout, simdWidth, lo, hi, meshStages);
     outPSO.cacheHashLo = lo;
     outPSO.cacheHashHi = hi;
 
@@ -2438,7 +2974,7 @@ bool compileGraphicsPSO(
     CachedPSOMeta meta;
     if (!synthesizeGraphicsPSOMLIR(
             desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, combinedMod, meta,
-            outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError)) {
+            outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError, meshStages)) {
         return false;
     }
 
@@ -2475,6 +3011,22 @@ bool compileGraphicsPSO(
     outPSO.numHSInputScalars = meta.numHSInputScalars;
     outPSO.numHSOutputScalars = meta.numHSOutputScalars;
     outPSO.numPatchConstScalars = meta.numPatchConstScalars;
+    outPSO.hasMS = meta.hasMS != 0;
+    outPSO.hasAS = meta.hasAS != 0;
+    outPSO.msThreadGroupSize[0] = meta.msThreadGroupSize[0];
+    outPSO.msThreadGroupSize[1] = meta.msThreadGroupSize[1];
+    outPSO.msThreadGroupSize[2] = meta.msThreadGroupSize[2];
+    outPSO.msGroupSharedBytes = meta.msGroupSharedBytes;
+    outPSO.msMaxVertexCount = meta.msMaxVertexCount;
+    outPSO.msMaxPrimitiveCount = meta.msMaxPrimitiveCount;
+    outPSO.msOutputTopology = meta.msOutputTopology;
+    outPSO.msPayloadBytes = meta.msPayloadBytes;
+    outPSO.msPrimAttrMask = meta.msPrimAttrMask;
+    outPSO.asThreadGroupSize[0] = meta.asThreadGroupSize[0];
+    outPSO.asThreadGroupSize[1] = meta.asThreadGroupSize[1];
+    outPSO.asThreadGroupSize[2] = meta.asThreadGroupSize[2];
+    outPSO.asGroupSharedBytes = meta.asGroupSharedBytes;
+    outPSO.asPayloadBytes = meta.asPayloadBytes;
     outPSO.psWritesDepth = meta.psWritesDepth != 0;
     outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
     outPSO.psHasSideEffects = meta.psHasSideEffects != 0;

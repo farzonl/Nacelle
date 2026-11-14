@@ -227,6 +227,10 @@ void STDMETHODCALLTYPE NacelleCommandList::Dispatch(UINT x, UINT y, UINT z) {
     commands_.push_back(CmdDispatch{x, y, z});
 }
 
+void STDMETHODCALLTYPE NacelleCommandList::DispatchMesh(UINT x, UINT y, UINT z) {
+    commands_.push_back(CmdDispatchMesh{x, y, z});
+}
+
 void STDMETHODCALLTYPE NacelleCommandList::CopyBufferRegion(ID3D12Resource* pDst, UINT64 dstOff, ID3D12Resource* pSrc, UINT64 srcOff, UINT64 bytes) {
     if (pDst) { pDst->AddRef(); heldRefs_.push_back(pDst); }
     if (pSrc) { pSrc->AddRef(); heldRefs_.push_back(pSrc); }
@@ -1018,6 +1022,8 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 }
             } else if constexpr (std::is_same_v<T, CmdDispatch>) {
                 execDispatch(pool, state, c.x, c.y, c.z);
+            } else if constexpr (std::is_same_v<T, CmdDispatchMesh>) {
+                executeRasterMeshDispatch(pool, state.gfx, MeshDispatchParams{c.x, c.y, c.z});
             } else if constexpr (std::is_same_v<T, CmdDrawInstanced>) {
                 executeRasterDrawCall(pool, state.gfx, DrawCallParams{false, c.vCount, c.iCount, c.startV, 0, c.startI});
             } else if constexpr (std::is_same_v<T, CmdDrawIndexedInstanced>) {
@@ -1284,6 +1290,12 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                             D3D12_DISPATCH_ARGUMENTS da;
                             std::memcpy(&da, rec + off, sizeof(da));
                             execDispatch(pool, state, da.ThreadGroupCountX, da.ThreadGroupCountY, da.ThreadGroupCountZ);
+                            off += sizeof(da);
+                        } else if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
+                            D3D12_DISPATCH_MESH_ARGUMENTS da;
+                            std::memcpy(&da, rec + off, sizeof(da));
+                            executeRasterMeshDispatch(pool, state.gfx, MeshDispatchParams{
+                                da.ThreadGroupCountX, da.ThreadGroupCountY, da.ThreadGroupCountZ});
                             off += sizeof(da);
                         }
                     }

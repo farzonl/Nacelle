@@ -385,6 +385,308 @@ void processTriangle(
     }
 }
 
+void setupClippedLine(
+    const ShadedVertex& v0,
+    const ShadedVertex& v1,
+    const float* flatAttrsV0,
+    uint32_t primitiveId,
+    uint32_t viewportIndex,
+    uint32_t shadingRate,
+    const D3D12_VIEWPORT& vp,
+    const D3D12_RECT& scissor,
+    const D3D12_RASTERIZER_DESC& rast,
+    RasterScene& scene,
+    bool unclipped = false) {
+    if (v0.clipW <= 1e-7f || v1.clipW <= 1e-7f) return;
+
+    float iw0 = 1.0f / v0.clipW;
+    float iw1 = 1.0f / v1.clipW;
+
+    float ndcX0 = v0.clipX * iw0, ndcY0 = v0.clipY * iw0, ndcZ0 = v0.clipZ * iw0;
+    float ndcX1 = v1.clipX * iw1, ndcY1 = v1.clipY * iw1, ndcZ1 = v1.clipZ * iw1;
+
+    float sx0 = vp.TopLeftX + (ndcX0 * 0.5f + 0.5f) * vp.Width;
+    float sy0 = vp.TopLeftY + (-ndcY0 * 0.5f + 0.5f) * vp.Height;
+    float sz0 = vp.MinDepth + ndcZ0 * (vp.MaxDepth - vp.MinDepth);
+
+    float sx1 = vp.TopLeftX + (ndcX1 * 0.5f + 0.5f) * vp.Width;
+    float sy1 = vp.TopLeftY + (-ndcY1 * 0.5f + 0.5f) * vp.Height;
+    float sz1 = vp.MinDepth + ndcZ1 * (vp.MaxDepth - vp.MinDepth);
+
+    int64_t fx0 = std::llround(static_cast<double>(sx0) * 256.0);
+    int64_t fy0 = std::llround(static_cast<double>(sy0) * 256.0);
+    int64_t fx1 = std::llround(static_cast<double>(sx1) * 256.0);
+    int64_t fy1 = std::llround(static_cast<double>(sy1) * 256.0);
+    if (fx0 == fx1 && fy0 == fy1) return;
+
+    float lx0 = static_cast<float>(fx0) * (1.0f / 256.0f);
+    float ly0 = static_cast<float>(fy0) * (1.0f / 256.0f);
+    float lx1 = static_cast<float>(fx1) * (1.0f / 256.0f);
+    float ly1 = static_cast<float>(fy1) * (1.0f / 256.0f);
+
+    int32_t minX = std::max<int32_t>(scissor.left, static_cast<int32_t>(std::floor(std::min(lx0, lx1))) - 1);
+    int32_t maxX = std::min<int32_t>(scissor.right, static_cast<int32_t>(std::ceil(std::max(lx0, lx1))) + 2);
+    int32_t minY = std::max<int32_t>(scissor.top, static_cast<int32_t>(std::floor(std::min(ly0, ly1))) - 1);
+    int32_t maxY = std::min<int32_t>(scissor.bottom, static_cast<int32_t>(std::ceil(std::max(ly0, ly1))) + 2);
+    if (minX >= maxX || minY >= maxY) return;
+
+    float depthBiasVal = 0.0f;
+    if (rast.DepthBias != 0) {
+        depthBiasVal = static_cast<float>(rast.DepthBias) * (1.0f / 16777216.0f);
+        if (rast.DepthBiasClamp > 0.0f) {
+            depthBiasVal = std::min(depthBiasVal, rast.DepthBiasClamp);
+        } else if (rast.DepthBiasClamp < 0.0f) {
+            depthBiasVal = std::max(depthBiasVal, rast.DepthBiasClamp);
+        }
+    }
+
+    SetupTriangle tri;
+    tri.isLine = true;
+    tri.lineX0 = lx0;
+    tri.lineY0 = ly0;
+    tri.lineX1 = lx1;
+    tri.lineY1 = ly1;
+    tri.minX = minX;
+    tri.maxX = maxX;
+    tri.minY = minY;
+    tri.maxY = maxY;
+    tri.isFrontFace = 1u;
+    tri.primitiveId = primitiveId;
+    tri.viewportIndex = viewportIndex;
+    tri.shadingRate = shadingRate;
+
+    tri.invW[0] = iw0;
+    tri.invW[1] = iw1 - iw0;
+    tri.invW[2] = 0.0f;
+
+    for (int k = 0; k < 2; ++k) {
+        float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
+        float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
+        float b0w = b0 * iw0;
+        float b1w = b1 * iw1;
+        tri.origBary[k * 3 + 0] = b0w;
+        tri.origBary[k * 3 + 1] = b1w - b0w;
+        tri.origBary[k * 3 + 2] = 0.0f;
+    }
+
+    float z0 = sz0 + depthBiasVal;
+    float z1 = sz1 + depthBiasVal;
+    tri.depth[0] = z0;
+    tri.depth[1] = z1 - z0;
+    tri.depth[2] = 0.0f;
+
+    uint32_t numScalars = scene.numPSInputScalars;
+    tri.attrBaseOffset = static_cast<uint32_t>(scene.attrBaseArena.size());
+    tri.attrFlatOffset = static_cast<uint32_t>(scene.attrFlatArena.size());
+
+    if (numScalars > 0) {
+        scene.attrBaseArena.resize(tri.attrBaseOffset + numScalars * 3);
+        scene.attrFlatArena.resize(tri.attrFlatOffset + numScalars);
+        float* baseDst = scene.attrBaseArena.data() + tri.attrBaseOffset;
+        float* flatDst = scene.attrFlatArena.data() + tri.attrFlatOffset;
+        for (uint32_t s = 0; s < numScalars; ++s) {
+            float a0 = v0.attrs[s] * iw0;
+            float a1 = v1.attrs[s] * iw1;
+            baseDst[s * 3 + 0] = a0;
+            baseDst[s * 3 + 1] = a1 - a0;
+            baseDst[s * 3 + 2] = 0.0f;
+            flatDst[s] = flatAttrsV0[s];
+        }
+    }
+
+    scene.triangles.push_back(tri);
+}
+
+void processLine(
+    const ShadedVertex& v0,
+    const ShadedVertex& v1,
+    uint32_t primitiveId,
+    const D3D12_VIEWPORT& /*defaultVp*/,
+    const D3D12_RASTERIZER_DESC& rast,
+    RasterScene& scene) {
+    uint32_t numScalars = scene.numPSInputScalars;
+
+    uint32_t rawVpIdx = 0;
+    if (scene.hasViewportArrayIndex && scene.vpIndexAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&rawVpIdx, &v0.attrs[scene.vpIndexAttrOffset], sizeof(rawVpIdx));
+    }
+    uint32_t vpIdx = (rawVpIdx < scene.numViewports) ? rawVpIdx : 0u;
+    uint32_t scIdx = (rawVpIdx < scene.numScissors) ? rawVpIdx : 0u;
+    const D3D12_VIEWPORT& vp = scene.viewports[vpIdx];
+    const D3D12_RECT& scissor = scene.scissors[scIdx];
+
+    uint32_t primSR = 0;
+    if (scene.hasPerPrimShadingRate && scene.shadingRateAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&primSR, &v0.attrs[scene.shadingRateAttrOffset], sizeof(primSR));
+    }
+    uint32_t shadingRate = combineShadingRate(scene.drawShadingRate, primSR, scene.shadingRateCombiner);
+
+    if (scene.cullDistMask != 0) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (!(scene.cullDistMask & (1u << k))) continue;
+            uint32_t s = scene.cullAttrOffset + k;
+            if (s < kMaxPSInputScalars && v0.attrs[s] < 0.0f && v1.attrs[s] < 0.0f) {
+                return;
+            }
+        }
+    }
+
+    auto insideGuardBand = [&](const ShadedVertex& v) {
+        if (!(v.clipW > 1e-6f && (!rast.DepthClipEnable || (v.clipZ >= 0.0f && v.clipZ <= v.clipW)))) {
+            return false;
+        }
+        float iw = 1.0f / v.clipW;
+        float sx = vp.TopLeftX + (v.clipX * iw * 0.5f + 0.5f) * vp.Width;
+        float sy = vp.TopLeftY + (-v.clipY * iw * 0.5f + 0.5f) * vp.Height;
+        if (!(sx >= -16384.0f && sx <= 16384.0f && sy >= -16384.0f && sy <= 16384.0f)) {
+            return false;
+        }
+        if (scene.clipDistMask != 0) {
+            for (uint32_t k = 0; k < 8; ++k) {
+                if (!(scene.clipDistMask & (1u << k))) continue;
+                uint32_t s = scene.clipAttrOffset + k;
+                if (s < kMaxPSInputScalars && v.attrs[s] < 0.0f) return false;
+            }
+        }
+        return true;
+    };
+    if (insideGuardBand(v0) && insideGuardBand(v1)) {
+        setupClippedLine(v0, v1, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene, /*unclipped=*/true);
+        return;
+    }
+
+    ShadedVertex a = v0;
+    ShadedVertex b = v1;
+    a.origBary[0] = 1.0f; a.origBary[1] = 0.0f; a.origBary[2] = 0.0f;
+    b.origBary[0] = 0.0f; b.origBary[1] = 1.0f; b.origBary[2] = 0.0f;
+
+    auto clipSegPlane = [&](auto&& eval) -> bool {
+        float d0 = eval(a);
+        float d1 = eval(b);
+        if (d0 < 0.0f && d1 < 0.0f) return false;
+        if (d0 >= 0.0f && d1 >= 0.0f) return true;
+        float denom = d0 - d1;
+        float t = (std::fabs(denom) > 1e-20f) ? std::clamp(d0 / denom, 0.0f, 1.0f) : 0.0f;
+        ShadedVertex interp;
+        interp.clipX = a.clipX + t * (b.clipX - a.clipX);
+        interp.clipY = a.clipY + t * (b.clipY - a.clipY);
+        interp.clipZ = a.clipZ + t * (b.clipZ - a.clipZ);
+        interp.clipW = a.clipW + t * (b.clipW - a.clipW);
+        for (int k = 0; k < 3; ++k) {
+            interp.origBary[k] = a.origBary[k] + t * (b.origBary[k] - a.origBary[k]);
+        }
+        for (uint32_t s = 0; s < numScalars; ++s) {
+            interp.attrs[s] = a.attrs[s] + t * (b.attrs[s] - a.attrs[s]);
+        }
+        if (d0 < 0.0f) {
+            a = interp;
+        } else {
+            b = interp;
+        }
+        return true;
+    };
+
+    if (!clipSegPlane([](const ShadedVertex& v) { return v.clipW - 1e-6f; })) return;
+    if (!clipSegPlane([](const ShadedVertex& v) { return v.clipX + v.clipW; })) return;
+    if (!clipSegPlane([](const ShadedVertex& v) { return v.clipW - v.clipX; })) return;
+    if (!clipSegPlane([](const ShadedVertex& v) { return v.clipY + v.clipW; })) return;
+    if (!clipSegPlane([](const ShadedVertex& v) { return v.clipW - v.clipY; })) return;
+    if (rast.DepthClipEnable) {
+        if (!clipSegPlane([](const ShadedVertex& v) { return v.clipZ; })) return;
+        if (!clipSegPlane([](const ShadedVertex& v) { return v.clipW - v.clipZ; })) return;
+    }
+    if (scene.clipDistMask != 0) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (!(scene.clipDistMask & (1u << k))) continue;
+            uint32_t s = scene.clipAttrOffset + k;
+            if (s >= kMaxPSInputScalars) continue;
+            if (!clipSegPlane([s](const ShadedVertex& v) { return v.attrs[s]; })) return;
+        }
+    }
+
+    setupClippedLine(a, b, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene, /*unclipped=*/false);
+}
+
+bool initRasterSceneHeader(
+    const GraphicsExecutionState& state,
+    const CompiledGraphicsPSO& compiled,
+    RasterScene& outScene,
+    D3D12_VIEWPORT& outDefaultVp) {
+    uint32_t fbW = 0;
+    uint32_t fbH = 0;
+    for (uint32_t i = 0; i < state.numRTVs; ++i) {
+        if (state.rtvs[i].resource) {
+            const auto& rd = state.rtvs[i].resource->resourceDesc();
+            uint32_t mip = state.rtvs[i].mip_slice;
+            fbW = std::max<uint32_t>(fbW, std::max<uint32_t>(1u, static_cast<uint32_t>(rd.Width >> mip)));
+            fbH = std::max<uint32_t>(fbH, std::max<uint32_t>(1u, rd.Height >> mip));
+        }
+    }
+    if (state.hasDSV && state.dsv.resource) {
+        const auto& dd = state.dsv.resource->resourceDesc();
+        uint32_t mip = state.dsv.mip_slice;
+        fbW = std::max<uint32_t>(fbW, std::max<uint32_t>(1u, static_cast<uint32_t>(dd.Width >> mip)));
+        fbH = std::max<uint32_t>(fbH, std::max<uint32_t>(1u, dd.Height >> mip));
+    }
+    if (fbW == 0 || fbH == 0) {
+        return false;
+    }
+
+    outDefaultVp = D3D12_VIEWPORT{0.0f, 0.0f, static_cast<float>(fbW), static_cast<float>(fbH), 0.0f, 1.0f};
+    if (state.numViewports > 0) {
+        outDefaultVp = state.viewports[0];
+    }
+
+    D3D12_RECT defaultScissor{0, 0, static_cast<LONG>(fbW), static_cast<LONG>(fbH)};
+    outScene.numViewports = std::max<uint32_t>(1u, std::min<uint32_t>(state.numViewports, 16u));
+    outScene.numScissors = std::max<uint32_t>(1u, std::min<uint32_t>(state.numScissors, 16u));
+    for (uint32_t i = 0; i < 16; ++i) {
+        outScene.viewports[i] = (i < state.numViewports) ? state.viewports[i] : outDefaultVp;
+        if (i < state.numScissors) {
+            outScene.scissors[i].left = std::max<LONG>(0, state.scissors[i].left);
+            outScene.scissors[i].top = std::max<LONG>(0, state.scissors[i].top);
+            outScene.scissors[i].right = std::min<LONG>(static_cast<LONG>(fbW), state.scissors[i].right);
+            outScene.scissors[i].bottom = std::min<LONG>(static_cast<LONG>(fbH), state.scissors[i].bottom);
+        } else {
+            outScene.scissors[i] = (state.numScissors > 0) ? outScene.scissors[0] : defaultScissor;
+        }
+    }
+    bool anyNonEmptyScissor = false;
+    for (uint32_t i = 0; i < outScene.numScissors; ++i) {
+        if (outScene.scissors[i].left < outScene.scissors[i].right &&
+            outScene.scissors[i].top < outScene.scissors[i].bottom) {
+            anyNonEmptyScissor = true;
+            break;
+        }
+    }
+    if (!anyNonEmptyScissor) {
+        return false;
+    }
+
+    outScene.fbWidth = fbW;
+    outScene.fbHeight = fbH;
+    outScene.numTilesX = (fbW + kTileSize - 1) / kTileSize;
+    outScene.numTilesY = (fbH + kTileSize - 1) / kTileSize;
+    outScene.numPSInputScalars = std::min<uint32_t>(
+        std::max(compiled.totalVSScalarAttrs, compiled.numPSInputRegs * 4), kMaxPSInputScalars);
+    outScene.clipDistMask = compiled.clipDistMask;
+    outScene.cullDistMask = compiled.cullDistMask;
+    outScene.clipAttrOffset = compiled.clipAttrOffset;
+    outScene.cullAttrOffset = compiled.cullAttrOffset;
+    outScene.hasViewportArrayIndex = compiled.hasViewportArrayIndex;
+    outScene.vpIndexAttrOffset = compiled.vpIndexAttrOffset;
+    outScene.hasPerPrimShadingRate = compiled.hasPerPrimShadingRate;
+    outScene.shadingRateAttrOffset = compiled.shadingRateAttrOffset;
+    outScene.drawShadingRate = state.shadingRate;
+    outScene.shadingRateCombiner = state.shadingRateCombiners[0];
+    outScene.triangles.clear();
+    outScene.attrBaseArena.clear();
+    outScene.attrFlatArena.clear();
+    {
+        return true;
+    }
+}
+
 } // namespace
 
 bool buildRasterScene(
@@ -519,8 +821,16 @@ bool buildRasterScene(
             break;
         }
     } else {
-        isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
-                   state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+        if (state.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST) {
+            vertsPerPrim = 2;
+            isStrip = false;
+        } else if (state.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP) {
+            vertsPerPrim = 2;
+            isStrip = true;
+        } else {
+            isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+                       state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+        }
     }
 
     // Build primitive vertex index list (referencing unique vertex indices)
@@ -675,7 +985,11 @@ bool buildRasterScene(
                 uint32_t baseV = 0;
                 for (uint32_t s = 0; s < numStrips; ++s) {
                     uint32_t sc = gsStripCounts[s];
-                    if (compiled->gsOutputTopology == 5 && sc >= 3) { // TriangleStrip
+                    if (compiled->gsOutputTopology == 3 && sc >= 2) { // LineStrip
+                        for (uint32_t k = 0; k + 1 < sc; ++k) {
+                            processLine(makeGsVert(baseV + k), makeGsVert(baseV + k + 1), primId, vp, rast, outScene);
+                        }
+                    } else if (compiled->gsOutputTopology == 5 && sc >= 3) { // TriangleStrip
                         for (uint32_t k = 0; k + 2 < sc; ++k) {
                             uint32_t i0 = baseV + k;
                             uint32_t i1 = baseV + k + ((k & 1u) ? 2u : 1u);
@@ -873,7 +1187,18 @@ bool buildRasterScene(
                 runGSOnPrim(primVerts.data(), vertsPerPrim, p, vsOutScalars);
             }
         } else {
-            for (size_t t = 0; t + 2 < triVerts.size(); t += 3) {
+            if (vertsPerPrim == 2) {
+                for (size_t t = 0; t + 1 < triVerts.size(); t += 2) {
+                    processLine(
+                        shadedVerts[triVerts[t + 0]],
+                        shadedVerts[triVerts[t + 1]],
+                        static_cast<uint32_t>(t / 2),
+                        vp,
+                        rast,
+                        outScene);
+                }
+            }
+            for (size_t t = 0; vertsPerPrim == 3 && t + 2 < triVerts.size(); t += 3) {
                 processTriangle(
                     shadedVerts[triVerts[t + 0]],
                     shadedVerts[triVerts[t + 1]],
@@ -884,6 +1209,197 @@ bool buildRasterScene(
                     outScene,
                     polyA,
                     polyB);
+            }
+        }
+    }
+
+    return !outScene.triangles.empty();
+}
+
+bool buildMeshRasterScene(
+    BS::thread_pool<>& /*pool*/,
+    const GraphicsExecutionState& state,
+    const MeshDispatchParams& dispatch,
+    RasterScene& outScene) {
+    if (!state.pso || state.pso->isCompute()) return false;
+    if (dispatch.groupCountX == 0 || dispatch.groupCountY == 0 || dispatch.groupCountZ == 0) {
+        return false;
+    }
+    const auto& compiled = state.pso->graphicsPSO();
+    if (!compiled || !compiled->hasMS) return false;
+
+    CompiledMeshFn msFn = compiled->msFn.load(std::memory_order_acquire);
+    CompiledAmplificationFn asFn = compiled->hasAS ? compiled->asFn.load(std::memory_order_acquire) : nullptr;
+    if (!msFn || (compiled->hasAS && !asFn)) {
+        waitForAllAsyncJITTasks();
+        msFn = compiled->msFn.load(std::memory_order_acquire);
+        if (compiled->hasAS) {
+            asFn = compiled->asFn.load(std::memory_order_acquire);
+        }
+    }
+    if (!msFn || (compiled->hasAS && !asFn)) return false;
+    ScopedFlushDenormals flushDenorms;
+
+    D3D12_VIEWPORT vp{};
+    if (!initRasterSceneHeader(state, *compiled, outScene, vp)) {
+        return false;
+    }
+
+    struct PendingMeshDispatch {
+        uint32_t gx = 0;
+        uint32_t gy = 0;
+        uint32_t gz = 0;
+        std::vector<uint8_t> payload;
+    };
+    std::vector<PendingMeshDispatch> meshDispatches;
+
+    const uint32_t payloadBytes = std::max<uint32_t>({64u, compiled->asPayloadBytes, compiled->msPayloadBytes});
+    if (compiled->hasAS) {
+        std::vector<uint8_t> asScratch(std::max<uint32_t>(64u, compiled->asGroupSharedBytes), 0);
+        for (uint32_t az = 0; az < dispatch.groupCountZ; ++az) {
+            for (uint32_t ay = 0; ay < dispatch.groupCountY; ++ay) {
+                for (uint32_t ax = 0; ax < dispatch.groupCountX; ++ax) {
+                    if (compiled->asGroupSharedBytes > 0) {
+                        std::memset(asScratch.data(), 0, compiled->asGroupSharedBytes);
+                    }
+                    uint32_t outDims[4]{0, 0, 0, 0};
+                    std::vector<uint8_t> payloadBuf(payloadBytes, 0);
+
+                    AmplificationThreadGroupArgs asArgs{};
+                    asArgs.rootCtx = &state.rootCtx;
+                    asArgs.groupSharedScratch = asScratch.data();
+                    asArgs.gx = ax;
+                    asArgs.gy = ay;
+                    asArgs.gz = az;
+                    asArgs.ngx = dispatch.groupCountX;
+                    asArgs.ngy = dispatch.groupCountY;
+                    asArgs.ngz = dispatch.groupCountZ;
+                    asArgs.outDispatchDims = outDims;
+                    asArgs.outPayload = payloadBuf.data();
+                    asFn(&asArgs);
+
+                    if (outDims[3] != 0 && outDims[0] > 0 && outDims[1] > 0 && outDims[2] > 0) {
+                        meshDispatches.push_back(PendingMeshDispatch{
+                            outDims[0], outDims[1], outDims[2], std::move(payloadBuf)});
+                    }
+                }
+            }
+        }
+    } else {
+        PendingMeshDispatch single{};
+        single.gx = dispatch.groupCountX;
+        single.gy = dispatch.groupCountY;
+        single.gz = dispatch.groupCountZ;
+        single.payload.assign(payloadBytes, 0);
+        meshDispatches.push_back(std::move(single));
+    }
+
+    if (meshDispatches.empty()) return false;
+
+    const D3D12_RASTERIZER_DESC& rast = state.pso->graphicsDesc().RasterizerState;
+    const uint32_t maxVerts = std::max<uint32_t>(1u, compiled->msMaxVertexCount);
+    const uint32_t maxPrims = std::max<uint32_t>(1u, compiled->msMaxPrimitiveCount);
+    const uint32_t attrStride = compiled->totalVSScalarAttrs;
+    const uint32_t copyScalars = std::min<uint32_t>(attrStride, kMaxPSInputScalars);
+    const uint64_t primAttrMask = compiled->msPrimAttrMask;
+
+    std::vector<uint8_t> msScratch(std::max<uint32_t>(64u, compiled->msGroupSharedBytes), 0);
+    std::vector<float> outVertPosXYZW(maxVerts * 4u, 0.0f);
+    std::vector<float> outVertAttrs(std::max<size_t>(1, static_cast<size_t>(maxVerts) * attrStride), 0.0f);
+    std::vector<uint32_t> outPrimIndices(maxPrims * 3u, 0u);
+    std::vector<float> outPrimAttrs(std::max<size_t>(1, static_cast<size_t>(maxPrims) * attrStride), 0.0f);
+    std::vector<uint8_t> outPrimCull(maxPrims, 0u);
+    std::vector<uint32_t> outPrimId(maxPrims, 0u);
+    std::vector<ShadedVertex> polyA, polyB;
+
+    auto makeMeshVertex = [&](uint32_t vIdx) -> ShadedVertex {
+        ShadedVertex sv;
+        sv.clipX = outVertPosXYZW[vIdx * 4u + 0];
+        sv.clipY = outVertPosXYZW[vIdx * 4u + 1];
+        sv.clipZ = outVertPosXYZW[vIdx * 4u + 2];
+        sv.clipW = outVertPosXYZW[vIdx * 4u + 3];
+        for (uint32_t s = 0; s < copyScalars; ++s) {
+            sv.attrs[s] = outVertAttrs[static_cast<size_t>(vIdx) * attrStride + s];
+        }
+        return sv;
+    };
+
+    auto applyPrimAttrs = [&](ShadedVertex& v0, uint32_t pIdx) {
+        if (primAttrMask == 0 || copyScalars == 0) return;
+        const uint32_t limit = std::min<uint32_t>(copyScalars, 64u);
+        for (uint32_t s = 0; s < limit; ++s) {
+            if ((primAttrMask & (1ull << s)) != 0) {
+                v0.attrs[s] = outPrimAttrs[static_cast<size_t>(pIdx) * attrStride + s];
+            }
+        }
+    };
+
+    for (const auto& md : meshDispatches) {
+        for (uint32_t gz = 0; gz < md.gz; ++gz) {
+            for (uint32_t gy = 0; gy < md.gy; ++gy) {
+                for (uint32_t gx = 0; gx < md.gx; ++gx) {
+                    if (compiled->msGroupSharedBytes > 0) {
+                        std::memset(msScratch.data(), 0, compiled->msGroupSharedBytes);
+                    }
+                    uint32_t outCounts[2]{0, 0};
+                    std::fill(outVertPosXYZW.begin(), outVertPosXYZW.end(), 0.0f);
+                    std::fill(outVertAttrs.begin(), outVertAttrs.end(), 0.0f);
+                    std::fill(outPrimIndices.begin(), outPrimIndices.end(), 0u);
+                    std::fill(outPrimAttrs.begin(), outPrimAttrs.end(), 0.0f);
+                    std::fill(outPrimCull.begin(), outPrimCull.end(), 0u);
+                    for (uint32_t p = 0; p < maxPrims; ++p) {
+                        outPrimId[p] = p;
+                    }
+
+                    MeshThreadGroupArgs msArgs{};
+                    msArgs.rootCtx = &state.rootCtx;
+                    msArgs.groupSharedScratch = msScratch.data();
+                    msArgs.payloadPtr = md.payload.data();
+                    msArgs.gx = gx;
+                    msArgs.gy = gy;
+                    msArgs.gz = gz;
+                    msArgs.ngx = md.gx;
+                    msArgs.ngy = md.gy;
+                    msArgs.ngz = md.gz;
+                    msArgs.outCounts = outCounts;
+                    msArgs.outVertPosXYZW = outVertPosXYZW.data();
+                    msArgs.outVertAttrs = outVertAttrs.data();
+                    msArgs.outPrimIndices = outPrimIndices.data();
+                    msArgs.outPrimAttrs = outPrimAttrs.data();
+                    msArgs.outPrimCull = outPrimCull.data();
+                    msArgs.outPrimId = outPrimId.data();
+                    msFn(&msArgs);
+
+                    const uint32_t nv = std::min<uint32_t>(outCounts[0], compiled->msMaxVertexCount);
+                    const uint32_t np = std::min<uint32_t>(outCounts[1], compiled->msMaxPrimitiveCount);
+                    if (nv == 0 || np == 0) continue;
+
+                    if (compiled->msOutputTopology == 1) { // line
+                        for (uint32_t p = 0; p < np; ++p) {
+                            if (outPrimCull[p] != 0) continue;
+                            uint32_t i0 = outPrimIndices[p * 3u + 0];
+                            uint32_t i1 = outPrimIndices[p * 3u + 1];
+                            if (i0 >= nv || i1 >= nv) continue;
+                            ShadedVertex v0 = makeMeshVertex(i0);
+                            ShadedVertex v1 = makeMeshVertex(i1);
+                            applyPrimAttrs(v0, p);
+                            processLine(v0, v1, outPrimId[p], vp, rast, outScene);
+                        }
+                    } else { // triangle
+                        for (uint32_t p = 0; p < np; ++p) {
+                            if (outPrimCull[p] != 0) continue;
+                            uint32_t i0 = outPrimIndices[p * 3u + 0];
+                            uint32_t i1 = outPrimIndices[p * 3u + 1];
+                            uint32_t i2 = outPrimIndices[p * 3u + 2];
+                            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+                            ShadedVertex v0 = makeMeshVertex(i0);
+                            ShadedVertex v1 = makeMeshVertex(i1);
+                            ShadedVertex v2 = makeMeshVertex(i2);
+                            applyPrimAttrs(v0, p);
+                            processTriangle(v0, v1, v2, outPrimId[p], vp, rast, outScene, polyA, polyB);
+                        }
+                    }
+                }
             }
         }
     }

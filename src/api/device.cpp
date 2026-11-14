@@ -159,6 +159,14 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
         return S_OK;
     }
+    case D3D12_FEATURE_D3D12_OPTIONS7: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->MeshShaderTier = D3D12_MESH_SHADER_TIER_1;
+        o->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+        return S_OK;
+    }
     case D3D12_FEATURE_D3D12_OPTIONS9: {
         if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS9)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9*>(pData);
@@ -535,6 +543,131 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::SetEventOnMultipleFenceCompletion(
     }
     signalOsEvent(hEvent);
     return S_OK;
+}
+
+namespace {
+
+struct PipelineStreamParser final : ID3DX12PipelineParserCallbacks {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gfxDesc{};
+    MeshShaderStages meshStages{};
+    D3D12_SHADER_BYTECODE csBytecode{};
+    bool seenDSS = false;
+    bool seenMS = false;
+    bool seenCS = false;
+    bool seenTopology = false;
+
+    PipelineStreamParser() noexcept {
+        gfxDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        gfxDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        gfxDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+        gfxDesc.DepthStencilState.DepthEnable = FALSE;
+        gfxDesc.SampleMask = UINT_MAX;
+        gfxDesc.SampleDesc = DXGI_SAMPLE_DESC{1, 0};
+        gfxDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    }
+
+    void FlagsCb(D3D12_PIPELINE_STATE_FLAGS v) override { gfxDesc.Flags = v; }
+    void NodeMaskCb(UINT v) override { gfxDesc.NodeMask = v; }
+    void RootSignatureCb(ID3D12RootSignature* v) override { gfxDesc.pRootSignature = v; }
+    void InputLayoutCb(const D3D12_INPUT_LAYOUT_DESC& v) override { gfxDesc.InputLayout = v; }
+    void IBStripCutValueCb(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE v) override { gfxDesc.IBStripCutValue = v; }
+    void PrimitiveTopologyTypeCb(D3D12_PRIMITIVE_TOPOLOGY_TYPE v) override {
+        gfxDesc.PrimitiveTopologyType = v;
+        seenTopology = true;
+    }
+    void VSCb(const D3D12_SHADER_BYTECODE& v) override { gfxDesc.VS = v; }
+    void GSCb(const D3D12_SHADER_BYTECODE& v) override { gfxDesc.GS = v; }
+    void StreamOutputCb(const D3D12_STREAM_OUTPUT_DESC& v) override { gfxDesc.StreamOutput = v; }
+    void HSCb(const D3D12_SHADER_BYTECODE& v) override { gfxDesc.HS = v; }
+    void DSCb(const D3D12_SHADER_BYTECODE& v) override { gfxDesc.DS = v; }
+    void PSCb(const D3D12_SHADER_BYTECODE& v) override { gfxDesc.PS = v; }
+    void ASCb(const D3D12_SHADER_BYTECODE& v) override { meshStages.AS = v; }
+    void MSCb(const D3D12_SHADER_BYTECODE& v) override {
+        meshStages.MS = v;
+        seenMS = true;
+    }
+    void CSCb(const D3D12_SHADER_BYTECODE& v) override {
+        csBytecode = v;
+        seenCS = true;
+    }
+    void BlendStateCb(const D3D12_BLEND_DESC& v) override { gfxDesc.BlendState = v; }
+    void DepthStencilStateCb(const D3D12_DEPTH_STENCIL_DESC& v) override {
+        gfxDesc.DepthStencilState = v;
+        seenDSS = true;
+    }
+    void DepthStencilState1Cb(const D3D12_DEPTH_STENCIL_DESC1& v) override {
+        gfxDesc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC(CD3DX12_DEPTH_STENCIL_DESC1(v));
+        seenDSS = true;
+    }
+#if defined(D3D12_SDK_VERSION) && (D3D12_SDK_VERSION >= 606)
+    void DepthStencilState2Cb(const D3D12_DEPTH_STENCIL_DESC2& v) override {
+        gfxDesc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC(CD3DX12_DEPTH_STENCIL_DESC2(v));
+        seenDSS = true;
+    }
+#endif
+    void DSVFormatCb(DXGI_FORMAT v) override { gfxDesc.DSVFormat = v; }
+    void RasterizerStateCb(const D3D12_RASTERIZER_DESC& v) override { gfxDesc.RasterizerState = v; }
+#if defined(D3D12_SDK_VERSION) && (D3D12_SDK_VERSION >= 608)
+    void RasterizerState1Cb(const D3D12_RASTERIZER_DESC1& v) override {
+        gfxDesc.RasterizerState = D3D12_RASTERIZER_DESC(CD3DX12_RASTERIZER_DESC1(v));
+    }
+#endif
+#if defined(D3D12_SDK_VERSION) && (D3D12_SDK_VERSION >= 610)
+    void RasterizerState2Cb(const D3D12_RASTERIZER_DESC2& v) override {
+        gfxDesc.RasterizerState = D3D12_RASTERIZER_DESC(CD3DX12_RASTERIZER_DESC2(v));
+    }
+#endif
+    void RTVFormatsCb(const D3D12_RT_FORMAT_ARRAY& v) override {
+        gfxDesc.NumRenderTargets = std::min<UINT>(v.NumRenderTargets, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
+        std::memcpy(gfxDesc.RTVFormats, v.RTFormats, sizeof(gfxDesc.RTVFormats));
+    }
+    void SampleDescCb(const DXGI_SAMPLE_DESC& v) override { gfxDesc.SampleDesc = v; }
+    void SampleMaskCb(UINT v) override { gfxDesc.SampleMask = v; }
+    void CachedPSOCb(const D3D12_CACHED_PIPELINE_STATE& v) override { gfxDesc.CachedPSO = v; }
+};
+
+} // namespace
+
+HRESULT STDMETHODCALLTYPE NacelleDevice::CreatePipelineState(
+    const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) {
+    if (!pDesc || !ppPipelineState) return E_INVALIDARG;
+
+    PipelineStreamParser parser;
+    HRESULT hr = D3DX12ParsePipelineStream(*pDesc, &parser);
+    if (FAILED(hr)) return hr;
+
+    if (!parser.seenDSS && parser.gfxDesc.DSVFormat != DXGI_FORMAT_UNKNOWN) {
+        parser.gfxDesc.DepthStencilState.DepthEnable = TRUE;
+    }
+    if (!parser.seenTopology && parser.seenMS) {
+        parser.gfxDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    }
+
+    if (parser.seenCS && parser.csBytecode.pShaderBytecode && parser.csBytecode.BytecodeLength > 0) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC csDesc{};
+        csDesc.pRootSignature = parser.gfxDesc.pRootSignature;
+        csDesc.CS = parser.csBytecode;
+        csDesc.NodeMask = parser.gfxDesc.NodeMask;
+        csDesc.CachedPSO = parser.gfxDesc.CachedPSO;
+        csDesc.Flags = parser.gfxDesc.Flags;
+        return CreateComputePipelineState(&csDesc, riid, ppPipelineState);
+    }
+
+    auto* rs = static_cast<NacelleRootSignature*>(parser.gfxDesc.pRootSignature);
+    RootSignatureLayout emptyLayout;
+    const RootSignatureLayout& layout = rs ? rs->layout() : emptyLayout;
+
+    auto compiled = std::make_shared<CompiledGraphicsPSO>();
+    std::string err;
+    if (!compileGraphicsPSO(parser.gfxDesc, layout, *compiled, err, parser.meshStages)) {
+        std::fprintf(stderr, "[Nacelle] CreatePipelineState error: %s\n", err.c_str());
+        return E_FAIL;
+    }
+
+    auto* pso = new NacellePipelineState(this, parser.gfxDesc, rs, std::move(compiled));
+    hr = pso->QueryInterface(riid, ppPipelineState);
+    pso->Release();
+    return hr;
 }
 
 // --- NacelleSwapChain ---

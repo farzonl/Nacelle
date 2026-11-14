@@ -84,6 +84,7 @@ struct CmdSetRootDescTable { bool compute = false; UINT idx = 0; D3D12_GPU_DESCR
 struct CmdSetRoot32BitConsts { bool compute = false; UINT idx = 0; UINT destOffset = 0; std::vector<UINT> data; };
 struct CmdSetRootView { bool compute = false; UINT idx = 0; D3D12_GPU_VIRTUAL_ADDRESS addr = 0; };
 struct CmdDispatch { UINT x = 1, y = 1, z = 1; };
+struct CmdDispatchMesh { UINT x = 1, y = 1, z = 1; };
 struct CmdDrawInstanced { UINT vCount = 0, iCount = 1, startV = 0, startI = 0; };
 struct CmdDrawIndexedInstanced { UINT idxCount = 0, iCount = 1, startIdx = 0; INT baseV = 0; UINT startI = 0; };
 struct CmdCopyBufferRegion { NacelleResource* dst = nullptr; UINT64 dstOff = 0; NacelleResource* src = nullptr; UINT64 srcOff = 0; UINT64 bytes = 0; };
@@ -134,7 +135,7 @@ struct CmdCopyRaytracingAS {
 using RecordedCommand = std::variant<
     CmdSetPipelineState, CmdSetRootSignature, CmdSetDescriptorHeaps,
     CmdSetRootDescTable, CmdSetRoot32BitConsts, CmdSetRootView,
-    CmdDispatch, CmdDrawInstanced, CmdDrawIndexedInstanced,
+    CmdDispatch, CmdDispatchMesh, CmdDrawInstanced, CmdDrawIndexedInstanced,
     CmdCopyBufferRegion, CmdCopyTextureRegion, CmdCopyResource, CmdCopyTiles, CmdResolveSubresource,
     CmdIASetTopology, CmdIASetIndexBuffer, CmdIASetVertexBuffers,
     CmdRSSetViewports, CmdRSSetScissors, CmdOMSetBlendFactor, CmdOMSetStencilRef,
@@ -250,7 +251,7 @@ public:
     void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource*) override {}
 
     // ID3D12GraphicsCommandList6
-    void STDMETHODCALLTYPE DispatchMesh(UINT, UINT, UINT) override {}
+    void STDMETHODCALLTYPE DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
 
     void execute(BS::thread_pool<>& pool, ExecutionState& state) const;
 

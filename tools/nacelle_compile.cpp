@@ -40,6 +40,8 @@ void printUsage(const char* argv0) {
     std::cerr << "Usage: " << argv0 << " [options] [<compute.dxil>]\n"
               << "  --cs <path>              Compute DXIL shader\n"
               << "  --vs <path>              Vertex DXIL shader (graphics mode)\n"
+              << "  --ms <path>              Mesh DXIL shader (mesh PSO mode)\n"
+              << "  --as <path>              Amplification DXIL shader (mesh PSO mode)\n"
               << "  --ps <path>              Pixel DXIL shader (graphics mode)\n"
               << "  --simd-width=4|8|16      Target SIMD width (default: host)\n"
               << "  --blend=opaque|alpha     Blend mode for graphics PSO\n"
@@ -55,6 +57,8 @@ int main(int argc, char** argv) {
     llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
     std::string csPath;
     std::string vsPath;
+    std::string msPath;
+    std::string asPath;
     std::string psPath;
     uint32_t simdWidth = 0;
     bool blendAlpha = false;
@@ -80,6 +84,10 @@ int main(int argc, char** argv) {
             csPath = nextVal(arg);
         } else if (arg == "--vs") {
             vsPath = nextVal(arg);
+        } else if (arg == "--ms") {
+            msPath = nextVal(arg);
+        } else if (arg == "--as") {
+            asPath = nextVal(arg);
         } else if (arg == "--ps") {
             psPath = nextVal(arg);
         } else if (arg.rfind("--simd-width=", 0) == 0) {
@@ -117,10 +125,18 @@ int main(int argc, char** argv) {
     mlir::MLIRContext mlirCtx;
     nacelle::configureNacelleMLIRContext(mlirCtx);
 
-    if (!vsPath.empty()) {
-        std::vector<uint8_t> vsBytes, psBytes;
-        if (!readBinaryFile(vsPath, vsBytes)) {
+    if (!vsPath.empty() || !msPath.empty()) {
+        std::vector<uint8_t> vsBytes, msBytes, asBytes, psBytes;
+        if (!vsPath.empty() && !readBinaryFile(vsPath, vsBytes)) {
             std::cerr << "Failed to read VS DXIL: " << vsPath << "\n";
+            return 1;
+        }
+        if (!msPath.empty() && !readBinaryFile(msPath, msBytes)) {
+            std::cerr << "Failed to read MS DXIL: " << msPath << "\n";
+            return 1;
+        }
+        if (!asPath.empty() && !readBinaryFile(asPath, asBytes)) {
+            std::cerr << "Failed to read AS DXIL: " << asPath << "\n";
             return 1;
         }
         if (!psPath.empty() && !readBinaryFile(psPath, psBytes)) {
@@ -132,13 +148,14 @@ int main(int argc, char** argv) {
             llvm::LLVMContext lctx;
             nacelle::DxilLoadedShader loaded;
             std::string err;
-            if (!nacelle::loadAndUpgradeDXIL({vsBytes.data(), vsBytes.size()}, lctx, loaded, err)) {
-                std::cerr << "VS DXIL load error: " << err << "\n";
+            const auto& primaryBytes = !msBytes.empty() ? msBytes : vsBytes;
+            if (!nacelle::loadAndUpgradeDXIL({primaryBytes.data(), primaryBytes.size()}, lctx, loaded, err)) {
+                std::cerr << "Graphics DXIL load error: " << err << "\n";
                 return 1;
             }
             auto scfMod = nacelle::importAndLiftDXILToSCF(std::move(loaded.module), loaded.entryName, mlirCtx, err);
             if (!scfMod) {
-                std::cerr << "VS SCF lift error: " << err << "\n";
+                std::cerr << "Graphics SCF lift error: " << err << "\n";
                 return 1;
             }
             scfMod->print(llvm::outs());
@@ -147,7 +164,16 @@ int main(int argc, char** argv) {
 
         if (emitSIMD || emitLLVM) {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-            desc.VS = {vsBytes.data(), vsBytes.size()};
+            if (!vsBytes.empty()) {
+                desc.VS = {vsBytes.data(), vsBytes.size()};
+            }
+            nacelle::MeshShaderStages meshStages{};
+            if (!msBytes.empty()) {
+                meshStages.MS = {msBytes.data(), msBytes.size()};
+            }
+            if (!asBytes.empty()) {
+                meshStages.AS = {asBytes.data(), asBytes.size()};
+            }
             if (!psBytes.empty()) {
                 desc.PS = {psBytes.data(), psBytes.size()};
             }
@@ -181,7 +207,7 @@ int main(int argc, char** argv) {
             if (!nacelle::synthesizeGraphicsPSOMLIR(
                     desc, rootLayout, effectiveW,
                     "nacelle_vs_test", "nacelle_ps_test",
-                    mlirCtx, combinedMod, meta, vsIn, vsOut, psIn, psOut, err)) {
+                    mlirCtx, combinedMod, meta, vsIn, vsOut, psIn, psOut, err, meshStages)) {
                 std::cerr << "Graphics PSO synthesis error: " << err << "\n";
                 return 1;
             }

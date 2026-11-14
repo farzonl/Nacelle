@@ -1,0 +1,97 @@
+// RUN: %split_file %s %t
+// RUN: %dxc -T as_6_5 -E PayloadAS -Fo %t/as.dxil %t/shader.hlsl
+// RUN: %dxc -T ms_6_5 -E PayloadMS -Fo %t/ms.dxil %t/shader.hlsl
+// RUN: %dxc -T ms_6_5 -E BarrierPrimMS -Fo %t/barrier_ms.dxil %t/shader.hlsl
+// RUN: %dxc -T ps_6_5 -E PSMain -Fo %t/ps.dxil %t/shader.hlsl
+// RUN: %dxc -T ps_6_5 -E PrimPSMain -Fo %t/prim_ps.dxil %t/shader.hlsl
+// RUN: %nacelle_compile --as %t/as.dxil --ms %t/ms.dxil --ps %t/ps.dxil --simd-width=4 --emit-simd-mlir | %FileCheck %s --check-prefix=ASMS
+// RUN: %nacelle_compile --ms %t/barrier_ms.dxil --ps %t/prim_ps.dxil --simd-width=4 --emit-llvm | %FileCheck %s --check-prefix=LLVM
+
+//--- shader.hlsl
+struct Payload {
+    float3 color;
+};
+
+groupshared Payload gs_payload;
+
+[numthreads(1, 1, 1)]
+void PayloadAS() {
+    gs_payload.color = float3(1.0, 0.5, 1.0);
+    DispatchMesh(1, 1, 1, gs_payload);
+}
+
+struct MSOut {
+    float4 pos : SV_Position;
+    float4 col : COLOR;
+};
+
+[outputtopology("triangle")]
+[numthreads(3, 1, 1)]
+void PayloadMS(
+    uint gtid : SV_GroupThreadID,
+    in payload Payload p,
+    out vertices MSOut verts[3],
+    out indices uint3 tris[1]) {
+    SetMeshOutputCounts(3, 1);
+    verts[gtid].pos = float4(float(gtid) * 0.25, 0.0, 0.5, 1.0);
+    verts[gtid].col = float4(p.color, 1.0);
+    if (gtid == 0) {
+        tris[0] = uint3(0, 1, 2);
+    }
+}
+
+float4 PSMain(MSOut input) : SV_Target {
+    return input.col;
+}
+
+struct PrimAttr {
+    float4 primCol : PRIMCOLOR;
+    bool cull : SV_CullPrimitive;
+};
+
+struct PrimPSIn {
+    float4 pos : SV_Position;
+    float4 col : COLOR;
+    float4 primCol : PRIMCOLOR;
+};
+
+groupshared float4 gs_pos[3];
+
+[outputtopology("triangle")]
+[numthreads(8, 1, 1)]
+void BarrierPrimMS(
+    uint gtid : SV_GroupThreadID,
+    out vertices MSOut verts[3],
+    out indices uint3 tris[1],
+    out primitives PrimAttr prims[1]) {
+    SetMeshOutputCounts(3, 1);
+    if (gtid < 3) {
+        gs_pos[gtid] = float4(float(gtid) * 0.5 - 0.5, 0.0, 0.5, 1.0);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gtid >= 4 && gtid < 7) {
+        uint v = gtid - 4;
+        verts[v].pos = gs_pos[v];
+        verts[v].col = float4(0.25, 0.5, 0.75, 1.0);
+    }
+    if (gtid == 7) {
+        tris[0] = uint3(0, 1, 2);
+        prims[0].primCol = float4(0.0, 1.0, 0.0, 1.0);
+        prims[0].cull = false;
+    }
+}
+
+float4 PrimPSMain(PrimPSIn input) : SV_Target {
+    return input.col + input.primCol;
+}
+
+// ASMS-NOT: dx.op.
+// ASMS-DAG: func.func @nacelle_vs_test_as
+// ASMS-DAG: func.func @nacelle_vs_test_ms
+// ASMS-DAG: func.func @nacelle_ps_test
+// ASMS-NOT: dx.op.
+
+// LLVM-NOT: dx.op.
+// LLVM-DAG: define void @nacelle_vs_test_ms(
+// LLVM-DAG: define void @nacelle_ps_test(
+// LLVM-NOT: dx.op.
