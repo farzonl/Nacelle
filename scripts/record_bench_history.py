@@ -110,12 +110,20 @@ def main() -> None:
     with open(data_dir / "bench-history.json", "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # Preserve compliance history.json from live Pages if not already in _site/data
-    if args.pages_url and not (data_dir / "history.json").exists():
-        compliance = fetch_json_url(args.pages_url.rstrip("/") + "/data/history.json")
-        if isinstance(compliance, list):
-            with open(data_dir / "history.json", "w", encoding="utf-8") as f:
-                json.dump(compliance, f, indent=2)
+    # Preserve compliance history.json, latest.json, and badge.json from live Pages if not already in _site/data
+    if args.pages_url:
+        base_url = args.pages_url.rstrip("/")
+        if not (data_dir / "history.json").exists():
+            compliance = fetch_json_url(base_url + "/data/history.json")
+            if isinstance(compliance, list):
+                with open(data_dir / "history.json", "w", encoding="utf-8") as f:
+                    json.dump(compliance, f, indent=2)
+        for fname in ("latest.json", "badge.json"):
+            if not (data_dir / fname).exists():
+                obj = fetch_json_url(base_url + f"/data/{fname}")
+                if isinstance(obj, dict):
+                    with open(data_dir / fname, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, indent=2)
 
     ran_backends = [f"{r['backend']}={r['medianMs']}ms" for r in entry["results"] if r["ran"]]
     print(f"Recorded benchmark {entry['shortSha']}: {', '.join(ran_backends)}. History length: {len(history)}")
