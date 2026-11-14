@@ -1,0 +1,37 @@
+// RUN: %dxc -T cs_6_2 -E CSMain -O3 -Fo %t.dxil %s
+// RUN: %nacelle_compile --cs %t.dxil --simd-width=8 --emit-simd-mlir | %FileCheck %s
+// RUN: %nacelle_compile --cs %t.dxil --simd-width=8 --emit-llvm | %FileCheck %s --check-prefix=LLVM
+
+// Verify lowering of CheckAccessFullyMapped (DXIL op 71) and tiled buffer/texture residency status.
+// CHECK-LABEL: func.func @nacelle_cs_test
+// CHECK-DAG: llvm.call @nacelle_tex_load({{.*}}) : (!llvm.ptr, i32, i32, i32, i32, !llvm.ptr) -> i32
+// CHECK-DAG: llvm.call @nacelle_tex_sample({{.*}}) : (!llvm.ptr, !llvm.ptr, {{.*}}) -> i32
+// CHECK-DAG: arith.cmpi ne
+
+// LLVM-LABEL: define void @nacelle_cs_test(
+
+StructuredBuffer<int4> TiledBuf : register(t0);
+Texture2D<float4> TiledTex : register(t1);
+SamplerState Samp : register(s0);
+RWStructuredBuffer<float4> OutVal : register(u0);
+RWStructuredBuffer<uint> OutMapped : register(u1);
+
+[numthreads(8, 1, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID) {
+    uint lane = dtid.x;
+
+    uint bufStatus = 0;
+    int4 b = TiledBuf.Load(lane * 1024u, bufStatus);
+    bool bufOk = CheckAccessFullyMapped(bufStatus);
+
+    uint loadStatus = 0;
+    float4 t0 = TiledTex.Load(int3(lane * 8u, 0, 0), loadStatus);
+    bool loadOk = CheckAccessFullyMapped(loadStatus);
+
+    uint sampStatus = 0;
+    float4 t1 = TiledTex.SampleLevel(Samp, float2(0.25f, 0.25f), 0.0f, int2(0, 0), sampStatus);
+    bool sampOk = CheckAccessFullyMapped(sampStatus);
+
+    OutVal[lane] = float4(b) + t0 + t1;
+    OutMapped[lane] = (bufOk ? 1u : 0u) | (loadOk ? 2u : 0u) | (sampOk ? 4u : 0u);
+}

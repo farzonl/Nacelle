@@ -2,11 +2,89 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
 
 namespace nacelle {
 
+namespace {
+constexpr uint64_t kReservedGpuVaStride = 1ULL << 40; // 1 TiB virtual range per reserved buffer
+
+std::mutex g_reservedVaMutex;
+uint64_t g_nextReservedVaSlot = 1;
+std::unordered_map<uint64_t, NacelleResource*> g_reservedVaMap;
+
+D3D12_GPU_VIRTUAL_ADDRESS registerReservedBufferVA(NacelleResource* res) {
+    std::lock_guard<std::mutex> lock(g_reservedVaMutex);
+    const uint64_t slot = g_nextReservedVaSlot++;
+    g_reservedVaMap[slot] = res;
+    return NacelleResource::kReservedGpuVaFlag | (slot * kReservedGpuVaStride);
+}
+
+void unregisterReservedBufferVA(D3D12_GPU_VIRTUAL_ADDRESS va) {
+    if ((va & NacelleResource::kReservedGpuVaFlag) == 0) return;
+    const uint64_t slot = (va & ~NacelleResource::kReservedGpuVaFlag) / kReservedGpuVaStride;
+    std::lock_guard<std::mutex> lock(g_reservedVaMutex);
+    g_reservedVaMap.erase(slot);
+}
+} // namespace
+
+NacelleResource* NacelleResource::resolveReservedGpuVA(D3D12_GPU_VIRTUAL_ADDRESS va,
+                                                       uint64_t* outByteOffset) {
+    if ((va & kReservedGpuVaFlag) == 0) return nullptr;
+    const uint64_t rel = va & ~kReservedGpuVaFlag;
+    const uint64_t slot = rel / kReservedGpuVaStride;
+    const uint64_t byteOffset = rel % kReservedGpuVaStride;
+    std::lock_guard<std::mutex> lock(g_reservedVaMutex);
+    auto it = g_reservedVaMap.find(slot);
+    if (it == g_reservedVaMap.end()) return nullptr;
+    if (outByteOffset) *outByteOffset = byteOffset;
+    return it->second;
+}
+
 static inline uint64_t alignUp(uint64_t v, uint64_t a) {
     return (v + a - 1) & ~(a - 1);
+}
+
+D3D12_TILE_SHAPE NacelleResource::computeStandardTileShape(const D3D12_RESOURCE_DESC& desc) {
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return D3D12_TILE_SHAPE{kTileSizeBytes, 1, 1};
+    }
+
+    const FormatInfo fi = getFormatInfo(desc.Format);
+    const uint32_t bpb = std::max<uint32_t>(1, fi.bytesPerBlock);
+
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        return D3D12_TILE_SHAPE{(kTileSizeBytes / bpb) * fi.blockWidth, 1, 1};
+    }
+
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        if (fi.isCompressed) {
+            if (bpb <= 8) return D3D12_TILE_SHAPE{128, 64, 16}; // 32x16x16 blocks * 8B = 65536
+            return D3D12_TILE_SHAPE{64, 64, 16};                // 16x16x16 blocks * 16B = 65536
+        }
+        switch (bpb) {
+        case 1:  return D3D12_TILE_SHAPE{64, 32, 32};
+        case 2:  return D3D12_TILE_SHAPE{32, 32, 32};
+        case 4:  return D3D12_TILE_SHAPE{32, 32, 16};
+        case 8:  return D3D12_TILE_SHAPE{32, 16, 16};
+        case 16: return D3D12_TILE_SHAPE{16, 16, 16};
+        default: return D3D12_TILE_SHAPE{std::max<uint32_t>(1, kTileSizeBytes / bpb), 1, 1};
+        }
+    }
+
+    // TEXTURE2D (and cubemaps / arrays):
+    if (fi.isCompressed) {
+        if (bpb <= 8) return D3D12_TILE_SHAPE{512, 256, 1}; // 128x64 blocks * 8B = 65536
+        return D3D12_TILE_SHAPE{256, 256, 1};               // 64x64 blocks * 16B = 65536
+    }
+    switch (bpb) {
+    case 1:  return D3D12_TILE_SHAPE{256, 256, 1};
+    case 2:  return D3D12_TILE_SHAPE{256, 128, 1};
+    case 4:  return D3D12_TILE_SHAPE{128, 128, 1};
+    case 8:  return D3D12_TILE_SHAPE{128, 64, 1};
+    case 16: return D3D12_TILE_SHAPE{64, 64, 1};
+    default: return D3D12_TILE_SHAPE{std::max<uint32_t>(1, kTileSizeBytes / bpb), 1, 1};
+    }
 }
 
 NacelleHeap::NacelleHeap(ID3D12Device* device, const D3D12_HEAP_DESC& desc)
@@ -70,9 +148,6 @@ uint64_t NacelleResource::computeResourceFootprints(
     }
 
     const UINT mipLevels = std::max<UINT>(1, desc.MipLevels);
-    const UINT arraySize = (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
-                               ? 1
-                               : std::max<UINT>(1, desc.DepthOrArraySize);
     const FormatInfo fi = getFormatInfo(desc.Format);
 
     UINT64 curOffset = baseOffset;
@@ -124,11 +199,16 @@ uint64_t NacelleResource::computeResourceFootprints(
 }
 
 NacelleResource::NacelleResource(ID3D12Device* device,
-                           const D3D12_HEAP_PROPERTIES& heapProps,
-                           const D3D12_RESOURCE_DESC& desc,
-                           NacelleHeap* placedHeap,
-                           uint64_t heapOffset)
-    : D3D12PageableBase(device), heapProps_(heapProps), desc_(desc), placedHeap_(placedHeap) {
+                                 const D3D12_HEAP_PROPERTIES& heapProps,
+                                 const D3D12_RESOURCE_DESC& desc,
+                                 NacelleHeap* placedHeap,
+                                 uint64_t heapOffset,
+                                 bool isReserved)
+    : D3D12PageableBase(device),
+      heapProps_(heapProps),
+      desc_(desc),
+      placedHeap_(placedHeap),
+      isReserved_(isReserved) {
     if (desc_.MipLevels == 0) {
         if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             desc_.MipLevels = 1;
@@ -168,7 +248,52 @@ NacelleResource::NacelleResource(ID3D12Device* device,
         subresources_[i].depth = layouts[i].Footprint.Depth;
     }
 
-    if (placedHeap_) {
+    const FormatInfo fi = getFormatInfo(desc_.Format);
+    tileShape_ = computeStandardTileShape(desc_);
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        tileBlocksX_ = kTileSizeBytes;
+        tileBlocksY_ = 1;
+        tileBlocksZ_ = 1;
+        subresourceTilings_.resize(1);
+        const uint32_t numTiles = static_cast<uint32_t>((desc_.Width + kTileSizeBytes - 1) / kTileSizeBytes);
+        subresourceTilings_[0].WidthInTiles = numTiles;
+        subresourceTilings_[0].HeightInTiles = 1;
+        subresourceTilings_[0].DepthInTiles = 1;
+        subresourceTilings_[0].StartTileIndexInOverallResource = 0;
+        totalTiles_ = numTiles;
+    } else {
+        tileBlocksX_ = std::max<uint32_t>(1, tileShape_.WidthInTexels / std::max<uint32_t>(1, fi.blockWidth));
+        tileBlocksY_ = std::max<uint32_t>(1, tileShape_.HeightInTexels / std::max<uint32_t>(1, fi.blockHeight));
+        tileBlocksZ_ = std::max<uint32_t>(1, tileShape_.DepthInTexels);
+        subresourceTilings_.resize(totalSubs);
+        uint32_t runningTile = 0;
+        for (UINT sub = 0; sub < totalSubs; ++sub) {
+            const auto& sr = subresources_[sub];
+            const uint32_t blocksX = std::max<uint32_t>(1, (sr.width + fi.blockWidth - 1) / fi.blockWidth);
+            const uint32_t blocksY = std::max<uint32_t>(1, (sr.height + fi.blockHeight - 1) / fi.blockHeight);
+            const uint32_t wTiles = std::max<uint32_t>(1, (blocksX + tileBlocksX_ - 1) / tileBlocksX_);
+            const uint32_t hTiles = std::max<uint32_t>(1, (blocksY + tileBlocksY_ - 1) / tileBlocksY_);
+            const uint32_t dTiles = std::max<uint32_t>(1, (sr.depth + tileBlocksZ_ - 1) / tileBlocksZ_);
+            subresourceTilings_[sub].WidthInTiles = wTiles;
+            subresourceTilings_[sub].HeightInTiles = hTiles;
+            subresourceTilings_[sub].DepthInTiles = dTiles;
+            subresourceTilings_[sub].StartTileIndexInOverallResource = runningTile;
+            runningTile += wTiles * hTiles * dTiles;
+        }
+        totalTiles_ = runningTile;
+    }
+
+    if (isReserved_) {
+        data_ = nullptr;
+        ownsMemory_ = false;
+        const size_t tableSlots = std::max<size_t>(1, totalTiles_);
+        tilePtrs_.assign(tableSlots, nullptr);
+        tileHeaps_.assign(tableSlots, nullptr);
+        tileHeapIndices_.assign(tableSlots, 0);
+        if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            reservedGpuVa_ = registerReservedBufferVA(this);
+        }
+    } else if (placedHeap_) {
         placedHeap_->AddRef();
         data_ = placedHeap_->data() + heapOffset;
         ownsMemory_ = false;
@@ -181,21 +306,47 @@ NacelleResource::NacelleResource(ID3D12Device* device,
     }
 
     // Populate base texture metadata (slice 0 mips; SRV creation copies & adjusts for array/view)
-    const FormatInfo fi = getFormatInfo(desc_.Format);
     texMeta_.array_size = arraySize;
     texMeta_.mip_levels = std::min<uint32_t>(mipLevels, NacelleTextureMetadata::kMaxMips);
     texMeta_.most_detailed_mip = 0;
     texMeta_.dimension = desc_.Dimension;
     texMeta_.is_compressed = fi.isCompressed ? 1u : 0u;
+    texMeta_.is_tiled = isReserved_ ? 1u : 0u;
     texMeta_.array_slice_stride = (arraySize > 1 && mipLevels < subresources_.size())
                                       ? subresources_[mipLevels].offset
                                       : 0;
     for (uint32_t m = 0; m < texMeta_.mip_levels; ++m) {
         texMeta_.mips[m] = subresources_[m];
     }
+
+    if (isReserved_ && desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        texMeta_.tile_table = tilePtrs_.data();
+        texMeta_.total_tiles = totalTiles_;
+        texMeta_.tile_width = tileBlocksX_;
+        texMeta_.tile_height = tileBlocksY_;
+        texMeta_.tile_depth = tileBlocksZ_;
+        uint32_t sliceTiles = 0;
+        for (uint32_t m = 0; m < mipLevels; ++m) {
+            const auto& st = subresourceTilings_[m];
+            if (m < NacelleTextureMetadata::kMaxMips) {
+                texMeta_.mip_tiling[m].width_in_tiles = st.WidthInTiles;
+                texMeta_.mip_tiling[m].height_in_tiles = st.HeightInTiles;
+                texMeta_.mip_tiling[m].depth_in_tiles = st.DepthInTiles;
+                texMeta_.mip_tiling[m].start_tile_index = st.StartTileIndexInOverallResource;
+            }
+            sliceTiles += st.WidthInTiles * st.HeightInTiles * st.DepthInTiles;
+        }
+        texMeta_.mip_tiles_per_slice = sliceTiles;
+    }
 }
 
 NacelleResource::~NacelleResource() {
+    if (reservedGpuVa_ != 0) {
+        unregisterReservedBufferVA(reservedGpuVa_);
+    }
+    for (NacelleHeap* h : tileHeaps_) {
+        if (h) h->Release();
+    }
     if (ownsMemory_) {
         alignedFree(data_);
     }
@@ -215,6 +366,7 @@ HRESULT STDMETHODCALLTYPE NacelleResource::QueryInterface(REFIID riid, void** pp
 }
 
 HRESULT STDMETHODCALLTYPE NacelleResource::Map(UINT Subresource, const D3D12_RANGE*, void** ppData) {
+    if (isReserved_) return E_INVALIDARG;
     if (!ppData) return E_INVALIDARG;
     if (Subresource >= subresources_.size()) return E_INVALIDARG;
     *ppData = data_ + subresources_[Subresource].offset;
@@ -222,6 +374,7 @@ HRESULT STDMETHODCALLTYPE NacelleResource::Map(UINT Subresource, const D3D12_RAN
 }
 
 void STDMETHODCALLTYPE NacelleResource::Unmap(UINT, const D3D12_RANGE* pWrittenRange) {
+    if (isReserved_) return;
     if (!pWrittenRange || pWrittenRange->End > pWrittenRange->Begin) {
         invalidateDecodedCache();
         if (texMeta_.is_compressed && texMeta_.decoded_rgba32f != nullptr) {
@@ -242,7 +395,194 @@ D3D12_RESOURCE_DESC* STDMETHODCALLTYPE NacelleResource::GetDesc(D3D12_RESOURCE_D
 #endif
 
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE NacelleResource::GetGPUVirtualAddress() {
+    if (isReserved_) return reservedGpuVa_;
     return reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(data_);
+}
+
+void NacelleResource::setTileMapping(uint32_t tileIdx, NacelleHeap* heap, uint32_t heapTileIdx) {
+    if (!isReserved_ || tileIdx >= totalTiles_) return;
+
+    uint8_t* ptr = nullptr;
+    if (heap) {
+        const uint64_t byteOff = static_cast<uint64_t>(heapTileIdx) * kTileSizeBytes;
+        if (byteOff + kTileSizeBytes <= heap->size() && heap->data()) {
+            ptr = heap->data() + byteOff;
+        } else {
+            heap = nullptr;
+            heapTileIdx = 0;
+        }
+    }
+
+    if (heap) heap->AddRef();
+    if (tileHeaps_[tileIdx]) tileHeaps_[tileIdx]->Release();
+
+    tileHeaps_[tileIdx] = heap;
+    tileHeapIndices_[tileIdx] = heap ? heapTileIdx : 0;
+    tilePtrs_[tileIdx] = ptr;
+
+    if (texMeta_.is_compressed) {
+        invalidateDecodedCache();
+    }
+}
+
+void NacelleResource::finalizeTileMappingsUpdate() {
+    if (texMeta_.is_compressed && texMeta_.decoded_rgba32f != nullptr) {
+        ensureDecodedBC();
+    }
+}
+
+void NacelleResource::enumerateRegionTiles(const D3D12_TILED_RESOURCE_COORDINATE& coord,
+                                           const D3D12_TILE_REGION_SIZE* pSize,
+                                           std::vector<uint32_t>& outTileIndices) const {
+    if (!isReserved_ || coord.Subresource >= subresourceTilings_.size()) return;
+
+    const UINT mipLevels = std::max<UINT>(1, desc_.MipLevels);
+    const auto& st0 = subresourceTilings_[coord.Subresource];
+
+    if (pSize && pSize->UseBox) {
+        for (UINT dz = 0; dz < pSize->Depth; ++dz) {
+            UINT sub = coord.Subresource;
+            UINT tz = 0;
+            if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                tz = coord.Z + dz;
+            } else {
+                sub = coord.Subresource + (coord.Z + dz) * mipLevels;
+            }
+            if (sub >= subresourceTilings_.size()) continue;
+            const auto& st = subresourceTilings_[sub];
+            if (tz >= st.DepthInTiles) continue;
+            for (UINT dy = 0; dy < pSize->Height; ++dy) {
+                const UINT ty = coord.Y + dy;
+                if (ty >= st.HeightInTiles) continue;
+                for (UINT dx = 0; dx < pSize->Width; ++dx) {
+                    const UINT tx = coord.X + dx;
+                    if (tx >= st.WidthInTiles) continue;
+                    const uint32_t idx = st.StartTileIndexInOverallResource +
+                                         (tz * st.HeightInTiles + ty) * st.WidthInTiles + tx;
+                    if (idx < totalTiles_) {
+                        outTileIndices.push_back(idx);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    uint32_t startIdx = st0.StartTileIndexInOverallResource;
+    if (desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        startIdx += (coord.Z * st0.HeightInTiles + coord.Y) * st0.WidthInTiles + coord.X;
+    } else {
+        const UINT sub = coord.Subresource + coord.Z * mipLevels;
+        if (sub >= subresourceTilings_.size()) return;
+        const auto& st = subresourceTilings_[sub];
+        startIdx = st.StartTileIndexInOverallResource + coord.Y * st.WidthInTiles + coord.X;
+    }
+
+    const uint32_t count = pSize ? pSize->NumTiles : 1u;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t idx = startIdx + i;
+        if (idx >= totalTiles_) break;
+        outTileIndices.push_back(idx);
+    }
+}
+
+uint8_t* NacelleResource::bufferBytePtr(uint64_t byteOffset) {
+    if (!isReserved_) {
+        return (data_ && byteOffset < totalBytes_) ? (data_ + byteOffset) : nullptr;
+    }
+    if (byteOffset >= totalBytes_) return nullptr;
+    const uint64_t tileIdx = byteOffset / kTileSizeBytes;
+    if (tileIdx >= totalTiles_) return nullptr;
+    uint8_t* tileBase = tilePtrs_[static_cast<size_t>(tileIdx)];
+    return tileBase ? (tileBase + (byteOffset % kTileSizeBytes)) : nullptr;
+}
+
+const uint8_t* NacelleResource::bufferBytePtr(uint64_t byteOffset) const {
+    return const_cast<NacelleResource*>(this)->bufferBytePtr(byteOffset);
+}
+
+uint8_t* NacelleResource::texBlockPtr(uint32_t subresource, uint32_t bx, uint32_t by, uint32_t z) {
+    if (subresource >= subresources_.size()) return nullptr;
+    const FormatInfo fi = getFormatInfo(desc_.Format);
+    if (!isReserved_) {
+        const auto& sr = subresources_[subresource];
+        return data_ + sr.offset + uint64_t(z) * sr.slice_pitch +
+               uint64_t(by) * sr.row_pitch + uint64_t(bx) * fi.bytesPerBlock;
+    }
+
+    if (subresource >= subresourceTilings_.size()) return nullptr;
+    const auto& st = subresourceTilings_[subresource];
+    const uint32_t tx = bx / tileBlocksX_;
+    const uint32_t ty = by / tileBlocksY_;
+    const uint32_t tz = z / tileBlocksZ_;
+    if (tx >= st.WidthInTiles || ty >= st.HeightInTiles || tz >= st.DepthInTiles) {
+        return nullptr;
+    }
+    const uint32_t tileIdx = st.StartTileIndexInOverallResource +
+                             (tz * st.HeightInTiles + ty) * st.WidthInTiles + tx;
+    if (tileIdx >= totalTiles_) return nullptr;
+    uint8_t* tileBase = tilePtrs_[tileIdx];
+    if (!tileBase) return nullptr;
+
+    const uint32_t inX = bx % tileBlocksX_;
+    const uint32_t inY = by % tileBlocksY_;
+    const uint32_t inZ = z % tileBlocksZ_;
+    const uint32_t tileRowBytes = tileBlocksX_ * fi.bytesPerBlock;
+    const uint32_t tileSliceBytes = tileRowBytes * tileBlocksY_;
+    return tileBase + uint64_t(inZ) * tileSliceBytes + uint64_t(inY) * tileRowBytes +
+           uint64_t(inX) * fi.bytesPerBlock;
+}
+
+const uint8_t* NacelleResource::texBlockPtr(uint32_t subresource, uint32_t bx, uint32_t by, uint32_t z) const {
+    return const_cast<NacelleResource*>(this)->texBlockPtr(subresource, bx, by, z);
+}
+
+void NacelleResource::copyBufferBytes(NacelleResource* dst,
+                                      uint64_t dstOffset,
+                                      const NacelleResource* src,
+                                      uint64_t srcOffset,
+                                      uint64_t numBytes) {
+    if (!dst || !src || numBytes == 0) return;
+    if (!dst->isReserved() && !src->isReserved()) {
+        std::memcpy(dst->basePtr() + dstOffset,
+                    src->basePtr() + srcOffset,
+                    static_cast<size_t>(numBytes));
+        return;
+    }
+
+    uint64_t remaining = numBytes;
+    while (remaining > 0) {
+        const uint64_t dstRem = dst->isReserved()
+                                    ? (kTileSizeBytes - (dstOffset % kTileSizeBytes))
+                                    : remaining;
+        const uint64_t srcRem = src->isReserved()
+                                    ? (kTileSizeBytes - (srcOffset % kTileSizeBytes))
+                                    : remaining;
+        const uint64_t chunk = std::min({remaining, dstRem, srcRem});
+
+        uint8_t* dstPtr = dst->isReserved()
+                              ? dst->bufferBytePtr(dstOffset)
+                              : ((dst->basePtr() && dstOffset < dst->totalBytes())
+                                     ? (dst->basePtr() + dstOffset)
+                                     : nullptr);
+        const uint8_t* srcPtr = src->isReserved()
+                                    ? src->bufferBytePtr(srcOffset)
+                                    : ((src->basePtr() && srcOffset < src->totalBytes())
+                                           ? (src->basePtr() + srcOffset)
+                                           : nullptr);
+
+        if (dstPtr) {
+            if (srcPtr) {
+                std::memcpy(dstPtr, srcPtr, static_cast<size_t>(chunk));
+            } else {
+                std::memset(dstPtr, 0, static_cast<size_t>(chunk));
+            }
+        }
+
+        dstOffset += chunk;
+        srcOffset += chunk;
+        remaining -= chunk;
+    }
 }
 
 HRESULT STDMETHODCALLTYPE NacelleResource::WriteToSubresource(
@@ -268,14 +608,29 @@ HRESULT STDMETHODCALLTYPE NacelleResource::WriteToSubresource(
     UINT bh = std::max<UINT>(1, (y1 - y0 + fi.blockHeight - 1) / fi.blockHeight);
     UINT copyBytes = bw * fi.bytesPerBlock;
 
-    for (UINT z = z0; z < z1; ++z) {
-        const uint8_t* srcSlice = static_cast<const uint8_t*>(pSrcData) + (z - z0) * SrcDepthPitch;
-        uint8_t* dstSlice = data_ + dst.offset + z * dst.slice_pitch;
-        for (UINT by = 0; by < bh; ++by) {
-            std::memcpy(
-                dstSlice + (by0 + by) * dst.row_pitch + bx0 * fi.bytesPerBlock,
-                srcSlice + by * SrcRowPitch,
-                copyBytes);
+    if (!isReserved_) {
+        for (UINT z = z0; z < z1; ++z) {
+            const uint8_t* srcSlice = static_cast<const uint8_t*>(pSrcData) + (z - z0) * SrcDepthPitch;
+            uint8_t* dstSlice = data_ + dst.offset + z * dst.slice_pitch;
+            for (UINT by = 0; by < bh; ++by) {
+                std::memcpy(
+                    dstSlice + (by0 + by) * dst.row_pitch + bx0 * fi.bytesPerBlock,
+                    srcSlice + by * SrcRowPitch,
+                    copyBytes);
+            }
+        }
+    } else {
+        for (UINT z = z0; z < z1; ++z) {
+            const uint8_t* srcSlice = static_cast<const uint8_t*>(pSrcData) + (z - z0) * SrcDepthPitch;
+            for (UINT by = 0; by < bh; ++by) {
+                const uint8_t* srcRow = srcSlice + by * SrcRowPitch;
+                for (UINT bx = 0; bx < bw; ++bx) {
+                    uint8_t* dstBlk = texBlockPtr(DstSubresource, bx0 + bx, by0 + by, z);
+                    if (dstBlk) {
+                        std::memcpy(dstBlk, srcRow + bx * fi.bytesPerBlock, fi.bytesPerBlock);
+                    }
+                }
+            }
         }
     }
     invalidateDecodedCache();
@@ -308,14 +663,31 @@ HRESULT STDMETHODCALLTYPE NacelleResource::ReadFromSubresource(
     UINT bh = std::max<UINT>(1, (y1 - y0 + fi.blockHeight - 1) / fi.blockHeight);
     UINT copyBytes = bw * fi.bytesPerBlock;
 
-    for (UINT z = z0; z < z1; ++z) {
-        uint8_t* dstSlice = static_cast<uint8_t*>(pDstData) + (z - z0) * DstDepthPitch;
-        const uint8_t* srcSlice = data_ + src.offset + z * src.slice_pitch;
-        for (UINT by = 0; by < bh; ++by) {
-            std::memcpy(
-                dstSlice + by * DstRowPitch,
-                srcSlice + (by0 + by) * src.row_pitch + bx0 * fi.bytesPerBlock,
-                copyBytes);
+    if (!isReserved_) {
+        for (UINT z = z0; z < z1; ++z) {
+            uint8_t* dstSlice = static_cast<uint8_t*>(pDstData) + (z - z0) * DstDepthPitch;
+            const uint8_t* srcSlice = data_ + src.offset + z * src.slice_pitch;
+            for (UINT by = 0; by < bh; ++by) {
+                std::memcpy(
+                    dstSlice + by * DstRowPitch,
+                    srcSlice + (by0 + by) * src.row_pitch + bx0 * fi.bytesPerBlock,
+                    copyBytes);
+            }
+        }
+    } else {
+        for (UINT z = z0; z < z1; ++z) {
+            uint8_t* dstSlice = static_cast<uint8_t*>(pDstData) + (z - z0) * DstDepthPitch;
+            for (UINT by = 0; by < bh; ++by) {
+                uint8_t* dstRow = dstSlice + by * DstRowPitch;
+                for (UINT bx = 0; bx < bw; ++bx) {
+                    const uint8_t* srcBlk = texBlockPtr(SrcSubresource, bx0 + bx, by0 + by, z);
+                    if (srcBlk) {
+                        std::memcpy(dstRow + bx * fi.bytesPerBlock, srcBlk, fi.bytesPerBlock);
+                    } else {
+                        std::memset(dstRow + bx * fi.bytesPerBlock, 0, fi.bytesPerBlock);
+                    }
+                }
+            }
         }
     }
     return S_OK;
@@ -324,6 +696,7 @@ HRESULT STDMETHODCALLTYPE NacelleResource::ReadFromSubresource(
 HRESULT STDMETHODCALLTYPE NacelleResource::GetHeapProperties(
     D3D12_HEAP_PROPERTIES* pHeapProperties,
     D3D12_HEAP_FLAGS* pHeapFlags) {
+    if (isReserved_) return E_INVALIDARG;
     if (pHeapProperties) *pHeapProperties = heapProps_;
     if (pHeapFlags) *pHeapFlags = D3D12_HEAP_FLAG_NONE;
     return S_OK;
@@ -367,15 +740,21 @@ void NacelleResource::ensureDecodedBC() {
             const uint32_t byCount = (src.height + 3) / 4;
 
             for (uint32_t z = 0; z < src.depth; ++z) {
-                const uint8_t* srcSlice = data_ + src.offset + z * src.slice_pitch;
+                const uint8_t* srcSlice = isReserved_ ? nullptr : (data_ + src.offset + z * src.slice_pitch);
                 float* dstSlice = bcDecodedPixels_.data() +
                                   (dstMip.offset / sizeof(float)) +
                                   size_t(slice * src.depth + z) * src.width * src.height * 4;
 
                 for (uint32_t by = 0; by < byCount; ++by) {
                     for (uint32_t bx = 0; bx < bxCount; ++bx) {
-                        const uint8_t* blk = srcSlice + by * src.row_pitch + bx * fi.bytesPerBlock;
-                        decompressBCBlockRGBA32F(desc_.Format, blk, blockOut);
+                        const uint8_t* blk = isReserved_
+                                                 ? texBlockPtr(sub, bx, by, z)
+                                                 : (srcSlice + by * src.row_pitch + bx * fi.bytesPerBlock);
+                        if (blk) {
+                            decompressBCBlockRGBA32F(desc_.Format, blk, blockOut);
+                        } else {
+                            std::memset(blockOut, 0, sizeof(blockOut));
+                        }
                         for (uint32_t py = 0; py < 4; ++py) {
                             const uint32_t y = by * 4 + py;
                             if (y >= src.height) break;

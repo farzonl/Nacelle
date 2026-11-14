@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include "../common/platform.h"
 
@@ -18,6 +19,16 @@ struct NacelleMipLayout {
     uint32_t depth = 1;
 };
 
+/// Per-mip tile grid info for reserved (tiled) textures, shared with texture_sampler.bc.
+struct NacelleSubresourceTilingInfo {
+    uint32_t width_in_tiles = 0;
+    uint32_t height_in_tiles = 0;
+    uint32_t depth_in_tiles = 0;
+    uint32_t start_tile_index = 0;
+};
+static_assert(sizeof(NacelleSubresourceTilingInfo) == 16,
+              "NacelleSubresourceTilingInfo must be 16 bytes");
+
 /// Extra metadata attached to texture descriptors via NacelleDescriptor::extra_ptr.
 struct NacelleTextureMetadata {
     static constexpr uint32_t kMaxMips = 16;
@@ -28,13 +39,25 @@ struct NacelleTextureMetadata {
     uint32_t is_cubemap = 0;
     uint32_t is_compressed = 0;
     uint32_t resource_planes = 1;
-    uint32_t reserved = 0;
+    uint32_t is_tiled = 0;
     uint64_t array_slice_stride = 0;
     // If non-null, points to an RGBA32F decoded mip array (used for BC1-BC7 textures on demand).
     const float* decoded_rgba32f = nullptr;
     NacelleMipLayout mips[kMaxMips]{};
     NacelleMipLayout decoded_mips[kMaxMips]{};
+    // Tiled (reserved) texture metadata:
+    uint8_t* const* tile_table = nullptr;
+    uint32_t total_tiles = 0;
+    uint32_t tile_width = 1;  // in texels (or blocks when compressed)
+    uint32_t tile_height = 1; // in texels (or blocks when compressed)
+    uint32_t tile_depth = 1;  // in slices
+    uint32_t mip_tiles_per_slice = 0;
+    uint32_t tiling_pad = 0;
+    NacelleSubresourceTilingInfo mip_tiling[kMaxMips]{};
 };
+
+/// Descriptor view_flags bit set on buffer CBV/SRV/UAV descriptors backed by a reserved resource.
+constexpr uint32_t kDescViewFlagReservedBuffer = 0x80000000u;
 
 /// Sampler flags packed into NacelleDescriptor::sampler_flags.
 namespace SamplerFlags {

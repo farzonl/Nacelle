@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <utility>
 
 #include "../common/format_utils.h"
 #include "../common/fp_env.h"
@@ -130,9 +131,9 @@ HRESULT STDMETHODCALLTYPE NacelleQueryHeap::QueryInterface(REFIID riid, void** p
 // --- NacelleCommandList ---
 
 NacelleCommandList::NacelleCommandList(ID3D12Device* device,
-                                 D3D12_COMMAND_LIST_TYPE type,
-                                 NacelleCommandAllocator*,
-                                 ID3D12PipelineState* initialState)
+                                       D3D12_COMMAND_LIST_TYPE type,
+                                       NacelleCommandAllocator*,
+                                       ID3D12PipelineState* initialState)
     : D3D12DeviceChildBase(device), type_(type) {
     if (initialState) {
         SetPipelineState(initialState);
@@ -255,6 +256,32 @@ void STDMETHODCALLTYPE NacelleCommandList::CopyResource(ID3D12Resource* pDst, ID
     if (pDst) { pDst->AddRef(); heldRefs_.push_back(pDst); }
     if (pSrc) { pSrc->AddRef(); heldRefs_.push_back(pSrc); }
     commands_.push_back(CmdCopyResource{static_cast<NacelleResource*>(pDst), static_cast<NacelleResource*>(pSrc)});
+}
+
+void STDMETHODCALLTYPE NacelleCommandList::CopyTiles(
+    ID3D12Resource* pTiledResource,
+    const D3D12_TILED_RESOURCE_COORDINATE* pTileRegionStartCoordinate,
+    const D3D12_TILE_REGION_SIZE* pTileRegionSize,
+    ID3D12Resource* pBuffer,
+    UINT64 BufferStartOffsetInBytes,
+    D3D12_TILE_COPY_FLAGS Flags) {
+    if (!pTiledResource || !pBuffer) return;
+    pTiledResource->AddRef();
+    heldRefs_.push_back(pTiledResource);
+    pBuffer->AddRef();
+    heldRefs_.push_back(pBuffer);
+
+    CmdCopyTiles cmd{};
+    cmd.tiledRes = static_cast<NacelleResource*>(pTiledResource);
+    if (pTileRegionStartCoordinate) cmd.coord = *pTileRegionStartCoordinate;
+    if (pTileRegionSize) {
+        cmd.hasSize = true;
+        cmd.size = *pTileRegionSize;
+    }
+    cmd.buffer = static_cast<NacelleResource*>(pBuffer);
+    cmd.bufferOffset = BufferStartOffsetInBytes;
+    cmd.flags = Flags;
+    commands_.push_back(cmd);
 }
 
 void STDMETHODCALLTYPE NacelleCommandList::ResolveSubresource(
@@ -546,6 +573,38 @@ void applyRootSignatureStaticSamplers(const NacelleRootSignature* sig, DriverRoo
     }
 }
 
+void copyBufferBlock(NacelleResource* buf, uint64_t bufOff, void* hostDst, const void* hostSrc, size_t nBytes, bool toBuffer) {
+    if (!buf->isReserved()) {
+        if (toBuffer) {
+            std::memcpy(buf->basePtr() + bufOff, hostSrc, nBytes);
+        } else {
+            std::memcpy(hostDst, buf->basePtr() + bufOff, nBytes);
+        }
+        return;
+    }
+
+    size_t pos = 0;
+    while (pos < nBytes) {
+        const uint64_t curOff = bufOff + pos;
+        const size_t tileRem = static_cast<size_t>(
+            NacelleResource::kTileSizeBytes - (curOff % NacelleResource::kTileSizeBytes));
+        const size_t chunk = std::min(nBytes - pos, tileRem);
+        uint8_t* ptr = buf->bufferBytePtr(curOff);
+        if (toBuffer) {
+            if (ptr) {
+                std::memcpy(ptr, static_cast<const uint8_t*>(hostSrc) + pos, chunk);
+            }
+        } else {
+            if (ptr) {
+                std::memcpy(static_cast<uint8_t*>(hostDst) + pos, ptr, chunk);
+            } else {
+                std::memset(static_cast<uint8_t*>(hostDst) + pos, 0, chunk);
+            }
+        }
+        pos += chunk;
+    }
+}
+
 void execCopyTextureRegion(const CmdCopyTextureRegion& c) {
     auto* dstRes = static_cast<NacelleResource*>(c.dst.pResource);
     auto* srcRes = static_cast<NacelleResource*>(c.src.pResource);
@@ -570,14 +629,32 @@ void execCopyTextureRegion(const CmdCopyTextureRegion& c) {
         UINT copyBytes = bw * fi.bytesPerBlock;
         UINT64 srcSlicePitch = UINT64(fp.Footprint.RowPitch) * ((fp.Footprint.Height + fi.blockHeight - 1) / fi.blockHeight);
 
-        for (UINT z = 0; z < d; ++z) {
-            const uint8_t* srcSlice = srcRes->basePtr() + fp.Offset + (z0 + z) * srcSlicePitch;
-            uint8_t* dstSlice = dstRes->basePtr() + dstSub.offset + (c.dstZ + z) * dstSub.slice_pitch;
-            for (UINT by = 0; by < bh; ++by) {
-                std::memcpy(
-                    dstSlice + (byDst + by) * dstSub.row_pitch + bxDst * fi.bytesPerBlock,
-                    srcSlice + (bySrc + by) * fp.Footprint.RowPitch + bxSrc * fi.bytesPerBlock,
-                    copyBytes);
+        if (!srcRes->isReserved() && !dstRes->isReserved()) {
+            for (UINT z = 0; z < d; ++z) {
+                const uint8_t* srcSlice = srcRes->basePtr() + fp.Offset + (z0 + z) * srcSlicePitch;
+                uint8_t* dstSlice = dstRes->basePtr() + dstSub.offset + (c.dstZ + z) * dstSub.slice_pitch;
+                for (UINT by = 0; by < bh; ++by) {
+                    std::memcpy(
+                        dstSlice + (byDst + by) * dstSub.row_pitch + bxDst * fi.bytesPerBlock,
+                        srcSlice + (bySrc + by) * fp.Footprint.RowPitch + bxSrc * fi.bytesPerBlock,
+                        copyBytes);
+                }
+            }
+        } else {
+            uint8_t blkTmp[16]{};
+            for (UINT z = 0; z < d; ++z) {
+                const UINT64 srcSliceOff = fp.Offset + (z0 + z) * srcSlicePitch;
+                for (UINT by = 0; by < bh; ++by) {
+                    const UINT64 srcRowOff = srcSliceOff + UINT64(bySrc + by) * fp.Footprint.RowPitch;
+                    for (UINT bx = 0; bx < bw; ++bx) {
+                        uint8_t* dstBlk = dstRes->texBlockPtr(
+                            c.dst.SubresourceIndex, bxDst + bx, byDst + by, c.dstZ + z);
+                        if (!dstBlk) continue;
+                        const UINT64 srcBlkOff = srcRowOff + UINT64(bxSrc + bx) * fi.bytesPerBlock;
+                        copyBufferBlock(srcRes, srcBlkOff, blkTmp, nullptr, fi.bytesPerBlock, false);
+                        std::memcpy(dstBlk, blkTmp, fi.bytesPerBlock);
+                    }
+                }
             }
         }
         dstRes->invalidateDecodedCache();
@@ -603,14 +680,30 @@ void execCopyTextureRegion(const CmdCopyTextureRegion& c) {
         UINT copyBytes = bw * fi.bytesPerBlock;
         UINT64 dstSlicePitch = UINT64(fp.Footprint.RowPitch) * ((fp.Footprint.Height + fi.blockHeight - 1) / fi.blockHeight);
 
-        for (UINT z = 0; z < d; ++z) {
-            const uint8_t* srcSlice = srcRes->basePtr() + srcSub.offset + (z0 + z) * srcSub.slice_pitch;
-            uint8_t* dstSlice = dstRes->basePtr() + fp.Offset + (c.dstZ + z) * dstSlicePitch;
-            for (UINT by = 0; by < bh; ++by) {
-                std::memcpy(
-                    dstSlice + (byDst + by) * fp.Footprint.RowPitch + bxDst * fi.bytesPerBlock,
-                    srcSlice + (bySrc + by) * srcSub.row_pitch + bxSrc * fi.bytesPerBlock,
-                    copyBytes);
+        if (!srcRes->isReserved() && !dstRes->isReserved()) {
+            for (UINT z = 0; z < d; ++z) {
+                const uint8_t* srcSlice = srcRes->basePtr() + srcSub.offset + (z0 + z) * srcSub.slice_pitch;
+                uint8_t* dstSlice = dstRes->basePtr() + fp.Offset + (c.dstZ + z) * dstSlicePitch;
+                for (UINT by = 0; by < bh; ++by) {
+                    std::memcpy(
+                        dstSlice + (byDst + by) * fp.Footprint.RowPitch + bxDst * fi.bytesPerBlock,
+                        srcSlice + (bySrc + by) * srcSub.row_pitch + bxSrc * fi.bytesPerBlock,
+                        copyBytes);
+                }
+            }
+        } else {
+            static constexpr uint8_t kZeroBlk[16]{};
+            for (UINT z = 0; z < d; ++z) {
+                const UINT64 dstSliceOff = fp.Offset + (c.dstZ + z) * dstSlicePitch;
+                for (UINT by = 0; by < bh; ++by) {
+                    const UINT64 dstRowOff = dstSliceOff + UINT64(byDst + by) * fp.Footprint.RowPitch;
+                    for (UINT bx = 0; bx < bw; ++bx) {
+                        const uint8_t* srcBlk = srcRes->texBlockPtr(
+                            c.src.SubresourceIndex, bxSrc + bx, bySrc + by, z0 + z);
+                        const UINT64 dstBlkOff = dstRowOff + UINT64(bxDst + bx) * fi.bytesPerBlock;
+                        copyBufferBlock(dstRes, dstBlkOff, nullptr, srcBlk ? srcBlk : kZeroBlk, fi.bytesPerBlock, true);
+                    }
+                }
             }
         }
         dstRes->invalidateDecodedCache();
@@ -635,14 +728,33 @@ void execCopyTextureRegion(const CmdCopyTextureRegion& c) {
         UINT bh = std::max<UINT>(1, (h + fi.blockHeight - 1) / fi.blockHeight);
         UINT copyBytes = bw * fi.bytesPerBlock;
 
-        for (UINT z = 0; z < d; ++z) {
-            const uint8_t* srcSlice = srcRes->basePtr() + srcSub.offset + (z0 + z) * srcSub.slice_pitch;
-            uint8_t* dstSlice = dstRes->basePtr() + dstSub.offset + (c.dstZ + z) * dstSub.slice_pitch;
-            for (UINT by = 0; by < bh; ++by) {
-                std::memcpy(
-                    dstSlice + (byDst + by) * dstSub.row_pitch + bxDst * fi.bytesPerBlock,
-                    srcSlice + (bySrc + by) * srcSub.row_pitch + bxSrc * fi.bytesPerBlock,
-                    copyBytes);
+        if (!srcRes->isReserved() && !dstRes->isReserved()) {
+            for (UINT z = 0; z < d; ++z) {
+                const uint8_t* srcSlice = srcRes->basePtr() + srcSub.offset + (z0 + z) * srcSub.slice_pitch;
+                uint8_t* dstSlice = dstRes->basePtr() + dstSub.offset + (c.dstZ + z) * dstSub.slice_pitch;
+                for (UINT by = 0; by < bh; ++by) {
+                    std::memcpy(
+                        dstSlice + (byDst + by) * dstSub.row_pitch + bxDst * fi.bytesPerBlock,
+                        srcSlice + (bySrc + by) * srcSub.row_pitch + bxSrc * fi.bytesPerBlock,
+                        copyBytes);
+                }
+            }
+        } else {
+            for (UINT z = 0; z < d; ++z) {
+                for (UINT by = 0; by < bh; ++by) {
+                    for (UINT bx = 0; bx < bw; ++bx) {
+                        uint8_t* dstBlk = dstRes->texBlockPtr(
+                            c.dst.SubresourceIndex, bxDst + bx, byDst + by, c.dstZ + z);
+                        if (!dstBlk) continue;
+                        const uint8_t* srcBlk = srcRes->texBlockPtr(
+                            c.src.SubresourceIndex, bxSrc + bx, bySrc + by, z0 + z);
+                        if (srcBlk) {
+                            std::memcpy(dstBlk, srcBlk, fi.bytesPerBlock);
+                        } else {
+                            std::memset(dstBlk, 0, fi.bytesPerBlock);
+                        }
+                    }
+                }
             }
         }
         dstRes->invalidateDecodedCache();
@@ -652,29 +764,81 @@ void execCopyTextureRegion(const CmdCopyTextureRegion& c) {
     }
 }
 
+void execCopyTiles(const CmdCopyTiles& c) {
+    if (!c.tiledRes || !c.buffer || !c.tiledRes->isReserved()) return;
+
+    std::vector<uint32_t> tiles;
+    if (!c.hasSize) {
+        D3D12_TILE_REGION_SIZE defaultSz{};
+        defaultSz.NumTiles = c.tiledRes->totalTileCount();
+        defaultSz.UseBox = FALSE;
+        c.tiledRes->enumerateRegionTiles(c.coord, &defaultSz, tiles);
+    } else {
+        c.tiledRes->enumerateRegionTiles(c.coord, &c.size, tiles);
+    }
+
+    const bool linearToTiled =
+        (c.flags & D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE) != 0;
+
+    for (size_t i = 0; i < tiles.size(); ++i) {
+        const uint64_t bufOff = c.bufferOffset + i * NacelleResource::kTileSizeBytes;
+        uint8_t* tPtr = c.tiledRes->tilePtr(tiles[i]);
+        if (linearToTiled) {
+            if (tPtr) {
+                copyBufferBlock(c.buffer, bufOff, tPtr, nullptr, NacelleResource::kTileSizeBytes, false);
+            }
+        } else {
+            if (tPtr) {
+                copyBufferBlock(c.buffer, bufOff, nullptr, tPtr, NacelleResource::kTileSizeBytes, true);
+            } else {
+                std::vector<uint8_t> zeros(NacelleResource::kTileSizeBytes, 0);
+                copyBufferBlock(c.buffer, bufOff, nullptr, zeros.data(), NacelleResource::kTileSizeBytes, true);
+            }
+        }
+    }
+
+    if (linearToTiled) {
+        c.tiledRes->invalidateDecodedCache();
+        c.tiledRes->finalizeTileMappingsUpdate();
+    }
+}
+
 void execClearRTV(const CmdClearRTV& c) {
     if (!c.rtv.resource) return;
-    const auto& sub = c.rtv.resource->subresourceLayout(c.rtv.mip_slice);
+    const uint32_t mipLevels = std::max<uint32_t>(1, c.rtv.resource->resourceDesc().MipLevels);
+    const uint32_t subIdx = c.rtv.mip_slice + c.rtv.first_array_slice * mipLevels;
+    const auto& sub = c.rtv.resource->subresourceLayout(subIdx);
     const FormatInfo fi = getFormatInfo(c.rtv.format);
     uint8_t encoded[16]{};
     packPixelRGBA32F(c.rtv.format, c.rgba, encoded);
     const UINT sampleCount = std::max<UINT>(1, c.rtv.resource->resourceDesc().SampleDesc.Count);
+    const bool reserved = c.rtv.resource->isReserved();
 
     auto clearRect = [&](uint8_t* base, LONG x0, LONG y0, LONG x1, LONG y1) {
         x0 = std::max<LONG>(0, x0);
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
         y1 = std::min<LONG>(sub.height, y1);
-        for (LONG y = y0; y < y1; ++y) {
-            uint8_t* row = base + y * sub.row_pitch;
-            for (LONG x = x0; x < x1; ++x) {
-                std::memcpy(row + x * fi.bytesPerBlock, encoded, fi.bytesPerBlock);
+        if (!reserved) {
+            for (LONG y = y0; y < y1; ++y) {
+                uint8_t* row = base + y * sub.row_pitch;
+                for (LONG x = x0; x < x1; ++x) {
+                    std::memcpy(row + x * fi.bytesPerBlock, encoded, fi.bytesPerBlock);
+                }
+            }
+        } else {
+            for (LONG y = y0; y < y1; ++y) {
+                for (LONG x = x0; x < x1; ++x) {
+                    if (uint8_t* px = c.rtv.resource->texBlockPtr(subIdx, static_cast<uint32_t>(x), static_cast<uint32_t>(y), 0)) {
+                        std::memcpy(px, encoded, fi.bytesPerBlock);
+                    }
+                }
             }
         }
     };
 
     for (UINT s = 0; s < sampleCount; ++s) {
-        uint8_t* base = c.rtv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch;
+        uint8_t* base = reserved ? nullptr : (c.rtv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch);
         if (c.rects.empty()) {
             clearRect(base, 0, 0, sub.width, sub.height);
         } else {
@@ -685,47 +849,62 @@ void execClearRTV(const CmdClearRTV& c) {
 
 void execClearDSV(const CmdClearDSV& c) {
     if (!c.dsv.resource) return;
-    const auto& sub = c.dsv.resource->subresourceLayout(c.dsv.mip_slice);
+    const uint32_t mipLevels = std::max<uint32_t>(1, c.dsv.resource->resourceDesc().MipLevels);
+    const uint32_t subIdx = c.dsv.mip_slice + c.dsv.first_array_slice * mipLevels;
+    const auto& sub = c.dsv.resource->subresourceLayout(subIdx);
     const FormatInfo fi = getFormatInfo(c.dsv.format);
     const UINT sampleCount = std::max<UINT>(1, c.dsv.resource->resourceDesc().SampleDesc.Count);
+    const bool reserved = c.dsv.resource->isReserved();
+
+    auto clearPixel = [&](uint8_t* px) {
+        if (!px) return;
+        if (c.dsv.format == DXGI_FORMAT_D32_FLOAT || c.dsv.format == DXGI_FORMAT_R32_TYPELESS) {
+            if (c.flags & D3D12_CLEAR_FLAG_DEPTH) std::memcpy(px, &c.depth, 4);
+        } else if (c.dsv.format == DXGI_FORMAT_D16_UNORM) {
+            if (c.flags & D3D12_CLEAR_FLAG_DEPTH) {
+                uint16_t d16 = static_cast<uint16_t>(std::clamp(c.depth, 0.0f, 1.0f) * 65535.0f + 0.5f);
+                std::memcpy(px, &d16, 2);
+            }
+        } else if (c.dsv.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+            uint32_t cur = 0;
+            std::memcpy(&cur, px, 4);
+            if (c.flags & D3D12_CLEAR_FLAG_DEPTH) {
+                uint32_t d24 = static_cast<uint32_t>(std::clamp(c.depth, 0.0f, 1.0f) * 16777215.0f + 0.5f);
+                cur = (cur & 0xFF000000u) | (d24 & 0x00FFFFFFu);
+            }
+            if (c.flags & D3D12_CLEAR_FLAG_STENCIL) {
+                cur = (cur & 0x00FFFFFFu) | (uint32_t(c.stencil) << 24);
+            }
+            std::memcpy(px, &cur, 4);
+        } else if (c.dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+            if (c.flags & D3D12_CLEAR_FLAG_DEPTH) std::memcpy(px, &c.depth, 4);
+            if (c.flags & D3D12_CLEAR_FLAG_STENCIL) px[4] = c.stencil;
+        }
+    };
 
     auto clearRect = [&](uint8_t* base, LONG x0, LONG y0, LONG x1, LONG y1) {
         x0 = std::max<LONG>(0, x0);
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
         y1 = std::min<LONG>(sub.height, y1);
-        for (LONG y = y0; y < y1; ++y) {
-            uint8_t* row = base + y * sub.row_pitch;
-            for (LONG x = x0; x < x1; ++x) {
-                uint8_t* px = row + x * fi.bytesPerBlock;
-                if (c.dsv.format == DXGI_FORMAT_D32_FLOAT || c.dsv.format == DXGI_FORMAT_R32_TYPELESS) {
-                    if (c.flags & D3D12_CLEAR_FLAG_DEPTH) std::memcpy(px, &c.depth, 4);
-                } else if (c.dsv.format == DXGI_FORMAT_D16_UNORM) {
-                    if (c.flags & D3D12_CLEAR_FLAG_DEPTH) {
-                        uint16_t d16 = static_cast<uint16_t>(std::clamp(c.depth, 0.0f, 1.0f) * 65535.0f + 0.5f);
-                        std::memcpy(px, &d16, 2);
-                    }
-                } else if (c.dsv.format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
-                    uint32_t cur = 0;
-                    std::memcpy(&cur, px, 4);
-                    if (c.flags & D3D12_CLEAR_FLAG_DEPTH) {
-                        uint32_t d24 = static_cast<uint32_t>(std::clamp(c.depth, 0.0f, 1.0f) * 16777215.0f + 0.5f);
-                        cur = (cur & 0xFF000000u) | (d24 & 0x00FFFFFFu);
-                    }
-                    if (c.flags & D3D12_CLEAR_FLAG_STENCIL) {
-                        cur = (cur & 0x00FFFFFFu) | (uint32_t(c.stencil) << 24);
-                    }
-                    std::memcpy(px, &cur, 4);
-                } else if (c.dsv.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
-                    if (c.flags & D3D12_CLEAR_FLAG_DEPTH) std::memcpy(px, &c.depth, 4);
-                    if (c.flags & D3D12_CLEAR_FLAG_STENCIL) px[4] = c.stencil;
+        if (!reserved) {
+            for (LONG y = y0; y < y1; ++y) {
+                uint8_t* row = base + y * sub.row_pitch;
+                for (LONG x = x0; x < x1; ++x) {
+                    clearPixel(row + x * fi.bytesPerBlock);
+                }
+            }
+        } else {
+            for (LONG y = y0; y < y1; ++y) {
+                for (LONG x = x0; x < x1; ++x) {
+                    clearPixel(c.dsv.resource->texBlockPtr(subIdx, static_cast<uint32_t>(x), static_cast<uint32_t>(y), 0));
                 }
             }
         }
     };
 
     for (UINT s = 0; s < sampleCount; ++s) {
-        uint8_t* base = c.dsv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch;
+        uint8_t* base = reserved ? nullptr : (c.dsv.resource->basePtr() + sub.offset + static_cast<size_t>(s) * sub.slice_pitch);
         if (c.rects.empty()) clearRect(base, 0, 0, sub.width, sub.height);
         else for (const auto& r : c.rects) clearRect(base, r.left, r.top, r.right, r.bottom);
     }
@@ -815,10 +994,26 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 if (c.idx < DriverRootContext::kMaxRootSlots) {
                     auto& sd = ctx.inline_descriptors[c.idx];
                     sd = NacelleDescriptor{};
-                    sd.base_ptr = reinterpret_cast<void*>(c.addr);
-                    sd.byte_size = UINT64_MAX;
-                    sd.width = UINT32_MAX;
-                    sd.elem_stride = 4;
+                    uint64_t reservedOff = 0;
+                    if (NacelleResource* reservedRes =
+                            NacelleResource::resolveReservedGpuVA(c.addr, &reservedOff)) {
+                        sd.base_ptr = const_cast<uint8_t**>(reservedRes->tileTablePtr());
+                        sd.byte_size = (reservedOff < reservedRes->totalBytes())
+                                           ? (reservedRes->totalBytes() - reservedOff)
+                                           : 0;
+                        sd.width = static_cast<uint32_t>(
+                            std::min<uint64_t>(UINT32_MAX, sd.byte_size / 4));
+                        sd.height = reservedRes->totalTileCount();
+                        sd.row_pitch = static_cast<uint32_t>(reservedOff & 0xFFFFFFFFu);
+                        sd.depth_or_array = static_cast<uint32_t>(reservedOff >> 32);
+                        sd.elem_stride = 4;
+                        sd.view_flags = D3D12_SRV_DIMENSION_BUFFER | kDescViewFlagReservedBuffer;
+                    } else {
+                        sd.base_ptr = reinterpret_cast<void*>(c.addr);
+                        sd.byte_size = UINT64_MAX;
+                        sd.width = UINT32_MAX;
+                        sd.elem_stride = 4;
+                    }
                     ctx.root_slots[c.idx] = &sd;
                 }
             } else if constexpr (std::is_same_v<T, CmdDispatch>) {
@@ -829,17 +1024,48 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 executeRasterDrawCall(pool, state.gfx, DrawCallParams{true, c.idxCount, c.iCount, c.startIdx, c.baseV, c.startI});
             } else if constexpr (std::is_same_v<T, CmdCopyBufferRegion>) {
                 if (c.dst && c.src && c.bytes > 0) {
-                    std::memcpy(c.dst->basePtr() + c.dstOff, c.src->basePtr() + c.srcOff, static_cast<size_t>(c.bytes));
+                    NacelleResource::copyBufferBytes(c.dst, c.dstOff, c.src, c.srcOff, c.bytes);
                     c.dst->invalidateDecodedCache();
                 }
             } else if constexpr (std::is_same_v<T, CmdCopyTextureRegion>) {
                 execCopyTextureRegion(c);
             } else if constexpr (std::is_same_v<T, CmdCopyResource>) {
                 if (c.dst && c.src) {
-                    size_t n = static_cast<size_t>(std::min(c.dst->totalBytes(), c.src->totalBytes()));
-                    std::memcpy(c.dst->basePtr(), c.src->basePtr(), n);
+                    if (c.dst->resourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                        uint64_t n = std::min(c.dst->totalBytes(), c.src->totalBytes());
+                        NacelleResource::copyBufferBytes(c.dst, 0, c.src, 0, n);
+                    } else if (!c.dst->isReserved() && !c.src->isReserved()) {
+                        size_t n = static_cast<size_t>(std::min(c.dst->totalBytes(), c.src->totalBytes()));
+                        std::memcpy(c.dst->basePtr(), c.src->basePtr(), n);
+                    } else {
+                        const uint32_t subs = std::min(c.dst->subresourceCount(), c.src->subresourceCount());
+                        const FormatInfo fi = getFormatInfo(c.dst->resourceDesc().Format);
+                        for (uint32_t sub = 0; sub < subs; ++sub) {
+                            const auto& dSub = c.dst->subresourceLayout(sub);
+                            const auto& sSub = c.src->subresourceLayout(sub);
+                            const uint32_t bw = std::max<uint32_t>(1, (std::min(dSub.width, sSub.width) + fi.blockWidth - 1) / fi.blockWidth);
+                            const uint32_t bh = std::max<uint32_t>(1, (std::min(dSub.height, sSub.height) + fi.blockHeight - 1) / fi.blockHeight);
+                            const uint32_t d = std::min(dSub.depth, sSub.depth);
+                            for (uint32_t z = 0; z < d; ++z) {
+                                for (uint32_t by = 0; by < bh; ++by) {
+                                    for (uint32_t bx = 0; bx < bw; ++bx) {
+                                        uint8_t* dBlk = c.dst->texBlockPtr(sub, bx, by, z);
+                                        if (!dBlk) continue;
+                                        const uint8_t* sBlk = c.src->texBlockPtr(sub, bx, by, z);
+                                        if (sBlk) std::memcpy(dBlk, sBlk, fi.bytesPerBlock);
+                                        else std::memset(dBlk, 0, fi.bytesPerBlock);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     c.dst->invalidateDecodedCache();
+                    if (c.dst->textureMetadata()->is_compressed && c.dst->textureMetadata()->decoded_rgba32f != nullptr) {
+                        c.dst->ensureDecodedBC();
+                    }
                 }
+            } else if constexpr (std::is_same_v<T, CmdCopyTiles>) {
+                execCopyTiles(c);
             } else if constexpr (std::is_same_v<T, CmdResolveSubresource>) {
                 if (c.dst && c.src) {
                     const auto& dSub = c.dst->subresourceLayout(c.dstSub);
@@ -847,16 +1073,37 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                     const UINT sampleCount = std::max<UINT>(1, c.src->resourceDesc().SampleDesc.Count);
                     const DXGI_FORMAT fmt = (c.fmt != DXGI_FORMAT_UNKNOWN) ? c.fmt : c.dst->resourceDesc().Format;
                     if (sampleCount <= 1) {
-                        size_t n = std::min<size_t>(dSub.slice_pitch, sSub.slice_pitch);
-                        std::memcpy(c.dst->basePtr() + dSub.offset, c.src->basePtr() + sSub.offset, n);
-                    } else {
+                        if (!c.dst->isReserved() && !c.src->isReserved()) {
+                            size_t n = std::min<size_t>(dSub.slice_pitch, sSub.slice_pitch);
+                            std::memcpy(c.dst->basePtr() + dSub.offset, c.src->basePtr() + sSub.offset, n);
+                        } else {
+                            const FormatInfo fi = getFormatInfo(fmt);
+                            const uint32_t bw = std::max<uint32_t>(1, (std::min(dSub.width, sSub.width) + fi.blockWidth - 1) / fi.blockWidth);
+                            const uint32_t bh = std::max<uint32_t>(1, (std::min(dSub.height, sSub.height) + fi.blockHeight - 1) / fi.blockHeight);
+                            for (uint32_t by = 0; by < bh; ++by) {
+                                for (uint32_t bx = 0; bx < bw; ++bx) {
+                                    uint8_t* dBlk = c.dst->texBlockPtr(c.dstSub, bx, by, 0);
+                                    if (!dBlk) continue;
+                                    const uint8_t* sBlk = c.src->texBlockPtr(c.srcSub, bx, by, 0);
+                                    if (sBlk) std::memcpy(dBlk, sBlk, fi.bytesPerBlock);
+                                    else std::memset(dBlk, 0, fi.bytesPerBlock);
+                                }
+                            }
+                        }
+                    } else if (!c.src->isReserved()) {
                         const FormatInfo fi = getFormatInfo(fmt);
                         const uint32_t w = std::min(dSub.width, sSub.width);
                         const uint32_t h = std::min(dSub.height, sSub.height);
                         const float invSamples = 1.0f / static_cast<float>(sampleCount);
                         for (uint32_t y = 0; y < h; ++y) {
-                            uint8_t* dstRow = c.dst->basePtr() + dSub.offset + static_cast<size_t>(y) * dSub.row_pitch;
+                            uint8_t* dstRow = c.dst->isReserved()
+                                                  ? nullptr
+                                                  : (c.dst->basePtr() + dSub.offset + static_cast<size_t>(y) * dSub.row_pitch);
                             for (uint32_t x = 0; x < w; ++x) {
+                                uint8_t* dstPx = c.dst->isReserved()
+                                                     ? c.dst->texBlockPtr(c.dstSub, x, y, 0)
+                                                     : (dstRow + static_cast<size_t>(x) * fi.bytesPerBlock);
+                                if (!dstPx) continue;
                                 float sum[4]{0.0f, 0.0f, 0.0f, 0.0f};
                                 for (UINT s = 0; s < sampleCount; ++s) {
                                     const uint8_t* srcPx = c.src->basePtr() + sSub.offset +
@@ -868,7 +1115,7 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                                     for (int ch = 0; ch < 4; ++ch) sum[ch] += rgba[ch];
                                 }
                                 for (int ch = 0; ch < 4; ++ch) sum[ch] *= invSamples;
-                                packPixelRGBA32F(fmt, sum, dstRow + static_cast<size_t>(x) * fi.bytesPerBlock);
+                                packPixelRGBA32F(fmt, sum, dstPx);
                             }
                         }
                     }
@@ -878,12 +1125,27 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 state.gfx.topology = c.topo;
             } else if constexpr (std::is_same_v<T, CmdIASetIndexBuffer>) {
                 state.gfx.indexBuffer = c.view;
+                if ((c.view.BufferLocation & NacelleResource::kReservedGpuVaFlag) != 0) {
+                    uint64_t off = 0;
+                    if (auto* res = NacelleResource::resolveReservedGpuVA(c.view.BufferLocation, &off)) {
+                        state.gfx.indexBuffer.BufferLocation =
+                            reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(res->bufferBytePtr(off));
+                    }
+                }
             } else if constexpr (std::is_same_v<T, CmdIASetVertexBuffers>) {
                 for (size_t i = 0; i < c.views.size() && (c.startSlot + i) < 16; ++i) {
-                    state.gfx.vertexBuffers[c.startSlot + i] = c.views[i];
-                    state.gfx.rootCtx.vertex_buffers[c.startSlot + i] = c.views[i].BufferLocation;
-                    state.gfx.rootCtx.vertex_strides[c.startSlot + i] = c.views[i].StrideInBytes;
-                    state.gfx.rootCtx.vertex_sizes[c.startSlot + i] = c.views[i].SizeInBytes;
+                    D3D12_VERTEX_BUFFER_VIEW vbv = c.views[i];
+                    if ((vbv.BufferLocation & NacelleResource::kReservedGpuVaFlag) != 0) {
+                        uint64_t off = 0;
+                        if (auto* res = NacelleResource::resolveReservedGpuVA(vbv.BufferLocation, &off)) {
+                            vbv.BufferLocation =
+                                reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(res->bufferBytePtr(off));
+                        }
+                    }
+                    state.gfx.vertexBuffers[c.startSlot + i] = vbv;
+                    state.gfx.rootCtx.vertex_buffers[c.startSlot + i] = vbv.BufferLocation;
+                    state.gfx.rootCtx.vertex_strides[c.startSlot + i] = vbv.StrideInBytes;
+                    state.gfx.rootCtx.vertex_sizes[c.startSlot + i] = vbv.SizeInBytes;
                 }
             } else if constexpr (std::is_same_v<T, CmdRSSetViewports>) {
                 state.gfx.numViewports = static_cast<uint32_t>(std::min<size_t>(c.vps.size(), 16));
@@ -909,7 +1171,51 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
             } else if constexpr (std::is_same_v<T, CmdClearDSV>) {
                 execClearDSV(c);
             } else if constexpr (std::is_same_v<T, CmdClearUAV>) {
-                if (c.desc.base_ptr && c.desc.byte_size > 0) {
+                if ((c.desc.view_flags & kDescViewFlagReservedBuffer) != 0) {
+                    if (c.desc.base_ptr && c.desc.byte_size > 0) {
+                        const uint32_t* u32 = c.isFloat ? reinterpret_cast<const uint32_t*>(c.fVal) : c.uVal;
+                        auto* const* tileTable = static_cast<uint8_t* const*>(c.desc.base_ptr);
+                        const uint32_t totalTiles = c.desc.height;
+                        const uint64_t viewOff = (uint64_t(c.desc.depth_or_array) << 32) | c.desc.row_pitch;
+                        const size_t words = static_cast<size_t>(c.desc.byte_size / 4);
+                        for (size_t i = 0; i < words; ++i) {
+                            const uint64_t byteOff = viewOff + i * 4;
+                            const uint64_t tileIdx = byteOff / NacelleResource::kTileSizeBytes;
+                            if (tileIdx >= totalTiles) break;
+                            uint8_t* tileBase = tileTable[tileIdx];
+                            if (tileBase) {
+                                std::memcpy(tileBase + (byteOff % NacelleResource::kTileSizeBytes),
+                                            &u32[i & 3], 4);
+                            }
+                        }
+                    }
+                } else if (c.res && c.res->isReserved() &&
+                           c.res->resourceDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    const uint32_t mipSlice = (c.desc.view_flags >> 8) & 0xFFu;
+                    const uint32_t firstSlice = (c.desc.view_flags >> 16) & 0xFFFFu;
+                    const uint32_t sliceCount = std::max<uint32_t>(1, c.desc.depth_or_array);
+                    const DXGI_FORMAT fmt = static_cast<DXGI_FORMAT>(c.desc.format);
+                    const FormatInfo fi = getFormatInfo(fmt);
+                    uint8_t encoded[16]{};
+                    if (c.isFloat) {
+                        packPixelRGBA32F(fmt, c.fVal, encoded);
+                    } else {
+                        std::memcpy(encoded, c.uVal, 16);
+                    }
+                    const uint32_t mipLevels = std::max<uint32_t>(1, c.res->resourceDesc().MipLevels);
+                    for (uint32_t s = 0; s < sliceCount; ++s) {
+                        const bool is3D = (c.res->resourceDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+                        const uint32_t subIdx = is3D ? mipSlice : (mipSlice + (firstSlice + s) * mipLevels);
+                        const uint32_t zCoord = is3D ? (firstSlice + s) : 0u;
+                        for (uint32_t y = 0; y < c.desc.height; ++y) {
+                            for (uint32_t x = 0; x < c.desc.width; ++x) {
+                                if (uint8_t* px = c.res->texBlockPtr(subIdx, x, y, zCoord)) {
+                                    std::memcpy(px, encoded, fi.bytesPerBlock);
+                                }
+                            }
+                        }
+                    }
+                } else if (c.desc.base_ptr && c.desc.byte_size > 0) {
                     const uint32_t* u32 = c.isFloat ? reinterpret_cast<const uint32_t*>(c.fVal) : c.uVal;
                     auto* dst = static_cast<uint32_t*>(c.desc.base_ptr);
                     size_t words = c.desc.byte_size / 4;
@@ -924,9 +1230,8 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 }
             } else if constexpr (std::is_same_v<T, CmdResolveQueryData>) {
                 if (c.heap && c.dst && c.start + c.count <= c.heap->values.size()) {
-                    std::memcpy(c.dst->basePtr() + c.offset,
-                                &c.heap->values[c.start],
-                                c.count * sizeof(uint64_t));
+                    copyBufferBlock(c.dst, c.offset, nullptr, &c.heap->values[c.start],
+                                    c.count * sizeof(uint64_t), true);
                 }
             } else if constexpr (std::is_same_v<T, CmdBuildRaytracingAS>) {
                 D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC localDesc = c.desc;
@@ -942,13 +1247,23 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                 UINT count = c.maxCount;
                 if (c.cntBuf) {
                     UINT actual = 0;
-                    std::memcpy(&actual, c.cntBuf->basePtr() + c.cntOff, 4);
+                    copyBufferBlock(c.cntBuf, c.cntOff, &actual, nullptr, 4, false);
                     count = std::min(count, actual);
                 }
-                const uint8_t* ptr = c.argBuf->basePtr() + c.argOff;
                 const UINT stride = c.sig->desc().ByteStride;
+                std::vector<uint8_t> recScratch;
+                if (c.argBuf->isReserved()) {
+                    recScratch.resize(stride);
+                }
                 for (UINT i = 0; i < count; ++i) {
-                    const uint8_t* rec = ptr + i * stride;
+                    const uint8_t* rec = nullptr;
+                    if (!c.argBuf->isReserved()) {
+                        rec = c.argBuf->basePtr() + c.argOff + i * stride;
+                    } else {
+                        copyBufferBlock(c.argBuf, c.argOff + uint64_t(i) * stride,
+                                        recScratch.data(), nullptr, stride, false);
+                        rec = recScratch.data();
+                    }
                     size_t off = 0;
                     for (const auto& arg : c.sig->args()) {
                         if (arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) {
@@ -995,6 +1310,122 @@ HRESULT STDMETHODCALLTYPE NacelleCommandQueue::QueryInterface(REFIID riid, void*
         return S_OK;
     }
     return D3D12PageableBase::QueryInterface(riid, ppvObject);
+}
+
+void STDMETHODCALLTYPE NacelleCommandQueue::UpdateTileMappings(
+    ID3D12Resource* pResource,
+    UINT NumResourceRegions,
+    const D3D12_TILED_RESOURCE_COORDINATE* pResourceRegionStartCoordinates,
+    const D3D12_TILE_REGION_SIZE* pResourceRegionSizes,
+    ID3D12Heap* pHeap,
+    UINT NumRanges,
+    const D3D12_TILE_RANGE_FLAGS* pRangeFlags,
+    const UINT* pHeapRangeStartOffsets,
+    const UINT* pRangeTileCounts,
+    D3D12_TILE_MAPPING_FLAGS) {
+    if (!pResource || NumResourceRegions == 0 || NumRanges == 0) return;
+
+    std::lock_guard<std::mutex> lock(execMutex_);
+    auto* res = static_cast<NacelleResource*>(pResource);
+    if (!res->isReserved()) return;
+
+    auto* heap = static_cast<NacelleHeap*>(pHeap);
+
+    std::vector<uint32_t> regionTiles;
+    if (NumResourceRegions == 1 && !pResourceRegionStartCoordinates && !pResourceRegionSizes) {
+        regionTiles.resize(res->totalTileCount());
+        for (uint32_t i = 0; i < res->totalTileCount(); ++i) regionTiles[i] = i;
+    } else {
+        for (UINT r = 0; r < NumResourceRegions; ++r) {
+            const D3D12_TILED_RESOURCE_COORDINATE coord =
+                pResourceRegionStartCoordinates
+                    ? pResourceRegionStartCoordinates[r]
+                    : D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0};
+            D3D12_TILE_REGION_SIZE defaultSize{};
+            if (!pResourceRegionSizes) {
+                defaultSize.NumTiles = pResourceRegionStartCoordinates ? 1u : res->totalTileCount();
+                defaultSize.UseBox = FALSE;
+            }
+            const D3D12_TILE_REGION_SIZE* sz =
+                pResourceRegionSizes ? &pResourceRegionSizes[r] : &defaultSize;
+            res->enumerateRegionTiles(coord, sz, regionTiles);
+        }
+    }
+
+    size_t cursor = 0;
+    uint32_t sequentialHeapTile = 0;
+    for (UINT i = 0; i < NumRanges && cursor < regionTiles.size(); ++i) {
+        const D3D12_TILE_RANGE_FLAGS rf =
+            pRangeFlags ? pRangeFlags[i] : D3D12_TILE_RANGE_FLAG_NONE;
+        const UINT count = pRangeTileCounts
+                               ? pRangeTileCounts[i]
+                               : ((NumRanges == 1) ? static_cast<UINT>(regionTiles.size()) : 1u);
+
+        if ((rf & D3D12_TILE_RANGE_FLAG_SKIP) != 0) {
+            cursor = std::min(regionTiles.size(), cursor + count);
+            continue;
+        }
+
+        if ((rf & D3D12_TILE_RANGE_FLAG_NULL) != 0 || !heap) {
+            for (UINT k = 0; k < count && cursor < regionTiles.size(); ++k, ++cursor) {
+                res->setTileMapping(regionTiles[cursor], nullptr, 0);
+            }
+            continue;
+        }
+
+        const uint32_t heapStart =
+            pHeapRangeStartOffsets ? pHeapRangeStartOffsets[i] : sequentialHeapTile;
+        const bool reuseSingle = (rf & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) != 0;
+        for (UINT k = 0; k < count && cursor < regionTiles.size(); ++k, ++cursor) {
+            const uint32_t hTile = reuseSingle ? heapStart : (heapStart + k);
+            res->setTileMapping(regionTiles[cursor], heap, hTile);
+        }
+        sequentialHeapTile = reuseSingle ? (heapStart + 1) : (heapStart + count);
+    }
+
+    res->finalizeTileMappingsUpdate();
+}
+
+void STDMETHODCALLTYPE NacelleCommandQueue::CopyTileMappings(
+    ID3D12Resource* pDstResource,
+    const D3D12_TILED_RESOURCE_COORDINATE* pDstRegionStartCoordinate,
+    ID3D12Resource* pSrcResource,
+    const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate,
+    const D3D12_TILE_REGION_SIZE* pRegionSize,
+    D3D12_TILE_MAPPING_FLAGS) {
+    if (!pDstResource || !pSrcResource) return;
+
+    std::lock_guard<std::mutex> lock(execMutex_);
+    auto* dstRes = static_cast<NacelleResource*>(pDstResource);
+    auto* srcRes = static_cast<NacelleResource*>(pSrcResource);
+    if (!dstRes->isReserved() || !srcRes->isReserved()) return;
+
+    const D3D12_TILED_RESOURCE_COORDINATE dstCoord =
+        pDstRegionStartCoordinate ? *pDstRegionStartCoordinate : D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0};
+    const D3D12_TILED_RESOURCE_COORDINATE srcCoord =
+        pSrcRegionStartCoordinate ? *pSrcRegionStartCoordinate : D3D12_TILED_RESOURCE_COORDINATE{0, 0, 0, 0};
+
+    D3D12_TILE_REGION_SIZE defaultSize{};
+    if (!pRegionSize) {
+        defaultSize.NumTiles = std::min(dstRes->totalTileCount(), srcRes->totalTileCount());
+        defaultSize.UseBox = FALSE;
+    }
+    const D3D12_TILE_REGION_SIZE* sz = pRegionSize ? pRegionSize : &defaultSize;
+
+    std::vector<uint32_t> dstTiles;
+    std::vector<uint32_t> srcTiles;
+    dstRes->enumerateRegionTiles(dstCoord, sz, dstTiles);
+    srcRes->enumerateRegionTiles(srcCoord, sz, srcTiles);
+
+    const size_t n = std::min(dstTiles.size(), srcTiles.size());
+    std::vector<std::pair<NacelleHeap*, uint32_t>> srcMappings(n);
+    for (size_t i = 0; i < n; ++i) {
+        srcMappings[i] = {srcRes->tileHeap(srcTiles[i]), srcRes->tileHeapIndex(srcTiles[i])};
+    }
+    for (size_t i = 0; i < n; ++i) {
+        dstRes->setTileMapping(dstTiles[i], srcMappings[i].first, srcMappings[i].second);
+    }
+    dstRes->finalizeTileMappingsUpdate();
 }
 
 void STDMETHODCALLTYPE NacelleCommandQueue::ExecuteCommandLists(

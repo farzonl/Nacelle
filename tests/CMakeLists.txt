@@ -54,6 +54,9 @@ add_hlsl_dxil(quad_derivatives.hlsl ps_6_0 PSMain quad_derivatives_ps.dxil)
 add_hlsl_dxil(texture_array_ops.hlsl cs_6_0 CSMain texture_array_ops.dxil)
 add_hlsl_dxil(depth_stencil_readback.hlsl vs_6_0 VSMain depth_stencil_readback_vs.dxil)
 add_hlsl_dxil(depth_stencil_readback.hlsl ps_6_0 PSMain depth_stencil_readback_ps.dxil)
+add_hlsl_dxil(tiled_resources.hlsl cs_6_2 PartiallyMappedCS tiled_partially_mapped_cs.dxil)
+add_hlsl_dxil(tiled_resources.hlsl cs_6_2 DivergentTiledBufferCS tiled_divergent_buf_cs.dxil)
+add_hlsl_dxil(tiled_resources.hlsl cs_6_2 TiledTextureCS tiled_texture_cs.dxil)
 
 # Cross-backend benchmark shader (DXIL + SPIR-V)
 add_hlsl_dxil(bench_raymarch.hlsl cs_6_0 main bench_raymarch.dxil)
@@ -141,6 +144,7 @@ add_nacelle_test(pso_cache_bcn_test pso_cache_bcn_test.cpp)
 add_nacelle_test(interlocked_barrier_test interlocked_barrier_test.cpp)
 add_nacelle_test(hlsl_intrinsics_matrix_test hlsl_intrinsics_matrix_test.cpp)
 add_nacelle_test(texture_sampler_test texture_sampler_test.cpp)
+add_nacelle_test(tiled_resource_test tiled_resource_test.cpp)
 
 # lit / FileCheck compiler IR tests
 file(GLOB NACELLE_LIT_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/lit/*.test")

@@ -89,6 +89,15 @@ struct CmdDrawIndexedInstanced { UINT idxCount = 0, iCount = 1, startIdx = 0; IN
 struct CmdCopyBufferRegion { NacelleResource* dst = nullptr; UINT64 dstOff = 0; NacelleResource* src = nullptr; UINT64 srcOff = 0; UINT64 bytes = 0; };
 struct CmdCopyTextureRegion { D3D12_TEXTURE_COPY_LOCATION dst{}; D3D12_TEXTURE_COPY_LOCATION src{}; UINT dstX = 0, dstY = 0, dstZ = 0; bool hasBox = false; D3D12_BOX srcBox{}; };
 struct CmdCopyResource { NacelleResource* dst = nullptr; NacelleResource* src = nullptr; };
+struct CmdCopyTiles {
+    NacelleResource* tiledRes = nullptr;
+    D3D12_TILED_RESOURCE_COORDINATE coord{};
+    bool hasSize = false;
+    D3D12_TILE_REGION_SIZE size{};
+    NacelleResource* buffer = nullptr;
+    UINT64 bufferOffset = 0;
+    D3D12_TILE_COPY_FLAGS flags = D3D12_TILE_COPY_FLAG_NONE;
+};
 struct CmdResolveSubresource { NacelleResource* dst = nullptr; UINT dstSub = 0; NacelleResource* src = nullptr; UINT srcSub = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; };
 struct CmdIASetTopology { D3D12_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST; };
 struct CmdIASetIndexBuffer { D3D12_INDEX_BUFFER_VIEW view{}; bool valid = false; };
@@ -126,7 +135,7 @@ using RecordedCommand = std::variant<
     CmdSetPipelineState, CmdSetRootSignature, CmdSetDescriptorHeaps,
     CmdSetRootDescTable, CmdSetRoot32BitConsts, CmdSetRootView,
     CmdDispatch, CmdDrawInstanced, CmdDrawIndexedInstanced,
-    CmdCopyBufferRegion, CmdCopyTextureRegion, CmdCopyResource, CmdResolveSubresource,
+    CmdCopyBufferRegion, CmdCopyTextureRegion, CmdCopyResource, CmdCopyTiles, CmdResolveSubresource,
     CmdIASetTopology, CmdIASetIndexBuffer, CmdIASetVertexBuffers,
     CmdRSSetViewports, CmdRSSetScissors, CmdOMSetBlendFactor, CmdOMSetStencilRef,
     CmdRSSetShadingRate,
@@ -145,9 +154,9 @@ struct ExecutionState {
 class NacelleCommandList : public D3D12DeviceChildBase<ID3D12GraphicsCommandList6> {
 public:
     NacelleCommandList(ID3D12Device* device,
-                    D3D12_COMMAND_LIST_TYPE type,
-                    NacelleCommandAllocator* allocator,
-                    ID3D12PipelineState* initialState);
+                       D3D12_COMMAND_LIST_TYPE type,
+                       NacelleCommandAllocator* allocator,
+                       ID3D12PipelineState* initialState);
     ~NacelleCommandList() override;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -162,7 +171,7 @@ public:
     void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* pDstBuffer, UINT64 DstOffset, ID3D12Resource* pSrcBuffer, UINT64 SrcOffset, UINT64 NumBytes) override;
     void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* pDst, UINT DstX, UINT DstY, UINT DstZ, const D3D12_TEXTURE_COPY_LOCATION* pSrc, const D3D12_BOX* pSrcBox) override;
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* pDstResource, ID3D12Resource* pSrcResource) override;
-    void STDMETHODCALLTYPE CopyTiles(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*, ID3D12Resource*, UINT64, D3D12_TILE_COPY_FLAGS) override {}
+    void STDMETHODCALLTYPE CopyTiles(ID3D12Resource* pTiledResource, const D3D12_TILED_RESOURCE_COORDINATE* pTileRegionStartCoordinate, const D3D12_TILE_REGION_SIZE* pTileRegionSize, ID3D12Resource* pBuffer, UINT64 BufferStartOffsetInBytes, D3D12_TILE_COPY_FLAGS Flags) override;
     void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* pDstResource, UINT DstSubresource, ID3D12Resource* pSrcResource, UINT SrcSubresource, DXGI_FORMAT Format) override;
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY PrimitiveTopology) override;
     void STDMETHODCALLTYPE RSSetViewports(UINT NumViewports, const D3D12_VIEWPORT* pViewports) override;
@@ -261,8 +270,8 @@ public:
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
 
-    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*, UINT, const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT, const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*, D3D12_TILE_MAPPING_FLAGS) override {}
-    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*, D3D12_TILE_MAPPING_FLAGS) override {}
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* pResource, UINT NumResourceRegions, const D3D12_TILED_RESOURCE_COORDINATE* pResourceRegionStartCoordinates, const D3D12_TILE_REGION_SIZE* pResourceRegionSizes, ID3D12Heap* pHeap, UINT NumRanges, const D3D12_TILE_RANGE_FLAGS* pRangeFlags, const UINT* pHeapRangeStartOffsets, const UINT* pRangeTileCounts, D3D12_TILE_MAPPING_FLAGS Flags) override;
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* pDstResource, const D3D12_TILED_RESOURCE_COORDINATE* pDstRegionStartCoordinate, ID3D12Resource* pSrcResource, const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate, const D3D12_TILE_REGION_SIZE* pRegionSize, D3D12_TILE_MAPPING_FLAGS Flags) override;
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists) override;
     void STDMETHODCALLTYPE SetMarker(UINT, const void*, UINT) override {}
     void STDMETHODCALLTYPE BeginEvent(UINT, const void*, UINT) override {}
