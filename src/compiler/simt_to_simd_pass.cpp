@@ -2518,7 +2518,7 @@ private:
             mlir::Value descP = h.lanes[0];
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
                                          ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
                                          : mlir::Value();
             mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
@@ -2552,7 +2552,7 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
                                          ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
                                          : mlir::Value();
             mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
@@ -2630,7 +2630,7 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             mlir::Value basePtr = loadDescBasePtr(loc, descP);
             mlir::Value byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
-            mlir::Value elemStride = (!isRawOp && !hasElemOff)
+            mlir::Value elemStride = (!isRawOp && !hasElemOff && h.resourceKind != 11)
                                          ? loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, elem_stride), 0)
                                          : mlir::Value();
             mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());

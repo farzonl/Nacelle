@@ -199,6 +199,35 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->HighestVersion = std::min(o->HighestVersion, D3D_ROOT_SIGNATURE_VERSION_1_1);
         return S_OK;
     }
+    case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
+        if (size < sizeof(D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS*>(pData);
+        const UINT sc = o->SampleCount;
+        o->NumQualityLevels = (sc == 1 || sc == 2 || sc == 4 || sc == 8) ? 1u : 0u;
+        return S_OK;
+    }
+    case D3D12_FEATURE_FORMAT_SUPPORT: {
+        if (size < sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(pData);
+        o->Support1 = D3D12_FORMAT_SUPPORT1_BUFFER |
+                      D3D12_FORMAT_SUPPORT1_TEXTURE1D |
+                      D3D12_FORMAT_SUPPORT1_TEXTURE2D |
+                      D3D12_FORMAT_SUPPORT1_TEXTURE3D |
+                      D3D12_FORMAT_SUPPORT1_TEXTURECUBE |
+                      D3D12_FORMAT_SUPPORT1_SHADER_LOAD |
+                      D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE |
+                      D3D12_FORMAT_SUPPORT1_MIP |
+                      D3D12_FORMAT_SUPPORT1_RENDER_TARGET |
+                      D3D12_FORMAT_SUPPORT1_BLENDABLE |
+                      D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL |
+                      D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE |
+                      D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET |
+                      D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD |
+                      D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        o->Support2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+                      D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+        return S_OK;
+    }
     default:
         return S_OK;
     }
