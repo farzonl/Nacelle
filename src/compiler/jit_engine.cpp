@@ -167,10 +167,13 @@ struct JitRuntime {
     std::unordered_map<std::string, InMemCacheEntry> memCache;
     std::atomic<uint64_t> dylibSeq{1};
     std::atomic<uint64_t> tmpSeq{1};
-    BS::thread_pool<> tier2Pool{2};
+    std::unique_ptr<BS::thread_pool<>> tier2PoolOwned;
+    std::atomic<BS::thread_pool<>*> activeTier2Pool{nullptr};
 
     ~JitRuntime() {
-        tier2Pool.wait();
+        if (tier2PoolOwned) {
+            tier2PoolOwned->wait();
+        }
     }
 };
 
@@ -224,6 +227,30 @@ bool emitObjectBytesO3(
     llvm::SmallVectorImpl<char>& outObjBytes,
     std::string& outError);
 
+BS::thread_pool<>& ensureTier2PoolReady(JitRuntime& rt) {
+    static std::once_flag tier2Once;
+    std::call_once(tier2Once, [&rt]() {
+        rt.tier2PoolOwned = std::make_unique<BS::thread_pool<>>(2);
+        rt.activeTier2Pool.store(rt.tier2PoolOwned.get(), std::memory_order_release);
+
+        llvm::LLVMContext initCtx;
+        llvm::Module initMod("__nacelle_warmup", initCtx);
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(initCtx), false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, "__nacelle_warmup", initMod);
+        auto* bb = llvm::BasicBlock::Create(initCtx, "entry", fn);
+        llvm::ReturnInst::Create(initCtx, bb);
+        llvm::SmallVector<char, 0> dummyObj;
+        std::string dummyErr;
+        emitObjectBytesO3(initMod, dummyObj, dummyErr);
+        std::atexit([]() {
+            if (auto* pool = getJitRuntime().activeTier2Pool.load(std::memory_order_acquire)) {
+                pool->wait();
+            }
+        });
+    });
+    return *rt.activeTier2Pool.load(std::memory_order_acquire);
+}
+
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
@@ -241,19 +268,6 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         return;
     }
     rt.jit = std::move(*jitOrErr);
-    static std::once_flag atexitOnce;
-    std::call_once(atexitOnce, []() {
-        llvm::LLVMContext initCtx;
-        llvm::Module initMod("__nacelle_warmup", initCtx);
-        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(initCtx), false);
-        auto* fn = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, "__nacelle_warmup", initMod);
-        auto* bb = llvm::BasicBlock::Create(initCtx, "entry", fn);
-        llvm::ReturnInst::Create(initCtx, bb);
-        llvm::SmallVector<char, 0> dummyObj;
-        std::string dummyErr;
-        emitObjectBytesO3(initMod, dummyObj, dummyErr);
-        std::atexit([]() { getJitRuntime().tier2Pool.wait(); });
-    });
 
     {
         auto& es = rt.jit->getExecutionSession();
@@ -960,7 +974,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
     std::string bcStr(bcBytes.data(), bcBytes.size());
 
-    rt.tier2Pool.detach_task([box, meta, symbolName, cacheDir, hex, bcStr = std::move(bcStr)]() {
+    ensureTier2PoolReady(rt).detach_task([box, meta, symbolName, cacheDir, hex, bcStr = std::move(bcStr)]() {
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
         auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
         auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -1010,9 +1024,11 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     CompiledGraphicsPSO& outPSO,
     std::string& outError) {
     JitRuntime& rt = getJitRuntime();
+    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
+    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
     llvm::SmallString<0> bcBytes;
-    {
+    if (scheduleTier2) {
         llvm::raw_svector_ostream bcOS(bcBytes);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
@@ -1064,7 +1080,7 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     outPSO.hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr), std::memory_order_release);
     outPSO.dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr), std::memory_order_release);
 
-    if (const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2"); noT2 && noT2[0] == '1') {
+    if (!scheduleTier2) {
         return true;
     }
 
@@ -1076,7 +1092,7 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
     std::string bcStr(bcBytes.data(), bcBytes.size());
 
-    rt.tier2Pool.detach_task([box, meta, vsSym, psSym, cacheDir, hex, bcStr = std::move(bcStr)]() {
+    ensureTier2PoolReady(rt).detach_task([box, meta, vsSym, psSym, cacheDir, hex, bcStr = std::move(bcStr)]() {
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
         auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
         auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -1216,7 +1232,9 @@ bool compileComputePSO(
 }
 
 void waitForAllAsyncJITTasks() {
-    getJitRuntime().tier2Pool.wait();
+    if (auto* pool = getJitRuntime().activeTier2Pool.load(std::memory_order_acquire)) {
+        pool->wait();
+    }
 }
 
 void clearInMemoryPSOCacheForTesting() {
