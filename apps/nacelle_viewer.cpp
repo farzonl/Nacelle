@@ -84,6 +84,12 @@ std::vector<uint8_t> loadShader(const char* name) {
     return loadBinaryFile(std::string(NACELLE_SHADER_BIN_DIR) + "/" + name);
 }
 
+std::vector<uint8_t> resolveAndLoadShader(const std::string& pathOrName) {
+    auto bytes = loadBinaryFile(pathOrName);
+    if (!bytes.empty()) return bytes;
+    return loadShader(pathOrName.c_str());
+}
+
 void writePPM(const std::string& path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     std::ofstream ofs(path, std::ios::binary);
     ofs << "P6\n" << w << " " << h << "\n255\n";
@@ -201,7 +207,19 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--headless" || arg == "-headless") {
+        if (arg == "--help" || arg == "-h") {
+            std::printf(
+                "Usage: %s [options]\n"
+                "  --headless          Render offscreen without opening an SDL3 window\n"
+                "  --frames <N>        Exit after rendering N frames\n"
+                "  --dump <file.ppm>   Write final rendered frame to a PPM file\n"
+                "  --ps <shader.dxil>  Pixel shader path or filename in shader bin dir\n"
+                "  --vs <shader.dxil>  Vertex shader path or filename in shader bin dir\n"
+                "  --width <W>         Render width in pixels (default: 640)\n"
+                "  --height <H>        Render height in pixels (default: 480)\n",
+                argv[0]);
+            return 0;
+        } else if (arg == "--headless" || arg == "-headless") {
             headless = true;
         } else if ((arg == "--frames" || arg == "-frames") && i + 1 < argc) {
             maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -273,10 +291,10 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> vsBytes = vsPath.empty()
         ? loadShader(customPsMode ? "fullscreen_quad_vs.dxil" : "raster_basic_vs.dxil")
-        : loadBinaryFile(vsPath);
+        : resolveAndLoadShader(vsPath);
     std::vector<uint8_t> psBytes = psPath.empty()
         ? loadShader("raster_basic_ps.dxil")
-        : loadBinaryFile(psPath);
+        : resolveAndLoadShader(psPath);
 
     if (vsBytes.empty() || psBytes.empty()) {
         std::fprintf(stderr, "Failed to load shaders (vs=%s, ps=%s)\n",
@@ -366,6 +384,9 @@ int main(int argc, char** argv) {
         }
         renderer = SDL_CreateRenderer(win, nullptr);
         if (!renderer) {
+            renderer = SDL_CreateRenderer(win, "software");
+        }
+        if (!renderer) {
             std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
             SDL_DestroyWindow(win);
             SDL_Quit();
@@ -373,6 +394,13 @@ int main(int argc, char** argv) {
         }
         SDL_SetRenderVSync(renderer, 1);
         tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(kW), static_cast<int>(kH));
+        if (!tex) {
+            std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
     }
 #endif
 
@@ -388,8 +416,11 @@ int main(int argc, char** argv) {
         if (!headless && win) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
-                if (ev.type == SDL_EVENT_QUIT) running = false;
-                if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                    running = false;
+                } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
+                    running = false;
+                } else if (ev.type == SDL_EVENT_MOUSE_MOTION) {
                     mouseX = ev.motion.x;
                     mouseY = static_cast<float>(kH) - ev.motion.y;
                 } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
