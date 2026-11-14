@@ -1,5 +1,7 @@
 #include "device.h"
 
+#include "../rasterizer/raytracing_bvh.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -137,6 +139,15 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS4*>(pData);
         std::memset(o, 0, sizeof(*o));
         o->Native16BitShaderOpsSupported = TRUE;
+        return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS5: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->SRVOnlyTiledResourceTier3 = FALSE;
+        o->RenderPassesTier = D3D12_RENDER_PASS_TIER_0;
+        o->RaytracingTier = D3D12_RAYTRACING_TIER_1_1;
         return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS6: {
@@ -545,6 +556,12 @@ HRESULT STDMETHODCALLTYPE NacelleSwapChain::MapFrontBufferPtr(
     if (pHeight) *pHeight = height_;
     if (pRowPitch) *pRowPitch = sub.row_pitch;
     return S_OK;
+}
+
+void STDMETHODCALLTYPE NacelleDevice::GetRaytracingAccelerationStructurePrebuildInfo(
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
+    getRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo);
 }
 
 void STDMETHODCALLTYPE NacelleSwapChain::SetPresentCallback(PFN_NacellePresentCallback Callback, void* UserData) {

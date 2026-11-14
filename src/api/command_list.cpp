@@ -7,6 +7,7 @@
 
 #include "../common/format_utils.h"
 #include "../common/fp_env.h"
+#include "../rasterizer/raytracing_bvh.h"
 
 namespace nacelle {
 
@@ -501,6 +502,39 @@ void STDMETHODCALLTYPE NacelleCommandList::ExecuteIndirect(
         static_cast<NacelleResource*>(pCntBuf), cntOff});
 }
 
+void STDMETHODCALLTYPE NacelleCommandList::BuildRaytracingAccelerationStructure(
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
+    UINT /*NumPostbuildInfoDescs*/,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* /*pPostbuildInfoDescs*/) {
+    if (closed_ || !pDesc) return;
+    CmdBuildRaytracingAS cmd{};
+    cmd.desc = *pDesc;
+    if (pDesc->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+        cmd.geomDescs.reserve(pDesc->Inputs.NumDescs);
+        for (UINT i = 0; i < pDesc->Inputs.NumDescs; ++i) {
+            if (pDesc->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS) {
+                if (pDesc->Inputs.ppGeometryDescs && pDesc->Inputs.ppGeometryDescs[i]) {
+                    cmd.geomDescs.push_back(*pDesc->Inputs.ppGeometryDescs[i]);
+                }
+            } else if (pDesc->Inputs.pGeometryDescs) {
+                cmd.geomDescs.push_back(pDesc->Inputs.pGeometryDescs[i]);
+            }
+        }
+        cmd.desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        cmd.desc.Inputs.pGeometryDescs = nullptr;
+    }
+    commands_.push_back(std::move(cmd));
+}
+
+void STDMETHODCALLTYPE NacelleCommandList::CopyRaytracingAccelerationStructure(
+    D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
+    D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) {
+    if (closed_) return;
+    commands_.push_back(CmdCopyRaytracingAS{
+        DestAccelerationStructureData, SourceAccelerationStructureData, Mode});
+}
+
 namespace {
 
 void applyRootSignatureStaticSamplers(const NacelleRootSignature* sig, DriverRootContext& ctx) {
@@ -894,6 +928,15 @@ void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state)
                                 &c.heap->values[c.start],
                                 c.count * sizeof(uint64_t));
                 }
+            } else if constexpr (std::is_same_v<T, CmdBuildRaytracingAS>) {
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC localDesc = c.desc;
+                if (localDesc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+                    localDesc.Inputs.NumDescs = static_cast<UINT>(c.geomDescs.size());
+                    localDesc.Inputs.pGeometryDescs = c.geomDescs.data();
+                }
+                buildRaytracingAccelerationStructure(&localDesc);
+            } else if constexpr (std::is_same_v<T, CmdCopyRaytracingAS>) {
+                copyRaytracingAccelerationStructure(c.dest, c.src, c.mode);
             } else if constexpr (std::is_same_v<T, CmdExecuteIndirect>) {
                 if (!c.sig || !c.argBuf) return;
                 UINT count = c.maxCount;

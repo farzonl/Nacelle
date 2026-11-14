@@ -112,6 +112,15 @@ struct CmdExecuteBundle { class NacelleCommandList* bundle = nullptr; };
 struct CmdEndQuery { NacelleQueryHeap* heap = nullptr; D3D12_QUERY_TYPE type{}; UINT index = 0; };
 struct CmdResolveQueryData { NacelleQueryHeap* heap = nullptr; UINT start = 0; UINT count = 0; NacelleResource* dst = nullptr; UINT64 offset = 0; };
 struct CmdExecuteIndirect { NacelleCommandSignature* sig = nullptr; UINT maxCount = 0; NacelleResource* argBuf = nullptr; UINT64 argOff = 0; NacelleResource* cntBuf = nullptr; UINT64 cntOff = 0; };
+struct CmdBuildRaytracingAS {
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc{};
+    std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs;
+};
+struct CmdCopyRaytracingAS {
+    D3D12_GPU_VIRTUAL_ADDRESS dest = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS src = 0;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE;
+};
 
 using RecordedCommand = std::variant<
     CmdSetPipelineState, CmdSetRootSignature, CmdSetDescriptorHeaps,
@@ -122,7 +131,8 @@ using RecordedCommand = std::variant<
     CmdRSSetViewports, CmdRSSetScissors, CmdOMSetBlendFactor, CmdOMSetStencilRef,
     CmdRSSetShadingRate,
     CmdOMSetRenderTargets, CmdClearRTV, CmdClearDSV, CmdClearUAV,
-    CmdExecuteBundle, CmdEndQuery, CmdResolveQueryData, CmdExecuteIndirect>;
+    CmdExecuteBundle, CmdEndQuery, CmdResolveQueryData, CmdExecuteIndirect,
+    CmdBuildRaytracingAS, CmdCopyRaytracingAS>;
 
 struct ExecutionState {
     NacellePipelineState* pso = nullptr;
@@ -214,9 +224,15 @@ public:
     void STDMETHODCALLTYPE EndRenderPass() override {}
     void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
     void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
-    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*, UINT, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*) override {}
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
+        UINT NumPostbuildInfoDescs,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) override;
     void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*, UINT, const D3D12_GPU_VIRTUAL_ADDRESS*) override {}
-    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS, D3D12_GPU_VIRTUAL_ADDRESS, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE) override {}
+    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(
+        D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
+        D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) override;
     void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject*) override {}
     void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC*) override {}
 
