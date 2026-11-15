@@ -655,6 +655,14 @@ private:
         return mlir::LLVM::AllocaOp::create(b_, loc, ptrTy(), elemTy, cInt(loc, i32Ty(), count), align);
     }
 
+    mlir::Value getOrCreateScratchAlloca(mlir::Location loc) {
+        if (!scratchAlloca_) {
+            // 16-byte aligned scratch slot in entry block for masked-off alloca lanes.
+            scratchAlloca_ = createEntryAlloca(loc, i64Ty(), 2, 16);
+        }
+        return scratchAlloca_;
+    }
+
     mlir::LLVM::LLVMFuncOp getOrDeclareRuntimeFn(
         mlir::Location loc, llvm::StringRef name, mlir::Type retTy, llvm::ArrayRef<mlir::Type> argTys) {
         if (auto existing = mod_.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) {
@@ -822,6 +830,7 @@ private:
             SimdVal sv;
             sv.kind = SimdVal::Kind::Lanes;
             sv.origType = ptrTy();
+            sv.isAllocaPtr = true;
             mlir::Type elemTy = allocaOp.getElemType();
             uint64_t count = getConstIntValue(allocaOp.getArraySize()).value_or(1);
             mlir::Type slotTy = (count == 1) ? elemTy : mlir::Type(mlir::LLVM::LLVMArrayType::get(elemTy, count));
@@ -864,6 +873,7 @@ private:
             SimdVal out;
             out.kind = SimdVal::Kind::Lanes;
             out.origType = gep.getType();
+            out.isAllocaPtr = base.isAllocaPtr;
             auto rawConsts = gep.getRawConstantIndices();
             uint32_t lanesOut = uniform ? 1u : W_;
             for (uint32_t l = 0; l < lanesOut; ++l) {
@@ -895,6 +905,20 @@ private:
                 return true;
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
+                if (addr.isAllocaPtr) {
+                    mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(elemTy));
+                    mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                    for (uint32_t l = 0; l < W_; ++l) {
+                        if (isLaneMaskConstFalse(execMask, l)) continue;
+                        mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                        mlir::Value pL = laneValue(loc, addr, l);
+                        mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value s = loadScalar(loc, elemTy, safePtr);
+                        v = mlir::vector::InsertOp::create(b_, loc, s, v, static_cast<int64_t>(l));
+                    }
+                    setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, v, {}, {}});
+                    return true;
+                }
                 mlir::Value ptrs = asVec(loc, addr);
                 mlir::Value undefVec = mlir::LLVM::UndefOp::create(b_, loc, vecTy(elemTy));
                 mlir::Value v = mlir::LLVM::masked_gather::create(
@@ -918,6 +942,25 @@ private:
                         mlir::Value s = loadScalar(loc, scalarTy, ep);
                         mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(scalarTy), s);
                         res.fields[static_cast<size_t>(i)] = {SimdVal::Kind::Vector, scalarTy, bvec, {}, {}};
+                    }
+                } else if (addr.isAllocaPtr && mlir::isa<mlir::IntegerType, mlir::FloatType>(scalarTy)) {
+                    mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                    for (int64_t i = 0; i < n; ++i) {
+                        mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(scalarTy));
+                        for (uint32_t l = 0; l < W_; ++l) {
+                            if (isLaneMaskConstFalse(execMask, l)) continue;
+                            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                            mlir::Value pL = laneValue(loc, addr, l);
+                            mlir::Value ep = (i == 0)
+                                                 ? pL
+                                                 : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                       b_, loc, ptrTy, scalarTy, pL,
+                                                       mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)}));
+                            mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, ep, scratch);
+                            mlir::Value s = loadScalar(loc, scalarTy, safePtr);
+                            v = mlir::vector::InsertOp::create(b_, loc, s, v, static_cast<int64_t>(l));
+                        }
+                        res.fields[static_cast<size_t>(i)] = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                     }
                 } else if (mlir::isa<mlir::IntegerType, mlir::FloatType>(scalarTy)) {
                     mlir::Value ptrs = asVec(loc, addr);
@@ -979,6 +1022,25 @@ private:
                     mlir::Type scalarTy = vt.getElementType();
                     mlir::Type ptrTy = storeOp.getAddr().getType();
                     if (mlir::isa<mlir::IntegerType, mlir::FloatType>(scalarTy)) {
+                        if (addr.isAllocaPtr) {
+                            mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                            for (int64_t i = 0; i < vt.getNumElements(); ++i) {
+                                for (uint32_t l = 0; l < W_; ++l) {
+                                    if (isLaneMaskConstFalse(execMask, l)) continue;
+                                    mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                                    mlir::Value pL = laneValue(loc, addr, l);
+                                    mlir::Value ep = (i == 0)
+                                                         ? pL
+                                                         : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                               b_, loc, ptrTy, scalarTy, pL,
+                                                               mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)}));
+                                    mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, ep, scratch);
+                                    mlir::Value vL = laneValue(loc, val.fields[static_cast<size_t>(i)], l);
+                                    storeScalar(loc, vL, safePtr);
+                                }
+                            }
+                            return true;
+                        }
                         mlir::Value ptrs = asVec(loc, addr);
                         for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                             mlir::Value valVec = asVec(loc, val.fields[static_cast<size_t>(i)]);
@@ -1010,6 +1072,18 @@ private:
                 }
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::LLVM::LLVMPointerType>(valTy)) {
+                if (addr.isAllocaPtr) {
+                    mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                    for (uint32_t l = 0; l < W_; ++l) {
+                        if (isLaneMaskConstFalse(execMask, l)) continue;
+                        mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                        mlir::Value pL = laneValue(loc, addr, l);
+                        mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value vL = laneValue(loc, val, l);
+                        storeScalar(loc, vL, safePtr);
+                    }
+                    return true;
+                }
                 mlir::Value valVec = asVec(loc, val);
                 mlir::Value ptrs = asVec(loc, addr);
                 if (valVec && ptrs) {
@@ -5868,6 +5942,7 @@ private:
     uint32_t W_;
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
+    mlir::Value scratchAlloca_;
 
 public:
     llvm::DenseMap<mlir::Value, SimdVal> valueMap_;
