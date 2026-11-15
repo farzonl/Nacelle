@@ -74,6 +74,8 @@
 
 namespace nacelle {
 
+bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError);
+
 CompiledComputePSO::~CompiledComputePSO() {
     if (asyncBox) {
         std::lock_guard<std::mutex> lock(asyncBox->mu);
@@ -183,6 +185,8 @@ struct JitRuntime {
     std::unordered_map<std::string, InMemVSCacheEntry> vsMemCache;
     std::atomic<uint64_t> dylibSeq{1};
     std::atomic<uint64_t> tmpSeq{1};
+    bool mathSimdLoaded = false;
+    bool texSamplerLoaded = false;
     std::unique_ptr<BS::thread_pool<>> tier2PoolOwned;
     std::atomic<BS::thread_pool<>*> activeTier2Pool{nullptr};
 
@@ -303,7 +307,7 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Aggressive);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::None);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
@@ -398,6 +402,9 @@ bool emitObjectBytesO3(
     llvm::Module& mod,
     llvm::SmallVectorImpl<char>& outObjBytes,
     std::string& outError) {
+    if (!linkRuntimeBitcodeAndInline(mod, outError)) {
+        return false;
+    }
     auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Aggressive);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
@@ -485,8 +492,6 @@ void runTier1Optimize(llvm::Module& mod) {
 
     llvm::FunctionPassManager fpm;
     fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-    fpm.addPass(llvm::EarlyCSEPass(true));
-    fpm.addPass(llvm::InstCombinePass());
     fpm.addPass(llvm::SimplifyCFGPass());
 
     for (llvm::Function& fn : mod) {
@@ -804,10 +809,167 @@ void computeVertexStageHash(
     outHi = h.high64;
 }
 
+bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
+    llvm::LLVMContext& llvmCtx = mod.getContext();
+    auto linkRuntimeBitcode = [&](const unsigned char* bcData, size_t bcSize,
+                                  llvm::StringRef modName, llvm::StringRef fnPrefix) -> bool {
+        bool needed = false;
+        for (const llvm::Function& f : mod) {
+            if (f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) return true;
+
+        auto bcBuf = llvm::MemoryBuffer::getMemBuffer(
+            llvm::StringRef(reinterpret_cast<const char*>(bcData), bcSize), modName, false);
+        auto bcModOrErr = llvm::parseBitcodeFile(bcBuf->getMemBufferRef(), llvmCtx);
+        if (!bcModOrErr) {
+            outError = "Failed to parse embedded " + modName.str() + ": " + llvm::toString(bcModOrErr.takeError());
+            return false;
+        }
+        std::unique_ptr<llvm::Module> bcMod = std::move(*bcModOrErr);
+        bcMod->setTargetTriple(mod.getTargetTriple());
+        bcMod->setDataLayout(mod.getDataLayout());
+
+        if (llvm::Linker::linkModules(mod, std::move(bcMod), llvm::Linker::Flags::LinkOnlyNeeded)) {
+            outError = "llvm::Linker failed linking " + modName.str();
+            return false;
+        }
+
+        for (llvm::Function& f : mod) {
+            if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
+                f.setLinkage(llvm::GlobalValue::InternalLinkage);
+                f.removeFnAttr("target-cpu");
+                f.removeFnAttr("target-features");
+                f.removeFnAttr("tune-cpu");
+                if (!isStrictFloatingPointEnabled()) {
+                    f.addFnAttr("reciprocal-estimates", "none");
+                }
+                if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
+                    f.addFnAttr(llvm::Attribute::AlwaysInline);
+                }
+            }
+        }
+        return true;
+    };
+
+    if (!linkRuntimeBitcode(kTextureSamplerBitcode, kTextureSamplerBitcode_size, "texture_sampler.bc", "nacelle_tex_")) {
+        return false;
+    }
+    if (!linkRuntimeBitcode(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
+        return false;
+    }
+
+    bool needsAlwaysInline = false;
+    for (const llvm::Function& f : mod) {
+        if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+            needsAlwaysInline = true;
+            break;
+        }
+    }
+    if (needsAlwaysInline) {
+        llvm::LoopAnalysisManager lam;
+        llvm::FunctionAnalysisManager fam;
+        llvm::CGSCCAnalysisManager cgam;
+        llvm::ModuleAnalysisManager mam;
+#if LLVM_VERSION_MAJOR >= 24
+        llvm::PassBuilder pb(mod.getContext());
+#else
+        llvm::PassBuilder pb;
+#endif
+        pb.registerModuleAnalyses(mam);
+        pb.registerCGSCCAnalyses(cgam);
+        pb.registerFunctionAnalyses(fam);
+        pb.registerLoopAnalyses(lam);
+        pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+        llvm::ModulePassManager inlinerPM;
+        inlinerPM.addPass(llvm::AlwaysInlinerPass());
+        inlinerPM.run(mod, mam);
+    }
+
+#if defined(_WIN32)
+    for (llvm::Function& f : mod) {
+        if (!f.isDeclaration()) {
+            f.setDoesNotThrow();
+            f.addFnAttr("stackrealign");
+        }
+    }
+#endif
+    return true;
+}
+
+bool ensureRuntimeBitcodeInMainJDLocked(
+    JitRuntime& rt,
+    const llvm::Module& shaderMod,
+    std::string& outError) {
+    auto hasPrefixDecl = [&](llvm::StringRef prefix) {
+        for (const llvm::Function& f : shaderMod) {
+            if (f.isDeclaration() && f.getName().starts_with(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto loadIntoMainJD = [&](const unsigned char* bcData, size_t bcSize,
+                              llvm::StringRef modName, llvm::StringRef fnPrefix) -> bool {
+        auto bcCtx = std::make_unique<llvm::LLVMContext>();
+        auto bcBuf = llvm::MemoryBuffer::getMemBuffer(
+            llvm::StringRef(reinterpret_cast<const char*>(bcData), bcSize), modName, false);
+        auto bcModOrErr = llvm::parseBitcodeFile(bcBuf->getMemBufferRef(), *bcCtx);
+        if (!bcModOrErr) {
+            outError = "Failed to parse embedded " + modName.str() + ": " + llvm::toString(bcModOrErr.takeError());
+            return false;
+        }
+        std::unique_ptr<llvm::Module> bcMod = std::move(*bcModOrErr);
+        bcMod->setTargetTriple(rt.jit->getTargetTriple());
+        bcMod->setDataLayout(rt.jit->getDataLayout());
+        for (llvm::Function& f : *bcMod) {
+            if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
+                f.removeFnAttr("target-cpu");
+                f.removeFnAttr("target-features");
+                f.removeFnAttr("tune-cpu");
+                if (!isStrictFloatingPointEnabled()) {
+                    f.addFnAttr("reciprocal-estimates", "none");
+                }
+#if defined(_WIN32)
+                f.setDoesNotThrow();
+                f.addFnAttr("stackrealign");
+#endif
+            }
+        }
+        if (auto err = rt.jit->addIRModule(
+                rt.jit->getMainJITDylib(),
+                llvm::orc::ThreadSafeModule(std::move(bcMod), std::move(bcCtx)))) {
+            outError = llvm::toString(std::move(err));
+            return false;
+        }
+        return true;
+    };
+
+    if (!rt.texSamplerLoaded && hasPrefixDecl("nacelle_tex_")) {
+        if (!loadIntoMainJD(kTextureSamplerBitcode, kTextureSamplerBitcode_size, "texture_sampler.bc", "nacelle_tex_")) {
+            return false;
+        }
+        rt.texSamplerLoaded = true;
+    }
+    if (!rt.mathSimdLoaded && hasPrefixDecl("nacelle_math_")) {
+        if (!loadIntoMainJD(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
+            return false;
+        }
+        rt.mathSimdLoaded = true;
+    }
+    return true;
+}
+
 std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
-    std::string& outError) {
+    std::string& outError,
+    bool linkRuntime) {
     mlir::PassManager pm(mlirMod.getContext());
     pm.addPass(mlir::createSCFToControlFlowPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
@@ -874,83 +1036,10 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     }
 
-    auto linkRuntimeBitcode = [&](const unsigned char* bcData, size_t bcSize,
-                                  llvm::StringRef modName, llvm::StringRef fnPrefix) -> bool {
-        bool needed = false;
-        for (const llvm::Function& f : *llvmMod) {
-            if (f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
-                needed = true;
-                break;
-            }
+    if (linkRuntime) {
+        if (!linkRuntimeBitcodeAndInline(*llvmMod, outError)) {
+            return nullptr;
         }
-        if (!needed) return true;
-
-        auto bcBuf = llvm::MemoryBuffer::getMemBuffer(
-            llvm::StringRef(reinterpret_cast<const char*>(bcData), bcSize), modName, false);
-        auto bcModOrErr = llvm::parseBitcodeFile(bcBuf->getMemBufferRef(), llvmCtx);
-        if (!bcModOrErr) {
-            outError = "Failed to parse embedded " + modName.str() + ": " + llvm::toString(bcModOrErr.takeError());
-            return false;
-        }
-        std::unique_ptr<llvm::Module> bcMod = std::move(*bcModOrErr);
-        bcMod->setTargetTriple(llvmMod->getTargetTriple());
-        bcMod->setDataLayout(llvmMod->getDataLayout());
-
-        if (llvm::Linker::linkModules(*llvmMod, std::move(bcMod), llvm::Linker::Flags::LinkOnlyNeeded)) {
-            outError = "llvm::Linker failed linking " + modName.str();
-            return false;
-        }
-
-        for (llvm::Function& f : *llvmMod) {
-            if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
-                f.setLinkage(llvm::GlobalValue::InternalLinkage);
-                f.removeFnAttr("target-cpu");
-                f.removeFnAttr("target-features");
-                f.removeFnAttr("tune-cpu");
-                if (!isStrictFloatingPointEnabled()) {
-                    f.addFnAttr("reciprocal-estimates", "none");
-                }
-                if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
-                    f.addFnAttr(llvm::Attribute::AlwaysInline);
-                }
-            }
-        }
-        return true;
-    };
-
-    if (!linkRuntimeBitcode(kTextureSamplerBitcode, kTextureSamplerBitcode_size, "texture_sampler.bc", "nacelle_tex_")) {
-        return nullptr;
-    }
-    if (!linkRuntimeBitcode(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
-        return nullptr;
-    }
-
-    bool needsAlwaysInline = false;
-    for (const llvm::Function& f : *llvmMod) {
-        if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
-            needsAlwaysInline = true;
-            break;
-        }
-    }
-    if (needsAlwaysInline) {
-        llvm::LoopAnalysisManager lam;
-        llvm::FunctionAnalysisManager fam;
-        llvm::CGSCCAnalysisManager cgam;
-        llvm::ModuleAnalysisManager mam;
-#if LLVM_VERSION_MAJOR >= 24
-        llvm::PassBuilder pb(llvmMod->getContext());
-#else
-        llvm::PassBuilder pb;
-#endif
-        pb.registerModuleAnalyses(mam);
-        pb.registerCGSCCAnalyses(cgam);
-        pb.registerFunctionAnalyses(fam);
-        pb.registerLoopAnalyses(lam);
-        pb.crossRegisterProxies(lam, fam, cgam, mam);
-
-        llvm::ModulePassManager inlinerPM;
-        inlinerPM.addPass(llvm::AlwaysInlinerPass());
-        inlinerPM.run(*llvmMod, mam);
     }
 
 #if defined(_WIN32)
@@ -1215,6 +1304,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
         std::lock_guard<std::mutex> lock(rt.mu);
         ensureLLJITLocked(rt, outError);
         if (!rt.jit) return false;
+        if (!ensureRuntimeBitcodeInMainJDLocked(rt, *llvmMod, outError)) return false;
         auto jdOrErr = createIsolatedDylibLocked(rt);
         if (!jdOrErr) {
             outError = llvm::toString(jdOrErr.takeError());
@@ -1320,6 +1410,7 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
         std::lock_guard<std::mutex> lock(rt.mu);
         ensureLLJITLocked(rt, outError);
         if (!rt.jit) return false;
+        if (!ensureRuntimeBitcodeInMainJDLocked(rt, *llvmMod, outError)) return false;
         auto jdOrErr = createIsolatedDylibLocked(rt);
         if (!jdOrErr) {
             outError = llvm::toString(jdOrErr.takeError());
@@ -1477,6 +1568,7 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
         } else {
             ensureLLJITLocked(rt, outError);
             if (!rt.jit) return false;
+            if (!ensureRuntimeBitcodeInMainJDLocked(rt, *llvmMod, outError)) return false;
             auto jdOrErr = createIsolatedDylibLocked(rt);
             if (!jdOrErr) {
                 outError = llvm::toString(jdOrErr.takeError());
@@ -1600,6 +1692,7 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         std::lock_guard<std::mutex> lock(rt.mu);
         ensureLLJITLocked(rt, outError);
         if (!rt.jit) return false;
+        if (!ensureRuntimeBitcodeInMainJDLocked(rt, *llvmMod, outError)) return false;
         auto jdOrErr = createIsolatedDylibLocked(rt);
         if (!jdOrErr) {
             outError = llvm::toString(jdOrErr.takeError());
@@ -1740,7 +1833,7 @@ bool compileComputePSO(
     const auto tPacketize = Clock::now();
 
     auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
+    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
     if (!linkedMod) return false;
     const auto tTranslate = Clock::now();
 
@@ -1941,13 +2034,14 @@ bool compileDxrShader(
     }
 
     auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
+    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
     if (!linkedMod) return false;
 
     auto& rt = getJitRuntime();
     std::lock_guard<std::mutex> lock(rt.mu);
     ensureLLJITLocked(rt, outError);
     if (!rt.jit) return false;
+    if (!ensureRuntimeBitcodeInMainJDLocked(rt, *linkedMod, outError)) return false;
 
     auto jdOrErr = createIsolatedDylibLocked(rt);
     if (!jdOrErr) {

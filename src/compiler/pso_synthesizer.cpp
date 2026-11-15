@@ -3968,7 +3968,7 @@ bool compileGraphicsPSO(
                 return false;
             }
             auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
-            auto vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError);
+            auto vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError, /*linkRuntime=*/false);
             if (!vsLinkedMod) return false;
             if (!jitCompileVertexStageTier1AndScheduleTier2(
                     std::move(vsLinkedMod), std::move(vsLlvmCtx), vsHashLo, vsHashHi, vsSym,
@@ -3990,7 +3990,7 @@ bool compileGraphicsPSO(
         meta.vsHashHi = vsHashHi;
 
         auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
-        auto psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError);
+        auto psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError, /*linkRuntime=*/false);
         if (!psLinkedMod) return false;
 
         populatePSOFromMeta(meta);
@@ -4013,7 +4013,7 @@ bool compileGraphicsPSO(
     }
 
     auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError);
+    auto linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
     if (!linkedMod) return false;
 
     populatePSOFromMeta(meta);
