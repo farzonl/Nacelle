@@ -838,6 +838,23 @@ bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
             return false;
         }
 
+        uint32_t mathCallCount = 0;
+        if (fnPrefix == "nacelle_math_") {
+            for (const llvm::Function& fn : mod) {
+                for (const llvm::BasicBlock& bb : fn) {
+                    for (const llvm::Instruction& inst : bb) {
+                        if (const auto* cb = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+                            if (const llvm::Function* callee = cb->getCalledFunction();
+                                callee && callee->getName().starts_with("nacelle_math_")) {
+                                ++mathCallCount;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const bool forceAlwaysInline = (fnPrefix != "nacelle_math_") || (mathCallCount <= 32);
+
         for (llvm::Function& f : mod) {
             if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
                 f.setLinkage(llvm::GlobalValue::InternalLinkage);
@@ -848,7 +865,11 @@ bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
                     f.addFnAttr("reciprocal-estimates", "none");
                 }
                 if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
-                    f.addFnAttr(llvm::Attribute::AlwaysInline);
+                    if (forceAlwaysInline) {
+                        f.addFnAttr(llvm::Attribute::AlwaysInline);
+                    } else {
+                        f.addFnAttr(llvm::Attribute::InlineHint);
+                    }
                 }
             }
         }
