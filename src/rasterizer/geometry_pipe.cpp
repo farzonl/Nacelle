@@ -667,48 +667,89 @@ void executeVertexTriangleChunk(
     const D3D12_VIEWPORT& vp0 = sceneCfg.viewports[0];
     const D3D12_RECT& scissor0 = sceneCfg.scissors[0];
 
+    const float vpHalfW = vp0.Width * 0.5f;
+    const float vpHalfH = vp0.Height * 0.5f;
+    const float vpCenterX = vp0.TopLeftX + vpHalfW;
+    const float vpCenterY = vp0.TopLeftY + vpHalfH;
+    const float vpDepthRange = vp0.MaxDepth - vp0.MinDepth;
+
     for (uint32_t b = 0; b < numBatches; ++b) {
         uint32_t base = b * W;
         uint32_t active = std::min<uint32_t>(W, numUnique - base);
-        const float* posX = &scratch.posSOA[base * 4u + 0u * W];
-        const float* posY = &scratch.posSOA[base * 4u + 1u * W];
-        const float* posZ = &scratch.posSOA[base * 4u + 2u * W];
-        const float* posW = &scratch.posSOA[base * 4u + 3u * W];
+        const float* __restrict posX = &scratch.posSOA[base * 4u + 0u * W];
+        const float* __restrict posY = &scratch.posSOA[base * 4u + 1u * W];
+        const float* __restrict posZ = &scratch.posSOA[base * 4u + 2u * W];
+        const float* __restrict posW = &scratch.posSOA[base * 4u + 3u * W];
+        uint8_t* __restrict outcodesDst = &scratch.outcodes[base];
+        float* __restrict invWDst = &scratch.invW[base];
+        float* __restrict screenXDst = &scratch.screenX[base];
+        float* __restrict screenYDst = &scratch.screenY[base];
+        float* __restrict screenZDst = &scratch.screenZ[base];
+        int64_t* __restrict fixedXDst = &scratch.fixedX[base];
+        int64_t* __restrict fixedYDst = &scratch.fixedY[base];
 
-        for (uint32_t l = 0; l < active; ++l) {
-            uint32_t u = base + l;
-            float cx = posX[l];
-            float cy = posY[l];
-            float cz = posZ[l];
-            float cw = posW[l];
+        if (!specialPerPrimState) {
+            // Branchless SIMD-friendly epilogue over W-wide SOA packet (tail lanes are padded).
+            for (uint32_t l = 0; l < W; ++l) {
+                float cx = posX[l];
+                float cy = posY[l];
+                float cz = posZ[l];
+                float cw = posW[l];
 
-            uint8_t oc = 0;
-            if (cx < -cw) oc |= 0x01u;
-            if (cx >  cw) oc |= 0x02u;
-            if (cy < -cw) oc |= 0x04u;
-            if (cy >  cw) oc |= 0x08u;
-            if (cz < 0.0f) oc |= 0x10u;
-            if (cz >  cw) oc |= 0x20u;
-            if (!(cw > 0.0f)) oc |= 0x40u;
+                uint8_t oc = 0;
+                oc |= (cx < -cw) ? 0x01u : 0u;
+                oc |= (cx >  cw) ? 0x02u : 0u;
+                oc |= (cy < -cw) ? 0x04u : 0u;
+                oc |= (cy >  cw) ? 0x08u : 0u;
+                oc |= (cz < 0.0f) ? 0x10u : 0u;
+                oc |= (cz >  cw) ? 0x20u : 0u;
+                oc |= (!(cw > 0.0f)) ? 0x40u : 0u;
 
-            if (!specialPerPrimState && cw > 1e-6f && cz >= 0.0f && cz <= cw) {
-                float iw = 1.0f / cw;
+                bool validW = (cw > 1e-6f);
+                float safeW = validW ? cw : 1.0f;
+                float iw = 1.0f / safeW;
                 float ndcX = cx * iw;
                 float ndcY = cy * iw;
                 float ndcZ = cz * iw;
-                float sx = vp0.TopLeftX + (ndcX * 0.5f + 0.5f) * vp0.Width;
-                float sy = vp0.TopLeftY + (-ndcY * 0.5f + 0.5f) * vp0.Height;
-                if (sx >= -16384.0f && sx <= 16384.0f && sy >= -16384.0f && sy <= 16384.0f) {
-                    oc |= 0x80u;
-                    scratch.invW[u] = iw;
-                    scratch.screenX[u] = sx;
-                    scratch.screenY[u] = sy;
-                    scratch.screenZ[u] = vp0.MinDepth + ndcZ * (vp0.MaxDepth - vp0.MinDepth);
-                    scratch.fixedX[u] = std::llround(static_cast<double>(sx) * 256.0);
-                    scratch.fixedY[u] = std::llround(static_cast<double>(sy) * 256.0);
-                }
+                float sx = vpCenterX + ndcX * vpHalfW;
+                float sy = vpCenterY - ndcY * vpHalfH;
+                float sz = vp0.MinDepth + ndcZ * vpDepthRange;
+
+                bool inGuard = validW && (cz >= 0.0f) && (cz <= cw) &&
+                               (sx >= -16384.0f) && (sx <= 16384.0f) &&
+                               (sy >= -16384.0f) && (sy <= 16384.0f);
+                oc |= inGuard ? 0x80u : 0u;
+
+                float scaledX = inGuard ? (sx * 256.0f) : 0.0f;
+                float scaledY = inGuard ? (sy * 256.0f) : 0.0f;
+                int32_t fx32 = static_cast<int32_t>(scaledX + (scaledX >= 0.0f ? 0.5f : -0.5f));
+                int32_t fy32 = static_cast<int32_t>(scaledY + (scaledY >= 0.0f ? 0.5f : -0.5f));
+
+                outcodesDst[l] = oc;
+                invWDst[l] = iw;
+                screenXDst[l] = sx;
+                screenYDst[l] = sy;
+                screenZDst[l] = sz;
+                fixedXDst[l] = static_cast<int64_t>(fx32);
+                fixedYDst[l] = static_cast<int64_t>(fy32);
             }
-            scratch.outcodes[u] = oc;
+        } else {
+            for (uint32_t l = 0; l < active; ++l) {
+                float cx = posX[l];
+                float cy = posY[l];
+                float cz = posZ[l];
+                float cw = posW[l];
+
+                uint8_t oc = 0;
+                if (cx < -cw) oc |= 0x01u;
+                if (cx >  cw) oc |= 0x02u;
+                if (cy < -cw) oc |= 0x04u;
+                if (cy >  cw) oc |= 0x08u;
+                if (cz < 0.0f) oc |= 0x10u;
+                if (cz >  cw) oc |= 0x20u;
+                if (!(cw > 0.0f)) oc |= 0x40u;
+                outcodesDst[l] = oc;
+            }
         }
     }
 
