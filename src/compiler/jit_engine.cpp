@@ -911,6 +911,89 @@ bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
         inlinerPM.run(mod, mam);
     }
 
+    // For non-inlined internal nacelle_math_v<W>_* functions, promote the `out`
+    // pointer parameter to a `fastcc` vector return value so O3 SROA eliminates
+    // caller/callee stack allocas and stores.
+    {
+        llvm::SmallVector<llvm::Function*, 16> mathFns;
+        for (llvm::Function& f : mod) {
+            if (!f.isDeclaration() && f.hasInternalLinkage() &&
+                f.getName().starts_with("nacelle_math_v") &&
+                f.getReturnType()->isVoidTy() && f.arg_size() == 2 &&
+                !f.use_empty()) {
+                mathFns.push_back(&f);
+            }
+        }
+        for (llvm::Function* oldFn : mathFns) {
+            llvm::Type* vecTy = nullptr;
+            bool valid = true;
+            llvm::SmallVector<llvm::CallInst*, 32> calls;
+            for (llvm::User* u : oldFn->users()) {
+                auto* ci = llvm::dyn_cast<llvm::CallInst>(u);
+                if (!ci || ci->getCalledFunction() != oldFn) {
+                    valid = false;
+                    break;
+                }
+                auto* outAlloca = llvm::dyn_cast<llvm::AllocaInst>(ci->getArgOperand(0));
+                if (!outAlloca || !outAlloca->getAllocatedType()->isVectorTy()) {
+                    valid = false;
+                    break;
+                }
+                if (!vecTy) {
+                    vecTy = outAlloca->getAllocatedType();
+                } else if (vecTy != outAlloca->getAllocatedType()) {
+                    valid = false;
+                    break;
+                }
+                calls.push_back(ci);
+            }
+            if (!valid || !vecTy || calls.empty()) continue;
+
+            std::string fnName = oldFn->getName().str();
+            oldFn->setName(fnName + ".ptr_out");
+
+            llvm::FunctionType* newTy = llvm::FunctionType::get(vecTy, {oldFn->getArg(1)->getType()}, false);
+            llvm::Function* newFn = llvm::Function::Create(
+                newTy, llvm::GlobalValue::InternalLinkage, fnName, &mod);
+            newFn->setCallingConv(llvm::CallingConv::Fast);
+            newFn->copyAttributesFrom(oldFn);
+            // Clear parameter-specific attributes from the removed arg0 and remap arg1 -> arg0.
+            newFn->setAttributes(llvm::AttributeList::get(
+                llvmCtx,
+                oldFn->getAttributes().getFnAttrs(),
+                llvm::AttributeSet(),
+                {oldFn->getAttributes().getParamAttrs(1)}));
+
+            newFn->splice(newFn->begin(), oldFn);
+            llvm::IRBuilder<> eb(&newFn->getEntryBlock().front());
+            llvm::AllocaInst* localOut = eb.CreateAlloca(vecTy, nullptr, "math.ret.slot");
+            oldFn->getArg(0)->replaceAllUsesWith(localOut);
+            oldFn->getArg(1)->replaceAllUsesWith(newFn->getArg(0));
+
+            llvm::SmallVector<llvm::ReturnInst*, 4> rets;
+            for (llvm::BasicBlock& bb : *newFn) {
+                if (auto* ri = llvm::dyn_cast<llvm::ReturnInst>(bb.getTerminator())) {
+                    rets.push_back(ri);
+                }
+            }
+            for (llvm::ReturnInst* ri : rets) {
+                llvm::IRBuilder<> rb(ri);
+                llvm::Value* retVal = rb.CreateLoad(vecTy, localOut, "math.ret");
+                rb.CreateRet(retVal);
+                ri->eraseFromParent();
+            }
+
+            for (llvm::CallInst* ci : calls) {
+                llvm::IRBuilder<> cb(ci);
+                llvm::CallInst* newCall = cb.CreateCall(newFn, {ci->getArgOperand(1)}, "math.call");
+                newCall->setCallingConv(llvm::CallingConv::Fast);
+                cb.CreateStore(newCall, ci->getArgOperand(0));
+                ci->eraseFromParent();
+            }
+            oldFn->eraseFromParent();
+        }
+    }
+
 #if defined(_WIN32)
     for (llvm::Function& f : mod) {
         if (!f.isDeclaration()) {
