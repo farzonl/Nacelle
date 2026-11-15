@@ -77,6 +77,7 @@ constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO = 2
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO = 22;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO = 23;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO = 24;
+constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO = 25;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO = 26;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO = 27;
 constexpr uint32_t VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO = 28;
@@ -87,6 +88,7 @@ constexpr uint32_t VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO = 43;
 constexpr VkFlags VK_QUEUE_GRAPHICS_BIT = 0x00000001;
 constexpr VkFlags VK_QUEUE_COMPUTE_BIT = 0x00000002;
 constexpr VkFlags VK_BUFFER_USAGE_TRANSFER_DST_BIT = 0x00000002;
+constexpr VkFlags VK_BUFFER_USAGE_INDEX_BUFFER_BIT = 0x00000040;
 constexpr VkFlags VK_BUFFER_USAGE_VERTEX_BUFFER_BIT = 0x00000080;
 constexpr VkFlags VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT = 0x00000010;
 constexpr VkFlags VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 0x00000020;
@@ -103,24 +105,37 @@ constexpr uint32_t VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020;
 constexpr uint32_t VK_PIPELINE_BIND_POINT_GRAPHICS = 0;
 constexpr uint32_t VK_PIPELINE_BIND_POINT_COMPUTE = 1;
 constexpr uint32_t VK_FORMAT_R8G8B8A8_UNORM = 37;
+constexpr uint32_t VK_FORMAT_R8G8B8A8_UINT = 41;
+constexpr uint32_t VK_FORMAT_R16G16_UNORM = 77;
+constexpr uint32_t VK_FORMAT_R16G16B16A16_SNORM = 92;
 constexpr uint32_t VK_FORMAT_R32G32B32_SFLOAT = 106;
+constexpr uint32_t VK_FORMAT_D32_SFLOAT = 126;
 constexpr uint32_t VK_IMAGE_TYPE_2D = 1;
 constexpr uint32_t VK_IMAGE_TILING_OPTIMAL = 0;
 constexpr uint32_t VK_IMAGE_USAGE_TRANSFER_SRC_BIT = 0x00000001;
 constexpr uint32_t VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = 0x00000010;
+constexpr uint32_t VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x00000020;
 constexpr uint32_t VK_IMAGE_LAYOUT_UNDEFINED = 0;
 constexpr uint32_t VK_IMAGE_LAYOUT_GENERAL = 1;
 constexpr uint32_t VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2;
+constexpr uint32_t VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL = 3;
 constexpr uint32_t VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6;
 constexpr uint32_t VK_IMAGE_VIEW_TYPE_2D = 1;
 constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 0x00000001;
+constexpr uint32_t VK_IMAGE_ASPECT_DEPTH_BIT = 0x00000002;
 constexpr uint32_t VK_SAMPLE_COUNT_1_BIT = 0x00000001;
 constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_POINT_LIST = 0;
 constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 3;
 constexpr uint32_t VK_PRIMITIVE_TOPOLOGY_PATCH_LIST = 10;
 constexpr uint32_t VK_POLYGON_MODE_FILL = 0;
 constexpr uint32_t VK_CULL_MODE_NONE = 0;
+constexpr uint32_t VK_CULL_MODE_BACK_BIT = 0x00000002;
 constexpr uint32_t VK_FRONT_FACE_COUNTER_CLOCKWISE = 0;
+constexpr uint32_t VK_FRONT_FACE_CLOCKWISE = 1;
+constexpr uint32_t VK_COMPARE_OP_LESS = 1;
+constexpr uint32_t VK_INDEX_TYPE_UINT32 = 1;
+constexpr uint32_t VK_DYNAMIC_STATE_VIEWPORT = 0;
+constexpr uint32_t VK_DYNAMIC_STATE_SCISSOR = 1;
 constexpr uint32_t VK_ATTACHMENT_LOAD_OP_CLEAR = 1;
 constexpr uint32_t VK_ATTACHMENT_STORE_OP_STORE = 0;
 constexpr uint32_t VK_ATTACHMENT_LOAD_OP_DONT_CARE = 2;
@@ -969,6 +984,39 @@ struct VkPipelineTessellationStateCreateInfo {
     uint32_t patchControlPoints;
 };
 
+struct VkPipelineDynamicStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t dynamicStateCount;
+    const uint32_t* pDynamicStates;
+};
+
+struct VkStencilOpState {
+    uint32_t failOp;
+    uint32_t passOp;
+    uint32_t depthFailOp;
+    uint32_t compareOp;
+    uint32_t compareMask;
+    uint32_t writeMask;
+    uint32_t reference;
+};
+
+struct VkPipelineDepthStencilStateCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 depthTestEnable;
+    VkBool32 depthWriteEnable;
+    uint32_t depthCompareOp;
+    VkBool32 depthBoundsTestEnable;
+    VkBool32 stencilTestEnable;
+    VkStencilOpState front;
+    VkStencilOpState back;
+    float minDepthBounds;
+    float maxDepthBounds;
+};
+
 struct VkGraphicsPipelineCreateInfo {
     uint32_t sType;
     const void* pNext;
@@ -1091,8 +1139,12 @@ struct Loader {
     VkResult (VK_PTR* vkCreateGraphicsPipelines)(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const void*, VkPipeline*) = nullptr;
     void (VK_PTR* vkCmdBeginRenderPass)(VkCommandBuffer, const VkRenderPassBeginInfo*, uint32_t) = nullptr;
     void (VK_PTR* vkCmdEndRenderPass)(VkCommandBuffer) = nullptr;
+    void (VK_PTR* vkCmdSetViewport)(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*) = nullptr;
+    void (VK_PTR* vkCmdSetScissor)(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D*) = nullptr;
     void (VK_PTR* vkCmdBindVertexBuffers)(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*) = nullptr;
+    void (VK_PTR* vkCmdBindIndexBuffer)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t) = nullptr;
     void (VK_PTR* vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
+    void (VK_PTR* vkCmdDrawIndexed)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) = nullptr;
     void (VK_PTR* vkCmdCopyImageToBuffer)(VkCommandBuffer, VkImage, uint32_t, VkBuffer, uint32_t, const VkBufferImageCopy*) = nullptr;
 
     ~Loader() {
@@ -1200,8 +1252,12 @@ struct Loader {
         loadSym(inst, vkCreateGraphicsPipelines, "vkCreateGraphicsPipelines");
         loadSym(inst, vkCmdBeginRenderPass, "vkCmdBeginRenderPass");
         loadSym(inst, vkCmdEndRenderPass, "vkCmdEndRenderPass");
+        loadSym(inst, vkCmdSetViewport, "vkCmdSetViewport");
+        loadSym(inst, vkCmdSetScissor, "vkCmdSetScissor");
         loadSym(inst, vkCmdBindVertexBuffers, "vkCmdBindVertexBuffers");
+        loadSym(inst, vkCmdBindIndexBuffer, "vkCmdBindIndexBuffer");
         loadSym(inst, vkCmdDraw, "vkCmdDraw");
+        loadSym(inst, vkCmdDrawIndexed, "vkCmdDrawIndexed");
         loadSym(inst, vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
         return vkEnumeratePhysicalDevices && vkCreateDevice && vkCreateComputePipelines && vkCmdDispatch;
     }

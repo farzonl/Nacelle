@@ -7,9 +7,14 @@ namespace nacelle {
 void binTrianglesToTiles(
     const RasterScene& scene,
     std::vector<TileBin>& outBins) {
+    if (scene.binsAlreadyPopulated) return;
     const uint32_t numTilesX = scene.numTilesX;
     const uint32_t numTilesY = scene.numTilesY;
-    outBins.assign(static_cast<size_t>(numTilesX) * numTilesY, TileBin{});
+    const size_t numTiles = static_cast<size_t>(numTilesX) * numTilesY;
+    outBins.resize(numTiles);
+    for (auto& bin : outBins) {
+        bin.triIndices.clear();
+    }
     if (outBins.empty() || scene.triangles.empty()) return;
 
     for (uint32_t triIdx = 0; triIdx < static_cast<uint32_t>(scene.triangles.size()); ++triIdx) {

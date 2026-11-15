@@ -46,6 +46,7 @@ void printUsage(const char* argv0) {
               << "  --simd-width=4|8|16      Target SIMD width (default: host)\n"
               << "  --blend=opaque|alpha     Blend mode for graphics PSO\n"
               << "  --depth=none|less        Depth mode for graphics PSO\n"
+              << "  --auto-input-layout      Synthesize D3D12_INPUT_LAYOUT_DESC from VS input signature\n"
               << "  --emit-scf               Print lifted SCF MLIR\n"
               << "  --emit-simd-mlir         Print packetized SIMD MLIR\n"
               << "  --emit-llvm              Print linked LLVM IR\n";
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
     uint32_t simdWidth = 0;
     bool blendAlpha = false;
     bool depthLess = false;
+    bool autoInputLayout = false;
     bool emitSCF = false;
     bool emitSIMD = false;
     bool emitLLVM = false;
@@ -98,6 +100,8 @@ int main(int argc, char** argv) {
             blendAlpha = (arg.substr(8) == "alpha");
         } else if (arg.rfind("--depth=", 0) == 0) {
             depthLess = (arg.substr(8) == "less");
+        } else if (arg == "--auto-input-layout") {
+            autoInputLayout = true;
         } else if (arg == "--emit-scf") {
             emitSCF = true;
         } else if (arg == "--emit-simd-mlir") {
@@ -197,6 +201,52 @@ int main(int argc, char** argv) {
                 desc.DepthStencilState.DepthEnable = TRUE;
                 desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
                 desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            }
+
+            std::vector<std::string> autoSemNames;
+            std::vector<D3D12_INPUT_ELEMENT_DESC> autoElems;
+            if (autoInputLayout) {
+                llvm::LLVMContext sigCtx;
+                nacelle::DxilLoadedShader vsSigLoaded;
+                std::string sigErr;
+                if (!nacelle::loadAndUpgradeDXIL({vsBytes.data(), vsBytes.size()}, sigCtx, vsSigLoaded, sigErr)) {
+                    std::cerr << "VS DXIL load error: " << sigErr << "\n";
+                    return 1;
+                }
+                autoSemNames.reserve(vsSigLoaded.inputSigs.size());
+                autoElems.reserve(vsSigLoaded.inputSigs.size());
+                for (const auto& sig : vsSigLoaded.inputSigs) {
+                    if (sig.systemValueType != 0) continue;
+                    autoSemNames.push_back(sig.semanticName);
+                    DXGI_FORMAT fmt = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    if (sig.componentType == 1) { // uint32
+                        fmt = (sig.cols == 1) ? DXGI_FORMAT_R32_UINT
+                              : (sig.cols == 2) ? DXGI_FORMAT_R32G32_UINT
+                              : (sig.cols == 3) ? DXGI_FORMAT_R32G32B32_UINT
+                                                : DXGI_FORMAT_R32G32B32A32_UINT;
+                    } else if (sig.componentType == 2) { // sint32
+                        fmt = (sig.cols == 1) ? DXGI_FORMAT_R32_SINT
+                              : (sig.cols == 2) ? DXGI_FORMAT_R32G32_SINT
+                              : (sig.cols == 3) ? DXGI_FORMAT_R32G32B32_SINT
+                                                : DXGI_FORMAT_R32G32B32A32_SINT;
+                    } else { // float32
+                        fmt = (sig.cols == 1) ? DXGI_FORMAT_R32_FLOAT
+                              : (sig.cols == 2) ? DXGI_FORMAT_R32G32_FLOAT
+                              : (sig.cols == 3) ? DXGI_FORMAT_R32G32B32_FLOAT
+                                                : DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    }
+                    D3D12_INPUT_ELEMENT_DESC el{};
+                    el.SemanticName = autoSemNames.back().c_str();
+                    el.SemanticIndex = sig.semanticIndex;
+                    el.Format = fmt;
+                    el.InputSlot = 0;
+                    el.AlignedByteOffset = D3D12_APPEND_ALIGNED_ELEMENT;
+                    el.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                    el.InstanceDataStepRate = 0;
+                    autoElems.push_back(el);
+                }
+                desc.InputLayout.pInputElementDescs = autoElems.data();
+                desc.InputLayout.NumElements = static_cast<UINT>(autoElems.size());
             }
 
             nacelle::RootSignatureLayout rootLayout{};

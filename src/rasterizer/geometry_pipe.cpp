@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -12,6 +13,14 @@
 
 namespace nacelle {
 namespace {
+
+constexpr uint32_t kMaxSimdWidth = 16;
+constexpr uint32_t kChunkPrims = 1024;
+constexpr uint32_t kMaxChunkVerts = kChunkPrims * 3 + kMaxSimdWidth;
+constexpr uint32_t kVtxCacheSize = 2048; // Power of two; 20 KB total fits in L1d
+constexpr uint32_t kVtxCacheMask = kVtxCacheSize - 1u;
+constexpr uint64_t kParallelPrimThreshold = 512;
+constexpr uint64_t kMaxFusedBinMatrixEntries = 524288;
 
 inline uint32_t readIndex(const D3D12_INDEX_BUFFER_VIEW& ibv, uint32_t idxPos, bool& isCut) {
     isCut = false;
@@ -32,12 +41,127 @@ inline uint32_t readIndex(const D3D12_INDEX_BUFFER_VIEW& ibv, uint32_t idxPos, b
     }
 }
 
+struct FastIndexReader {
+    const uint8_t* base = nullptr;
+    uint64_t maxElems = 0;
+    bool is16Bit = false;
+
+    void init(const D3D12_INDEX_BUFFER_VIEW& ibv) {
+        base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ibv.BufferLocation));
+        is16Bit = (ibv.Format == DXGI_FORMAT_R16_UINT);
+        maxElems = base ? (ibv.SizeInBytes / (is16Bit ? 2u : 4u)) : 0u;
+    }
+
+    inline uint32_t readNoCut(uint32_t idxPos) const {
+        if (idxPos >= maxElems) return 0;
+        if (is16Bit) {
+            uint16_t v = 0;
+            std::memcpy(&v, base + static_cast<size_t>(idxPos) * 2, 2);
+            return v;
+        }
+        uint32_t v = 0;
+        std::memcpy(&v, base + static_cast<size_t>(idxPos) * 4, 4);
+        return v;
+    }
+};
+
+struct ChunkBinPair {
+    uint32_t tileIdx;
+    uint32_t localTriIdx;
+};
+
+struct TriangleEmitTarget {
+    std::vector<SetupTriangle>* triangles = nullptr;
+    std::vector<float>* attrBaseArena = nullptr;
+    std::vector<float>* attrFlatArena = nullptr;
+    std::vector<float>* origBaryArena = nullptr;
+    std::vector<uint32_t>* tileCounts = nullptr;
+    std::vector<ChunkBinPair>* binPairs = nullptr;
+    uint32_t numTilesX = 0;
+    uint32_t numTilesY = 0;
+
+    inline void recordBinIfActive(const SetupTriangle& tri, uint32_t localTriIdx) {
+        if (!tileCounts || !binPairs) return;
+        if (numTilesX == 0 || numTilesY == 0 || tri.minX >= tri.maxX || tri.minY >= tri.maxY) return;
+        uint32_t tx0 = static_cast<uint32_t>(std::max<int32_t>(0, tri.minX)) / kTileSize;
+        uint32_t ty0 = static_cast<uint32_t>(std::max<int32_t>(0, tri.minY)) / kTileSize;
+        uint32_t tx1 = std::min<uint32_t>(
+            numTilesX - 1, static_cast<uint32_t>(std::max<int32_t>(0, tri.maxX - 1)) / kTileSize);
+        uint32_t ty1 = std::min<uint32_t>(
+            numTilesY - 1, static_cast<uint32_t>(std::max<int32_t>(0, tri.maxY - 1)) / kTileSize);
+        for (uint32_t ty = ty0; ty <= ty1; ++ty) {
+            uint32_t rowOff = ty * numTilesX;
+            for (uint32_t tx = tx0; tx <= tx1; ++tx) {
+                uint32_t tIdx = rowOff + tx;
+                ++(*tileCounts)[tIdx];
+                binPairs->push_back(ChunkBinPair{tIdx, localTriIdx});
+            }
+        }
+    }
+};
+
+struct ChunkOutput {
+    std::vector<SetupTriangle> triangles;
+    std::vector<float> attrBase;
+    std::vector<float> attrFlat;
+    std::vector<float> origBary;
+    std::vector<uint32_t> tileCounts;
+    std::vector<ChunkBinPair> binPairs;
+
+    void reset(size_t numTiles, bool enableFusedBinning) {
+        triangles.clear();
+        attrBase.clear();
+        attrFlat.clear();
+        origBary.clear();
+        binPairs.clear();
+        if (enableFusedBinning && numTiles > 0) {
+            tileCounts.assign(numTiles, 0u);
+        } else {
+            tileCounts.clear();
+        }
+    }
+};
+
+struct alignas(64) ChunkTransientScratch {
+    uint32_t cacheVId[kVtxCacheSize]{};
+    uint32_t cacheGen[kVtxCacheSize]{};
+    uint16_t cacheLocalIdx[kVtxCacheSize]{};
+    uint32_t curGen = 1;
+
+    alignas(64) uint32_t uniqueVIds[kMaxChunkVerts]{};
+    alignas(64) uint32_t uniqueIIds[kMaxChunkVerts]{};
+    uint16_t localTriVerts[kChunkPrims * 3]{};
+    uint32_t localPrimIds[kChunkPrims]{};
+
+    alignas(64) float posSOA[kMaxChunkVerts * 4]{};
+    std::vector<float> attrsSOA;
+
+    uint8_t outcodes[kMaxChunkVerts]{};
+    float invW[kMaxChunkVerts]{};
+    float screenX[kMaxChunkVerts]{};
+    float screenY[kMaxChunkVerts]{};
+    float screenZ[kMaxChunkVerts]{};
+    int64_t fixedX[kMaxChunkVerts]{};
+    int64_t fixedY[kMaxChunkVerts]{};
+
+    std::vector<ShadedVertex> polyA;
+    std::vector<ShadedVertex> polyB;
+
+    inline uint32_t advanceGen() {
+        if (++curGen == 0) {
+            std::memset(cacheGen, 0, sizeof(cacheGen));
+            curGen = 1;
+        }
+        return curGen;
+    }
+};
+
 // Clip polygon against one homogeneous plane f(v) >= 0.
 template <typename EvalFn>
 void clipPolygonPlane(
     const std::vector<ShadedVertex>& inPoly,
     std::vector<ShadedVertex>& outPoly,
-    uint32_t numScalars,
+    uint32_t numAttrScalars,
     EvalFn&& eval) {
     outPoly.clear();
     if (inPoly.empty()) return;
@@ -64,7 +188,7 @@ void clipPolygonPlane(
             for (int k = 0; k < 3; ++k) {
                 interp.origBary[k] = prev.origBary[k] + t * (curr.origBary[k] - prev.origBary[k]);
             }
-            for (uint32_t s = 0; s < numScalars; ++s) {
+            for (uint32_t s = 0; s < numAttrScalars; ++s) {
                 interp.attrs[s] = prev.attrs[s] + t * (curr.attrs[s] - prev.attrs[s]);
             }
             outPoly.push_back(interp);
@@ -101,6 +225,34 @@ uint32_t combineShadingRate(
     }
 }
 
+inline float evalDepthBias(
+    const D3D12_RASTERIZER_DESC& rast,
+    int64_t posArea256,
+    float sx0, float sy0, float sz0,
+    float sx1, float sy1, float sz1,
+    float sx2, float sy2, float sz2) {
+    if (rast.DepthBias == 0 && rast.SlopeScaledDepthBias == 0.0f) {
+        return 0.0f;
+    }
+    constexpr float r = 1.0f / 16777216.0f; // UNORM24 / float32 unit
+    float biasTerm = static_cast<float>(rast.DepthBias) * r;
+    float slopeTerm = 0.0f;
+    if (rast.SlopeScaledDepthBias != 0.0f) {
+        float d = static_cast<float>(posArea256) / 65536.0f;
+        float dzdx = ((sz1 - sz0) * (sy2 - sy0) - (sz2 - sz0) * (sy1 - sy0)) / d;
+        float dzdy = ((sx1 - sx0) * (sz2 - sz0) - (sx2 - sx0) * (sz1 - sz0)) / d;
+        float maxSlope = std::max(std::fabs(dzdx), std::fabs(dzdy));
+        slopeTerm = rast.SlopeScaledDepthBias * maxSlope;
+    }
+    float depthBiasVal = biasTerm + slopeTerm;
+    if (rast.DepthBiasClamp > 0.0f) {
+        depthBiasVal = std::min(depthBiasVal, rast.DepthBiasClamp);
+    } else if (rast.DepthBiasClamp < 0.0f) {
+        depthBiasVal = std::max(depthBiasVal, rast.DepthBiasClamp);
+    }
+    return depthBiasVal;
+}
+
 void setupClippedTriangle(
     const ShadedVertex& v0,
     const ShadedVertex& v1,
@@ -112,7 +264,8 @@ void setupClippedTriangle(
     const D3D12_VIEWPORT& vp,
     const D3D12_RECT& scissor,
     const D3D12_RASTERIZER_DESC& rast,
-    RasterScene& scene,
+    const RasterScene& sceneCfg,
+    TriangleEmitTarget& target,
     bool unclipped = false) {
     if (v0.clipW <= 1e-7f || v1.clipW <= 1e-7f || v2.clipW <= 1e-7f) return;
 
@@ -136,7 +289,6 @@ void setupClippedTriangle(
     float sy2 = vp.TopLeftY + (-ndcY2 * 0.5f + 0.5f) * vp.Height;
     float sz2 = vp.MinDepth + ndcZ2 * (vp.MaxDepth - vp.MinDepth);
 
-    // Snap to 24.8 fixed-point subpixel coordinates
     int64_t fx0 = std::llround(static_cast<double>(sx0) * 256.0);
     int64_t fy0 = std::llround(static_cast<double>(sy0) * 256.0);
     int64_t fx1 = std::llround(static_cast<double>(sx1) * 256.0);
@@ -144,7 +296,6 @@ void setupClippedTriangle(
     int64_t fx2 = std::llround(static_cast<double>(sx2) * 256.0);
     int64_t fy2 = std::llround(static_cast<double>(sy2) * 256.0);
 
-    // 2x signed area in 24.8^2 units. In Y-down screen space, > 0 is clockwise (D3D12 default front face).
     int64_t signedArea256 = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
     if (signedArea256 == 0) return;
 
@@ -154,7 +305,6 @@ void setupClippedTriangle(
     if (rast.CullMode == D3D12_CULL_MODE_BACK && !isFront) return;
     if (rast.CullMode == D3D12_CULL_MODE_FRONT && isFront) return;
 
-    // Bounding box in integer pixels
     int64_t minFx = std::min({fx0, fx1, fx2});
     int64_t maxFx = std::max({fx0, fx1, fx2});
     int64_t minFy = std::min({fy0, fy1, fy2});
@@ -167,8 +317,6 @@ void setupClippedTriangle(
 
     if (minX >= maxX || minY >= maxY) return;
 
-    // Edge equations: E(px, py) = (b.x - a.x)*(py*256+128 - a.y) - (b.y - a.y)*(px*256+128 - a.x)
-    // Edge 0: v1 -> v2, Edge 1: v2 -> v0, Edge 2: v0 -> v1
     int64_t vxA[3] = {fx1, fx2, fx0};
     int64_t vyA[3] = {fy1, fy2, fy0};
     int64_t vxB[3] = {fx2, fx0, fx1};
@@ -191,8 +339,6 @@ void setupClippedTriangle(
     for (int k = 0; k < 3; ++k) {
         int64_t dx = (vxB[k] - vxA[k]) * signFlip;
         int64_t dy = (vyB[k] - vyA[k]) * signFlip;
-        // E = dx * (py*256 + 128 - vyA) - dy * (px*256 + 128 - vxA)
-        //   = (-256 * dy) * px + (256 * dx) * py + (dx*(128 - vyA) - dy*(128 - vxA))
         tri.stepX[k] = -256 * dy;
         tri.stepY[k] = 256 * dx;
         tri.base[k] = dx * (128 - vyA[k]) - dy * (128 - vxA[k]);
@@ -200,42 +346,11 @@ void setupClippedTriangle(
         tri.bias[k] = isTopLeft ? 0 : -1;
     }
 
-    // Optional depth bias
-    float depthBiasVal = 0.0f;
-    if (rast.DepthBias != 0 || rast.SlopeScaledDepthBias != 0.0f) {
-        float r = 1.0f / 16777216.0f; // UNORM24 / float32 unit
-        float biasTerm = static_cast<float>(rast.DepthBias) * r;
-        float slopeTerm = 0.0f;
-        if (rast.SlopeScaledDepthBias != 0.0f) {
-            float d = static_cast<float>(posArea256) / 65536.0f;
-            float dzdx = ((sz1 - sz0) * (sy2 - sy0) - (sz2 - sz0) * (sy1 - sy0)) / d;
-            float dzdy = ((sx1 - sx0) * (sz2 - sz0) - (sx2 - sx0) * (sz1 - sz0)) / d;
-            float maxSlope = std::max(std::fabs(dzdx), std::fabs(dzdy));
-            slopeTerm = rast.SlopeScaledDepthBias * maxSlope;
-        }
-        depthBiasVal = biasTerm + slopeTerm;
-        if (rast.DepthBiasClamp > 0.0f) {
-            depthBiasVal = std::min(depthBiasVal, rast.DepthBiasClamp);
-        } else if (rast.DepthBiasClamp < 0.0f) {
-            depthBiasVal = std::max(depthBiasVal, rast.DepthBiasClamp);
-        }
-    }
+    float depthBiasVal = evalDepthBias(rast, posArea256, sx0, sy0, sz0, sx1, sy1, sz1, sx2, sy2, sz2);
 
     tri.invW[0] = iw0;
     tri.invW[1] = iw1 - iw0;
     tri.invW[2] = iw2 - iw0;
-
-    for (int k = 0; k < 3; ++k) {
-        float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
-        float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
-        float b2 = unclipped ? (k == 2 ? 1.0f : 0.0f) : v2.origBary[k];
-        float b0w = b0 * iw0;
-        float b1w = b1 * iw1;
-        float b2w = b2 * iw2;
-        tri.origBary[k * 3 + 0] = b0w;
-        tri.origBary[k * 3 + 1] = b1w - b0w;
-        tri.origBary[k * 3 + 2] = b2w - b0w;
-    }
 
     float z0 = sz0 + depthBiasVal;
     float z1 = sz1 + depthBiasVal;
@@ -244,27 +359,58 @@ void setupClippedTriangle(
     tri.depth[1] = z1 - z0;
     tri.depth[2] = z2 - z0;
 
-    uint32_t numScalars = scene.numPSInputScalars;
-    tri.attrBaseOffset = static_cast<uint32_t>(scene.attrBaseArena.size());
-    tri.attrFlatOffset = static_cast<uint32_t>(scene.attrFlatArena.size());
-
-    if (numScalars > 0) {
-        scene.attrBaseArena.resize(tri.attrBaseOffset + numScalars * 3);
-        scene.attrFlatArena.resize(tri.attrFlatOffset + numScalars);
-        float* baseDst = scene.attrBaseArena.data() + tri.attrBaseOffset;
-        float* flatDst = scene.attrFlatArena.data() + tri.attrFlatOffset;
-        for (uint32_t s = 0; s < numScalars; ++s) {
-            float a0 = v0.attrs[s] * iw0;
-            float a1 = v1.attrs[s] * iw1;
-            float a2 = v2.attrs[s] * iw2;
-            baseDst[s * 3 + 0] = a0;
-            baseDst[s * 3 + 1] = a1 - a0;
-            baseDst[s * 3 + 2] = a2 - a0;
-            flatDst[s] = flatAttrsV0[s];
+    if (sceneCfg.needsOrigBary) {
+        size_t obOff = target.origBaryArena->size();
+        target.origBaryArena->resize(obOff + 9);
+        float* obDst = target.origBaryArena->data() + obOff;
+        for (int k = 0; k < 3; ++k) {
+            float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
+            float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
+            float b2 = unclipped ? (k == 2 ? 1.0f : 0.0f) : v2.origBary[k];
+            float b0w = b0 * iw0;
+            float b1w = b1 * iw1;
+            float b2w = b2 * iw2;
+            obDst[k * 3 + 0] = b0w;
+            obDst[k * 3 + 1] = b1w - b0w;
+            obDst[k * 3 + 2] = b2w - b0w;
         }
     }
 
-    scene.triangles.push_back(tri);
+    const uint32_t numScalars = sceneCfg.numPSInputScalars;
+    if (numScalars > 0) {
+        size_t baseOff = target.attrBaseArena->size();
+        target.attrBaseArena->resize(baseOff + static_cast<size_t>(numScalars) * 3);
+        float* baseDst = target.attrBaseArena->data() + baseOff;
+
+        float* flatDst = nullptr;
+        if (sceneCfg.needsFlatAttrs) {
+            size_t flatOff = target.attrFlatArena->size();
+            target.attrFlatArena->resize(flatOff + numScalars);
+            flatDst = target.attrFlatArena->data() + flatOff;
+        }
+
+        for (uint32_t s = 0; s < numScalars; ++s) {
+            int16_t srcSlot = sceneCfg.psInputFromPreRastSlot[s];
+            float raw0 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v0.attrs[srcSlot] : 0.0f;
+            float raw1 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v1.attrs[srcSlot] : 0.0f;
+            float raw2 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v2.attrs[srcSlot] : 0.0f;
+            float a0 = raw0 * iw0;
+            float a1 = raw1 * iw1;
+            float a2 = raw2 * iw2;
+            baseDst[s * 3 + 0] = a0;
+            baseDst[s * 3 + 1] = a1 - a0;
+            baseDst[s * 3 + 2] = a2 - a0;
+            if (flatDst) {
+                flatDst[s] = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars)
+                                 ? flatAttrsV0[srcSlot]
+                                 : 0.0f;
+            }
+        }
+    }
+
+    uint32_t localTriIdx = static_cast<uint32_t>(target.triangles->size());
+    target.triangles->push_back(tri);
+    target.recordBinIfActive(tri, localTriIdx);
 }
 
 void processTriangle(
@@ -272,40 +418,38 @@ void processTriangle(
     const ShadedVertex& v1,
     const ShadedVertex& v2,
     uint32_t primitiveId,
-    const D3D12_VIEWPORT& /*defaultVp*/,
     const D3D12_RASTERIZER_DESC& rast,
-    RasterScene& scene,
+    const RasterScene& sceneCfg,
+    TriangleEmitTarget& target,
     std::vector<ShadedVertex>& polyA,
     std::vector<ShadedVertex>& polyB) {
-    uint32_t numScalars = scene.numPSInputScalars;
+    const uint32_t numPreRastScalars = sceneCfg.preRastScalarAttrs;
 
     uint32_t rawVpIdx = 0;
-    if (scene.hasViewportArrayIndex && scene.vpIndexAttrOffset < kMaxPSInputScalars) {
-        std::memcpy(&rawVpIdx, &v0.attrs[scene.vpIndexAttrOffset], sizeof(rawVpIdx));
+    if (sceneCfg.hasViewportArrayIndex && sceneCfg.vpIndexAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&rawVpIdx, &v0.attrs[sceneCfg.vpIndexAttrOffset], sizeof(rawVpIdx));
     }
-    uint32_t vpIdx = (rawVpIdx < scene.numViewports) ? rawVpIdx : 0u;
-    uint32_t scIdx = (rawVpIdx < scene.numScissors) ? rawVpIdx : 0u;
-    const D3D12_VIEWPORT& vp = scene.viewports[vpIdx];
-    const D3D12_RECT& scissor = scene.scissors[scIdx];
+    uint32_t vpIdx = (rawVpIdx < sceneCfg.numViewports) ? rawVpIdx : 0u;
+    uint32_t scIdx = (rawVpIdx < sceneCfg.numScissors) ? rawVpIdx : 0u;
+    const D3D12_VIEWPORT& vp = sceneCfg.viewports[vpIdx];
+    const D3D12_RECT& scissor = sceneCfg.scissors[scIdx];
 
     uint32_t primSR = 0;
-    if (scene.hasPerPrimShadingRate && scene.shadingRateAttrOffset < kMaxPSInputScalars) {
-        std::memcpy(&primSR, &v0.attrs[scene.shadingRateAttrOffset], sizeof(primSR));
+    if (sceneCfg.hasPerPrimShadingRate && sceneCfg.shadingRateAttrOffset < kMaxPSInputScalars) {
+        std::memcpy(&primSR, &v0.attrs[sceneCfg.shadingRateAttrOffset], sizeof(primSR));
     }
-    uint32_t shadingRate = combineShadingRate(scene.drawShadingRate, primSR, scene.shadingRateCombiner);
+    uint32_t shadingRate = combineShadingRate(sceneCfg.drawShadingRate, primSR, sceneCfg.shadingRateCombiner);
 
-    // SV_CullDistance: cull entire primitive if all vertices have < 0 for any active cull component
-    if (scene.cullDistMask != 0) {
+    if (sceneCfg.cullDistMask != 0) {
         for (uint32_t k = 0; k < 8; ++k) {
-            if (!(scene.cullDistMask & (1u << k))) continue;
-            uint32_t s = scene.cullAttrOffset + k;
+            if (!(sceneCfg.cullDistMask & (1u << k))) continue;
+            uint32_t s = sceneCfg.cullAttrOffset + k;
             if (s < kMaxPSInputScalars && v0.attrs[s] < 0.0f && v1.attrs[s] < 0.0f && v2.attrs[s] < 0.0f) {
                 return;
             }
         }
     }
 
-    // Fast trivial reject against frustum planes
     auto allOut = [&](auto&& pred) {
         return pred(v0) && pred(v1) && pred(v2);
     };
@@ -319,8 +463,6 @@ void processTriangle(
         return;
     }
 
-    // Guard-band trivial accept: skip X/Y clipping when all vertices are in front of near/far
-    // and within 24.8 fixed-point guard band (matches hardware subpixel snapping).
     auto insideGuardBand = [&](const ShadedVertex& v) {
         if (!(v.clipW > 1e-6f && v.clipZ >= 0.0f && v.clipZ <= v.clipW)) {
             return false;
@@ -331,21 +473,21 @@ void processTriangle(
         if (!(sx >= -16384.0f && sx <= 16384.0f && sy >= -16384.0f && sy <= 16384.0f)) {
             return false;
         }
-        if (scene.clipDistMask != 0) {
+        if (sceneCfg.clipDistMask != 0) {
             for (uint32_t k = 0; k < 8; ++k) {
-                if (!(scene.clipDistMask & (1u << k))) continue;
-                uint32_t s = scene.clipAttrOffset + k;
+                if (!(sceneCfg.clipDistMask & (1u << k))) continue;
+                uint32_t s = sceneCfg.clipAttrOffset + k;
                 if (s < kMaxPSInputScalars && v.attrs[s] < 0.0f) return false;
             }
         }
         return true;
     };
     if (insideGuardBand(v0) && insideGuardBand(v1) && insideGuardBand(v2)) {
-        setupClippedTriangle(v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene, /*unclipped=*/true);
+        setupClippedTriangle(
+            v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target, /*unclipped=*/true);
         return;
     }
 
-    // Homogeneous 6-plane + user clip-distance Sutherland-Hodgman clipping
     polyA.clear();
     polyA.push_back(v0);
     polyA.push_back(v1);
@@ -354,34 +496,394 @@ void processTriangle(
     polyA[1].origBary[0] = 0.0f; polyA[1].origBary[1] = 1.0f; polyA[1].origBary[2] = 0.0f;
     polyA[2].origBary[0] = 0.0f; polyA[2].origBary[1] = 0.0f; polyA[2].origBary[2] = 1.0f;
 
-    clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - 1e-6f; });
+    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - 1e-6f; });
     if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numScalars, [](const ShadedVertex& v) { return v.clipX + v.clipW; });
+    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipX + v.clipW; });
     if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - v.clipX; });
+    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipX; });
     if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numScalars, [](const ShadedVertex& v) { return v.clipY + v.clipW; });
+    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipY + v.clipW; });
     if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - v.clipY; });
+    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipY; });
     if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numScalars, [](const ShadedVertex& v) { return v.clipZ; });
+    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipZ; });
     if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numScalars, [](const ShadedVertex& v) { return v.clipW - v.clipZ; });
+    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipZ; });
     if (polyB.size() < 3) return;
 
-    if (scene.clipDistMask != 0) {
+    if (sceneCfg.clipDistMask != 0) {
         for (uint32_t k = 0; k < 8; ++k) {
-            if (!(scene.clipDistMask & (1u << k))) continue;
-            uint32_t s = scene.clipAttrOffset + k;
+            if (!(sceneCfg.clipDistMask & (1u << k))) continue;
+            uint32_t s = sceneCfg.clipAttrOffset + k;
             if (s >= kMaxPSInputScalars) continue;
-            clipPolygonPlane(polyB, polyA, numScalars, [s](const ShadedVertex& v) { return v.attrs[s]; });
+            clipPolygonPlane(polyB, polyA, numPreRastScalars, [s](const ShadedVertex& v) { return v.attrs[s]; });
             std::swap(polyA, polyB);
             if (polyB.size() < 3) return;
         }
     }
 
     for (size_t k = 1; k + 1 < polyB.size(); ++k) {
-        setupClippedTriangle(polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, scene);
+        setupClippedTriangle(
+            polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target);
+    }
+}
+
+void executeVertexTriangleChunk(
+    uint64_t globalPrimStart,
+    uint64_t globalPrimEnd,
+    uint32_t primsPerInstance,
+    bool isStrip,
+    const uint32_t* prebuiltIndexedStripVIds,
+    const FastIndexReader& ibReader,
+    const GraphicsExecutionState& state,
+    const DrawCallParams& draw,
+    CompiledVertexFn vsFn,
+    uint32_t W,
+    const D3D12_RASTERIZER_DESC& rast,
+    const RasterScene& sceneCfg,
+    TriangleEmitTarget& target) {
+    if (globalPrimStart >= globalPrimEnd || primsPerInstance == 0) return;
+    ScopedFlushDenormals flushDenorms;
+    thread_local ChunkTransientScratch scratch;
+
+    const uint32_t chunkPrimCount = static_cast<uint32_t>(globalPrimEnd - globalPrimStart);
+    const uint32_t vsAttrScalars = sceneCfg.preRastScalarAttrs;
+    const uint32_t vsAttrAllocScalars = std::max<uint32_t>(1u, vsAttrScalars);
+
+    uint32_t instIdx = static_cast<uint32_t>(globalPrimStart / primsPerInstance);
+    uint32_t primInInst = static_cast<uint32_t>(globalPrimStart % primsPerInstance);
+    uint32_t curInstId = draw.startInstanceLocation + instIdx;
+
+    uint32_t numUnique = 0;
+    if (!draw.indexed && !isStrip) {
+        // Non-indexed TRIANGLELIST: every vertex is unique and sequential; bypass vertex cache completely.
+        for (uint32_t lp = 0; lp < chunkPrimCount; ++lp) {
+            uint32_t baseV = draw.startIndexOrVertex + primInInst * 3u;
+            uint16_t uBase = static_cast<uint16_t>(lp * 3u);
+            scratch.uniqueVIds[uBase + 0] = baseV + 0u;
+            scratch.uniqueVIds[uBase + 1] = baseV + 1u;
+            scratch.uniqueVIds[uBase + 2] = baseV + 2u;
+            scratch.uniqueIIds[uBase + 0] = curInstId;
+            scratch.uniqueIIds[uBase + 1] = curInstId;
+            scratch.uniqueIIds[uBase + 2] = curInstId;
+            scratch.localTriVerts[lp * 3u + 0] = uBase + 0u;
+            scratch.localTriVerts[lp * 3u + 1] = uBase + 1u;
+            scratch.localTriVerts[lp * 3u + 2] = uBase + 2u;
+            scratch.localPrimIds[lp] = primInInst;
+
+            if (++primInInst == primsPerInstance) {
+                primInInst = 0;
+                ++instIdx;
+                curInstId = draw.startInstanceLocation + instIdx;
+            }
+        }
+        numUnique = chunkPrimCount * 3u;
+    } else {
+        // Indexed or TriangleStrip: L1-resident 2048-entry generation-tagged post-transform vertex cache.
+        uint32_t gen = scratch.advanceGen();
+        auto lookupOrInsert = [&](uint32_t vid, uint32_t iid) -> uint16_t {
+            uint32_t slot = (vid * 2654435761u) & kVtxCacheMask;
+            if (scratch.cacheGen[slot] == gen && scratch.cacheVId[slot] == vid) {
+                return scratch.cacheLocalIdx[slot];
+            }
+            uint16_t uIdx = static_cast<uint16_t>(numUnique++);
+            scratch.uniqueVIds[uIdx] = vid;
+            scratch.uniqueIIds[uIdx] = iid;
+            scratch.cacheGen[slot] = gen;
+            scratch.cacheVId[slot] = vid;
+            scratch.cacheLocalIdx[slot] = uIdx;
+            return uIdx;
+        };
+
+        for (uint32_t lp = 0; lp < chunkPrimCount; ++lp) {
+            uint32_t v0 = 0, v1 = 0, v2 = 0;
+            if (prebuiltIndexedStripVIds) {
+                const uint32_t* triSrc = prebuiltIndexedStripVIds + static_cast<size_t>(primInInst) * 3u;
+                v0 = triSrc[0];
+                v1 = triSrc[1];
+                v2 = triSrc[2];
+            } else if (!draw.indexed) {
+                // Non-indexed TRIANGLESTRIP
+                bool odd = (primInInst & 1u) != 0;
+                v0 = draw.startIndexOrVertex + primInInst;
+                v1 = draw.startIndexOrVertex + primInInst + (odd ? 2u : 1u);
+                v2 = draw.startIndexOrVertex + primInInst + (odd ? 1u : 2u);
+            } else {
+                // Indexed TRIANGLELIST
+                uint32_t ibOff = draw.startIndexOrVertex + primInInst * 3u;
+                int32_t baseVtx = draw.baseVertexLocation;
+                v0 = static_cast<uint32_t>(static_cast<int32_t>(ibReader.readNoCut(ibOff + 0u)) + baseVtx);
+                v1 = static_cast<uint32_t>(static_cast<int32_t>(ibReader.readNoCut(ibOff + 1u)) + baseVtx);
+                v2 = static_cast<uint32_t>(static_cast<int32_t>(ibReader.readNoCut(ibOff + 2u)) + baseVtx);
+            }
+
+            scratch.localTriVerts[lp * 3u + 0] = lookupOrInsert(v0, curInstId);
+            scratch.localTriVerts[lp * 3u + 1] = lookupOrInsert(v1, curInstId);
+            scratch.localTriVerts[lp * 3u + 2] = lookupOrInsert(v2, curInstId);
+            scratch.localPrimIds[lp] = primInInst;
+
+            if (++primInInst == primsPerInstance) {
+                primInInst = 0;
+                ++instIdx;
+                curInstId = draw.startInstanceLocation + instIdx;
+                gen = scratch.advanceGen(); // Invalidate post-transform cache across instance boundary in O(1)
+            }
+        }
+    }
+
+    if (numUnique == 0) return;
+
+    const uint32_t numBatches = (numUnique + W - 1u) / W;
+    const size_t neededAttrFloats = static_cast<size_t>(numBatches) * vsAttrAllocScalars * W;
+    if (scratch.attrsSOA.size() < neededAttrFloats) {
+        scratch.attrsSOA.resize(neededAttrFloats);
+    }
+
+    // Pad tail lanes of the final SIMD packet for contiguous W-wide vector loads in @nacelle_vs_*
+    const uint32_t paddedEnd = numBatches * W;
+    const uint32_t lastBase = (numBatches - 1u) * W;
+    for (uint32_t u = numUnique; u < paddedEnd; ++u) {
+        scratch.uniqueVIds[u] = scratch.uniqueVIds[lastBase];
+        scratch.uniqueIIds[u] = scratch.uniqueIIds[lastBase];
+    }
+
+    // 1. Shade unique vertices in W-wide SIMD packets (outputs stay in SOA!)
+    for (uint32_t b = 0; b < numBatches; ++b) {
+        uint32_t base = b * W;
+        uint32_t active = std::min<uint32_t>(W, numUnique - base);
+        vsFn(
+            &state.rootCtx,
+            &scratch.uniqueVIds[base],
+            &scratch.uniqueIIds[base],
+            active,
+            &scratch.posSOA[base * 4u],
+            &scratch.attrsSOA[static_cast<size_t>(b) * vsAttrAllocScalars * W]);
+    }
+
+    // 2. Fused once-per-unique-vertex post-VS epilogue: frustum outcodes, guard-band check, 1/w, viewport & 24.8 snap
+    const bool specialPerPrimState =
+        sceneCfg.hasViewportArrayIndex || sceneCfg.hasPerPrimShadingRate ||
+        (sceneCfg.clipDistMask != 0) || (sceneCfg.cullDistMask != 0);
+    const D3D12_VIEWPORT& vp0 = sceneCfg.viewports[0];
+    const D3D12_RECT& scissor0 = sceneCfg.scissors[0];
+
+    for (uint32_t b = 0; b < numBatches; ++b) {
+        uint32_t base = b * W;
+        uint32_t active = std::min<uint32_t>(W, numUnique - base);
+        const float* posX = &scratch.posSOA[base * 4u + 0u * W];
+        const float* posY = &scratch.posSOA[base * 4u + 1u * W];
+        const float* posZ = &scratch.posSOA[base * 4u + 2u * W];
+        const float* posW = &scratch.posSOA[base * 4u + 3u * W];
+
+        for (uint32_t l = 0; l < active; ++l) {
+            uint32_t u = base + l;
+            float cx = posX[l];
+            float cy = posY[l];
+            float cz = posZ[l];
+            float cw = posW[l];
+
+            uint8_t oc = 0;
+            if (cx < -cw) oc |= 0x01u;
+            if (cx >  cw) oc |= 0x02u;
+            if (cy < -cw) oc |= 0x04u;
+            if (cy >  cw) oc |= 0x08u;
+            if (cz < 0.0f) oc |= 0x10u;
+            if (cz >  cw) oc |= 0x20u;
+            if (!(cw > 0.0f)) oc |= 0x40u;
+
+            if (!specialPerPrimState && cw > 1e-6f && cz >= 0.0f && cz <= cw) {
+                float iw = 1.0f / cw;
+                float ndcX = cx * iw;
+                float ndcY = cy * iw;
+                float ndcZ = cz * iw;
+                float sx = vp0.TopLeftX + (ndcX * 0.5f + 0.5f) * vp0.Width;
+                float sy = vp0.TopLeftY + (-ndcY * 0.5f + 0.5f) * vp0.Height;
+                if (sx >= -16384.0f && sx <= 16384.0f && sy >= -16384.0f && sy <= 16384.0f) {
+                    oc |= 0x80u;
+                    scratch.invW[u] = iw;
+                    scratch.screenX[u] = sx;
+                    scratch.screenY[u] = sy;
+                    scratch.screenZ[u] = vp0.MinDepth + ndcZ * (vp0.MaxDepth - vp0.MinDepth);
+                    scratch.fixedX[u] = std::llround(static_cast<double>(sx) * 256.0);
+                    scratch.fixedY[u] = std::llround(static_cast<double>(sy) * 256.0);
+                }
+            }
+            scratch.outcodes[u] = oc;
+        }
+    }
+
+    // 3. Triangle assembly + early culling BEFORE touching attribute SOA
+    const bool cullBack = (rast.CullMode == D3D12_CULL_MODE_BACK);
+    const bool cullFront = (rast.CullMode == D3D12_CULL_MODE_FRONT);
+    const bool frontCCW = (rast.FrontCounterClockwise != FALSE);
+    const uint32_t defaultShadingRate =
+        combineShadingRate(sceneCfg.drawShadingRate, 0u, sceneCfg.shadingRateCombiner);
+    const uint32_t numPSScalars = sceneCfg.numPSInputScalars;
+    const bool needsFlat = sceneCfg.needsFlatAttrs;
+    const bool needsOrigBary = sceneCfg.needsOrigBary;
+    const size_t batchAttrStride = static_cast<size_t>(vsAttrAllocScalars) * W;
+
+    auto unpackFallbackVertex = [&](uint32_t u, ShadedVertex& sv) {
+        uint32_t b = u / W;
+        uint32_t l = u % W;
+        const float* pBase = &scratch.posSOA[b * W * 4u];
+        sv.clipX = pBase[0u * W + l];
+        sv.clipY = pBase[1u * W + l];
+        sv.clipZ = pBase[2u * W + l];
+        sv.clipW = pBase[3u * W + l];
+        const float* aBase = &scratch.attrsSOA[static_cast<size_t>(b) * batchAttrStride + l];
+        for (uint32_t s = 0; s < vsAttrScalars; ++s) {
+            sv.attrs[s] = aBase[static_cast<size_t>(s) * W];
+        }
+    };
+
+    for (uint32_t lp = 0; lp < chunkPrimCount; ++lp) {
+        uint32_t u0 = scratch.localTriVerts[lp * 3u + 0];
+        uint32_t u1 = scratch.localTriVerts[lp * 3u + 1];
+        uint32_t u2 = scratch.localTriVerts[lp * 3u + 2];
+
+        uint8_t oc0 = scratch.outcodes[u0];
+        uint8_t oc1 = scratch.outcodes[u1];
+        uint8_t oc2 = scratch.outcodes[u2];
+
+        // Trivial frustum reject across all 6 homogeneous planes + w <= 0
+        if (!sceneCfg.clipDistMask && !sceneCfg.cullDistMask && ((oc0 & oc1 & oc2 & 0x7Fu) != 0)) {
+            continue;
+        }
+
+        if (!specialPerPrimState && ((oc0 & oc1 & oc2 & 0x80u) != 0)) {
+            // Fast guard-band path: zero ShadedVertex copies, cull before reading attributes!
+            int64_t fx0 = scratch.fixedX[u0], fy0 = scratch.fixedY[u0];
+            int64_t fx1 = scratch.fixedX[u1], fy1 = scratch.fixedY[u1];
+            int64_t fx2 = scratch.fixedX[u2], fy2 = scratch.fixedY[u2];
+
+            int64_t signedArea256 = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
+            if (signedArea256 == 0) continue;
+
+            bool isCW = (signedArea256 > 0);
+            bool isFront = frontCCW ? !isCW : isCW;
+            if (cullBack && !isFront) continue;
+            if (cullFront && isFront) continue;
+
+            int64_t minFx = std::min({fx0, fx1, fx2});
+            int64_t maxFx = std::max({fx0, fx1, fx2});
+            int64_t minFy = std::min({fy0, fy1, fy2});
+            int64_t maxFy = std::max({fy0, fy1, fy2});
+
+            int32_t minX = std::max<int32_t>(scissor0.left, static_cast<int32_t>((minFx - 128 + 255) >> 8));
+            int32_t maxX = std::min<int32_t>(scissor0.right, static_cast<int32_t>((maxFx - 128) >> 8) + 1);
+            int32_t minY = std::max<int32_t>(scissor0.top, static_cast<int32_t>((minFy - 128 + 255) >> 8));
+            int32_t maxY = std::min<int32_t>(scissor0.bottom, static_cast<int32_t>((maxFy - 128) >> 8) + 1);
+            if (minX >= maxX || minY >= maxY) continue;
+
+            SetupTriangle tri;
+            tri.minX = minX;
+            tri.maxX = maxX;
+            tri.minY = minY;
+            tri.maxY = maxY;
+            tri.isFrontFace = isFront ? 1u : 0u;
+            tri.primitiveId = scratch.localPrimIds[lp];
+            tri.viewportIndex = 0u;
+            tri.shadingRate = defaultShadingRate;
+
+            int64_t signFlip = isCW ? 1 : -1;
+            int64_t posArea256 = signedArea256 * signFlip;
+            tri.invArea = 1.0f / static_cast<float>(posArea256);
+
+            int64_t vxA[3] = {fx1, fx2, fx0};
+            int64_t vyA[3] = {fy1, fy2, fy0};
+            int64_t vxB[3] = {fx2, fx0, fx1};
+            int64_t vyB[3] = {fy2, fy0, fy1};
+            for (int k = 0; k < 3; ++k) {
+                int64_t dx = (vxB[k] - vxA[k]) * signFlip;
+                int64_t dy = (vyB[k] - vyA[k]) * signFlip;
+                tri.stepX[k] = -256 * dy;
+                tri.stepY[k] = 256 * dx;
+                tri.base[k] = dx * (128 - vyA[k]) - dy * (128 - vxA[k]);
+                bool isTopLeft = (dy < 0) || (dy == 0 && dx > 0);
+                tri.bias[k] = isTopLeft ? 0 : -1;
+            }
+
+            float iw0 = scratch.invW[u0];
+            float iw1 = scratch.invW[u1];
+            float iw2 = scratch.invW[u2];
+            tri.invW[0] = iw0;
+            tri.invW[1] = iw1 - iw0;
+            tri.invW[2] = iw2 - iw0;
+
+            float sz0 = scratch.screenZ[u0];
+            float sz1 = scratch.screenZ[u1];
+            float sz2 = scratch.screenZ[u2];
+            float depthBiasVal = evalDepthBias(
+                rast, posArea256,
+                scratch.screenX[u0], scratch.screenY[u0], sz0,
+                scratch.screenX[u1], scratch.screenY[u1], sz1,
+                scratch.screenX[u2], scratch.screenY[u2], sz2);
+            float z0 = sz0 + depthBiasVal;
+            float z1 = sz1 + depthBiasVal;
+            float z2 = sz2 + depthBiasVal;
+            tri.depth[0] = z0;
+            tri.depth[1] = z1 - z0;
+            tri.depth[2] = z2 - z0;
+
+            if (needsOrigBary) {
+                size_t obOff = target.origBaryArena->size();
+                target.origBaryArena->resize(obOff + 9);
+                float* obDst = target.origBaryArena->data() + obOff;
+                obDst[0] = iw0;  obDst[1] = -iw0; obDst[2] = -iw0;
+                obDst[3] = 0.0f; obDst[4] = iw1;  obDst[5] = 0.0f;
+                obDst[6] = 0.0f; obDst[7] = 0.0f; obDst[8] = iw2;
+            }
+
+            if (numPSScalars > 0) {
+                size_t baseOff = target.attrBaseArena->size();
+                target.attrBaseArena->resize(baseOff + static_cast<size_t>(numPSScalars) * 3);
+                float* baseDst = target.attrBaseArena->data() + baseOff;
+
+                float* flatDst = nullptr;
+                if (needsFlat) {
+                    size_t flatOff = target.attrFlatArena->size();
+                    target.attrFlatArena->resize(flatOff + numPSScalars);
+                    flatDst = target.attrFlatArena->data() + flatOff;
+                }
+
+                const float* aPtr0 = &scratch.attrsSOA[static_cast<size_t>(u0 / W) * batchAttrStride + (u0 % W)];
+                const float* aPtr1 = &scratch.attrsSOA[static_cast<size_t>(u1 / W) * batchAttrStride + (u1 % W)];
+                const float* aPtr2 = &scratch.attrsSOA[static_cast<size_t>(u2 / W) * batchAttrStride + (u2 % W)];
+
+                for (uint32_t s = 0; s < numPSScalars; ++s) {
+                    int16_t vsSlot = sceneCfg.psInputFromPreRastSlot[s];
+                    float raw0 = 0.0f, raw1 = 0.0f, raw2 = 0.0f;
+                    if (vsSlot >= 0 && static_cast<uint32_t>(vsSlot) < vsAttrScalars) {
+                        size_t slotOff = static_cast<size_t>(vsSlot) * W;
+                        raw0 = aPtr0[slotOff];
+                        raw1 = aPtr1[slotOff];
+                        raw2 = aPtr2[slotOff];
+                    }
+                    float a0 = raw0 * iw0;
+                    float a1 = raw1 * iw1;
+                    float a2 = raw2 * iw2;
+                    baseDst[s * 3 + 0] = a0;
+                    baseDst[s * 3 + 1] = a1 - a0;
+                    baseDst[s * 3 + 2] = a2 - a0;
+                    if (flatDst) {
+                        flatDst[s] = raw0;
+                    }
+                }
+            }
+
+            uint32_t localTriIdx = static_cast<uint32_t>(target.triangles->size());
+            target.triangles->push_back(tri);
+            target.recordBinIfActive(tri, localTriIdx);
+            continue;
+        }
+
+        // Guard-band straddling or user clip/cull/viewport-array fallback
+        ShadedVertex sv0, sv1, sv2;
+        unpackFallbackVertex(u0, sv0);
+        unpackFallbackVertex(u1, sv1);
+        unpackFallbackVertex(u2, sv2);
+        processTriangle(sv0, sv1, sv2, scratch.localPrimIds[lp], rast, sceneCfg, target, scratch.polyA, scratch.polyB);
     }
 }
 
@@ -459,38 +961,57 @@ void setupClippedLine(
     tri.invW[1] = iw1 - iw0;
     tri.invW[2] = 0.0f;
 
-    for (int k = 0; k < 2; ++k) {
-        float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
-        float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
-        float b0w = b0 * iw0;
-        float b1w = b1 * iw1;
-        tri.origBary[k * 3 + 0] = b0w;
-        tri.origBary[k * 3 + 1] = b1w - b0w;
-        tri.origBary[k * 3 + 2] = 0.0f;
-    }
-
     float z0 = sz0 + depthBiasVal;
     float z1 = sz1 + depthBiasVal;
     tri.depth[0] = z0;
     tri.depth[1] = z1 - z0;
     tri.depth[2] = 0.0f;
 
-    uint32_t numScalars = scene.numPSInputScalars;
-    tri.attrBaseOffset = static_cast<uint32_t>(scene.attrBaseArena.size());
-    tri.attrFlatOffset = static_cast<uint32_t>(scene.attrFlatArena.size());
+    if (scene.needsOrigBary) {
+        size_t obOff = scene.origBaryArena.size();
+        scene.origBaryArena.resize(obOff + 9);
+        float* obDst = scene.origBaryArena.data() + obOff;
+        for (int k = 0; k < 2; ++k) {
+            float b0 = unclipped ? (k == 0 ? 1.0f : 0.0f) : v0.origBary[k];
+            float b1 = unclipped ? (k == 1 ? 1.0f : 0.0f) : v1.origBary[k];
+            float b0w = b0 * iw0;
+            float b1w = b1 * iw1;
+            obDst[k * 3 + 0] = b0w;
+            obDst[k * 3 + 1] = b1w - b0w;
+            obDst[k * 3 + 2] = 0.0f;
+        }
+        obDst[6] = 0.0f;
+        obDst[7] = 0.0f;
+        obDst[8] = 0.0f;
+    }
 
+    uint32_t numScalars = scene.numPSInputScalars;
     if (numScalars > 0) {
-        scene.attrBaseArena.resize(tri.attrBaseOffset + numScalars * 3);
-        scene.attrFlatArena.resize(tri.attrFlatOffset + numScalars);
-        float* baseDst = scene.attrBaseArena.data() + tri.attrBaseOffset;
-        float* flatDst = scene.attrFlatArena.data() + tri.attrFlatOffset;
+        size_t baseOff = scene.attrBaseArena.size();
+        scene.attrBaseArena.resize(baseOff + static_cast<size_t>(numScalars) * 3);
+        float* baseDst = scene.attrBaseArena.data() + baseOff;
+
+        float* flatDst = nullptr;
+        if (scene.needsFlatAttrs) {
+            size_t flatOff = scene.attrFlatArena.size();
+            scene.attrFlatArena.resize(flatOff + numScalars);
+            flatDst = scene.attrFlatArena.data() + flatOff;
+        }
+
         for (uint32_t s = 0; s < numScalars; ++s) {
-            float a0 = v0.attrs[s] * iw0;
-            float a1 = v1.attrs[s] * iw1;
+            int16_t srcSlot = scene.psInputFromPreRastSlot[s];
+            float raw0 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v0.attrs[srcSlot] : 0.0f;
+            float raw1 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v1.attrs[srcSlot] : 0.0f;
+            float a0 = raw0 * iw0;
+            float a1 = raw1 * iw1;
             baseDst[s * 3 + 0] = a0;
             baseDst[s * 3 + 1] = a1 - a0;
             baseDst[s * 3 + 2] = 0.0f;
-            flatDst[s] = flatAttrsV0[s];
+            if (flatDst) {
+                flatDst[s] = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars)
+                                 ? flatAttrsV0[srcSlot]
+                                 : 0.0f;
+            }
         }
     }
 
@@ -504,7 +1025,7 @@ void processLine(
     const D3D12_VIEWPORT& /*defaultVp*/,
     const D3D12_RASTERIZER_DESC& rast,
     RasterScene& scene) {
-    uint32_t numScalars = scene.numPSInputScalars;
+    uint32_t numScalars = scene.preRastScalarAttrs;
 
     uint32_t rawVpIdx = 0;
     if (scene.hasViewportArrayIndex && scene.vpIndexAttrOffset < kMaxPSInputScalars) {
@@ -667,8 +1188,9 @@ bool initRasterSceneHeader(
     outScene.fbHeight = fbH;
     outScene.numTilesX = (fbW + kTileSize - 1) / kTileSize;
     outScene.numTilesY = (fbH + kTileSize - 1) / kTileSize;
-    outScene.numPSInputScalars = std::min<uint32_t>(
-        std::max(compiled.totalVSScalarAttrs, compiled.numPSInputRegs * 4), kMaxPSInputScalars);
+    outScene.numPSInputScalars = std::min<uint32_t>(compiled.numPSInputRegs * 4u, kMaxPSInputScalars);
+    outScene.preRastScalarAttrs = std::min<uint32_t>(
+        std::max(compiled.totalVSScalarAttrs, compiled.numPSInputRegs * 4u), kMaxPSInputScalars);
     outScene.clipDistMask = compiled.clipDistMask;
     outScene.cullDistMask = compiled.cullDistMask;
     outScene.clipAttrOffset = compiled.clipAttrOffset;
@@ -677,23 +1199,29 @@ bool initRasterSceneHeader(
     outScene.vpIndexAttrOffset = compiled.vpIndexAttrOffset;
     outScene.hasPerPrimShadingRate = compiled.hasPerPrimShadingRate;
     outScene.shadingRateAttrOffset = compiled.shadingRateAttrOffset;
+    outScene.needsFlatAttrs = (outScene.numPSInputScalars > 0) &&
+                              (((compiled.flatInterpMask & 0xFFFFu) != 0) || (compiled.msPrimAttrMask != 0));
+    outScene.needsOrigBary = compiled.psUsesPerspBarycentrics;
+    outScene.binsAlreadyPopulated = false;
     outScene.drawShadingRate = state.shadingRate;
     outScene.shadingRateCombiner = state.shadingRateCombiners[0];
+    outScene.psInputFromPreRastSlot = compiled.psInputFromVSSlot;
     outScene.triangles.clear();
     outScene.attrBaseArena.clear();
     outScene.attrFlatArena.clear();
-    {
-        return true;
-    }
+    outScene.origBaryArena.clear();
+    return true;
 }
 
 } // namespace
 
 bool buildRasterScene(
-    BS::thread_pool<>& /*pool*/,
+    BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const DrawCallParams& draw,
-    RasterScene& outScene) {
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins) {
+    outScene.binsAlreadyPopulated = false;
     if (!state.pso || state.pso->isCompute()) return false;
     const auto& compiled = state.pso->graphicsPSO();
     if (!compiled) return false;
@@ -758,12 +1286,14 @@ bool buildRasterScene(
         return false;
     }
 
+    const bool hasTess = compiled->hasTess;
+    const bool hasGS = compiled->hasGS;
+
     outScene.fbWidth = fbW;
     outScene.fbHeight = fbH;
     outScene.numTilesX = (fbW + kTileSize - 1) / kTileSize;
     outScene.numTilesY = (fbH + kTileSize - 1) / kTileSize;
-    outScene.numPSInputScalars = std::min<uint32_t>(
-        std::max(compiled->totalVSScalarAttrs, compiled->numPSInputRegs * 4), kMaxPSInputScalars);
+    outScene.numPSInputScalars = std::min<uint32_t>(compiled->numPSInputRegs * 4u, kMaxPSInputScalars);
     outScene.clipDistMask = compiled->clipDistMask;
     outScene.cullDistMask = compiled->cullDistMask;
     outScene.clipAttrOffset = compiled->clipAttrOffset;
@@ -772,23 +1302,269 @@ bool buildRasterScene(
     outScene.vpIndexAttrOffset = compiled->vpIndexAttrOffset;
     outScene.hasPerPrimShadingRate = compiled->hasPerPrimShadingRate;
     outScene.shadingRateAttrOffset = compiled->shadingRateAttrOffset;
+    outScene.needsFlatAttrs = (outScene.numPSInputScalars > 0) && ((compiled->flatInterpMask & 0xFFFFu) != 0);
+    outScene.needsOrigBary = compiled->psUsesPerspBarycentrics;
     outScene.drawShadingRate = state.shadingRate;
     outScene.shadingRateCombiner = state.shadingRateCombiners[0];
+    outScene.psInputFromPreRastSlot = compiled->psInputFromVSSlot;
+
+    if (!hasTess && !hasGS) {
+        outScene.preRastScalarAttrs = std::min<uint32_t>(compiled->totalVSScalarAttrs, kMaxPSInputScalars);
+    } else {
+        uint32_t preRastMax = compiled->numPSInputRegs * 4u;
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (compiled->clipDistMask & (1u << k)) {
+                preRastMax = std::max(preRastMax, compiled->clipAttrOffset + k + 1u);
+            }
+            if (compiled->cullDistMask & (1u << k)) {
+                preRastMax = std::max(preRastMax, compiled->cullAttrOffset + k + 1u);
+            }
+        }
+        if (compiled->hasViewportArrayIndex) {
+            preRastMax = std::max(preRastMax, compiled->vpIndexAttrOffset + 1u);
+        }
+        if (compiled->hasPerPrimShadingRate) {
+            preRastMax = std::max(preRastMax, compiled->shadingRateAttrOffset + 1u);
+        }
+        outScene.preRastScalarAttrs = std::min<uint32_t>(preRastMax, kMaxPSInputScalars);
+    }
+
     outScene.triangles.clear();
     outScene.attrBaseArena.clear();
     outScene.attrFlatArena.clear();
+    outScene.origBaryArena.clear();
 
-    const uint32_t W = std::max<uint32_t>(1, compiled->simdWidth);
-    const uint32_t numScalars = outScene.numPSInputScalars;
-    const bool hasTess = compiled->hasTess;
-    const bool hasGS = compiled->hasGS;
+    const uint32_t W = std::clamp<uint32_t>(compiled->simdWidth, 1u, kMaxSimdWidth);
+    const D3D12_RASTERIZER_DESC& rast = state.pso->graphicsDesc().RasterizerState;
+
+    const bool isLineTopo = (state.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST ||
+                             state.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
+
+    // =========================================================================
+    // Fast-path VS -> Rasterizer pipeline (!hasTess && !hasGS && !isLineTopo):
+    // Chunked L1-resident vertex shading, post-transform cache, fused post-VS
+    // epilogue, early culling before attribute setup, and multi-threaded
+    // deterministic geometry + ordered tile binning.
+    // =========================================================================
+    if (!hasTess && !hasGS && !isLineTopo) {
+        const bool isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+                              state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
+        uint32_t primsPerInstance = 0;
+        thread_local std::vector<uint32_t> tlIndexedStripVIds;
+        auto& indexedStripVIds = tlIndexedStripVIds;
+        indexedStripVIds.clear();
+
+        if (!isStrip) {
+            primsPerInstance = draw.countPerInstance / 3u;
+        } else if (!draw.indexed) {
+            primsPerInstance = (draw.countPerInstance >= 3u) ? (draw.countPerInstance - 2u) : 0u;
+        } else {
+            // Indexed strip: scan index buffer once to resolve strip-cut restarts and winding parity.
+            uint32_t stripRunVerts[2]{};
+            uint32_t runLen = 0;
+            indexedStripVIds.reserve((draw.countPerInstance >= 3u ? (draw.countPerInstance - 2u) : 0u) * 3u);
+            for (uint32_t i = 0; i < draw.countPerInstance; ++i) {
+                bool cut = false;
+                uint32_t r = readIndex(state.indexBuffer, draw.startIndexOrVertex + i, cut);
+                if (cut) {
+                    runLen = 0;
+                    continue;
+                }
+                uint32_t vid = static_cast<uint32_t>(static_cast<int32_t>(r) + draw.baseVertexLocation);
+                if (runLen < 2u) {
+                    stripRunVerts[runLen++] = vid;
+                } else {
+                    bool odd = ((runLen - 2u) & 1u) != 0;
+                    uint32_t a = stripRunVerts[0];
+                    uint32_t b = odd ? vid : stripRunVerts[1];
+                    uint32_t c = odd ? stripRunVerts[1] : vid;
+                    indexedStripVIds.push_back(a);
+                    indexedStripVIds.push_back(b);
+                    indexedStripVIds.push_back(c);
+                    stripRunVerts[0] = stripRunVerts[1];
+                    stripRunVerts[1] = vid;
+                    ++runLen;
+                }
+            }
+            primsPerInstance = static_cast<uint32_t>(indexedStripVIds.size() / 3u);
+        }
+
+        if (primsPerInstance == 0) return false;
+        const uint64_t totalPrims = static_cast<uint64_t>(primsPerInstance) * draw.instanceCount;
+
+        FastIndexReader ibReader;
+        if (draw.indexed && !isStrip) {
+            ibReader.init(state.indexBuffer);
+        }
+        const uint32_t* stripPtr = indexedStripVIds.empty() ? nullptr : indexedStripVIds.data();
+
+        const char* forceSingleEnv = std::getenv("NACELLE_SINGLE_THREAD_GEOM");
+        const bool allowParallel = !(forceSingleEnv && forceSingleEnv[0] == '1');
+
+        if (!allowParallel || totalPrims < kParallelPrimThreshold || pool.get_thread_count() <= 1) {
+            TriangleEmitTarget directTarget;
+            directTarget.triangles = &outScene.triangles;
+            directTarget.attrBaseArena = &outScene.attrBaseArena;
+            directTarget.attrFlatArena = &outScene.attrFlatArena;
+            directTarget.origBaryArena = &outScene.origBaryArena;
+
+            for (uint64_t start = 0; start < totalPrims; start += kChunkPrims) {
+                uint64_t end = std::min<uint64_t>(totalPrims, start + kChunkPrims);
+                executeVertexTriangleChunk(
+                    start, end, primsPerInstance, isStrip, stripPtr, ibReader,
+                    state, draw, vsFn, W, rast, outScene, directTarget);
+            }
+            return !outScene.triangles.empty();
+        }
+
+        // Parallel chunked geometry + lock-free deterministic tile binning
+        const uint32_t numChunks = static_cast<uint32_t>((totalPrims + kChunkPrims - 1u) / kChunkPrims);
+        const size_t numTiles = static_cast<size_t>(outScene.numTilesX) * outScene.numTilesY;
+        const bool fuseBinning = (optOutBins != nullptr) && (numTiles > 0) &&
+                                 (static_cast<uint64_t>(numChunks) * numTiles <= kMaxFusedBinMatrixEntries);
+
+        thread_local std::vector<ChunkOutput> tlChunkOutputs;
+        auto& chunkOutputs = tlChunkOutputs;
+        if (chunkOutputs.size() < numChunks) {
+            chunkOutputs.resize(numChunks);
+        }
+        for (uint32_t c = 0; c < numChunks; ++c) {
+            chunkOutputs[c].reset(numTiles, fuseBinning);
+        }
+
+        pool.detach_loop<uint32_t>(0, numChunks, [&](uint32_t c) {
+            uint64_t start = static_cast<uint64_t>(c) * kChunkPrims;
+            uint64_t end = std::min<uint64_t>(totalPrims, start + kChunkPrims);
+            ChunkOutput& co = chunkOutputs[c];
+            TriangleEmitTarget chunkTarget;
+            chunkTarget.triangles = &co.triangles;
+            chunkTarget.attrBaseArena = &co.attrBase;
+            chunkTarget.attrFlatArena = &co.attrFlat;
+            chunkTarget.origBaryArena = &co.origBary;
+            if (fuseBinning) {
+                chunkTarget.tileCounts = &co.tileCounts;
+                chunkTarget.binPairs = &co.binPairs;
+                chunkTarget.numTilesX = outScene.numTilesX;
+                chunkTarget.numTilesY = outScene.numTilesY;
+            }
+            executeVertexTriangleChunk(
+                start, end, primsPerInstance, isStrip, stripPtr, ibReader,
+                state, draw, vsFn, W, rast, outScene, chunkTarget);
+        });
+        pool.wait();
+
+        thread_local std::vector<size_t> tlChunkTriOffsets;
+        auto& chunkTriOffsets = tlChunkTriOffsets;
+        chunkTriOffsets.resize(numChunks + 1);
+        chunkTriOffsets[0] = 0;
+        for (uint32_t c = 0; c < numChunks; ++c) {
+            chunkTriOffsets[c + 1] = chunkTriOffsets[c] + chunkOutputs[c].triangles.size();
+        }
+        const size_t totalTris = chunkTriOffsets[numChunks];
+        if (totalTris == 0) {
+            if (fuseBinning) {
+                optOutBins->resize(numTiles);
+                for (auto& b : *optOutBins) b.triIndices.clear();
+                outScene.binsAlreadyPopulated = true;
+            }
+            return false;
+        }
+
+        const size_t psScalars = static_cast<size_t>(outScene.numPSInputScalars);
+        outScene.triangles.resize(totalTris);
+        if (psScalars > 0) {
+            outScene.attrBaseArena.resize(totalTris * psScalars * 3);
+            if (outScene.needsFlatAttrs) {
+                outScene.attrFlatArena.resize(totalTris * psScalars);
+            }
+        }
+        if (outScene.needsOrigBary) {
+            outScene.origBaryArena.resize(totalTris * 9);
+        }
+
+        thread_local std::vector<uint32_t> tlChunkTileCursors;
+        auto& chunkTileCursors = tlChunkTileCursors;
+        if (fuseBinning) {
+            optOutBins->resize(numTiles);
+            chunkTileCursors.resize(static_cast<size_t>(numChunks) * numTiles);
+            for (size_t t = 0; t < numTiles; ++t) {
+                uint32_t sum = 0;
+                for (uint32_t c = 0; c < numChunks; ++c) {
+                    chunkTileCursors[static_cast<size_t>(c) * numTiles + t] = sum;
+                    sum += chunkOutputs[c].tileCounts[t];
+                }
+                (*optOutBins)[t].triIndices.resize(sum);
+            }
+        }
+
+        // Parallel scatter of triangles, arenas, and ordered tile indices into disjoint slices
+        pool.detach_loop<uint32_t>(0, numChunks, [&](uint32_t c) {
+            const ChunkOutput& co = chunkOutputs[c];
+            const size_t count = co.triangles.size();
+            if (count == 0) return;
+
+            const size_t triBase = chunkTriOffsets[c];
+            std::memcpy(
+                outScene.triangles.data() + triBase,
+                co.triangles.data(),
+                count * sizeof(SetupTriangle));
+
+            if (psScalars > 0) {
+                std::memcpy(
+                    outScene.attrBaseArena.data() + triBase * psScalars * 3,
+                    co.attrBase.data(),
+                    count * psScalars * 3 * sizeof(float));
+                if (outScene.needsFlatAttrs) {
+                    std::memcpy(
+                        outScene.attrFlatArena.data() + triBase * psScalars,
+                        co.attrFlat.data(),
+                        count * psScalars * sizeof(float));
+                }
+            }
+            if (outScene.needsOrigBary) {
+                std::memcpy(
+                    outScene.origBaryArena.data() + triBase * 9,
+                    co.origBary.data(),
+                    count * 9 * sizeof(float));
+            }
+
+            if (fuseBinning && !co.binPairs.empty()) {
+                uint32_t* cursors = &chunkTileCursors[static_cast<size_t>(c) * numTiles];
+                const uint32_t baseIdx32 = static_cast<uint32_t>(triBase);
+                for (const ChunkBinPair& bp : co.binPairs) {
+                    uint32_t dstPos = cursors[bp.tileIdx]++;
+                    (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
+                }
+            }
+        });
+        pool.wait();
+
+        if (fuseBinning) {
+            outScene.binsAlreadyPopulated = true;
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // Extended geometry pipeline (Tessellation HS/DS and/or Geometry Shader GS):
+    // W-wide SIMD packetized execution across VS, HS, DS, and GS stages.
+    // =========================================================================
     CompiledHullCPFn hsFn = hasTess ? compiled->hsFn.load(std::memory_order_acquire) : nullptr;
     CompiledHullPCFn hsPcFn = hasTess ? compiled->hsPcFn.load(std::memory_order_acquire) : nullptr;
     CompiledDomainFn dsFn = hasTess ? compiled->dsFn.load(std::memory_order_acquire) : nullptr;
     CompiledGeometryFn gsFn = hasGS ? compiled->gsFn.load(std::memory_order_acquire) : nullptr;
+    if ((hasTess && (!hsFn || !hsPcFn || !dsFn)) || (hasGS && !gsFn)) {
+        waitForAllAsyncJITTasks();
+        hsFn = hasTess ? compiled->hsFn.load(std::memory_order_acquire) : nullptr;
+        hsPcFn = hasTess ? compiled->hsPcFn.load(std::memory_order_acquire) : nullptr;
+        dsFn = hasTess ? compiled->dsFn.load(std::memory_order_acquire) : nullptr;
+        gsFn = hasGS ? compiled->gsFn.load(std::memory_order_acquire) : nullptr;
+    }
+
     const uint32_t vsOutScalars =
         hasTess ? std::min<uint32_t>(compiled->numHSInputScalars, kMaxPSInputScalars)
-                : (hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars) : numScalars);
+                : (hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars)
+                         : outScene.preRastScalarAttrs);
 
     uint32_t vertsPerPrim = 3;
     bool isStrip = false;
@@ -799,7 +1575,7 @@ bool buildRasterScene(
         } else {
             vertsPerPrim = std::max<uint32_t>(1, compiled->hsInputCPCount);
         }
-    } else if (hasGS) {
+    } else {
         switch (state.topology) {
         case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
             vertsPerPrim = 1;
@@ -820,20 +1596,8 @@ bool buildRasterScene(
             vertsPerPrim = 3;
             break;
         }
-    } else {
-        if (state.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST) {
-            vertsPerPrim = 2;
-            isStrip = false;
-        } else if (state.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP) {
-            vertsPerPrim = 2;
-            isStrip = true;
-        } else {
-            isStrip = (state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
-                       state.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ);
-        }
     }
 
-    // Build primitive vertex index list (referencing unique vertex indices)
     std::vector<uint32_t> triVerts;
     std::vector<uint32_t> uniqueVIds;
     std::unordered_map<uint32_t, uint32_t> vIdToUnique;
@@ -909,13 +1673,131 @@ bool buildRasterScene(
 
     if (triVerts.empty() || uniqueVIds.empty()) return false;
 
-    const D3D12_RASTERIZER_DESC& rast = state.pso->graphicsDesc().RasterizerState;
+    TriangleEmitTarget sceneTarget;
+    sceneTarget.triangles = &outScene.triangles;
+    sceneTarget.attrBaseArena = &outScene.attrBaseArena;
+    sceneTarget.attrFlatArena = &outScene.attrFlatArena;
+    sceneTarget.origBaryArena = &outScene.origBaryArena;
+
     std::vector<ShadedVertex> shadedVerts(uniqueVIds.size());
-    std::vector<uint32_t> batchVIds(W, 0);
-    std::vector<uint32_t> batchIIds(W, 0);
-    std::vector<float> outPosXYZW(4 * W, 0.0f);
+    alignas(64) uint32_t batchVIds[kMaxSimdWidth]{};
+    alignas(64) uint32_t batchIIds[kMaxSimdWidth]{};
+    alignas(64) float outPosXYZW[4 * kMaxSimdWidth]{};
     std::vector<float> outAttrs(std::max<uint32_t>(1, vsOutScalars) * W, 0.0f);
     std::vector<ShadedVertex> polyA, polyB;
+
+    // Reusable Geometry Shader batch buffers (hoisted outside primitive/patch loops)
+    const uint32_t gsMaxVerts = std::max<uint32_t>(1, compiled->gsMaxVertexCount);
+    const uint32_t gsInstCount = std::max<uint32_t>(1, compiled->gsInstanceCount);
+    const uint32_t gsOutScalars = outScene.preRastScalarAttrs;
+    std::vector<float> gsInPosSOA;
+    std::vector<float> gsInAttrsSOA;
+    std::vector<float> gsOutPos;
+    std::vector<float> gsOutAttrs;
+    std::vector<uint32_t> gsStripCounts;
+    std::vector<uint32_t> gsInstTotalVerts;
+    std::vector<uint32_t> gsInstNumStrips;
+    if (hasGS && gsFn) {
+        gsOutPos.resize(static_cast<size_t>(gsInstCount) * W * gsMaxVerts * 4, 0.0f);
+        gsOutAttrs.resize(std::max<size_t>(1, static_cast<size_t>(gsInstCount) * W * gsMaxVerts * gsOutScalars), 0.0f);
+        gsStripCounts.resize(static_cast<size_t>(gsInstCount) * W * gsMaxVerts, 0u);
+        gsInstTotalVerts.resize(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
+        gsInstNumStrips.resize(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
+    }
+
+    auto runGSBatch = [&](const ShadedVertex* batchPrims, uint32_t primVertCount,
+                          const uint32_t* primIdList, uint32_t activePrims, uint32_t inAttrScalars) {
+        if (activePrims == 0 || !gsFn) return;
+        gsInPosSOA.assign(static_cast<size_t>(primVertCount) * 4 * W, 0.0f);
+        gsInAttrsSOA.assign(std::max<size_t>(1, static_cast<size_t>(primVertCount) * inAttrScalars * W), 0.0f);
+        alignas(64) uint32_t paddedPrimIds[kMaxSimdWidth]{};
+
+        for (uint32_t l = 0; l < activePrims; ++l) {
+            paddedPrimIds[l] = primIdList[l];
+            for (uint32_t k = 0; k < primVertCount; ++k) {
+                const ShadedVertex& sv = batchPrims[l * primVertCount + k];
+                gsInPosSOA[(k * 4 + 0) * W + l] = sv.clipX;
+                gsInPosSOA[(k * 4 + 1) * W + l] = sv.clipY;
+                gsInPosSOA[(k * 4 + 2) * W + l] = sv.clipZ;
+                gsInPosSOA[(k * 4 + 3) * W + l] = sv.clipW;
+                for (uint32_t s = 0; s < inAttrScalars; ++s) {
+                    gsInAttrsSOA[(k * inAttrScalars + s) * W + l] = sv.attrs[s];
+                }
+            }
+        }
+
+        const size_t posInstStride = static_cast<size_t>(W) * gsMaxVerts * 4;
+        const size_t attrInstStride = static_cast<size_t>(W) * gsMaxVerts * gsOutScalars;
+        const size_t stripInstStride = static_cast<size_t>(W) * gsMaxVerts;
+
+        for (uint32_t gInst = 0; gInst < gsInstCount; ++gInst) {
+            alignas(64) uint32_t tvVec[kMaxSimdWidth]{};
+            alignas(64) uint32_t nsVec[kMaxSimdWidth]{};
+            gsFn(
+                &state.rootCtx,
+                gsInPosSOA.data(),
+                gsInAttrsSOA.data(),
+                paddedPrimIds,
+                gInst,
+                activePrims,
+                &gsOutPos[gInst * posInstStride],
+                gsOutScalars > 0 ? &gsOutAttrs[gInst * attrInstStride] : gsOutAttrs.data(),
+                &gsStripCounts[gInst * stripInstStride],
+                tvVec,
+                nsVec);
+            std::memcpy(&gsInstTotalVerts[gInst * kMaxSimdWidth], tvVec, sizeof(tvVec));
+            std::memcpy(&gsInstNumStrips[gInst * kMaxSimdWidth], nsVec, sizeof(nsVec));
+        }
+
+        // Emit primitives in exact D3D12 (inputPrimitive, gsInstance) stream order
+        for (uint32_t l = 0; l < activePrims; ++l) {
+            uint32_t primId = paddedPrimIds[l];
+            for (uint32_t gInst = 0; gInst < gsInstCount; ++gInst) {
+                uint32_t numStrips = gsInstNumStrips[gInst * kMaxSimdWidth + l];
+                const float* lanePos = &gsOutPos[gInst * posInstStride + static_cast<size_t>(l) * gsMaxVerts * 4];
+                const float* laneAttrs =
+                    gsOutScalars > 0
+                        ? &gsOutAttrs[gInst * attrInstStride + static_cast<size_t>(l) * gsMaxVerts * gsOutScalars]
+                        : nullptr;
+                const uint32_t* laneStrips =
+                    &gsStripCounts[gInst * stripInstStride + static_cast<size_t>(l) * gsMaxVerts];
+
+                auto makeGsVert = [&](uint32_t vIdx) {
+                    ShadedVertex sv;
+                    sv.clipX = lanePos[vIdx * 4 + 0];
+                    sv.clipY = lanePos[vIdx * 4 + 1];
+                    sv.clipZ = lanePos[vIdx * 4 + 2];
+                    sv.clipW = lanePos[vIdx * 4 + 3];
+                    if (laneAttrs) {
+                        for (uint32_t s = 0; s < gsOutScalars; ++s) {
+                            sv.attrs[s] = laneAttrs[vIdx * gsOutScalars + s];
+                        }
+                    }
+                    return sv;
+                };
+
+                uint32_t baseV = 0;
+                for (uint32_t s = 0; s < numStrips; ++s) {
+                    uint32_t sc = laneStrips[s];
+                    if (compiled->gsOutputTopology == 3 && sc >= 2) { // LineStrip
+                        for (uint32_t k = 0; k + 1 < sc; ++k) {
+                            processLine(makeGsVert(baseV + k), makeGsVert(baseV + k + 1), primId, vp, rast, outScene);
+                        }
+                    } else if (compiled->gsOutputTopology == 5 && sc >= 3) { // TriangleStrip
+                        for (uint32_t k = 0; k + 2 < sc; ++k) {
+                            uint32_t i0 = baseV + k;
+                            uint32_t i1 = baseV + k + ((k & 1u) ? 2u : 1u);
+                            uint32_t i2 = baseV + k + ((k & 1u) ? 1u : 2u);
+                            processTriangle(
+                                makeGsVert(i0), makeGsVert(i1), makeGsVert(i2),
+                                primId, rast, outScene, sceneTarget, polyA, polyB);
+                        }
+                    }
+                    baseV += sc;
+                }
+            }
+        }
+    };
 
     outScene.triangles.reserve((triVerts.size() / vertsPerPrim) * draw.instanceCount);
 
@@ -932,7 +1814,7 @@ bool buildRasterScene(
                 batchIIds[l] = instId;
             }
 
-            vsFn(&state.rootCtx, batchVIds.data(), batchIIds.data(), active, outPosXYZW.data(), outAttrs.data());
+            vsFn(&state.rootCtx, batchVIds, batchIIds, active, outPosXYZW, outAttrs.data());
 
             for (uint32_t l = 0; l < active; ++l) {
                 ShadedVertex& sv = shadedVerts[base + l];
@@ -946,62 +1828,6 @@ bool buildRasterScene(
             }
         }
 
-        auto runGSOnPrim = [&](const ShadedVertex* primVerts, uint32_t primVertCount, uint32_t primId,
-                               uint32_t inAttrScalars) {
-            uint32_t maxVerts = std::max<uint32_t>(1, compiled->gsMaxVertexCount);
-            std::vector<float> gsInPos(primVertCount * 4, 0.0f);
-            std::vector<float> gsInAttrs(std::max<uint32_t>(1, primVertCount * inAttrScalars), 0.0f);
-            std::vector<float> gsOutPos(maxVerts * 4, 0.0f);
-            std::vector<float> gsOutAttrs(std::max<uint32_t>(1, maxVerts * numScalars), 0.0f);
-            std::vector<uint32_t> gsStripCounts(maxVerts, 0);
-
-            auto makeGsVert = [&](uint32_t vIdx) {
-                ShadedVertex sv;
-                sv.clipX = gsOutPos[vIdx * 4 + 0];
-                sv.clipY = gsOutPos[vIdx * 4 + 1];
-                sv.clipZ = gsOutPos[vIdx * 4 + 2];
-                sv.clipW = gsOutPos[vIdx * 4 + 3];
-                for (uint32_t s = 0; s < numScalars; ++s) {
-                    sv.attrs[s] = gsOutAttrs[vIdx * numScalars + s];
-                }
-                return sv;
-            };
-
-            for (uint32_t k = 0; k < primVertCount; ++k) {
-                const ShadedVertex& sv = primVerts[k];
-                gsInPos[k * 4 + 0] = sv.clipX;
-                gsInPos[k * 4 + 1] = sv.clipY;
-                gsInPos[k * 4 + 2] = sv.clipZ;
-                gsInPos[k * 4 + 3] = sv.clipW;
-                for (uint32_t s = 0; s < inAttrScalars; ++s) {
-                    gsInAttrs[k * inAttrScalars + s] = sv.attrs[s];
-                }
-            }
-            for (uint32_t gInst = 0; gInst < std::max<uint32_t>(1, compiled->gsInstanceCount); ++gInst) {
-                uint32_t totalVerts = 0;
-                uint32_t numStrips = 0;
-                gsFn(&state.rootCtx, gsInPos.data(), gsInAttrs.data(), primId, gInst,
-                     gsOutPos.data(), gsOutAttrs.data(), gsStripCounts.data(), &totalVerts, &numStrips);
-                uint32_t baseV = 0;
-                for (uint32_t s = 0; s < numStrips; ++s) {
-                    uint32_t sc = gsStripCounts[s];
-                    if (compiled->gsOutputTopology == 3 && sc >= 2) { // LineStrip
-                        for (uint32_t k = 0; k + 1 < sc; ++k) {
-                            processLine(makeGsVert(baseV + k), makeGsVert(baseV + k + 1), primId, vp, rast, outScene);
-                        }
-                    } else if (compiled->gsOutputTopology == 5 && sc >= 3) { // TriangleStrip
-                        for (uint32_t k = 0; k + 2 < sc; ++k) {
-                            uint32_t i0 = baseV + k;
-                            uint32_t i1 = baseV + k + ((k & 1u) ? 2u : 1u);
-                            uint32_t i2 = baseV + k + ((k & 1u) ? 1u : 2u);
-                            processTriangle(makeGsVert(i0), makeGsVert(i1), makeGsVert(i2), primId, vp, rast, outScene, polyA, polyB);
-                        }
-                    }
-                    baseV += sc;
-                }
-            }
-        };
-
         if (hasTess && hsFn && hsPcFn && dsFn) {
             uint32_t inCPCount = vertsPerPrim;
             uint32_t outCPCount = std::max<uint32_t>(1, compiled->hsOutputCPCount);
@@ -1009,14 +1835,21 @@ bool buildRasterScene(
             uint32_t outAttrScalars = std::max<uint32_t>(1, compiled->numHSOutputScalars);
             uint32_t pcScalars = std::max<uint32_t>(1, compiled->numPatchConstScalars);
             uint32_t dsOutScalars =
-                hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars) : numScalars;
+                hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars)
+                      : outScene.preRastScalarAttrs;
 
             std::vector<float> inCPAttrs(inCPCount * inAttrScalars, 0.0f);
             std::vector<float> outCPAttrs(outCPCount * outAttrScalars, 0.0f);
+            std::vector<float> hsOutCPSOA(outAttrScalars * W, 0.0f);
             std::vector<float> patchConsts(pcScalars, 0.0f);
             float tessFactors[6]{};
-            std::vector<float> dsPos(4, 0.0f);
-            std::vector<float> dsAttrs(std::max<uint32_t>(1, dsOutScalars), 0.0f);
+            alignas(64) float dsPosSOA[4 * kMaxSimdWidth]{};
+            std::vector<float> dsAttrsSOA(std::max<uint32_t>(1, dsOutScalars) * W, 0.0f);
+            std::vector<float> patchDomU, patchDomV, patchDomW;
+            std::vector<ShadedVertex> patchDSVerts;
+            std::vector<uint32_t> triRowOffsets;
+            std::vector<ShadedVertex> gsPrimBuf;
+            std::vector<uint32_t> gsPrimIdBuf;
 
             auto partitionTF = [&](float tf) -> uint32_t {
                 float clamped = std::clamp(tf, 1.0f, std::max(1.0f, compiled->hsMaxTessFactor));
@@ -1033,7 +1866,7 @@ bool buildRasterScene(
                     uint32_t c = static_cast<uint32_t>(std::ceil(clamped));
                     return ((c % 2u) != 0u) ? (c + 1u) : std::max<uint32_t>(2, c);
                 }
-                default: // integer / undefined
+                default:
                     return static_cast<uint32_t>(std::max(1.0f, std::ceil(clamped)));
                 }
             };
@@ -1049,94 +1882,165 @@ bool buildRasterScene(
                     }
                 }
                 std::fill(outCPAttrs.begin(), outCPAttrs.end(), 0.0f);
-                for (uint32_t outCp = 0; outCp < outCPCount; ++outCp) {
-                    hsFn(&state.rootCtx, inCPAttrs.data(), p, outCp, &outCPAttrs[outCp * outAttrScalars]);
+                for (uint32_t baseCp = 0; baseCp < outCPCount; baseCp += W) {
+                    uint32_t activeCp = std::min<uint32_t>(W, outCPCount - baseCp);
+                    std::fill(hsOutCPSOA.begin(), hsOutCPSOA.end(), 0.0f);
+                    hsFn(&state.rootCtx, inCPAttrs.data(), p, baseCp, activeCp, hsOutCPSOA.data());
+                    for (uint32_t l = 0; l < activeCp; ++l) {
+                        float* dst = &outCPAttrs[(baseCp + l) * outAttrScalars];
+                        for (uint32_t s = 0; s < outAttrScalars; ++s) {
+                            dst[s] = hsOutCPSOA[s * W + l];
+                        }
+                    }
                 }
+
                 std::fill(patchConsts.begin(), patchConsts.end(), 0.0f);
                 std::fill(std::begin(tessFactors), std::end(tessFactors), 0.0f);
                 hsPcFn(&state.rootCtx, inCPAttrs.data(), outCPAttrs.data(), p, patchConsts.data(), tessFactors);
 
-                auto evalDS = [&](float u, float v, float w) -> ShadedVertex {
-                    std::fill(dsPos.begin(), dsPos.end(), 0.0f);
-                    std::fill(dsAttrs.begin(), dsAttrs.end(), 0.0f);
-                    dsFn(&state.rootCtx, outCPAttrs.data(), patchConsts.data(), tessFactors,
-                         p, u, v, w, dsPos.data(), dsAttrs.data());
-                    ShadedVertex sv;
-                    sv.clipX = dsPos[0];
-                    sv.clipY = dsPos[1];
-                    sv.clipZ = dsPos[2];
-                    sv.clipW = dsPos[3];
-                    for (uint32_t s = 0; s < dsOutScalars; ++s) {
-                        sv.attrs[s] = dsAttrs[s];
+                auto evalDSAllPoints = [&]() {
+                    const size_t totalPts = patchDomU.size();
+                    patchDSVerts.resize(totalPts);
+                    alignas(64) float uVec[kMaxSimdWidth]{};
+                    alignas(64) float vVec[kMaxSimdWidth]{};
+                    alignas(64) float wVec[kMaxSimdWidth]{};
+
+                    for (size_t base = 0; base < totalPts; base += W) {
+                        uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, totalPts - base));
+                        for (uint32_t l = 0; l < active; ++l) {
+                            uVec[l] = patchDomU[base + l];
+                            vVec[l] = patchDomV[base + l];
+                            wVec[l] = patchDomW[base + l];
+                        }
+                        for (uint32_t l = active; l < W; ++l) {
+                            uVec[l] = uVec[0];
+                            vVec[l] = vVec[0];
+                            wVec[l] = wVec[0];
+                        }
+                        std::memset(dsPosSOA, 0, sizeof(dsPosSOA));
+                        std::fill(dsAttrsSOA.begin(), dsAttrsSOA.end(), 0.0f);
+                        dsFn(
+                            &state.rootCtx, outCPAttrs.data(), patchConsts.data(), tessFactors,
+                            p, uVec, vVec, wVec, active, dsPosSOA, dsAttrsSOA.data());
+                        for (uint32_t l = 0; l < active; ++l) {
+                            ShadedVertex& sv = patchDSVerts[base + l];
+                            sv = ShadedVertex{};
+                            sv.clipX = dsPosSOA[0 * W + l];
+                            sv.clipY = dsPosSOA[1 * W + l];
+                            sv.clipZ = dsPosSOA[2 * W + l];
+                            sv.clipW = dsPosSOA[3 * W + l];
+                            for (uint32_t s = 0; s < dsOutScalars; ++s) {
+                                sv.attrs[s] = dsAttrsSOA[s * W + l];
+                            }
+                        }
                     }
-                    return sv;
+                };
+
+                gsPrimBuf.clear();
+                gsPrimIdBuf.clear();
+                auto flushGSBuf = [&](uint32_t primVCount) {
+                    if (gsPrimIdBuf.empty()) return;
+                    runGSBatch(gsPrimBuf.data(), primVCount, gsPrimIdBuf.data(),
+                               static_cast<uint32_t>(gsPrimIdBuf.size()), dsOutScalars);
+                    gsPrimBuf.clear();
+                    gsPrimIdBuf.clear();
                 };
 
                 auto emitTri = [&](const ShadedVertex& a, const ShadedVertex& b, const ShadedVertex& c) {
                     if (hasGS && gsFn) {
-                        ShadedVertex tri[3] = {a, b, c};
-                        runGSOnPrim(tri, 3, p, dsOutScalars);
+                        gsPrimBuf.push_back(a);
+                        gsPrimBuf.push_back(b);
+                        gsPrimBuf.push_back(c);
+                        gsPrimIdBuf.push_back(p);
+                        if (gsPrimIdBuf.size() == W) flushGSBuf(3);
                     } else {
-                        processTriangle(a, b, c, p, vp, rast, outScene, polyA, polyB);
+                        processTriangle(a, b, c, p, rast, outScene, sceneTarget, polyA, polyB);
                     }
                 };
                 auto emitPoint = [&](const ShadedVertex& v) {
                     if (hasGS && gsFn) {
-                        runGSOnPrim(&v, 1, p, dsOutScalars);
+                        gsPrimBuf.push_back(v);
+                        gsPrimIdBuf.push_back(p);
+                        if (gsPrimIdBuf.size() == W) flushGSBuf(1);
                     }
                 };
                 const bool pointOut = (compiled->tessOutputPrimitive == 1);
+
+                patchDomU.clear();
+                patchDomV.clear();
+                patchDomW.clear();
 
                 if (compiled->tessDomain == 1) { // Isoline
                     if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f)) continue;
                     uint32_t numLines = partitionTF(tessFactors[0]);
                     uint32_t numSegs = partitionTF(tessFactors[1]);
+                    size_t totalPts = static_cast<size_t>(numLines) * (numSegs + 1);
+                    patchDomU.reserve(totalPts);
+                    patchDomV.reserve(totalPts);
+                    patchDomW.reserve(totalPts);
                     for (uint32_t li = 0; li < numLines; ++li) {
                         float v = static_cast<float>(li) / static_cast<float>(numLines);
                         for (uint32_t si = 0; si <= numSegs; ++si) {
                             float u = static_cast<float>(si) / static_cast<float>(numSegs);
-                            ShadedVertex sv = evalDS(u, v, 0.0f);
-                            if (pointOut) emitPoint(sv);
+                            patchDomU.push_back(u);
+                            patchDomV.push_back(v);
+                            patchDomW.push_back(0.0f);
                         }
+                    }
+                    evalDSAllPoints();
+                    if (pointOut) {
+                        for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        flushGSBuf(1);
                     }
                 } else if (compiled->tessDomain == 2) { // Tri
                     if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) || !(tessFactors[2] > 0.0f)) continue;
                     uint32_t n = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[1]),
                                            partitionTF(tessFactors[2]), partitionTF(tessFactors[4])});
-                    std::vector<std::vector<ShadedVertex>> rows(n + 1);
+                    triRowOffsets.resize(n + 1);
+                    uint32_t running = 0;
                     for (uint32_t i = 0; i <= n; ++i) {
-                        rows[i].resize(n - i + 1);
+                        triRowOffsets[i] = running;
+                        running += (n - i + 1);
+                    }
+                    patchDomU.reserve(running);
+                    patchDomV.reserve(running);
+                    patchDomW.reserve(running);
+                    for (uint32_t i = 0; i <= n; ++i) {
                         for (uint32_t j = 0; j <= n - i; ++j) {
                             float u = static_cast<float>(i) / static_cast<float>(n);
                             float v = static_cast<float>(j) / static_cast<float>(n);
                             float w = std::max(0.0f, 1.0f - u - v);
-                            rows[i][j] = evalDS(u, v, w);
+                            patchDomU.push_back(u);
+                            patchDomV.push_back(v);
+                            patchDomW.push_back(w);
                         }
                     }
+                    evalDSAllPoints();
                     if (pointOut) {
-                        for (const auto& row : rows) {
-                            for (const auto& sv : row) {
-                                emitPoint(sv);
-                            }
-                        }
+                        for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        flushGSBuf(1);
                     } else {
                         bool cw = (compiled->tessOutputPrimitive == 3);
+                        auto rowAt = [&](uint32_t i, uint32_t j) -> const ShadedVertex& {
+                            return patchDSVerts[triRowOffsets[i] + j];
+                        };
                         for (uint32_t i = 0; i < n; ++i) {
                             for (uint32_t j = 0; j < n - i; ++j) {
                                 if (cw) {
-                                    emitTri(rows[i][j], rows[i][j + 1], rows[i + 1][j]);
+                                    emitTri(rowAt(i, j), rowAt(i, j + 1), rowAt(i + 1, j));
                                 } else {
-                                    emitTri(rows[i][j], rows[i + 1][j], rows[i][j + 1]);
+                                    emitTri(rowAt(i, j), rowAt(i + 1, j), rowAt(i, j + 1));
                                 }
                                 if (i + j + 1 < n) {
                                     if (cw) {
-                                        emitTri(rows[i + 1][j], rows[i][j + 1], rows[i + 1][j + 1]);
+                                        emitTri(rowAt(i + 1, j), rowAt(i, j + 1), rowAt(i + 1, j + 1));
                                     } else {
-                                        emitTri(rows[i + 1][j], rows[i + 1][j + 1], rows[i][j + 1]);
+                                        emitTri(rowAt(i + 1, j), rowAt(i + 1, j + 1), rowAt(i, j + 1));
                                     }
                                 }
                             }
                         }
+                        flushGSBuf(3);
                     }
                 } else if (compiled->tessDomain == 3) { // Quad
                     if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) ||
@@ -1145,26 +2049,31 @@ bool buildRasterScene(
                     }
                     uint32_t nu = std::max({partitionTF(tessFactors[1]), partitionTF(tessFactors[3]), partitionTF(tessFactors[4])});
                     uint32_t nv = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[2]), partitionTF(tessFactors[5])});
-                    std::vector<ShadedVertex> grid((nv + 1) * (nu + 1));
+                    size_t totalPts = static_cast<size_t>(nv + 1) * (nu + 1);
+                    patchDomU.reserve(totalPts);
+                    patchDomV.reserve(totalPts);
+                    patchDomW.reserve(totalPts);
                     for (uint32_t j = 0; j <= nv; ++j) {
                         float v = static_cast<float>(j) / static_cast<float>(nv);
                         for (uint32_t i = 0; i <= nu; ++i) {
                             float u = static_cast<float>(i) / static_cast<float>(nu);
-                            grid[j * (nu + 1) + i] = evalDS(u, v, 0.0f);
+                            patchDomU.push_back(u);
+                            patchDomV.push_back(v);
+                            patchDomW.push_back(0.0f);
                         }
                     }
+                    evalDSAllPoints();
                     if (pointOut) {
-                        for (const auto& sv : grid) {
-                            emitPoint(sv);
-                        }
+                        for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        flushGSBuf(1);
                     } else {
                         bool cw = (compiled->tessOutputPrimitive == 3);
                         for (uint32_t j = 0; j < nv; ++j) {
                             for (uint32_t i = 0; i < nu; ++i) {
-                                const ShadedVertex& v00 = grid[j * (nu + 1) + i];
-                                const ShadedVertex& v10 = grid[j * (nu + 1) + (i + 1)];
-                                const ShadedVertex& v01 = grid[(j + 1) * (nu + 1) + i];
-                                const ShadedVertex& v11 = grid[(j + 1) * (nu + 1) + (i + 1)];
+                                const ShadedVertex& v00 = patchDSVerts[j * (nu + 1) + i];
+                                const ShadedVertex& v10 = patchDSVerts[j * (nu + 1) + (i + 1)];
+                                const ShadedVertex& v01 = patchDSVerts[(j + 1) * (nu + 1) + i];
+                                const ShadedVertex& v11 = patchDSVerts[(j + 1) * (nu + 1) + (i + 1)];
                                 if (cw) {
                                     emitTri(v00, v11, v10);
                                     emitTri(v00, v01, v11);
@@ -1174,41 +2083,34 @@ bool buildRasterScene(
                                 }
                             }
                         }
+                        flushGSBuf(3);
                     }
                 }
             }
         } else if (hasGS && gsFn) {
             uint32_t numPrims = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
-            std::vector<ShadedVertex> primVerts(vertsPerPrim);
-            for (uint32_t p = 0; p < numPrims; ++p) {
-                for (uint32_t k = 0; k < vertsPerPrim; ++k) {
-                    primVerts[k] = shadedVerts[triVerts[p * vertsPerPrim + k]];
+            std::vector<ShadedVertex> batchPrims(static_cast<size_t>(W) * vertsPerPrim);
+            uint32_t batchPrimIds[kMaxSimdWidth]{};
+            for (uint32_t baseP = 0; baseP < numPrims; baseP += W) {
+                uint32_t activeP = std::min<uint32_t>(W, numPrims - baseP);
+                for (uint32_t l = 0; l < activeP; ++l) {
+                    uint32_t p = baseP + l;
+                    batchPrimIds[l] = p;
+                    for (uint32_t k = 0; k < vertsPerPrim; ++k) {
+                        batchPrims[l * vertsPerPrim + k] = shadedVerts[triVerts[p * vertsPerPrim + k]];
+                    }
                 }
-                runGSOnPrim(primVerts.data(), vertsPerPrim, p, vsOutScalars);
+                runGSBatch(batchPrims.data(), vertsPerPrim, batchPrimIds, activeP, vsOutScalars);
             }
-        } else {
-            if (vertsPerPrim == 2) {
-                for (size_t t = 0; t + 1 < triVerts.size(); t += 2) {
-                    processLine(
-                        shadedVerts[triVerts[t + 0]],
-                        shadedVerts[triVerts[t + 1]],
-                        static_cast<uint32_t>(t / 2),
-                        vp,
-                        rast,
-                        outScene);
-                }
-            }
-            for (size_t t = 0; vertsPerPrim == 3 && t + 2 < triVerts.size(); t += 3) {
-                processTriangle(
+        } else if (vertsPerPrim == 2) {
+            for (size_t t = 0; t + 1 < triVerts.size(); t += 2) {
+                processLine(
                     shadedVerts[triVerts[t + 0]],
                     shadedVerts[triVerts[t + 1]],
-                    shadedVerts[triVerts[t + 2]],
-                    static_cast<uint32_t>(t / 3),
+                    static_cast<uint32_t>(t / 2),
                     vp,
                     rast,
-                    outScene,
-                    polyA,
-                    polyB);
+                    outScene);
             }
         }
     }
@@ -1334,6 +2236,12 @@ bool buildMeshRasterScene(
         }
     };
 
+    TriangleEmitTarget meshTarget;
+    meshTarget.triangles = &outScene.triangles;
+    meshTarget.attrBaseArena = &outScene.attrBaseArena;
+    meshTarget.attrFlatArena = &outScene.attrFlatArena;
+    meshTarget.origBaryArena = &outScene.origBaryArena;
+
     for (const auto& md : meshDispatches) {
         for (uint32_t gz = 0; gz < md.gz; ++gz) {
             for (uint32_t gy = 0; gy < md.gy; ++gy) {
@@ -1396,7 +2304,7 @@ bool buildMeshRasterScene(
                             ShadedVertex v1 = makeMeshVertex(i1);
                             ShadedVertex v2 = makeMeshVertex(i2);
                             applyPrimAttrs(v0, p);
-                            processTriangle(v0, v1, v2, outPrimId[p], vp, rast, outScene, polyA, polyB);
+                            processTriangle(v0, v1, v2, outPrimId[p], rast, outScene, meshTarget, polyA, polyB);
                         }
                     }
                 }

@@ -113,26 +113,28 @@ struct PixelBatchArgs {
 
 using CompiledPixelQuadFn = void (*)(const PixelBatchArgs* args);
 
-/// Geometry Uber-PSO kernel: executes one input primitive (with lane 0 active).
+/// Geometry Uber-PSO SIMD batch kernel: executes up to W input primitives in parallel.
 using CompiledGeometryFn = void (*)(
     const DriverRootContext* rootCtx,
-    const float* inVertPosXYZW,   // [numInVerts * 4]
-    const float* inVertAttrs,     // [numInVerts * numGSInputScalars]
-    uint32_t primId,
+    const float* inVertPosXYZW,   // [numInVerts * 4 * W] SOA: (vIdx * 4 + c) * W + lane
+    const float* inVertAttrs,     // [numInVerts * numGSInputScalars * W] SOA: (vIdx * numGSInputScalars + slot) * W + lane
+    const uint32_t* primIds,      // [W]
     uint32_t gsInstanceId,
-    float* outVertPosXYZW,        // [maxVertexCount * 4]
-    float* outVertAttrs,          // [maxVertexCount * numOutScalars]
-    uint32_t* outStripVertCounts, // [maxVertexCount]
-    uint32_t* outTotalVerts,      // [1]
-    uint32_t* outNumStrips);      // [1]
+    uint32_t activeCount,
+    float* outVertPosXYZW,        // [W * maxVertexCount * 4]
+    float* outVertAttrs,          // [W * maxVertexCount * numOutScalars]
+    uint32_t* outStripVertCounts, // [W * maxVertexCount]
+    uint32_t* outTotalVerts,      // [W]
+    uint32_t* outNumStrips);      // [W]
 
-/// Hull shader control-point kernel: executes one output control point (lane 0 active).
+/// Hull shader control-point SIMD batch kernel: executes up to W output control points of a patch.
 using CompiledHullCPFn = void (*)(
     const DriverRootContext* rootCtx,
     const float* inCPAttrs,  // [hsInputCPCount * numHSInputScalars]
     uint32_t patchId,
-    uint32_t outCpId,
-    float* outCPAttrs);      // [numHSOutputScalars]
+    uint32_t baseOutCpId,
+    uint32_t activeCount,
+    float* outCPAttrsSOA);   // [numHSOutputScalars * W] SOA: slot * W + lane
 
 /// Hull shader patch-constant kernel: executes once per patch (lane 0 active).
 using CompiledHullPCFn = void (*)(
@@ -143,18 +145,19 @@ using CompiledHullPCFn = void (*)(
     float* outPatchConsts,    // [numPatchConstScalars]
     float* outTessFactors);   // [6]: 4 edge + 2 inside
 
-/// Domain shader kernel: executes one tessellated vertex (lane 0 active).
+/// Domain shader SIMD batch kernel: executes up to W tessellated vertices of a patch in parallel.
 using CompiledDomainFn = void (*)(
     const DriverRootContext* rootCtx,
     const float* inCPAttrs,     // [hsOutputCPCount * numHSOutputScalars]
     const float* inPatchConsts, // [numPatchConstScalars]
     const float* inTessFactors, // [6]
     uint32_t patchId,
-    float domU,
-    float domV,
-    float domW,
-    float* outPosXYZW,          // [4]
-    float* outAttrs);           // [numDSOutScalars]
+    const float* domU,          // [W]
+    const float* domV,          // [W]
+    const float* domW,          // [W]
+    uint32_t activeCount,
+    float* outPosXYZW,          // [4 * W] SOA: comp * W + lane
+    float* outAttrs);           // [numDSOutScalars * W] SOA: slot * W + lane
 
 /// Amplification shader threadgroup kernel arguments.
 struct AmplificationThreadGroupArgs {
@@ -222,7 +225,7 @@ struct CompiledComputePSO {
 
 /// Compiled Graphics PSO artifact.
 struct CompiledGraphicsPSO {
-    CompiledGraphicsPSO() = default;
+    CompiledGraphicsPSO() { psInputFromVSSlot.fill(-1); }
     CompiledGraphicsPSO(const CompiledGraphicsPSO&) = delete;
     CompiledGraphicsPSO& operator=(const CompiledGraphicsPSO&) = delete;
     CompiledGraphicsPSO(CompiledGraphicsPSO&&) = delete;
@@ -279,6 +282,8 @@ struct CompiledGraphicsPSO {
     bool hasPerPrimShadingRate = false;
     uint32_t shadingRateAttrOffset = 0;// Scalar slot in outAttrs/attrBaseArena for SV_ShadingRate
     uint32_t totalVSScalarAttrs = 0;   // Total scalar attributes emitted by VS into outAttrs
+    std::array<int16_t, 128> psInputFromVSSlot{}; // Maps PS scalar slot [0..127] -> pre-rast outAttrs scalar slot (-1 if unlinked)
+    bool psUsesPerspBarycentrics = false;
     bool psWritesDepth = false;
     bool psUsesDiscard = false;
     bool psHasSideEffects = false;
@@ -288,6 +293,8 @@ struct CompiledGraphicsPSO {
     std::vector<ShaderSigElement> psOutputs;
     uint64_t cacheHashLo = 0;
     uint64_t cacheHashHi = 0;
+    uint64_t vsCacheHashLo = 0;
+    uint64_t vsCacheHashHi = 0;
     std::string vsSymbolName;
     std::string psSymbolName;
     std::shared_ptr<PsoUpdateBox> asyncBox;

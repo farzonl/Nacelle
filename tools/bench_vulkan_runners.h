@@ -506,27 +506,41 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             return 0;
         };
 
-        uint32_t maxW = (spec.category == BenchCategory::Pixel) ? width * 2 : 128;
-        uint32_t maxH = (spec.category == BenchCategory::Pixel) ? height * 2 : 128;
+        const bool isVertexMesh = (spec.id == "bench_vertex_mesh");
+        uint32_t maxW = (spec.category == BenchCategory::Pixel || isVertexMesh) ? std::max(128u, width * 2) : 128;
+        uint32_t maxH = (spec.category == BenchCategory::Pixel || isVertexMesh) ? std::max(128u, height * 2) : 128;
 
-        // Render pass (clear + store color attachment)
-        vkmin::VkAttachmentDescription colorAtt{};
-        colorAtt.format = vkmin::VK_FORMAT_R8G8B8A8_UNORM;
-        colorAtt.samples = vkmin::VK_SAMPLE_COUNT_1_BIT;
-        colorAtt.loadOp = vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAtt.storeOp = vkmin::VK_ATTACHMENT_STORE_OP_STORE;
-        colorAtt.stencilLoadOp = vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        colorAtt.stencilStoreOp = vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        colorAtt.initialLayout = vkmin::VK_IMAGE_LAYOUT_UNDEFINED;
-        colorAtt.finalLayout = vkmin::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        // Render pass (clear + store color attachment, plus depth attachment for bench_vertex_mesh)
+        vkmin::VkAttachmentDescription atts[2]{};
+        atts[0].format = vkmin::VK_FORMAT_R8G8B8A8_UNORM;
+        atts[0].samples = vkmin::VK_SAMPLE_COUNT_1_BIT;
+        atts[0].loadOp = vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        atts[0].storeOp = vkmin::VK_ATTACHMENT_STORE_OP_STORE;
+        atts[0].stencilLoadOp = vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        atts[0].stencilStoreOp = vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[0].initialLayout = vkmin::VK_IMAGE_LAYOUT_UNDEFINED;
+        atts[0].finalLayout = vkmin::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+        atts[1].format = vkmin::VK_FORMAT_D32_SFLOAT;
+        atts[1].samples = vkmin::VK_SAMPLE_COUNT_1_BIT;
+        atts[1].loadOp = vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR;
+        atts[1].storeOp = vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[1].stencilLoadOp = vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        atts[1].stencilStoreOp = vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[1].initialLayout = vkmin::VK_IMAGE_LAYOUT_UNDEFINED;
+        atts[1].finalLayout = vkmin::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         vkmin::VkAttachmentReference colorRef{0, vkmin::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        vkmin::VkAttachmentReference depthRef{1, vkmin::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
         vkmin::VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         subpass.pColorAttachments = &colorRef;
+        subpass.pDepthStencilAttachment = isVertexMesh ? &depthRef : nullptr;
 
-        vkmin::VkRenderPassCreateInfo rpci{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, 1, &colorAtt, 1, &subpass, 0, nullptr};
+        vkmin::VkRenderPassCreateInfo rpci{
+            vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0,
+            isVertexMesh ? 2u : 1u, atts, 1, &subpass, 0, nullptr};
         vkmin::VkRenderPass rp = 0;
         vk.vkCreateRenderPass(dev, &rpci, nullptr, &rp);
 
@@ -580,15 +594,27 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         addStage(vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, psMod, isTessPoint ? "TessPointPS" : "PSMain");
 
         bool usesQuadVB = (spec.category == BenchCategory::Pixel);
-        vkmin::VkVertexInputBindingDescription vbd{0, 12, 0};
-        vkmin::VkVertexInputAttributeDescription vad{0, 0, vkmin::VK_FORMAT_R32G32B32_SFLOAT, 0};
+        vkmin::VkVertexInputBindingDescription vbd{0, isVertexMesh ? static_cast<uint32_t>(sizeof(MeshBenchVertex)) : 12u, 0};
+        vkmin::VkVertexInputAttributeDescription vadQuad{0, 0, vkmin::VK_FORMAT_R32G32B32_SFLOAT, 0};
+        vkmin::VkVertexInputAttributeDescription vadMesh[5] = {
+            {0, 0, vkmin::VK_FORMAT_R32G32B32_SFLOAT, 0},
+            {1, 0, vkmin::VK_FORMAT_R16G16B16A16_SNORM, 12},
+            {2, 0, vkmin::VK_FORMAT_R16G16_UNORM, 20},
+            {3, 0, vkmin::VK_FORMAT_R8G8B8A8_UNORM, 24},
+            {4, 0, vkmin::VK_FORMAT_R8G8B8A8_UINT, 28},
+        };
         vkmin::VkPipelineVertexInputStateCreateInfo vi{};
         vi.sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        if (usesQuadVB) {
+        if (isVertexMesh) {
+            vi.vertexBindingDescriptionCount = 1;
+            vi.pVertexBindingDescriptions = &vbd;
+            vi.vertexAttributeDescriptionCount = 5;
+            vi.pVertexAttributeDescriptions = vadMesh;
+        } else if (usesQuadVB) {
             vi.vertexBindingDescriptionCount = 1;
             vi.pVertexBindingDescriptions = &vbd;
             vi.vertexAttributeDescriptionCount = 1;
-            vi.pVertexAttributeDescriptions = &vad;
+            vi.pVertexAttributeDescriptions = &vadQuad;
         }
 
         uint32_t topology = vkmin::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -602,8 +628,24 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vkmin::VkViewport vp{0.0f, 0.0f, static_cast<float>(maxW), static_cast<float>(maxH), 0.0f, 1.0f};
         vkmin::VkRect2D sc{{0, 0}, {maxW, maxH}};
         vkmin::VkPipelineViewportStateCreateInfo vps{vkmin::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, &vp, 1, &sc};
-        vkmin::VkPipelineRasterizationStateCreateInfo rs{vkmin::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, nullptr, 0, 0, 0, vkmin::VK_POLYGON_MODE_FILL, vkmin::VK_CULL_MODE_NONE, vkmin::VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1.0f};
+        vkmin::VkPipelineRasterizationStateCreateInfo rs{
+            vkmin::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, nullptr, 0, 0, 0,
+            vkmin::VK_POLYGON_MODE_FILL,
+            isVertexMesh ? vkmin::VK_CULL_MODE_BACK_BIT : vkmin::VK_CULL_MODE_NONE,
+            isVertexMesh ? vkmin::VK_FRONT_FACE_CLOCKWISE : vkmin::VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            0, 0, 0, 0, 1.0f};
         vkmin::VkPipelineMultisampleStateCreateInfo ms{vkmin::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr, 0, vkmin::VK_SAMPLE_COUNT_1_BIT, 0, 1.0f, nullptr, 0, 0};
+        vkmin::VkPipelineDepthStencilStateCreateInfo dsState{};
+        dsState.sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        dsState.depthTestEnable = 1;
+        dsState.depthWriteEnable = 1;
+        dsState.depthCompareOp = vkmin::VK_COMPARE_OP_LESS;
+        dsState.maxDepthBounds = 1.0f;
+
+        uint32_t dynStates[2] = {vkmin::VK_DYNAMIC_STATE_VIEWPORT, vkmin::VK_DYNAMIC_STATE_SCISSOR};
+        vkmin::VkPipelineDynamicStateCreateInfo dynState{
+            vkmin::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, 2, dynStates};
+
         vkmin::VkPipelineColorBlendAttachmentState cba{};
         cba.colorWriteMask = 0xF;
         vkmin::VkPipelineColorBlendStateCreateInfo cbState{vkmin::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, 0, 0, 1, &cba, {0, 0, 0, 0}};
@@ -618,7 +660,9 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         gpci.pViewportState = &vps;
         gpci.pRasterizationState = &rs;
         gpci.pMultisampleState = &ms;
+        gpci.pDepthStencilState = isVertexMesh ? &dsState : nullptr;
         gpci.pColorBlendState = &cbState;
+        gpci.pDynamicState = isVertexMesh ? &dynState : nullptr;
         gpci.layout = pl;
         gpci.renderPass = rp;
         gpci.subpass = 0;
@@ -644,7 +688,7 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             continue;
         }
 
-        // Image + ImageView + Framebuffer
+        // Image + ImageView + Framebuffer (+ optional Depth attachment)
         vkmin::VkImageCreateInfo ici{vkmin::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr, 0, vkmin::VK_IMAGE_TYPE_2D, vkmin::VK_FORMAT_R8G8B8A8_UNORM, {maxW, maxH, 1}, 1, 1, vkmin::VK_SAMPLE_COUNT_1_BIT, vkmin::VK_IMAGE_TILING_OPTIMAL, vkmin::VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vkmin::VK_IMAGE_USAGE_TRANSFER_SRC_BIT, vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, vkmin::VK_IMAGE_LAYOUT_UNDEFINED};
         vkmin::VkImage img = 0;
         vk.vkCreateImage(dev, &ici, nullptr, &img);
@@ -659,12 +703,41 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vkmin::VkImageView iv = 0;
         vk.vkCreateImageView(dev, &ivci, nullptr, &iv);
 
-        vkmin::VkFramebufferCreateInfo fbci{vkmin::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, rp, 1, &iv, maxW, maxH, 1};
+        vkmin::VkImage depthImg = 0;
+        vkmin::VkDeviceMemory depthMem = 0;
+        vkmin::VkImageView depthIv = 0;
+        if (isVertexMesh) {
+            vkmin::VkImageCreateInfo dici{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr, 0, vkmin::VK_IMAGE_TYPE_2D,
+                vkmin::VK_FORMAT_D32_SFLOAT, {maxW, maxH, 1}, 1, 1, vkmin::VK_SAMPLE_COUNT_1_BIT,
+                vkmin::VK_IMAGE_TILING_OPTIMAL, vkmin::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, vkmin::VK_IMAGE_LAYOUT_UNDEFINED};
+            vk.vkCreateImage(dev, &dici, nullptr, &depthImg);
+            vkmin::VkMemoryRequirements dmr{};
+            vk.vkGetImageMemoryRequirements(dev, depthImg, &dmr);
+            vkmin::VkMemoryAllocateInfo dmai{
+                vkmin::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, dmr.size,
+                findMem(dmr.memoryTypeBits, vkmin::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            vk.vkAllocateMemory(dev, &dmai, nullptr, &depthMem);
+            vk.vkBindImageMemory(dev, depthImg, depthMem, 0);
+
+            vkmin::VkImageViewCreateInfo divci{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, depthImg,
+                vkmin::VK_IMAGE_VIEW_TYPE_2D, vkmin::VK_FORMAT_D32_SFLOAT, {0, 0, 0, 0},
+                {vkmin::VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+            vk.vkCreateImageView(dev, &divci, nullptr, &depthIv);
+        }
+
+        vkmin::VkImageView fbViews[2] = {iv, depthIv};
+        vkmin::VkFramebufferCreateInfo fbci{
+            vkmin::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, rp,
+            isVertexMesh ? 2u : 1u, fbViews, maxW, maxH, 1};
         vkmin::VkFramebuffer fb = 0;
         vk.vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
-        auto mkBuf = [&](size_t sz, vkmin::VkFlags usage) {
-            struct { vkmin::VkBuffer buf = 0; vkmin::VkDeviceMemory mem = 0; } ba;
+        struct GfxBufAlloc { vkmin::VkBuffer buf = 0; vkmin::VkDeviceMemory mem = 0; };
+        auto mkBuf = [&](size_t sz, vkmin::VkFlags usage) -> GfxBufAlloc {
+            GfxBufAlloc ba;
             vkmin::VkBufferCreateInfo bci{vkmin::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, sz, usage, vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
             vk.vkCreateBuffer(dev, &bci, nullptr, &ba.buf);
             vkmin::VkMemoryRequirements mr{};
@@ -675,11 +748,33 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             return ba;
         };
 
-        auto cb = mkBuf(256, vkmin::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        size_t cbBytes = isVertexMesh ? sizeof(MeshBenchConstants) : 256;
+        auto cb = mkBuf(cbBytes, vkmin::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         auto vb = mkBuf(18 * sizeof(float), vkmin::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         auto rb = mkBuf(static_cast<size_t>(maxW) * maxH * 4, vkmin::VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
+        MeshBenchSceneData meshScenes[3];
+        GfxBufAlloc meshVBs[3]{};
+        GfxBufAlloc meshIBs[3]{};
         void* ptr = nullptr;
+        if (isVertexMesh) {
+            for (int m = 0; m < 3; ++m) {
+                uint32_t g = 0, mrw = 0, mrh = 0;
+                getMeshBenchGridAndDims(m, width, height, g, mrw, mrh);
+                meshScenes[m] = buildMeshBenchScene(g, g);
+                size_t vbSz = meshScenes[m].vertices.size() * sizeof(MeshBenchVertex);
+                size_t ibSz = meshScenes[m].indices.size() * sizeof(uint32_t);
+                meshVBs[m] = mkBuf(vbSz, vkmin::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                meshIBs[m] = mkBuf(ibSz, vkmin::VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                vk.vkMapMemory(dev, meshVBs[m].mem, 0, vbSz, 0, &ptr);
+                std::memcpy(ptr, meshScenes[m].vertices.data(), vbSz);
+                vk.vkUnmapMemory(dev, meshVBs[m].mem);
+                vk.vkMapMemory(dev, meshIBs[m].mem, 0, ibSz, 0, &ptr);
+                std::memcpy(ptr, meshScenes[m].indices.data(), ibSz);
+                vk.vkUnmapMemory(dev, meshIBs[m].mem);
+            }
+        }
+
         vk.vkMapMemory(dev, vb.mem, 0, 18 * sizeof(float), 0, &ptr);
         const float quadVerts[18] = {
             -1.0f, -1.0f, 0.0f,  1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f,
@@ -695,7 +790,7 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vkmin::VkDescriptorSetAllocateInfo dsai{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, dp, 1, &dsl};
         vkmin::VkDescriptorSet ds = 0;
         vk.vkAllocateDescriptorSets(dev, &dsai, &ds);
-        vkmin::VkDescriptorBufferInfo bi{cb.buf, 0, 256};
+        vkmin::VkDescriptorBufferInfo bi{cb.buf, 0, cbBytes};
         vkmin::VkWriteDescriptorSet wds{vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 16, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bi, nullptr};
         vk.vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
 
@@ -706,9 +801,11 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         vkmin::VkCommandBuffer cmdBuf = nullptr;
         vk.vkAllocateCommandBuffers(dev, &cbai, &cmdBuf);
 
-        auto drawVK = [&](uint32_t rw, uint32_t rh, uint32_t vc) -> double {
-            vk.vkMapMemory(dev, cb.mem, 0, 256, 0, &ptr);
-            if (spec.category == BenchCategory::Pixel) {
+        auto drawVK = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vc) -> double {
+            vk.vkMapMemory(dev, cb.mem, 0, cbBytes, 0, &ptr);
+            if (isVertexMesh) {
+                std::memcpy(ptr, &meshScenes[mode].constants, sizeof(MeshBenchConstants));
+            } else if (spec.category == BenchCategory::Pixel) {
                 float cbData[8] = {static_cast<float>(rw), static_cast<float>(rh), 1.0f, 1.25f, 0.0f, 0.0f, 0.0f, 0.0f};
                 std::memcpy(ptr, cbData, sizeof(cbData));
             } else if (spec.category == BenchCategory::Vertex) {
@@ -727,17 +824,31 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             vk.vkResetCommandBuffer(cmdBuf, 0);
             vkmin::VkCommandBufferBeginInfo cbbi{vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, vkmin::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
             vk.vkBeginCommandBuffer(cmdBuf, &cbbi);
-            vkmin::VkClearValue cv{};
-            cv.float32[3] = 1.0f;
-            vkmin::VkRenderPassBeginInfo rpbi{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, rp, fb, {{0, 0}, {rw, rh}}, 1, &cv};
+            vkmin::VkClearValue cvs[2]{};
+            cvs[0].float32[3] = 1.0f;
+            cvs[1].float32[0] = 1.0f;
+            vkmin::VkRenderPassBeginInfo rpbi{
+                vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, rp, fb,
+                {{0, 0}, {rw, rh}}, isVertexMesh ? 2u : 1u, cvs};
             vk.vkCmdBeginRenderPass(cmdBuf, &rpbi, vkmin::VK_SUBPASS_CONTENTS_INLINE);
             vk.vkCmdBindPipeline(cmdBuf, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vk.vkCmdBindDescriptorSets(cmdBuf, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
-            if (usesQuadVB) {
+            if (isVertexMesh) {
+                vkmin::VkViewport dynVp{0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh), 0.0f, 1.0f};
+                vkmin::VkRect2D dynSc{{0, 0}, {rw, rh}};
+                vk.vkCmdSetViewport(cmdBuf, 0, 1, &dynVp);
+                vk.vkCmdSetScissor(cmdBuf, 0, 1, &dynSc);
                 vkmin::VkDeviceSize off = 0;
-                vk.vkCmdBindVertexBuffers(cmdBuf, 0, 1, &vb.buf, &off);
+                vk.vkCmdBindVertexBuffers(cmdBuf, 0, 1, &meshVBs[mode].buf, &off);
+                vk.vkCmdBindIndexBuffer(cmdBuf, meshIBs[mode].buf, 0, vkmin::VK_INDEX_TYPE_UINT32);
+                vk.vkCmdDrawIndexed(cmdBuf, static_cast<uint32_t>(meshScenes[mode].indices.size()), 1, 0, 0, 0);
+            } else {
+                if (usesQuadVB) {
+                    vkmin::VkDeviceSize off = 0;
+                    vk.vkCmdBindVertexBuffers(cmdBuf, 0, 1, &vb.buf, &off);
+                }
+                vk.vkCmdDraw(cmdBuf, vc, 1, 0, 0);
             }
-            vk.vkCmdDraw(cmdBuf, vc, 1, 0, 0);
             vk.vkCmdEndRenderPass(cmdBuf);
             vk.vkEndCommandBuffer(cmdBuf);
             vkmin::VkSubmitInfo si{vkmin::VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmdBuf, 0, nullptr};
@@ -748,7 +859,11 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         };
 
         auto getVkGfxParams = [&](int mode, uint32_t& rwOut, uint32_t& rhOut, uint32_t& vcOut) {
-            if (spec.category == BenchCategory::Pixel) {
+            if (isVertexMesh) {
+                uint32_t g = 0;
+                getMeshBenchGridAndDims(mode, width, height, g, rwOut, rhOut);
+                vcOut = static_cast<uint32_t>(meshScenes[mode].indices.size());
+            } else if (spec.category == BenchCategory::Pixel) {
                 rwOut = (mode == 0) ? 64 : (mode == 1 ? width : width * 2);
                 rhOut = (mode == 0) ? 64 : (mode == 1 ? height : height * 2);
                 vcOut = 6;
@@ -767,11 +882,11 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         uint32_t rw = 128, rh = 128, vc = 6;
         getVkGfxParams(1, rw, rh, vc);
 
-        r.firstDispatchMs = drawVK(rw, rh, vc);
+        r.firstDispatchMs = drawVK(1, rw, rh, vc);
         std::vector<double> samples;
         samples.reserve(iters);
         for (uint32_t i = 0; i < iters; ++i) {
-            samples.push_back(drawVK(rw, rh, vc));
+            samples.push_back(drawVK(1, rw, rh, vc));
         }
 
         // Copy image to readback for checksum
@@ -792,20 +907,35 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         r.checksum = sum;
 
         getVkGfxParams(0, rw, rh, vc);
-        r.shortJobMs = drawVK(rw, rh, vc);
+        r.shortJobMs = drawVK(0, rw, rh, vc);
         getVkGfxParams(2, rw, rh, vc);
-        r.longJobMs = drawVK(rw, rh, vc);
+        r.longJobMs = drawVK(2, rw, rh, vc);
 
         finalizeTimingAndMemory(r, memBefore, memAfterCompile, samples);
         results.push_back(r);
 
         vk.vkDestroyCommandPool(dev, cpool, nullptr);
         vk.vkDestroyDescriptorPool(dev, dp, nullptr);
+        for (int m = 0; m < 3; ++m) {
+            if (meshIBs[m].buf) {
+                vk.vkDestroyBuffer(dev, meshIBs[m].buf, nullptr);
+                vk.vkFreeMemory(dev, meshIBs[m].mem, nullptr);
+            }
+            if (meshVBs[m].buf) {
+                vk.vkDestroyBuffer(dev, meshVBs[m].buf, nullptr);
+                vk.vkFreeMemory(dev, meshVBs[m].mem, nullptr);
+            }
+        }
         for (auto& b : {cb, vb, rb}) {
             vk.vkDestroyBuffer(dev, b.buf, nullptr);
             vk.vkFreeMemory(dev, b.mem, nullptr);
         }
         vk.vkDestroyFramebuffer(dev, fb, nullptr);
+        if (depthIv) vk.vkDestroyImageView(dev, depthIv, nullptr);
+        if (depthImg) {
+            vk.vkDestroyImage(dev, depthImg, nullptr);
+            vk.vkFreeMemory(dev, depthMem, nullptr);
+        }
         vk.vkDestroyImageView(dev, iv, nullptr);
         vk.vkDestroyImage(dev, img, nullptr);
         vk.vkFreeMemory(dev, imgMem, nullptr);

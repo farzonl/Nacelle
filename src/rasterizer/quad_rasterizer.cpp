@@ -614,8 +614,12 @@ void rasterizeTiles(
     }
     if (!psFn) return;
 
-    std::vector<uint32_t> activeTiles;
-    activeTiles.reserve(bins.size());
+    thread_local std::vector<uint32_t> tlActiveTiles;
+    auto& activeTiles = tlActiveTiles;
+    activeTiles.clear();
+    if (activeTiles.capacity() < bins.size()) {
+        activeTiles.reserve(bins.size());
+    }
     for (uint32_t i = 0; i < static_cast<uint32_t>(bins.size()); ++i) {
         if (!bins[i].triIndices.empty()) activeTiles.push_back(i);
     }
@@ -701,10 +705,18 @@ void rasterizeTiles(
                 int32_t maxY = std::min<int32_t>(sampleTri.maxY, tileScissor.bottom);
                 if (minX >= maxX || minY >= maxY) continue;
 
-                emitter.args.triAttrBase = scene.numPSInputScalars > 0 ? (scene.attrBaseArena.data() + sampleTri.attrBaseOffset) : nullptr;
-                emitter.args.triAttrFlat = scene.numPSInputScalars > 0 ? (scene.attrFlatArena.data() + sampleTri.attrFlatOffset) : nullptr;
+                const size_t triIdxSz = static_cast<size_t>(triIdx);
+                const size_t psScalars = static_cast<size_t>(scene.numPSInputScalars);
+                emitter.args.triAttrBase = !scene.attrBaseArena.empty()
+                                               ? (scene.attrBaseArena.data() + triIdxSz * psScalars * 3)
+                                               : nullptr;
+                emitter.args.triAttrFlat = !scene.attrFlatArena.empty()
+                                               ? (scene.attrFlatArena.data() + triIdxSz * psScalars)
+                                               : nullptr;
                 emitter.args.triInvW = sampleTri.invW;
-                emitter.args.triOrigBary = sampleTri.origBary;
+                emitter.args.triOrigBary = !scene.origBaryArena.empty()
+                                               ? (scene.origBaryArena.data() + triIdxSz * 9)
+                                               : nullptr;
                 emitter.args.triDepth = sampleTri.depth;
                 emitter.args.isFrontFace = sampleTri.isFrontFace;
                 emitter.args.primitiveId = sampleTri.primitiveId;
@@ -785,10 +797,10 @@ void executeRasterDrawCall(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const DrawCallParams& draw) {
-    RasterScene scene;
-    if (!buildRasterScene(pool, state, draw, scene)) return;
+    thread_local RasterScene scene;
+    thread_local std::vector<TileBin> bins;
+    if (!buildRasterScene(pool, state, draw, scene, &bins)) return;
 
-    std::vector<TileBin> bins;
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
 }
