@@ -325,7 +325,7 @@ public:
         }
         if (!cOpt.has_value()) return mlir::Value();
         double c = *cOpt;
-        if (!(c >= 1.0 && c <= 32.0 && std::floor(c) == c)) return mlir::Value();
+        if (!(c >= 0.5 && c <= 32.5 && std::floor(c * 2.0) == c * 2.0)) return mlir::Value();
 
         mlir::Value base;
         if (auto logOp = logVal.getDefiningOp<mlir::LLVM::Log2Op>()) {
@@ -339,7 +339,9 @@ public:
         }
         if (!base || base.getType() != expArg.getType()) return mlir::Value();
 
-        uint32_t exp = static_cast<uint32_t>(c);
+        const uint32_t twoC = static_cast<uint32_t>(c * 2.0);
+        uint32_t exp = twoC >> 1u;
+        const bool hasHalf = (twoC & 1u) != 0u;
         mlir::Value res;
         mlir::Value p = base;
         while (exp > 0) {
@@ -350,6 +352,10 @@ public:
             if (exp > 0) {
                 p = createFp<mlir::LLVM::FMulOp>(loc, base.getType(), p, p);
             }
+        }
+        if (hasHalf) {
+            mlir::Value sq = createFp<mlir::LLVM::SqrtOp>(loc, base.getType(), base);
+            res = res ? createFp<mlir::LLVM::FMulOp>(loc, base.getType(), res, sq) : sq;
         }
         return res;
     }

@@ -472,6 +472,12 @@ inline vf32<W> tanh_v(vf32<W> x) {
     void nacelle_math_v##W##_cosf(vf32<W>* out, const vf32<W>* in) {                  \
         *out = cos_v<W>(*in);                                                         \
     }                                                                                 \
+    void nacelle_math_v##W##_sincosf(vf32<W>* out_s, vf32<W>* out_c, const vf32<W>* in) { \
+        vf32<W> s, c;                                                                 \
+        sincos_v<W>(*in, s, c);                                                       \
+        *out_s = s;                                                                   \
+        *out_c = c;                                                                   \
+    }                                                                                 \
     void nacelle_math_v##W##_tanf(vf32<W>* out, const vf32<W>* in) {                  \
         vf32<W> s, c;                                                                 \
         sincos_v<W>(*in, s, c);                                                       \

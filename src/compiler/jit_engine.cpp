@@ -1016,12 +1016,72 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     // in math_simd.bc and texture_sampler.bc are not rewritten by reassoc/nsz/arcp.
     applyShaderFastMathFlags(*llvmMod);
 
+    // Fuse same-argument (sinf, cosf) pairs in the same basic block into `nacelle_math_v<W>_sincosf`.
+    {
+        llvm::Type* voidTy = llvm::Type::getVoidTy(llvmCtx);
+        llvm::Type* ptrTy = llvm::PointerType::getUnqual(llvmCtx);
+        llvm::FunctionType* sincosFnTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy, ptrTy}, false);
+        for (llvm::Function& f : *llvmMod) {
+            if (f.isDeclaration()) continue;
+            for (llvm::BasicBlock& bb : f) {
+                std::unordered_map<llvm::Value*, llvm::CallInst*> sinByArg;
+                std::unordered_map<llvm::Value*, llvm::CallInst*> cosByArg;
+                llvm::SmallVector<std::pair<llvm::CallInst*, llvm::CallInst*>, 8> pairs;
+                for (llvm::Instruction& inst : bb) {
+                    auto* ci = llvm::dyn_cast<llvm::CallInst>(&inst);
+                    if (!ci || ci->arg_size() != 1) continue;
+                    llvm::Function* callee = ci->getCalledFunction();
+                    if (!callee) continue;
+                    llvm::StringRef cname = callee->getName();
+                    if (!cname.starts_with("nacelle_math_v")) continue;
+                    llvm::Value* arg = ci->getArgOperand(0);
+                    if (cname.ends_with("_sinf")) {
+                        if (auto it = cosByArg.find(arg); it != cosByArg.end()) {
+                            pairs.push_back({ci, it->second});
+                            cosByArg.erase(it);
+                        } else {
+                            sinByArg.emplace(arg, ci);
+                        }
+                    } else if (cname.ends_with("_cosf")) {
+                        if (auto it = sinByArg.find(arg); it != sinByArg.end()) {
+                            pairs.push_back({it->second, ci});
+                            sinByArg.erase(it);
+                        } else {
+                            cosByArg.emplace(arg, ci);
+                        }
+                    }
+                }
+                for (auto [sinCall, cosCall] : pairs) {
+                    llvm::CallInst* anchor = sinCall->comesBefore(cosCall) ? sinCall : cosCall;
+                    llvm::StringRef sinName = sinCall->getCalledFunction()->getName();
+                    std::string scName = sinName.drop_back(4).str() + "sincosf";
+                    llvm::FunctionCallee scCallee = llvmMod->getOrInsertFunction(scName, sincosFnTy);
+                    llvm::IRBuilder<> eb(&f.getEntryBlock().front());
+                    llvm::Type* vecTy = sinCall->getType();
+                    llvm::AllocaInst* inSlot = eb.CreateAlloca(vecTy, nullptr, "sincos.in");
+                    llvm::AllocaInst* outS = eb.CreateAlloca(vecTy, nullptr, "sincos.s");
+                    llvm::AllocaInst* outC = eb.CreateAlloca(vecTy, nullptr, "sincos.c");
+                    llvm::IRBuilder<> cb(anchor);
+                    cb.CreateStore(sinCall->getArgOperand(0), inSlot);
+                    cb.CreateCall(scCallee, {outS, outC, inSlot});
+                    llvm::Value* sVal = cb.CreateLoad(vecTy, outS, "sincos.s.res");
+                    llvm::Value* cVal = cb.CreateLoad(vecTy, outC, "sincos.c.res");
+                    sinCall->replaceAllUsesWith(sVal);
+                    cosCall->replaceAllUsesWith(cVal);
+                    sinCall->eraseFromParent();
+                    cosCall->eraseFromParent();
+                }
+            }
+        }
+    }
+
     // Rewrite vector-by-value `nacelle_math_v<W>_*` declarations/calls to ABI-neutral
     // `void(ptr out, ptr in)` so `AlwaysInlinerPass` matches `math_simd.bc` on all targets.
     {
         llvm::SmallVector<llvm::Function*, 16> mathDecls;
         for (llvm::Function& f : *llvmMod) {
-            if (f.isDeclaration() && f.getName().starts_with("nacelle_math_")) {
+            if (f.isDeclaration() && f.getName().starts_with("nacelle_math_") &&
+                !f.getReturnType()->isVoidTy()) {
                 mathDecls.push_back(&f);
             }
         }
