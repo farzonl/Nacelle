@@ -72,7 +72,56 @@
 #include "math_simd_bc.h"
 #include "texture_sampler_bc.h"
 
+#if defined(__APPLE__)
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+#endif
+
 namespace nacelle {
+
+#if defined(__APPLE__)
+extern "C" void nacelle_accel_sgemm(
+    const float* A,
+    const float* B,
+    const float* C,
+    float* Out,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    uint32_t hasC) {
+    if (hasC && C) {
+        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
+    }
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+        1.0f, A, static_cast<int>(K),
+        B, static_cast<int>(N),
+        (hasC && C) ? 1.0f : 0.0f,
+        Out, static_cast<int>(N));
+}
+
+extern "C" void nacelle_accel_dgemm(
+    const double* A,
+    const double* B,
+    const double* C,
+    double* Out,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    uint32_t hasC) {
+    if (hasC && C) {
+        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
+    }
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+        1.0, A, static_cast<int>(K),
+        B, static_cast<int>(N),
+        (hasC && C) ? 1.0 : 0.0,
+        Out, static_cast<int>(N));
+}
+#endif
 
 bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError);
 
@@ -353,6 +402,10 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         addSym("nacelle_dxr_accept_hit_and_end_search", &nacelle_dxr_accept_hit_and_end_search);
         addSym("nacelle_dxr_report_hit", &nacelle_dxr_report_hit);
         addSym("nacelle_dxr_call_shader", &nacelle_dxr_call_shader);
+#if defined(__APPLE__)
+        addSym("nacelle_accel_sgemm", &nacelle_accel_sgemm);
+        addSym("nacelle_accel_dgemm", &nacelle_accel_dgemm);
+#endif
         if (auto err = rt.jit->getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(syms)))) {
             outError = llvm::toString(std::move(err));
             rt.jit.reset();

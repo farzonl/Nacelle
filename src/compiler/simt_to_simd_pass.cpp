@@ -3607,6 +3607,41 @@ private:
             const bool isFlt = linAlgIsFloat(metaOut.compType);
             const uint32_t M = metaOut.rows, N = metaOut.cols, K = metaA.cols;
 
+#if defined(__APPLE__)
+            const bool canUseAccelerate =
+                (static_cast<uint64_t>(M) * N * K >= 4096ull) &&
+                (metaOut.compType == 9 || metaOut.compType == 10) &&
+                metaA.compType == metaOut.compType &&
+                metaB.compType == metaOut.compType &&
+                (!hasAcc || metaC.compType == metaOut.compType);
+            if (canUseAccelerate) {
+                const char* fnName = (metaOut.compType == 9) ? "nacelle_accel_sgemm" : "nacelle_accel_dgemm";
+                auto accelFn = mod_.lookupSymbol<mlir::LLVM::LLVMFuncOp>(fnName);
+                if (!accelFn) {
+                    mlir::OpBuilder mb(mod_.getBody(), mod_.getBody()->begin());
+                    auto fnTy = mlir::LLVM::LLVMFunctionType::get(
+                        mlir::LLVM::LLVMVoidType::get(ctx_),
+                        {ptrTy(), ptrTy(), ptrTy(), ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty()});
+                    accelFn = mlir::LLVM::LLVMFuncOp::create(mb, loc, fnName, fnTy);
+                }
+                for (uint32_t l = 0; l < W_; ++l) {
+                    if (!shouldRunLane(metaOut, l)) continue;
+                    mlir::Value bA = getMatBufForLane(matA, metaA, l);
+                    mlir::Value bB = getMatBufForLane(matB, metaB, l);
+                    mlir::Value bC = hasAcc ? getMatBufForLane(matC, metaC, l)
+                                            : mlir::Value(mlir::LLVM::ZeroOp::create(b_, loc, ptrTy()));
+                    mlir::Value bOut = getMatBufForLane(outMat, metaOut, l);
+                    mlir::LLVM::CallOp::create(
+                        b_, loc, accelFn,
+                        mlir::ValueRange{bA, bB, bC, bOut,
+                                         cInt(loc, i32Ty(), M), cInt(loc, i32Ty(), N),
+                                         cInt(loc, i32Ty(), K), cInt(loc, i32Ty(), hasAcc ? 1 : 0)});
+                }
+                setMapped(call.getResult(), outMat);
+                return true;
+            }
+#endif
+
             for (uint32_t l = 0; l < W_; ++l) {
                 if (!shouldRunLane(metaOut, l)) continue;
                 mlir::Value bA = getMatBufForLane(matA, metaA, l);
