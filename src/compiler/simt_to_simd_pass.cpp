@@ -3607,7 +3607,6 @@ private:
             const bool isFlt = linAlgIsFloat(metaOut.compType);
             const uint32_t M = metaOut.rows, N = metaOut.cols, K = metaA.cols;
 
-#if defined(__APPLE__)
             const bool canUseAccelerate =
                 (static_cast<uint64_t>(M) * N * K >= 4096ull) &&
                 (metaOut.compType == 9 || metaOut.compType == 10) &&
@@ -3640,7 +3639,6 @@ private:
                 setMapped(call.getResult(), outMat);
                 return true;
             }
-#endif
 
             for (uint32_t l = 0; l < W_; ++l) {
                 if (!shouldRunLane(metaOut, l)) continue;
