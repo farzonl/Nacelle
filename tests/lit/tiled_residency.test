@@ -3,10 +3,10 @@
 // RUN: %nacelle_compile --cs %t.dxil --simd-width=8 --emit-llvm | %FileCheck %s --check-prefix=LLVM
 
 // Verify lowering of CheckAccessFullyMapped (DXIL op 71) and tiled buffer/texture residency status.
-// CHECK-LABEL: func.func @nacelle_cs_test
-// CHECK-DAG: llvm.call @nacelle_tex_load({{.*}}) : (!llvm.ptr, i32, i32, i32, i32, !llvm.ptr) -> i32
-// CHECK-DAG: llvm.call @nacelle_tex_sample({{.*}}) : (!llvm.ptr, !llvm.ptr, {{.*}}) -> i32
-// CHECK-DAG: llvm.icmp "ne"
+// CHECK-LABEL: define void @nacelle_cs_test(
+// CHECK-DAG: call i32 @nacelle_tex_load(ptr {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, i32 {{.*}}, ptr {{.*}})
+// CHECK-DAG: call i32 @nacelle_tex_sample(ptr {{.*}}, ptr {{.*}}, {{.*}})
+// CHECK-DAG: icmp ne
 
 // LLVM-LABEL: define void @nacelle_cs_test(
 

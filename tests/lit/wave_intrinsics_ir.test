@@ -2,8 +2,8 @@
 // RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=SIMD
 // RUN: %nacelle_compile --simd-width=8 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM
 
-// SIMD: func.func @nacelle_cs_test
-// SIMD-DAG: vector<8x
+// SIMD: define void @nacelle_cs_test(
+// SIMD-DAG: <8 x 
 // SIMD-NOT: dx.op.wave
 
 // LLVM: define void @nacelle_cs_test

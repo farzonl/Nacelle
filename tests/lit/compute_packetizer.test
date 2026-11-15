@@ -4,29 +4,29 @@
 // RUN: %nacelle_compile --simd-width=16 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W16
 // RUN: %nacelle_compile --simd-width=4 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM
 
-// W4: func.func @nacelle_cs_test
-// W4: vector<4x
-// W4: llvm.intr.masked.load{{.*}}vector<4xf32>
-// W4: llvm.intr.masked.gather{{.*}}vector<4xf32>
-// W4: llvm.fadd{{.*}}vector<4xf32>
-// W4: llvm.intr.masked.store{{.*}}vector<4xf32>
-// W4: llvm.intr.masked.scatter{{.*}}vector<4xf32>
+// W4: define void @nacelle_cs_test(
+// W4: <4 x 
+// W4: call {{.*}}<4 x float> @llvm.masked.load.v4f32
+// W4: call {{.*}}<4 x float> @llvm.masked.gather.v4f32
+// W4: fadd {{.*}}<4 x float>
+// W4: call void @llvm.masked.store.v4f32
+// W4: call void @llvm.masked.scatter.v4f32
 
-// W8: func.func @nacelle_cs_test
-// W8: vector<8x
-// W8: llvm.intr.masked.load{{.*}}vector<8xf32>
-// W8: llvm.intr.masked.gather{{.*}}vector<8xf32>
-// W8: llvm.fadd{{.*}}vector<8xf32>
-// W8: llvm.intr.masked.store{{.*}}vector<8xf32>
-// W8: llvm.intr.masked.scatter{{.*}}vector<8xf32>
+// W8: define void @nacelle_cs_test(
+// W8: <8 x 
+// W8: call {{.*}}<8 x float> @llvm.masked.load.v8f32
+// W8: call {{.*}}<8 x float> @llvm.masked.gather.v8f32
+// W8: fadd {{.*}}<8 x float>
+// W8: call void @llvm.masked.store.v8f32
+// W8: call void @llvm.masked.scatter.v8f32
 
-// W16: func.func @nacelle_cs_test
-// W16: vector<16x
-// W16: llvm.intr.masked.load{{.*}}vector<16xf32>
-// W16: llvm.intr.masked.gather{{.*}}vector<16xf32>
-// W16: llvm.fadd{{.*}}vector<16xf32>
-// W16: llvm.intr.masked.store{{.*}}vector<16xf32>
-// W16: llvm.intr.masked.scatter{{.*}}vector<16xf32>
+// W16: define void @nacelle_cs_test(
+// W16: <16 x 
+// W16: call {{.*}}<16 x float> @llvm.masked.load.v16f32
+// W16: call {{.*}}<16 x float> @llvm.masked.gather.v16f32
+// W16: fadd {{.*}}<16 x float>
+// W16: call void @llvm.masked.store.v16f32
+// W16: call void @llvm.masked.scatter.v16f32
 
 // LLVM: define void @nacelle_cs_test(ptr noalias readonly %0, ptr %1,
 // LLVM: load {{.*}}, !invariant.load !

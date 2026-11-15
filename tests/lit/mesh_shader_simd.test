@@ -86,9 +86,9 @@ float4 PrimPSMain(PrimPSIn input) : SV_Target {
 }
 
 // ASMS-NOT: dx.op.
-// ASMS-DAG: func.func @nacelle_vs_test_as
-// ASMS-DAG: func.func @nacelle_vs_test_ms
-// ASMS-DAG: func.func @nacelle_ps_test
+// ASMS-DAG: define void @nacelle_vs_test_as(
+// ASMS-DAG: define void @nacelle_vs_test_ms(
+// ASMS-DAG: define void @nacelle_ps_test(
 // ASMS-NOT: dx.op.
 
 // LLVM-NOT: dx.op.

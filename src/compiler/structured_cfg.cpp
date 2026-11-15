@@ -182,8 +182,54 @@ public:
             if (mergeBB && stopBB && mergeBB != stopBB && pdt_.dominates(stopBB, mergeBB)) {
                 mergeBB = stopBB;
             }
-            if (!mergeBB && stopBB) {
-                mergeBB = stopBB;
+            if (!mergeBB || (stopBB && mergeBB == stopBB)) {
+                auto computeReach = [&](llvm::BasicBlock* start) {
+                    llvm::DenseMap<llvm::BasicBlock*, unsigned> dist;
+                    llvm::SmallVector<llvm::BasicBlock*, 16> q;
+                    bool reachesExit = false;
+                    auto enqueue = [&](llvm::BasicBlock* bb, unsigned d) {
+                        if (!bb) return;
+                        if (bb == stopBB || (curLoop && (bb == curLoop->getHeader() || bb == loopExitBB))) {
+                            reachesExit = true;
+                            return;
+                        }
+                        if (dist.try_emplace(bb, d).second) {
+                            q.push_back(bb);
+                        }
+                    };
+                    enqueue(start, 0);
+                    for (size_t qi = 0; qi < q.size(); ++qi) {
+                        llvm::BasicBlock* b = q[qi];
+                        unsigned d = dist[b];
+                        for (llvm::BasicBlock* s : llvm::successors(b)) {
+                            enqueue(s, d + 1);
+                        }
+                    }
+                    return std::make_pair(std::move(dist), reachesExit);
+                };
+                auto [distT, exitT] = computeReach(tBB);
+                auto [distF, exitF] = computeReach(fBB);
+                llvm::BasicBlock* bestMerge = nullptr;
+                unsigned bestScore = ~0u;
+                for (const auto& kv : distT) {
+                    auto itF = distF.find(kv.first);
+                    if (itF != distF.end()) {
+                        unsigned score = kv.second + itF->second;
+                        if (score < bestScore) {
+                            bestScore = score;
+                            bestMerge = kv.first;
+                        }
+                    }
+                }
+                if (bestMerge) {
+                    mergeBB = bestMerge;
+                } else if (exitT && !exitF) {
+                    mergeBB = tBB;
+                } else if (exitF && !exitT) {
+                    mergeBB = fBB;
+                } else if (!mergeBB && stopBB) {
+                    mergeBB = stopBB;
+                }
             }
 
             auto ifn = std::make_unique<IfNode>();

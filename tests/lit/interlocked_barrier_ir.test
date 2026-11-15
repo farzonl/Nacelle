@@ -3,20 +3,20 @@
 // RUN: %nacelle_compile --simd-width=8 --emit-simd-mlir %t.dxil | %FileCheck %s --check-prefix=W8
 // RUN: %nacelle_compile --simd-width=16 --emit-llvm %t.dxil | %FileCheck %s --check-prefix=LLVM16
 
-// W4: func.func @nacelle_cs_test
-// W4-DAG: vector<4x
-// W4-DAG: scf.while
-// W4-DAG: llvm.atomicrmw
-// W4-DAG: llvm.cmpxchg
+// W4: define void @nacelle_cs_test(
+// W4-DAG: <4 x 
+// W4-DAG: for.hdr
+// W4-DAG: atomicrmw
+// W4-DAG: cmpxchg
 // W4-NOT: dx.op.barrier
 // W4-NOT: dx.op.atomicBinOp
 // W4-NOT: dx.op.atomicCompareExchange
 
-// W8: func.func @nacelle_cs_test
-// W8-DAG: vector<8x
-// W8-DAG: scf.while
-// W8-DAG: llvm.atomicrmw
-// W8-DAG: llvm.cmpxchg
+// W8: define void @nacelle_cs_test(
+// W8-DAG: <8 x 
+// W8-DAG: for.hdr
+// W8-DAG: atomicrmw
+// W8-DAG: cmpxchg
 // W8-NOT: dx.op.barrier
 
 // LLVM16: define void @nacelle_cs_test

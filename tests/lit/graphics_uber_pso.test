@@ -27,15 +27,15 @@ float4 PSMain(PSIn input) : SV_Target {
     return input.col;
 }
 
-// GFX: func.func @nacelle_vs_test
-// GFX: func.func @nacelle_ps_test
-// GFX: vector<8xf32>
+// GFX: define void @nacelle_vs_test(
+// GFX: define void @nacelle_ps_test(
+// GFX: <8 x float>
 
-// DEPTHONLY: func.func @nacelle_vs_test
-// DEPTHONLY: func.func @nacelle_ps_test
+// DEPTHONLY: define void @nacelle_vs_test(
+// DEPTHONLY: define void @nacelle_ps_test(
 
-// VSVEC-LABEL: func.func @nacelle_vs_test
-// VSVEC-NOT: scf.if
-// VSVEC: llvm.intr.masked.gather
-// VSVEC-NOT: scf.if
-// VSVEC-LABEL: func.func @nacelle_ps_test
+// VSVEC-LABEL: define void @nacelle_vs_test(
+// VSVEC-NOT: br i1
+// VSVEC: call <8 x float> @llvm.masked.gather.v8f32
+// VSVEC-NOT: br i1
+// VSVEC-LABEL: define void @nacelle_ps_test(

@@ -318,7 +318,6 @@ int main(int argc, char** argv) {
             std::cerr << "Compute packetizer error: " << err << "\n";
             return 1;
         }
-        entryFn->eraseFromParent();
         if (emitSIMD) {
             loaded.module->print(llvm::outs(), nullptr);
             llvm::outs() << "\n";

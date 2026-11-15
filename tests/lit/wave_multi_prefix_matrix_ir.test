@@ -9,6 +9,7 @@
 // CHECK: alloca [{{[0-9]+}} x i64], i32 4, align 64
 // CHECK: br label
 // CHECK-NOT: alloca
+// CHECK: ret void
 
 //--- shader.hlsl
 StructuredBuffer<int4> Inputs : register(t0);

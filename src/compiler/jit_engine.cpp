@@ -1668,7 +1668,6 @@ bool compileComputePSO(
             outError)) {
         return false;
     }
-    entryFn->eraseFromParent();
     const auto tPacketize = Clock::now();
 
     if (!linkAndFinalizeLLVMModule(*shader.module, outError)) {
@@ -1877,7 +1876,6 @@ bool compileDxrShader(
     if (!packetizeDxrEntry(*shader.module, srcTree, shader, effectiveLayout, simdWidth, symbolName, outError)) {
         return false;
     }
-    entryFn->eraseFromParent();
 
     if (!linkAndFinalizeLLVMModule(*shader.module, outError)) {
         return false;

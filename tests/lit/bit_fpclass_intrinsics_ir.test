@@ -30,14 +30,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     OutU32[i * 4u + 3u] = uint4(infMat[0], infMat[1]);
 }
 
-// SIMD8: func.func @nacelle_cs_test
-// SIMD8-DAG: llvm.intr.ctpop{{.*}}vector<8xi64>
-// SIMD8-DAG: llvm.trunc {{.*}} : vector<8xi64> to vector<8xi32>
-// SIMD8-DAG: llvm.intr.ctpop{{.*}}vector<8xi16>
-// SIMD8-DAG: llvm.zext {{.*}} : vector<8xi16> to vector<8xi32>
-// SIMD8-DAG: llvm.intr.cttz{{.*}}vector<8xi64>
-// SIMD8-DAG: llvm.intr.ctlz{{.*}}vector<8xi64>
-// SIMD8-DAG: llvm.intr.is.fpclass{{.*}}vector<8xf32>
+// SIMD8: define void @nacelle_cs_test(
+// SIMD8-DAG: call <8 x i64> @llvm.ctpop.v8i64(
+// SIMD8-DAG: trunc <8 x i64> {{.*}} to <8 x i32>
+// SIMD8-DAG: call <8 x i16> @llvm.ctpop.v8i16(
+// SIMD8-DAG: zext <8 x i16> {{.*}} to <8 x i32>
+// SIMD8-DAG: call <8 x i64> @llvm.cttz.v8i64(
+// SIMD8-DAG: call <8 x i64> @llvm.ctlz.v8i64(
+// SIMD8-DAG: call <8 x i1> @llvm.is.fpclass.v8f32(
 // SIMD8-NOT: dx.op.unaryBits
 // SIMD8-NOT: dx.op.isSpecialFloat
 

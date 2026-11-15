@@ -792,7 +792,8 @@ public:
 
     struct WhileExitContext {
         const WhileNode* wn = nullptr;
-        llvm::Value* continueMask = nullptr;
+        llvm::Value* continueMaskSlot = nullptr;
+        llvm::DenseMap<llvm::PHINode*, SimdSlot>* hdrPhiSlots = nullptr;
         llvm::DenseMap<llvm::PHINode*, SimdSlot> exitPhiSlots;
     };
 
@@ -827,15 +828,79 @@ public:
             case RegionNode::Kind::Block: {
                 const auto& bn = llvm::cast<BlockNode>(*child);
                 if (!packetizeBlock(*bn.bb, curExec, realMask, outError)) return false;
+                if (whileCtx && whileCtx->wn) {
+                    llvm::BasicBlock* hdr = whileCtx->wn->headerBB;
+                    llvm::BasicBlock* exitBB = whileCtx->wn->exitBB;
+                    auto clearContinueLanes = [&](llvm::Value* exitLanes) {
+                        llvm::Value* curCont = b_.CreateLoad(vecTy(i1Ty()), whileCtx->continueMaskSlot);
+                        b_.CreateStore(b_.CreateAnd(curCont, b_.CreateNot(exitLanes)), whileCtx->continueMaskSlot);
+                    };
+                    auto updateHdrPhis = [&](llvm::Value* mask) {
+                        if (!whileCtx->hdrPhiSlots) return;
+                        for (auto& kv : *whileCtx->hdrPhiSlots) {
+                            int idx = kv.first->getBasicBlockIndex(bn.bb);
+                            if (idx >= 0) {
+                                SimdVal nextSv = getMapped(kv.first->getIncomingValue(idx));
+                                SimdVal curSv = loadSimdSlot(kv.second);
+                                storeSimdSlot(kv.second, selectVal(mask, nextSv, curSv));
+                            }
+                        }
+                    };
+                    auto updateExitPhis = [&](llvm::Value* mask) {
+                        if (!exitBB) return;
+                        for (llvm::PHINode& phi : exitBB->phis()) {
+                            int idx = phi.getBasicBlockIndex(bn.bb);
+                            if (idx >= 0) {
+                                SimdVal incSv = getMapped(phi.getIncomingValue(idx));
+                                auto& slot = whileCtx->exitPhiSlots[&phi];
+                                SimdVal prevSv = loadSimdSlot(slot);
+                                storeSimdSlot(slot, selectVal(mask, incSv, prevSv));
+                            }
+                        }
+                    };
+                    llvm::Instruction* term = bn.bb->getTerminatorOrNull();
+                    if (auto* cbr = llvm::dyn_cast_or_null<llvm::CondBrInst>(term)) {
+                        llvm::BasicBlock* tBB = cbr->getSuccessor(0);
+                        llvm::BasicBlock* fBB = cbr->getSuccessor(1);
+                        bool tIsBack = (tBB == hdr);
+                        bool fIsBack = (fBB == hdr);
+                        bool tIsExit = (tBB == exitBB);
+                        bool fIsExit = (fBB == exitBB);
+                        if ((tIsBack && fIsExit) || (fIsBack && tIsExit)) {
+                            llvm::Value* condVec = asVec(getMapped(cbr->getCondition()));
+                            llvm::Value* contCond = tIsBack ? condVec : b_.CreateNot(condVec);
+                            llvm::Value* stayLanes = b_.CreateAnd(curExec, contCond);
+                            llvm::Value* exitLanes = b_.CreateAnd(curExec, b_.CreateNot(contCond));
+                            clearContinueLanes(exitLanes);
+                            updateExitPhis(exitLanes);
+                            updateHdrPhis(stayLanes);
+                        } else if (tIsBack) {
+                            llvm::Value* condVec = asVec(getMapped(cbr->getCondition()));
+                            updateHdrPhis(b_.CreateAnd(curExec, condVec));
+                        } else if (fIsBack) {
+                            llvm::Value* condVec = asVec(getMapped(cbr->getCondition()));
+                            updateHdrPhis(b_.CreateAnd(curExec, b_.CreateNot(condVec)));
+                        }
+                    } else if (auto* ubr = llvm::dyn_cast_or_null<llvm::UncondBrInst>(term)) {
+                        llvm::BasicBlock* succ = ubr->getSuccessor(0);
+                        if (succ == hdr) {
+                            updateHdrPhis(curExec);
+                        } else if (succ == exitBB) {
+                            clearContinueLanes(curExec);
+                            updateExitPhis(curExec);
+                        }
+                    }
+                }
                 break;
             }
             case RegionNode::Kind::Seq: {
                 if (!packetizeSeq(llvm::cast<SeqNode>(*child), curExec, realMask, outError, whileCtx)) return false;
+                if (whileCtx) curExec = b_.CreateLoad(vecTy(i1Ty()), whileCtx->continueMaskSlot);
                 break;
             }
             case RegionNode::Kind::If: {
                 if (!packetizeIfNode(llvm::cast<IfNode>(*child), curExec, realMask, outError, whileCtx)) return false;
-                if (whileCtx) curExec = whileCtx->continueMask;
+                if (whileCtx) curExec = b_.CreateLoad(vecTy(i1Ty()), whileCtx->continueMaskSlot);
                 break;
             }
             case RegionNode::Kind::While: {
@@ -868,7 +933,8 @@ public:
         if (whileCtx) {
             if (ifn.thenExitsLoop) {
                 llvm::Value* exitLanes = b_.CreateAnd(execMask, condVec);
-                whileCtx->continueMask = b_.CreateAnd(whileCtx->continueMask, notCond);
+                llvm::Value* curCont = b_.CreateLoad(vecTy(i1Ty()), whileCtx->continueMaskSlot);
+                b_.CreateStore(b_.CreateAnd(curCont, b_.CreateNot(exitLanes)), whileCtx->continueMaskSlot);
                 if (whileCtx->wn && whileCtx->wn->exitBB) {
                     for (llvm::PHINode& phi : whileCtx->wn->exitBB->phis()) {
                         int idx = phi.getBasicBlockIndex(ifn.headerBB);
@@ -883,7 +949,8 @@ public:
             }
             if (ifn.elseExitsLoop) {
                 llvm::Value* exitLanes = b_.CreateAnd(execMask, notCond);
-                whileCtx->continueMask = b_.CreateAnd(whileCtx->continueMask, condVec);
+                llvm::Value* curCont = b_.CreateLoad(vecTy(i1Ty()), whileCtx->continueMaskSlot);
+                b_.CreateStore(b_.CreateAnd(curCont, b_.CreateNot(exitLanes)), whileCtx->continueMaskSlot);
                 if (whileCtx->wn && whileCtx->wn->exitBB) {
                     for (llvm::PHINode& phi : whileCtx->wn->exitBB->phis()) {
                         int idx = phi.getBasicBlockIndex(ifn.headerBB);
@@ -902,8 +969,80 @@ public:
         llvm::Value* realMaskSlot = hasRealMaskOut ? createEntryAlloca(vecTy(i1Ty()), 1) : nullptr;
 
         auto savedMap = valueMap_;
-        llvm::DenseMap<llvm::Value*, SimdVal> thenMap = savedMap;
-        llvm::DenseMap<llvm::Value*, SimdVal> elseMap = savedMap;
+
+        llvm::DenseSet<const llvm::BasicBlock*> thenBlocks, elseBlocks;
+        if (ifn.thenRegion) collectBlocks(*ifn.thenRegion, thenBlocks);
+        if (ifn.elseRegion) collectBlocks(*ifn.elseRegion, elseBlocks);
+
+        auto lookupFrom = [&](llvm::DenseMap<llvm::Value*, SimdVal>& m, llvm::Value* v) -> SimdVal {
+            auto it = m.find(v);
+            if (it != m.end()) return it->second;
+            return getMapped(v);
+        };
+
+        struct MergePhiInfo {
+            llvm::PHINode* phi = nullptr;
+            llvm::Value* thenIncV = nullptr;
+            llvm::Value* elseIncV = nullptr;
+            bool hasT = false;
+            bool hasE = false;
+            bool thenFromRegion = false;
+            bool elseFromRegion = false;
+            SimdSlot thenSlot;
+            SimdSlot elseSlot;
+        };
+        llvm::SmallVector<MergePhiInfo, 8> mergePhis;
+        if (ifn.mergeBB) {
+            for (llvm::PHINode& phi : ifn.mergeBB->phis()) {
+                MergePhiInfo mpi;
+                mpi.phi = &phi;
+                for (unsigned i = 0; i < phi.getNumIncomingValues(); ++i) {
+                    llvm::BasicBlock* incBB = phi.getIncomingBlock(i);
+                    llvm::Value* incV = phi.getIncomingValue(i);
+                    if (thenBlocks.count(incBB) || (thenBlocks.empty() && incBB == ifn.headerBB)) {
+                        mpi.thenIncV = incV;
+                        mpi.hasT = true;
+                        mpi.thenFromRegion = thenBlocks.count(incBB) > 0;
+                    } else if (elseBlocks.count(incBB) || (elseBlocks.empty() && incBB == ifn.headerBB)) {
+                        mpi.elseIncV = incV;
+                        mpi.hasE = true;
+                        mpi.elseFromRegion = elseBlocks.count(incBB) > 0;
+                    }
+                }
+                if (mpi.thenFromRegion && !ifn.thenExitsLoop && ifn.thenRegion && !ifn.thenRegion->children.empty()) {
+                    mpi.thenSlot = allocSimdSlot(phi.getType());
+                    storeSimdSlot(mpi.thenSlot, makeZeroSimd(phi.getType()));
+                } else {
+                    mpi.thenFromRegion = false;
+                }
+                if (mpi.elseFromRegion && !ifn.elseExitsLoop && ifn.elseRegion && !ifn.elseRegion->children.empty()) {
+                    mpi.elseSlot = allocSimdSlot(phi.getType());
+                    storeSimdSlot(mpi.elseSlot, makeZeroSimd(phi.getType()));
+                } else {
+                    mpi.elseFromRegion = false;
+                }
+                mergePhis.push_back(std::move(mpi));
+            }
+        }
+
+        llvm::SmallVector<std::pair<llvm::Value*, SimdSlot>, 8> exportedSlots;
+        auto exportRegionValues = [&](const llvm::DenseSet<const llvm::BasicBlock*>& regBlocks) {
+            for (const auto& kv : valueMap_) {
+                auto* inst = llvm::dyn_cast<llvm::Instruction>(kv.first);
+                if (!inst || !regBlocks.count(inst->getParent())) continue;
+                if (inst->getType()->isVoidTy() || !kv.second.valid()) continue;
+                SimdSlot slot = allocSimdSlot(inst->getType(), &kv.second);
+                // Initialize slot in entry block after allocas so all paths dominate uses.
+                if (llvm::BasicBlock* entryBlk = getFuncEntryBlock()) {
+                    llvm::IRBuilder<> eb(entryBlk, entryBlk->getFirstInsertionPt());
+                    for (size_t i = 0; i < slot.allocas.size(); ++i) {
+                        eb.CreateStore(llvm::Constant::getNullValue(slot.flatTys[i]), slot.allocas[i]);
+                    }
+                }
+                storeSimdSlot(slot, kv.second);
+                exportedSlots.push_back({kv.first, std::move(slot)});
+            }
+        };
 
         llvm::Value* realAfterThen = realThen;
         if (!ifn.thenExitsLoop && ifn.thenRegion && !ifn.thenRegion->children.empty()) {
@@ -912,7 +1051,14 @@ public:
                 llvm::Value* curReal = realThen;
                 if (!packetizeSeq(*ifn.thenRegion, execThen, curReal, outError, whileCtx)) return;
                 if (realMaskSlot) b_.CreateStore(curReal, realMaskSlot);
-                thenMap = std::move(valueMap_);
+                for (const auto& mpi : mergePhis) {
+                    if (mpi.thenFromRegion) {
+                        storeSimdSlot(mpi.thenSlot, lookupFrom(valueMap_, mpi.thenIncV));
+                    }
+                }
+                if (ifn.elseExitsLoop) {
+                    exportRegionValues(thenBlocks);
+                }
             });
             valueMap_ = savedMap;
             if (!outError.empty()) return false;
@@ -926,54 +1072,41 @@ public:
                 llvm::Value* curReal = realElse;
                 if (!packetizeSeq(*ifn.elseRegion, execElse, curReal, outError, whileCtx)) return;
                 if (realMaskSlot) b_.CreateStore(curReal, realMaskSlot);
-                elseMap = std::move(valueMap_);
+                for (const auto& mpi : mergePhis) {
+                    if (mpi.elseFromRegion) {
+                        storeSimdSlot(mpi.elseSlot, lookupFrom(valueMap_, mpi.elseIncV));
+                    }
+                }
+                if (ifn.thenExitsLoop) {
+                    exportRegionValues(elseBlocks);
+                }
             });
             valueMap_ = savedMap;
             if (!outError.empty()) return false;
             if (realMaskSlot) realAfterElse = b_.CreateLoad(vecTy(i1Ty()), realMaskSlot);
         }
 
-        if (ifn.mergeBB) {
-            llvm::DenseSet<const llvm::BasicBlock*> thenBlocks, elseBlocks;
-            if (ifn.thenRegion) collectBlocks(*ifn.thenRegion, thenBlocks);
-            if (ifn.elseRegion) collectBlocks(*ifn.elseRegion, elseBlocks);
-
-            auto lookupFrom = [&](llvm::DenseMap<llvm::Value*, SimdVal>& m, llvm::Value* v) -> SimdVal {
-                auto it = m.find(v);
-                if (it != m.end()) return it->second;
-                return getMapped(v);
-            };
-
-            for (llvm::PHINode& phi : ifn.mergeBB->phis()) {
-                SimdVal tv, ev;
-                bool hasT = false, hasE = false;
-                for (unsigned i = 0; i < phi.getNumIncomingValues(); ++i) {
-                    llvm::BasicBlock* incBB = phi.getIncomingBlock(i);
-                    llvm::Value* incV = phi.getIncomingValue(i);
-                    if (thenBlocks.count(incBB) || (thenBlocks.empty() && incBB == ifn.headerBB)) {
-                        tv = lookupFrom(thenMap, incV);
-                        hasT = true;
-                    } else if (elseBlocks.count(incBB) || (elseBlocks.empty() && incBB == ifn.headerBB)) {
-                        ev = lookupFrom(elseMap, incV);
-                        hasE = true;
-                    }
-                }
-                if (hasT && hasE) {
-                    setMapped(&phi, selectVal(condVec, tv, ev));
-                } else if (hasT) {
-                    setMapped(&phi, tv);
-                } else if (hasE) {
-                    setMapped(&phi, ev);
-                } else {
-                    setMapped(&phi, makeZeroSimd(phi.getType()));
-                }
-            }
+        for (const auto& es : exportedSlots) {
+            valueMap_[es.first] = loadSimdSlot(es.second);
         }
 
-        if (ifn.elseExitsLoop) {
-            for (auto& kv : thenMap) valueMap_[kv.first] = kv.second;
-        } else if (ifn.thenExitsLoop) {
-            for (auto& kv : elseMap) valueMap_[kv.first] = kv.second;
+        for (const auto& mpi : mergePhis) {
+            SimdVal tv, ev;
+            if (mpi.hasT) {
+                tv = mpi.thenFromRegion ? loadSimdSlot(mpi.thenSlot) : lookupFrom(savedMap, mpi.thenIncV);
+            }
+            if (mpi.hasE) {
+                ev = mpi.elseFromRegion ? loadSimdSlot(mpi.elseSlot) : lookupFrom(savedMap, mpi.elseIncV);
+            }
+            if (mpi.hasT && mpi.hasE) {
+                setMapped(mpi.phi, selectVal(condVec, tv, ev));
+            } else if (mpi.hasT) {
+                setMapped(mpi.phi, tv);
+            } else if (mpi.hasE) {
+                setMapped(mpi.phi, ev);
+            } else {
+                setMapped(mpi.phi, makeZeroSimd(mpi.phi->getType()));
+            }
         }
 
         if (hasRealMaskOut) {
@@ -989,6 +1122,7 @@ public:
         std::string& outError) {
         llvm::Value* loopExecSlot = createEntryAlloca(vecTy(i1Ty()), 1);
         llvm::Value* aliveMaskSlot = createEntryAlloca(vecTy(i1Ty()), 1);
+        llvm::Value* continueMaskSlot = createEntryAlloca(vecTy(i1Ty()), 1);
         b_.CreateStore(execMask, loopExecSlot);
         b_.CreateStore(realMask, aliveMaskSlot);
 
@@ -1040,42 +1174,15 @@ public:
             setMapped(kv.first, sv);
         }
 
-        exitCtx.continueMask = loopExec;
+        exitCtx.continueMaskSlot = continueMaskSlot;
+        exitCtx.hdrPhiSlots = &hdrPhiSlots;
+        b_.CreateStore(loopExec, continueMaskSlot);
         if (wn.body && !packetizeSeq(*wn.body, loopExec, curReal, outError, &exitCtx)) {
             valueMap_ = std::move(savedMap);
             return false;
         }
 
-        llvm::Value* nextExec = exitCtx.continueMask;
-        if (wn.latchBB) {
-            if (auto* br = llvm::dyn_cast<llvm::BranchInst>(wn.latchBB->getTerminator())) {
-                if (br->isConditional()) {
-                    llvm::Value* condVec = asVec(getMapped(br->getCondition()));
-                    llvm::Value* contCond = (br->getSuccessor(0) == wn.headerBB) ? condVec : b_.CreateNot(condVec);
-                    llvm::Value* exitLanes = b_.CreateAnd(nextExec, b_.CreateNot(contCond));
-                    nextExec = b_.CreateAnd(nextExec, contCond);
-                    if (wn.exitBB) {
-                        for (llvm::PHINode& phi : wn.exitBB->phis()) {
-                            int idx = phi.getBasicBlockIndex(wn.latchBB);
-                            if (idx >= 0) {
-                                SimdVal incSv = getMapped(phi.getIncomingValue(idx));
-                                auto& slot = exitCtx.exitPhiSlots[&phi];
-                                SimdVal prevSv = loadSimdSlot(slot);
-                                storeSimdSlot(slot, selectVal(exitLanes, incSv, prevSv));
-                            }
-                        }
-                    }
-                }
-            }
-            for (auto& kv : hdrPhiSlots) {
-                int idx = kv.first->getBasicBlockIndex(wn.latchBB);
-                if (idx >= 0) {
-                    SimdVal nextSv = getMapped(kv.first->getIncomingValue(idx));
-                    SimdVal blended = selectVal(loopExec, nextSv, curHdrVals[kv.first]);
-                    storeSimdSlot(kv.second, blended);
-                }
-            }
-        }
+        llvm::Value* nextExec = b_.CreateLoad(vecTy(i1Ty()), continueMaskSlot);
 
         llvm::Value* survived = b_.CreateOr(b_.CreateNot(loopExec), curReal);
         llvm::Value* aliveAfter = b_.CreateAnd(aliveMask, survived);
@@ -5603,7 +5710,7 @@ private:
     uint32_t W_;
     llvm::Value* rootCtxPtr_;
     StageHooks& hooks_;
-    llvm::Value* scratchAlloca_;
+    llvm::Value* scratchAlloca_ = nullptr;
     bool strictFp_ = false;
     DescInfoCache ownedDescCache_;
     DescInfoCache* descCache_ = nullptr;
@@ -6182,6 +6289,13 @@ bool packetizeComputeEntry(
     }
     b.CreateRetVoid();
 
+    std::string verifyErr;
+    llvm::raw_string_ostream verifyOs(verifyErr);
+    if (llvm::verifyModule(mod, &verifyOs)) {
+        outError = "LLVM verification failed after compute SIMT-to-SIMD packetization: " + verifyErr;
+        return false;
+    }
+
     srcTree.fn->eraseFromParent();
     if (llvm::Function* helper = mod.getFunction("nacelle.groupshared.ptr")) {
         if (helper->use_empty()) helper->eraseFromParent();
@@ -6193,13 +6307,6 @@ bool packetizeComputeEntry(
         }
     }
     for (llvm::Function* fnOp : deadDxOps) fnOp->eraseFromParent();
-
-    std::string verifyErr;
-    llvm::raw_string_ostream verifyOs(verifyErr);
-    if (llvm::verifyModule(mod, &verifyOs)) {
-        outError = "LLVM verification failed after compute SIMT-to-SIMD packetization: " + verifyErr;
-        return false;
-    }
     return true;
 }
 
@@ -6294,6 +6401,14 @@ bool packetizeDxrEntry(
     }
 
     b.CreateRetVoid();
+
+    std::string verifyErr;
+    llvm::raw_string_ostream verifyOs(verifyErr);
+    if (llvm::verifyModule(mod, &verifyOs)) {
+        outError = "LLVM verification failed after DXR SIMT-to-SIMD packetization: " + verifyErr;
+        return false;
+    }
+
     srcTree.fn->eraseFromParent();
 
     llvm::SmallVector<llvm::Function*, 16> deadDxOps;
@@ -6303,13 +6418,6 @@ bool packetizeDxrEntry(
         }
     }
     for (llvm::Function* fnOp : deadDxOps) fnOp->eraseFromParent();
-
-    std::string verifyErr;
-    llvm::raw_string_ostream verifyOs(verifyErr);
-    if (llvm::verifyModule(mod, &verifyOs)) {
-        outError = "LLVM verification failed after DXR SIMT-to-SIMD packetization: " + verifyErr;
-        return false;
-    }
     return true;
 }
 
