@@ -86,6 +86,7 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
 
     addCompute("bench_raymarch", "Raymarcher (ALU+CF)", "main", "bench_raymarch.dxil", "bench_raymarch.spv");
     addCompute("matmul", "MatMul 128x128 (FMA+Mem)", "CSMain", "matmul.dxil", "matmul.spv");
+    addCompute("linalg_matmul", "LinAlg MatMul 128x128 (CoopMat)", "CSMain", "linalg_matmul.dxil", "linalg_matmul.spv");
     addCompute("prefix_sum_groupshared", "Prefix Sum (Groupshared)", "CSMain", "prefix_sum_groupshared.dxil", "prefix_sum_groupshared.spv");
     addCompute("divergent_cf_atomics", "Divergent CF + Atomics", "CSMain", "divergent_cf_atomics.dxil", "divergent_cf_atomics.spv");
     addCompute("wave_intrinsics", "Wave Intrinsics (Subgroup)", "CSMain", "wave_intrinsics.dxil", "wave_intrinsics.spv");
@@ -366,7 +367,7 @@ BenchRunResult runWarpComputeBench(
         };
         std::memcpy(ptr, spheres, sizeof(spheres));
         srv0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul") {
+    } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
         srv0->Map(0, nullptr, &ptr);
         float* a = static_cast<float*>(ptr);
         for (size_t i = 0; i < 256 * 256; ++i) a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
@@ -397,7 +398,7 @@ BenchRunResult runWarpComputeBench(
         if (spec.id == "bench_raymarch") {
             RaymarchCB rcb{cbW, cbH, cbSteps, 0.0f};
             std::memcpy(ptr, &rcb, sizeof(rcb));
-        } else if (spec.id == "matmul") {
+        } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
             MatmulCB mcb{cbW, cbH, cbSteps, 0};
             std::memcpy(ptr, &mcb, sizeof(mcb));
         }
@@ -438,6 +439,11 @@ BenchRunResult runWarpComputeBench(
             cbW = n; cbH = n; cbSteps = n;
             gx = (n + 7) / 8;
             gy = (n + 7) / 8;
+        } else if (spec.id == "linalg_matmul") {
+            uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
+            cbW = n; cbH = n; cbSteps = n;
+            gx = (n + 31) / 32;
+            gy = (n + 31) / 32;
         } else {
             gx = (mode == 0) ? 64 : (mode == 1 ? 512 : 4096);
             gy = 1;

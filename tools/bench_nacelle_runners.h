@@ -214,7 +214,7 @@ inline BenchRunResult runNacelleComputeBench(
         };
         std::memcpy(sphPtr, spheres, sizeof(spheres));
         srv0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul") {
+    } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
         float* a = nullptr;
         float* b = nullptr;
         srv0->Map(0, nullptr, reinterpret_cast<void**>(&a));
@@ -239,7 +239,7 @@ inline BenchRunResult runNacelleComputeBench(
         if (spec.id == "bench_raymarch") {
             RaymarchCB cb{cbW, cbH, cbSteps, 0.0f};
             std::memcpy(cbPtr, &cb, sizeof(cb));
-        } else if (spec.id == "matmul") {
+        } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
             MatmulCB cb{cbW, cbH, cbSteps, 0};
             std::memcpy(cbPtr, &cb, sizeof(cb));
         }
@@ -279,6 +279,11 @@ inline BenchRunResult runNacelleComputeBench(
             cbW = n; cbH = n; cbSteps = n;
             gx = (n + 7) / 8;
             gy = (n + 7) / 8;
+        } else if (spec.id == "linalg_matmul") {
+            uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
+            cbW = n; cbH = n; cbSteps = n;
+            gx = (n + 31) / 32;
+            gy = (n + 31) / 32;
         } else {
             // 64 threads per group
             gx = (mode == 0) ? 64 : (mode == 1 ? 512 : 4096);
@@ -312,7 +317,7 @@ inline BenchRunResult runNacelleComputeBench(
         size_t count = static_cast<size_t>(width) * height * 4;
         for (size_t i = 0; i < count; ++i) sum += outPtr[i];
         uav0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul") {
+    } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
         float* outPtr = nullptr;
         uav0->Map(0, nullptr, reinterpret_cast<void**>(&outPtr));
         for (size_t i = 0; i < 128 * 128; ++i) sum += outPtr[i];
