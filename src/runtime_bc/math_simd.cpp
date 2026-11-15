@@ -152,6 +152,74 @@ inline vf32<W> log2_v(vf32<W> x) {
 }
 
 template <int W>
+inline vf32<W> sin_poly_half_pi_v(vf32<W> r) {
+    vf32<W> r2 = r * r;
+    vf32<W> p = splat_f<W>(1.60590438e-10f);
+    p = p * r2 + splat_f<W>(-2.50521084e-8f);
+    p = p * r2 + splat_f<W>(2.75573192e-6f);
+    p = p * r2 + splat_f<W>(-1.98412698e-4f);
+    p = p * r2 + splat_f<W>(8.33333333e-3f);
+    p = p * r2 + splat_f<W>(-1.66666667e-1f);
+    return r + r * (r2 * p);
+}
+
+template <int W>
+inline vf32<W> sin_v(vf32<W> x) {
+    constexpr float kOneOverPi = 0.3183098861837907f;
+    constexpr float kPi_1 = 3.140625f;              // 0x40490000
+    constexpr float kPi_2 = 9.675025939941406e-4f;  // 0x3a7d8000
+    constexpr float kPi_3 = 1.5099067241607776e-7f; // 0x34222000
+    constexpr float kPi_4 = 5.126688136514179e-12f; // remainder
+
+    vf32<W> ax = abs_v<W>(x);
+    vf32<W> sx = select_v<W>(ax < splat_f<W>(3.0e9f), x, splat_f<W>(0.0f));
+
+    vf32<W> qf = __builtin_elementwise_rint(sx * splat_f<W>(kOneOverPi));
+    vi32<W> q = __builtin_convertvector(qf, vi32<W>);
+
+    vf32<W> r = sx - qf * splat_f<W>(kPi_1);
+    r = r - qf * splat_f<W>(kPi_2);
+    r = r - qf * splat_f<W>(kPi_3);
+    r = r - qf * splat_f<W>(kPi_4);
+
+    vf32<W> sin_val = sin_poly_half_pi_v<W>(r);
+    vu32<W> sin_flip = bit_cast_v<vu32<W>>((q & splat_i<W>(1)) << 31);
+    sin_val = bit_cast_v<vf32<W>>(bit_cast_v<vu32<W>>(sin_val) ^ sin_flip);
+
+    vi32<W> not_finite = !(ax < pos_inf_v<W>());
+    sin_val = select_v<W>(x == splat_f<W>(0.0f), x, sin_val);
+    return select_v<W>(not_finite, qnan_v<W>(), sin_val);
+}
+
+template <int W>
+inline vf32<W> cos_v(vf32<W> x) {
+    constexpr float kOneOverPi = 0.3183098861837907f;
+    constexpr float kPi_1 = 3.140625f;              // 0x40490000
+    constexpr float kPi_2 = 9.675025939941406e-4f;  // 0x3a7d8000
+    constexpr float kPi_3 = 1.5099067241607776e-7f; // 0x34222000
+    constexpr float kPi_4 = 5.126688136514179e-12f; // remainder
+
+    vf32<W> ax = abs_v<W>(x);
+    vf32<W> sx = select_v<W>(ax < splat_f<W>(1.0e6f), ax, splat_f<W>(0.0f));
+
+    vf32<W> qf = __builtin_elementwise_rint(sx * splat_f<W>(kOneOverPi) - splat_f<W>(0.5f));
+    vi32<W> q = __builtin_convertvector(qf, vi32<W>);
+    vf32<W> qcf = qf + splat_f<W>(0.5f);
+
+    vf32<W> r = sx - qcf * splat_f<W>(kPi_1);
+    r = r - qcf * splat_f<W>(kPi_2);
+    r = r - qcf * splat_f<W>(kPi_3);
+    r = r - qcf * splat_f<W>(kPi_4);
+
+    vf32<W> cos_val = sin_poly_half_pi_v<W>(r);
+    vu32<W> cos_flip = bit_cast_v<vu32<W>>(((q + splat_i<W>(1)) & splat_i<W>(1)) << 31);
+    cos_val = bit_cast_v<vf32<W>>(bit_cast_v<vu32<W>>(cos_val) ^ cos_flip);
+
+    vi32<W> not_finite = !(ax < pos_inf_v<W>());
+    return select_v<W>(not_finite, qnan_v<W>(), cos_val);
+}
+
+template <int W>
 inline void sincos_v(vf32<W> x, vf32<W>& out_sin, vf32<W>& out_cos) {
     // 4-part Cody-Waite pi/2 constants with 12 trailing zero mantissa bits on c1..c3
     constexpr float kTwoOverPi = 0.63661977236758134f;
@@ -399,14 +467,10 @@ inline vf32<W> tanh_v(vf32<W> x) {
         *out = log2_v<W>(*in);                                                        \
     }                                                                                 \
     void nacelle_math_v##W##_sinf(vf32<W>* out, const vf32<W>* in) {                  \
-        vf32<W> s, c;                                                                 \
-        sincos_v<W>(*in, s, c);                                                       \
-        *out = s;                                                                     \
+        *out = sin_v<W>(*in);                                                         \
     }                                                                                 \
     void nacelle_math_v##W##_cosf(vf32<W>* out, const vf32<W>* in) {                  \
-        vf32<W> s, c;                                                                 \
-        sincos_v<W>(*in, s, c);                                                       \
-        *out = c;                                                                     \
+        *out = cos_v<W>(*in);                                                         \
     }                                                                                 \
     void nacelle_math_v##W##_tanf(vf32<W>* out, const vf32<W>* in) {                  \
         vf32<W> s, c;                                                                 \
