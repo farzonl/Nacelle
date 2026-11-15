@@ -416,7 +416,10 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     mlir::Value vbSizeVec,
     mlir::Value idxVec,
     uint32_t byteOffsetInElem,
-    uint8_t neededColsMask) {
+    uint8_t neededColsMask,
+    llvm::ArrayRef<mlir::Value> preloadedWords = {},
+    uint32_t preloadedBaseOff = 0,
+    mlir::Value preloadedLaneOkMask = mlir::Value()) {
     PredecodedVertexElement res;
     res.valid = true;
     mlir::OpBuilder& b = h.b;
@@ -439,23 +442,43 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     if (neededColsMask == 0) return res;
 
     uint32_t fmtBytes = formatByteSizeForVertex(el.Format);
-    mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), idxVec);
-    mlir::Value str64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbStrideVec);
-    mlir::Value off64Vec = mlir::LLVM::AddOp::create(
-        b, loc,
-        mlir::LLVM::MulOp::create(b, loc, idx64Vec, str64Vec),
-        h.splatInt(i64Ty, byteOffsetInElem));
-    mlir::Value end64Vec = mlir::LLVM::AddOp::create(b, loc, off64Vec, h.splatInt(i64Ty, fmtBytes));
-    mlir::Value sz64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbSizeVec);
-    mlir::Value inBoundsVec = mlir::LLVM::ICmpOp::create(
-        b, loc, mlir::LLVM::ICmpPredicate::ule, end64Vec, sz64Vec);
-    mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
-        b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtr, mlir::LLVM::ZeroOp::create(b, loc, ptrTy));
-    mlir::Value ptrNotNullVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getElementType(), ptrNotNull, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getNumElements());
-    mlir::Value laneOkMask = mlir::LLVM::AndOp::create(
-        b, loc, mlir::LLVM::AndOp::create(b, loc, activeMask, ptrNotNullVec), inBoundsVec);
+    const bool usePreloaded = !preloadedWords.empty();
+    mlir::Value off64Vec;
+    mlir::Value laneOkMask = preloadedLaneOkMask;
+    if (!usePreloaded) {
+        mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), idxVec);
+        mlir::Value str64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbStrideVec);
+        off64Vec = mlir::LLVM::AddOp::create(
+            b, loc,
+            mlir::LLVM::MulOp::create(b, loc, idx64Vec, str64Vec),
+            h.splatInt(i64Ty, byteOffsetInElem));
+        mlir::Value end64Vec = mlir::LLVM::AddOp::create(b, loc, off64Vec, h.splatInt(i64Ty, fmtBytes));
+        mlir::Value sz64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbSizeVec);
+        mlir::Value inBoundsVec = mlir::LLVM::ICmpOp::create(
+            b, loc, mlir::LLVM::ICmpPredicate::ule, end64Vec, sz64Vec);
+        mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
+            b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtr, mlir::LLVM::ZeroOp::create(b, loc, ptrTy));
+        mlir::Value ptrNotNullVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getElementType(), ptrNotNull, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getNumElements());
+        laneOkMask = mlir::LLVM::AndOp::create(
+            b, loc, mlir::LLVM::AndOp::create(b, loc, activeMask, ptrNotNullVec), inBoundsVec);
+    }
 
     auto gatherElem = [&](mlir::Type elemTy, int64_t deltaBytes, mlir::Value passThruVec) -> mlir::Value {
+        if (usePreloaded && (elemTy == i32Ty || elemTy == f32Ty) &&
+            byteOffsetInElem + deltaBytes >= preloadedBaseOff &&
+            ((byteOffsetInElem + deltaBytes - preloadedBaseOff) % 4) == 0) {
+            size_t wordIdx = static_cast<size_t>((byteOffsetInElem + deltaBytes - preloadedBaseOff) / 4);
+            if (wordIdx < preloadedWords.size()) {
+                mlir::Value w = preloadedWords[wordIdx];
+                if (elemTy == f32Ty) {
+                    w = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(f32Ty), w);
+                    if (passThruVec == oneF32) {
+                        w = mlir::LLVM::SelectOp::create(b, loc, laneOkMask, w, oneF32);
+                    }
+                }
+                return w;
+            }
+        }
         mlir::Value compBase = h.gepBytes(vbBasePtr, deltaBytes);
         mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
             b, loc, h.vecTy(ptrTy), i8Ty, compBase, mlir::ValueRange{off64Vec});
@@ -850,22 +873,138 @@ bool emitVertexStageFunction(
     mlir::Value vbBasePtrs[16]{};
     mlir::Value vbStrideVecs[16]{};
     mlir::Value vbSizeVecs[16]{};
+
+    struct CoalescedSlotData {
+        bool valid = false;
+        uint32_t baseByteOff = 0;
+        mlir::Value laneOkMask;
+        llvm::SmallVector<mlir::Value, 16> words;
+    };
+    CoalescedSlotData coalescedSlots[16];
+
+    for (UINT slot = 0; slot < 16; ++slot) {
+        bool anyNeeded = false;
+        bool allPerVertex4Aligned = true;
+        uint32_t minOff = UINT32_MAX;
+        uint32_t maxEnd = 0;
+        uint32_t elemCount = 0;
+        for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
+            if (elemNeededCols[i] == 0) continue;
+            const auto& el = inputLayout.pInputElementDescs[i];
+            if (std::min<UINT>(el.InputSlot, 15) != slot) continue;
+            anyNeeded = true;
+            ++elemCount;
+            uint32_t fmtBytes = formatByteSizeForVertex(el.Format);
+            if (el.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA ||
+                (elementByteOffsets[i] % 4) != 0 || (fmtBytes % 4) != 0 || fmtBytes == 0) {
+                allPerVertex4Aligned = false;
+                break;
+            }
+            minOff = std::min(minOff, elementByteOffsets[i]);
+            maxEnd = std::max(maxEnd, elementByteOffsets[i] + fmtBytes);
+        }
+        if (!anyNeeded) continue;
+
+        mlir::Value addrInt = h.loadScalar(
+            h.i64Ty(), h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_buffers) + slot * 8)));
+        vbBasePtrs[slot] = mlir::LLVM::IntToPtrOp::create(b, loc, ptrTy, addrInt);
+        mlir::Value str32 = h.loadScalar(
+            i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_strides) + slot * 4)));
+        mlir::Value sz32 = h.loadScalar(
+            i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_sizes) + slot * 4)));
+        vbStrideVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), str32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
+        vbSizeVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), sz32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
+
+        uint32_t spanBytes = (maxEnd > minOff) ? (maxEnd - minOff) : 0;
+        if (allPerVertex4Aligned && spanBytes >= 8 && spanBytes <= 64 && elemCount >= 1) {
+            uint32_t numWords = spanBytes / 4;
+            mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(h.i64Ty()), vidVec);
+            mlir::Value str64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(h.i64Ty()), vbStrideVecs[slot]);
+            mlir::Value off64Vec = mlir::LLVM::MulOp::create(b, loc, idx64Vec, str64Vec);
+            mlir::Value end64Vec = mlir::LLVM::AddOp::create(b, loc, off64Vec, h.splatInt(h.i64Ty(), maxEnd));
+            mlir::Value sz64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(h.i64Ty()), vbSizeVecs[slot]);
+            mlir::Value inBoundsVec = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::ule, end64Vec, sz64Vec);
+            mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
+                b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtrs[slot], mlir::LLVM::ZeroOp::create(b, loc, ptrTy));
+            mlir::Value ptrNotNullVec = llvmSplat(
+                b, loc, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getElementType(), ptrNotNull, simdWidth);
+            mlir::Value slotOkMask = mlir::LLVM::AndOp::create(
+                b, loc, mlir::LLVM::AndOp::create(b, loc, activeMask, ptrNotNullVec), inBoundsVec);
+
+            mlir::Value allOk = mlir::LLVM::vector_reduce_and::create(b, loc, h.i1Ty(), slotOkMask);
+            mlir::Value zeroI32Splat = h.splatInt(i32Ty, 0);
+            llvm::SmallVector<mlir::Type, 16> resTypes(numWords, h.vecTy(i32Ty));
+
+            auto emitLaneLoads = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value baseOff64,
+                                     llvm::SmallVectorImpl<mlir::Value>& outWordVecs, uint32_t lane) {
+                IRHelpers lh{lb, lloc, simdWidth};
+                mlir::Value vtxPtr = lh.gepBytesDyn(
+                    vbBasePtrs[slot],
+                    mlir::LLVM::AddOp::create(lb, lloc, baseOff64, lh.cInt(h.i64Ty(), minOff)));
+                uint32_t w = 0;
+                while (w < numWords) {
+                    uint32_t rem = numWords - w;
+                    uint32_t chunk = (rem >= 4) ? 4 : ((rem >= 2) ? 2 : 1);
+                    mlir::Value ptr = (w == 0) ? vtxPtr : lh.gepBytes(vtxPtr, static_cast<int64_t>(w * 4));
+                    if (chunk == 1) {
+                        mlir::Value val = mlir::LLVM::LoadOp::create(lb, lloc, i32Ty, ptr, /*alignment=*/4);
+                        outWordVecs[w] = llvmInsert(lb, lloc, outWordVecs[w], val, lane);
+                    } else {
+                        auto cTy = mlir::VectorType::get({static_cast<int64_t>(chunk)}, i32Ty);
+                        mlir::Value cVal = mlir::LLVM::LoadOp::create(lb, lloc, cTy, ptr, /*alignment=*/4);
+                        for (uint32_t k = 0; k < chunk; ++k) {
+                            mlir::Value elem = llvmExtract(lb, lloc, cVal, k);
+                            outWordVecs[w + k] = llvmInsert(lb, lloc, outWordVecs[w + k], elem, lane);
+                        }
+                    }
+                    w += chunk;
+                }
+            };
+
+            auto ifOp = mlir::scf::IfOp::create(b, loc, resTypes, allOk, /*withElseRegion=*/true);
+            {
+                mlir::OpBuilder::InsertionGuard g(b);
+                b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+                llvm::SmallVector<mlir::Value, 16> wordVecs(numWords, mlir::LLVM::PoisonOp::create(b, loc, h.vecTy(i32Ty)));
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value offL = llvmExtract(b, loc, off64Vec, l);
+                    emitLaneLoads(b, loc, offL, wordVecs, l);
+                }
+                mlir::scf::YieldOp::create(b, loc, wordVecs);
+
+                b.setInsertionPointToStart(&ifOp.getElseRegion().front());
+                llvm::SmallVector<mlir::Value, 16> elseVecs(numWords, zeroI32Splat);
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value mL = llvmExtract(b, loc, slotOkMask, l);
+                    auto laneIf = mlir::scf::IfOp::create(b, loc, resTypes, mL, /*withElseRegion=*/true);
+                    {
+                        mlir::OpBuilder::InsertionGuard lg(b);
+                        b.setInsertionPointToStart(&laneIf.getThenRegion().front());
+                        llvm::SmallVector<mlir::Value, 16> cur = elseVecs;
+                        mlir::Value offL = llvmExtract(b, loc, off64Vec, l);
+                        emitLaneLoads(b, loc, offL, cur, l);
+                        mlir::scf::YieldOp::create(b, loc, cur);
+
+                        b.setInsertionPointToStart(&laneIf.getElseRegion().front());
+                        mlir::scf::YieldOp::create(b, loc, elseVecs);
+                    }
+                    elseVecs.assign(laneIf.getResults().begin(), laneIf.getResults().end());
+                }
+                mlir::scf::YieldOp::create(b, loc, elseVecs);
+            }
+
+            coalescedSlots[slot].valid = true;
+            coalescedSlots[slot].baseByteOff = minOff;
+            coalescedSlots[slot].laneOkMask = slotOkMask;
+            coalescedSlots[slot].words.assign(ifOp.getResults().begin(), ifOp.getResults().end());
+        }
+    }
+
     std::vector<PredecodedVertexElement> predecodedElems(inputLayout.NumElements);
     for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
         if (elemNeededCols[i] == 0) continue;
         const auto& el = inputLayout.pInputElementDescs[i];
         UINT slot = std::min<UINT>(el.InputSlot, 15);
-        if (!vbBasePtrs[slot]) {
-            mlir::Value addrInt = h.loadScalar(
-                h.i64Ty(), h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_buffers) + slot * 8)));
-            vbBasePtrs[slot] = mlir::LLVM::IntToPtrOp::create(b, loc, ptrTy, addrInt);
-            mlir::Value str32 = h.loadScalar(
-                i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_strides) + slot * 4)));
-            mlir::Value sz32 = h.loadScalar(
-                i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_sizes) + slot * 4)));
-            vbStrideVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), str32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-            vbSizeVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), sz32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-        }
         mlir::Value idxVec = vidVec;
         if (el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) {
             if (el.InstanceDataStepRate == 0) {
@@ -877,9 +1016,16 @@ bool emitVertexStageFunction(
                     b, loc, iidVec, h.splatInt(i32Ty, el.InstanceDataStepRate));
             }
         }
-        predecodedElems[i] = predecodeVertexElementSIMD(
-            h, el, activeMask, vbBasePtrs[slot], vbStrideVecs[slot], vbSizeVecs[slot],
-            idxVec, elementByteOffsets[i], elemNeededCols[i]);
+        if (coalescedSlots[slot].valid) {
+            predecodedElems[i] = predecodeVertexElementSIMD(
+                h, el, activeMask, vbBasePtrs[slot], vbStrideVecs[slot], vbSizeVecs[slot],
+                idxVec, elementByteOffsets[i], elemNeededCols[i],
+                coalescedSlots[slot].words, coalescedSlots[slot].baseByteOff, coalescedSlots[slot].laneOkMask);
+        } else {
+            predecodedElems[i] = predecodeVertexElementSIMD(
+                h, el, activeMask, vbBasePtrs[slot], vbStrideVecs[slot], vbSizeVecs[slot],
+                idxVec, elementByteOffsets[i], elemNeededCols[i]);
+        }
     }
 
     StageHooks vsHooks;
