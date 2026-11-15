@@ -3826,14 +3826,32 @@ private:
 
         mlir::Value uniformIdx;
         if (h.isUniform() && tryGetUniformScalar(loc, idxArg, uniformIdx)) {
+            auto idxConst = getConstIntValue(idxArg);
+            mlir::Block* entryBlock = getFuncEntryBlock();
+            const bool canHoistToEntry = idxConst.has_value() && (entryBlock != nullptr) &&
+                                         (h.lanes[0].getParentBlock() == entryBlock);
+            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
+
+            mlir::OpBuilder::InsertionGuard guard(b_);
+            if (canHoistToEntry) {
+                if (auto* okDef = info.okPtr.getDefiningOp()) {
+                    b_.setInsertionPointAfter(okDef);
+                } else if (auto* baseDef = info.basePtr.getDefiningOp()) {
+                    b_.setInsertionPointAfter(baseDef);
+                } else if (auto* descDef = info.descP.getDefiningOp()) {
+                    b_.setInsertionPointAfter(descDef);
+                } else {
+                    b_.setInsertionPointToStart(entryBlock);
+                }
+            }
+
             mlir::Value byteOff;
-            if (auto idxConst = getConstIntValue(idxArg)) {
+            if (idxConst) {
                 byteOff = cInt(loc, i64Ty(), isLegacy ? (*idxConst * 16) : *idxConst);
             } else {
                 mlir::Value idx64 = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), uniformIdx);
                 byteOff = isLegacy ? mlir::Value(mlir::LLVM::MulOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
             }
-            BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
             auto [compVecs, _] = emitCoalescedUniformBufferLoad(
                 loc, elemTy, elemBytes, info, h.isRootConstants, /*nonStraddling=*/false, byteOff, numFields, activeComps,
                 /*isFlatCBV=*/true);
@@ -6189,7 +6207,7 @@ private:
                     return true;
                 };
                 auto flushDenormF = [&](mlir::Value v) -> mlir::Value {
-                    if (!resTy.isF32()) return v;
+                    if (!strictFp_ || !resTy.isF32()) return v;
                     mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
                     mlir::Value absBits = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
                     mlir::Value isDenorm = mlir::LLVM::ICmpOp::create(
@@ -6214,7 +6232,7 @@ private:
         };
 
         auto flushDenormF = [&](mlir::Value v) -> mlir::Value {
-            if (!resTy.isF32()) return v;
+            if (!strictFp_ || !resTy.isF32()) return v;
             mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
             mlir::Value absBits = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
             mlir::Value isDenorm = mlir::LLVM::ICmpOp::create(
