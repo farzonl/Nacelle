@@ -28,6 +28,7 @@
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/FMF.h>
 #include <llvm/IR/GlobalValue.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -58,10 +59,12 @@
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Conversion/UBToLLVM/UBToLLVM.h>
 #include <mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/SymbolTable.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Target/LLVMIR/Export.h>
 #include <mlir/Transforms/Passes.h>
@@ -70,6 +73,7 @@
 #include "mlir_pipeline.h"
 #include "simt_to_simd_pass.h"
 #include "compiler_version.h"
+#include "math_simd_bc.h"
 #include "texture_sampler_bc.h"
 
 namespace nacelle {
@@ -410,6 +414,18 @@ bool emitObjectBytesO3(
     llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     mpm.run(mod, mam);
 
+    if (const char* dumpEnv = std::getenv("NACELLE_DUMP_IR"); dumpEnv && dumpEnv[0] == '1') {
+        static std::atomic<uint64_t> postSeq{0};
+        uint64_t seq = postSeq.fetch_add(1, std::memory_order_relaxed);
+        std::string path = "/tmp/nacelle_ir_" + std::to_string(seq) + "_post_o3.ll";
+        std::error_code ec;
+        llvm::raw_fd_ostream os(path, ec);
+        if (!ec) {
+            mod.print(os, nullptr);
+            std::fprintf(stderr, "[nacelle] dumped post-O3 LLVM IR: %s\n", path.c_str());
+        }
+    }
+
     llvm::legacy::PassManager codegenPM;
     llvm::raw_svector_ostream objStream(outObjBytes);
     if (tm->addPassesToEmitFile(codegenPM, objStream, nullptr, llvm::CodeGenFileType::ObjectFile)) {
@@ -724,10 +740,29 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
     std::string& outError) {
+    const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
+    const bool strictFp = strictFpEnv && strictFpEnv[0] == '1';
+
     // Upstream MLIR's ConvertMathToLLVMPass lowers math.isnan and math.isfinite
     // to LLVM::IsFPClass, but omits math.isinf and math.isnormal, which would
     // otherwise be rejected as illegal by ConvertMathToLibmPass.
-    mlirMod.walk([](mlir::Operation* op) {
+    // Also, when !strictFp, rewrite vector<W x f32> transcendental math.* ops to
+    // our freestanding SIMD polynomial approximations in math_simd.bc.
+    mlir::SymbolTable symTable(mlirMod);
+    auto getOrInsertMathFn = [&](llvm::StringRef fnName, mlir::Type vecTy) -> mlir::func::FuncOp {
+        if (auto existing = symTable.lookup<mlir::func::FuncOp>(fnName)) {
+            return existing;
+        }
+        mlir::OpBuilder mb(mlirMod.getContext());
+        mb.setInsertionPointToStart(mlirMod.getBody());
+        auto fnTy = mb.getFunctionType({vecTy}, {vecTy});
+        auto fnOp = mlir::func::FuncOp::create(mb, mlirMod.getLoc(), fnName, fnTy);
+        fnOp.setPrivate();
+        symTable.insert(fnOp);
+        return fnOp;
+    };
+
+    mlirMod.walk([&](mlir::Operation* op) {
         if (auto isInf = llvm::dyn_cast<mlir::math::IsInfOp>(op)) {
             mlir::OpBuilder b(isInf);
             auto repl = mlir::LLVM::IsFPClass::create(
@@ -735,14 +770,49 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
                 isInf.getOperand(), static_cast<uint32_t>(llvm::fcInf));
             isInf.replaceAllUsesWith(repl.getRes());
             isInf.erase();
-        } else if (auto isNorm = llvm::dyn_cast<mlir::math::IsNormalOp>(op)) {
+            return;
+        }
+        if (auto isNorm = llvm::dyn_cast<mlir::math::IsNormalOp>(op)) {
             mlir::OpBuilder b(isNorm);
             auto repl = mlir::LLVM::IsFPClass::create(
                 b, isNorm.getLoc(), isNorm.getResult().getType(),
                 isNorm.getOperand(), static_cast<uint32_t>(llvm::fcNormal));
             isNorm.replaceAllUsesWith(repl.getRes());
             isNorm.erase();
+            return;
         }
+        if (strictFp || op->getNumOperands() != 1 || op->getNumResults() != 1) {
+            return;
+        }
+        auto vt = llvm::dyn_cast<mlir::VectorType>(op->getResult(0).getType());
+        if (!vt || vt.getRank() != 1 || !vt.getElementType().isF32()) {
+            return;
+        }
+        int64_t w = vt.getNumElements();
+        if (w != 4 && w != 8 && w != 16) {
+            return;
+        }
+        const char* suffix = nullptr;
+        if (llvm::isa<mlir::math::Exp2Op>(op)) suffix = "exp2f";
+        else if (llvm::isa<mlir::math::Log2Op>(op)) suffix = "log2f";
+        else if (llvm::isa<mlir::math::SinOp>(op)) suffix = "sinf";
+        else if (llvm::isa<mlir::math::CosOp>(op)) suffix = "cosf";
+        else if (llvm::isa<mlir::math::TanOp>(op)) suffix = "tanf";
+        else if (llvm::isa<mlir::math::AsinOp>(op)) suffix = "asinf";
+        else if (llvm::isa<mlir::math::AcosOp>(op)) suffix = "acosf";
+        else if (llvm::isa<mlir::math::AtanOp>(op)) suffix = "atanf";
+        else if (llvm::isa<mlir::math::SinhOp>(op)) suffix = "sinhf";
+        else if (llvm::isa<mlir::math::CoshOp>(op)) suffix = "coshf";
+        else if (llvm::isa<mlir::math::TanhOp>(op)) suffix = "tanhf";
+        if (!suffix) {
+            return;
+        }
+        std::string fnName = "nacelle_math_v" + std::to_string(w) + "_" + suffix;
+        mlir::func::FuncOp callee = getOrInsertMathFn(fnName, vt);
+        mlir::OpBuilder b(op);
+        auto call = mlir::func::CallOp::create(b, op->getLoc(), callee, op->getOperands());
+        op->replaceAllUsesWith(call.getResults());
+        op->erase();
     });
 
     mlir::PassManager pm(mlirMod.getContext());
@@ -770,42 +840,103 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     llvmMod->setTargetTriple(llvm::Triple(getHostTargetTripleString()));
     llvmMod->setDataLayout(getHostDataLayoutString());
 
-    bool needsTexRuntime = false;
-    for (const llvm::Function& f : *llvmMod) {
-        if (f.isDeclaration() && f.getName().starts_with("nacelle_tex_")) {
-            needsTexRuntime = true;
-            break;
+    // Rewrite vector-by-value `nacelle_math_v<W>_*` declarations/calls to ABI-neutral
+    // `void(ptr out, ptr in)` so `AlwaysInlinerPass` matches `math_simd.bc` on all targets.
+    {
+        llvm::SmallVector<llvm::Function*, 16> mathDecls;
+        for (llvm::Function& f : *llvmMod) {
+            if (f.isDeclaration() && f.getName().starts_with("nacelle_math_")) {
+                mathDecls.push_back(&f);
+            }
+        }
+        if (!mathDecls.empty()) {
+            llvm::Type* voidTy = llvm::Type::getVoidTy(llvmCtx);
+            llvm::Type* ptrTy = llvm::PointerType::getUnqual(llvmCtx);
+            llvm::FunctionType* ptrFnTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+            for (llvm::Function* oldDecl : mathDecls) {
+                std::string name = oldDecl->getName().str();
+                oldDecl->setName(name + ".vec_stub");
+                llvm::FunctionCallee newCallee = llvmMod->getOrInsertFunction(name, ptrFnTy);
+                llvm::SmallVector<llvm::CallInst*, 16> calls;
+                for (llvm::User* u : oldDecl->users()) {
+                    if (auto* ci = llvm::dyn_cast<llvm::CallInst>(u)) {
+                        calls.push_back(ci);
+                    }
+                }
+                for (llvm::CallInst* ci : calls) {
+                    llvm::Function* caller = ci->getFunction();
+                    llvm::IRBuilder<> eb(&caller->getEntryBlock().front());
+                    llvm::Type* vecTy = ci->getType();
+                    llvm::AllocaInst* inSlot = eb.CreateAlloca(vecTy, nullptr, "math.in");
+                    llvm::AllocaInst* outSlot = eb.CreateAlloca(vecTy, nullptr, "math.out");
+                    llvm::IRBuilder<> cb(ci);
+                    cb.CreateStore(ci->getArgOperand(0), inSlot);
+                    cb.CreateCall(newCallee, {outSlot, inSlot});
+                    llvm::Value* loaded = cb.CreateLoad(vecTy, outSlot, "math.res");
+                    ci->replaceAllUsesWith(loaded);
+                    ci->eraseFromParent();
+                }
+                oldDecl->eraseFromParent();
+            }
         }
     }
 
-    if (needsTexRuntime) {
+    auto linkRuntimeBitcode = [&](const unsigned char* bcData, size_t bcSize,
+                                  llvm::StringRef modName, llvm::StringRef fnPrefix) -> bool {
+        bool needed = false;
+        for (const llvm::Function& f : *llvmMod) {
+            if (f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) return true;
+
         auto bcBuf = llvm::MemoryBuffer::getMemBuffer(
-            llvm::StringRef(reinterpret_cast<const char*>(kTextureSamplerBitcode), kTextureSamplerBitcode_size),
-            "texture_sampler.bc",
-            false);
+            llvm::StringRef(reinterpret_cast<const char*>(bcData), bcSize), modName, false);
         auto bcModOrErr = llvm::parseBitcodeFile(bcBuf->getMemBufferRef(), llvmCtx);
         if (!bcModOrErr) {
-            outError = "Failed to parse embedded texture_sampler.bc: " + llvm::toString(bcModOrErr.takeError());
-            return nullptr;
+            outError = "Failed to parse embedded " + modName.str() + ": " + llvm::toString(bcModOrErr.takeError());
+            return false;
         }
         std::unique_ptr<llvm::Module> bcMod = std::move(*bcModOrErr);
         bcMod->setTargetTriple(llvmMod->getTargetTriple());
         bcMod->setDataLayout(llvmMod->getDataLayout());
 
         if (llvm::Linker::linkModules(*llvmMod, std::move(bcMod), llvm::Linker::Flags::LinkOnlyNeeded)) {
-            outError = "llvm::Linker failed linking texture_sampler.bc";
-            return nullptr;
+            outError = "llvm::Linker failed linking " + modName.str();
+            return false;
         }
 
         for (llvm::Function& f : *llvmMod) {
-            if (!f.isDeclaration() && f.getName().starts_with("nacelle_tex_")) {
+            if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
                 f.setLinkage(llvm::GlobalValue::InternalLinkage);
+                f.removeFnAttr("target-cpu");
+                f.removeFnAttr("target-features");
+                f.removeFnAttr("tune-cpu");
                 if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
                     f.addFnAttr(llvm::Attribute::AlwaysInline);
                 }
             }
         }
+        return true;
+    };
 
+    if (!linkRuntimeBitcode(kTextureSamplerBitcode, kTextureSamplerBitcode_size, "texture_sampler.bc", "nacelle_tex_")) {
+        return nullptr;
+    }
+    if (!linkRuntimeBitcode(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
+        return nullptr;
+    }
+
+    bool needsAlwaysInline = false;
+    for (const llvm::Function& f : *llvmMod) {
+        if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+            needsAlwaysInline = true;
+            break;
+        }
+    }
+    if (needsAlwaysInline) {
         llvm::LoopAnalysisManager lam;
         llvm::FunctionAnalysisManager fam;
         llvm::CGSCCAnalysisManager cgam;
@@ -836,6 +967,18 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     }
 #endif
+
+    if (const char* dumpEnv = std::getenv("NACELLE_DUMP_IR"); dumpEnv && dumpEnv[0] == '1') {
+        static std::atomic<uint64_t> preSeq{0};
+        uint64_t seq = preSeq.fetch_add(1, std::memory_order_relaxed);
+        std::string path = "/tmp/nacelle_ir_" + std::to_string(seq) + "_pre_o3.ll";
+        std::error_code ec;
+        llvm::raw_fd_ostream os(path, ec);
+        if (!ec) {
+            llvmMod->print(os, nullptr);
+            std::fprintf(stderr, "[nacelle] dumped pre-O3 LLVM IR: %s\n", path.c_str());
+        }
+    }
 
     return llvmMod;
 }
