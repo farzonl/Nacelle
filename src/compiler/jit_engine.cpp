@@ -800,8 +800,9 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         for (llvm::Function& f : *llvmMod) {
             if (!f.isDeclaration() && f.getName().starts_with("nacelle_tex_")) {
                 f.setLinkage(llvm::GlobalValue::InternalLinkage);
-                f.removeFnAttr(llvm::Attribute::NoInline);
-                f.addFnAttr(llvm::Attribute::AlwaysInline);
+                if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
+                    f.addFnAttr(llvm::Attribute::AlwaysInline);
+                }
             }
         }
 
