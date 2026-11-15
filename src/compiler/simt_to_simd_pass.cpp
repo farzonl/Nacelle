@@ -3212,6 +3212,15 @@ private:
             return v;
         };
 
+        auto getScopeThreadsAndTid = [&](const LinAlgMatrixMeta& meta) -> std::pair<uint32_t, mlir::Value> {
+            uint32_t totalGroupThreads =
+                std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
+            if (meta.scope == 1) {
+                return {std::min(W_, totalGroupThreads), laneIdxVec()};
+            }
+            return {totalGroupThreads, hooks_.flatGroupId};
+        };
+
         switch (op) {
         case 333: { // LinAlgMatrixQueryAccumulatorLayout() -> i32
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
@@ -3438,10 +3447,7 @@ private:
                 setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), total), {}, {}});
                 return true;
             }
-            uint32_t groupThreads = (meta.scope == 1)
-                                        ? W_
-                                        : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
-            mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+            auto [groupThreads, tidVec] = getScopeThreadsAndTid(meta);
             mlir::Value totalV = splatInt(loc, i32Ty(), total);
             mlir::Value grpV = splatInt(loc, i32Ty(), groupThreads);
             mlir::Value hasAny = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, tidVec, totalV);
@@ -3461,10 +3467,7 @@ private:
             mlir::Value idxVec = asVec(loc, getMapped(loc, arg(2)));
             mlir::Value linearVec = idxVec;
             if (meta.scope != 0) {
-                uint32_t groupThreads = (meta.scope == 1)
-                                            ? W_
-                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
-                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                auto [groupThreads, tidVec] = getScopeThreadsAndTid(meta);
                 linearVec = mlir::LLVM::AddOp::create(
                     b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
             }
@@ -3489,10 +3492,7 @@ private:
             mlir::Value idxVec = asVec(loc, getMapped(loc, arg(2)));
             mlir::Value linearVec = idxVec;
             if (meta.scope != 0) {
-                uint32_t groupThreads = (meta.scope == 1)
-                                            ? W_
-                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
-                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                auto [groupThreads, tidVec] = getScopeThreadsAndTid(meta);
                 linearVec = mlir::LLVM::AddOp::create(
                     b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
             }
@@ -3524,10 +3524,7 @@ private:
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(3)));
             mlir::Value linearVec = idxVec;
             if (meta.scope != 0) {
-                uint32_t groupThreads = (meta.scope == 1)
-                                            ? W_
-                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
-                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                auto [groupThreads, tidVec] = getScopeThreadsAndTid(meta);
                 linearVec = mlir::LLVM::AddOp::create(
                     b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
             }
