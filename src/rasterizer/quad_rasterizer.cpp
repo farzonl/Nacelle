@@ -138,31 +138,59 @@ void storeTileRTV(
     uint8_t* base = rtv.resource->basePtr() + sub.offset + static_cast<size_t>(sampleIdx) * sub.slice_pitch;
     const uint32_t rowPitch = sub.row_pitch;
 
-    if (rtv.format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-        for (uint32_t ty = 0; ty < tileH; ++ty) {
-            uint8_t* row = base + static_cast<size_t>(tileOriginY + ty) * rowPitch + static_cast<size_t>(tileOriginX) * 4;
-            for (uint32_t tx = 0; tx < tileW; ++tx) {
-                uint32_t pixIdx = quadSwizzlePixel(tx, ty);
-                uint8_t* p = row + tx * 4;
-                p[0] = static_cast<uint8_t>(std::clamp(srcSOA[0 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[1] = static_cast<uint8_t>(std::clamp(srcSOA[1 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[2] = static_cast<uint8_t>(std::clamp(srcSOA[2 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[3] = static_cast<uint8_t>(std::clamp(srcSOA[3 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
+    auto packUnorm8 = [](float v) -> uint32_t {
+        float c = (v < 0.0f) ? 0.0f : ((v > 1.0f) ? 1.0f : v);
+        return static_cast<uint32_t>(c * 255.0f + 0.5f);
+    };
+
+    if (rtv.format == DXGI_FORMAT_R8G8B8A8_UNORM || rtv.format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        const bool isBGRA = (rtv.format == DXGI_FORMAT_B8G8R8A8_UNORM);
+        const uint32_t c0 = isBGRA ? 2u : 0u;
+        const uint32_t c2 = isBGRA ? 0u : 2u;
+        const float* src0 = srcSOA + c0 * kTilePixels;
+        const float* src1 = srcSOA + 1 * kTilePixels;
+        const float* src2 = srcSOA + c2 * kTilePixels;
+        const float* src3 = srcSOA + 3 * kTilePixels;
+
+        uint32_t ty = 0;
+        for (; ty + 1 < tileH; ty += 2) {
+            uint8_t* row0 = base + static_cast<size_t>(tileOriginY + ty) * rowPitch + static_cast<size_t>(tileOriginX) * 4;
+            uint8_t* row1 = row0 + rowPitch;
+            uint32_t quadRowBase = (ty >> 1) * (kTileSize / 2u);
+            uint32_t tx = 0;
+            for (; tx + 1 < tileW; tx += 2) {
+                uint32_t pixBase = (quadRowBase + (tx >> 1)) << 2;
+                uint32_t p00 = packUnorm8(src0[pixBase + 0]) | (packUnorm8(src1[pixBase + 0]) << 8) |
+                               (packUnorm8(src2[pixBase + 0]) << 16) | (packUnorm8(src3[pixBase + 0]) << 24);
+                uint32_t p10 = packUnorm8(src0[pixBase + 1]) | (packUnorm8(src1[pixBase + 1]) << 8) |
+                               (packUnorm8(src2[pixBase + 1]) << 16) | (packUnorm8(src3[pixBase + 1]) << 24);
+                uint32_t p01 = packUnorm8(src0[pixBase + 2]) | (packUnorm8(src1[pixBase + 2]) << 8) |
+                               (packUnorm8(src2[pixBase + 2]) << 16) | (packUnorm8(src3[pixBase + 2]) << 24);
+                uint32_t p11 = packUnorm8(src0[pixBase + 3]) | (packUnorm8(src1[pixBase + 3]) << 8) |
+                               (packUnorm8(src2[pixBase + 3]) << 16) | (packUnorm8(src3[pixBase + 3]) << 24);
+                std::memcpy(row0 + tx * 4, &p00, 4);
+                std::memcpy(row0 + (tx + 1) * 4, &p10, 4);
+                std::memcpy(row1 + tx * 4, &p01, 4);
+                std::memcpy(row1 + (tx + 1) * 4, &p11, 4);
+            }
+            if (tx < tileW) {
+                uint32_t pix0 = quadSwizzlePixel(tx, ty);
+                uint32_t pix1 = quadSwizzlePixel(tx, ty + 1);
+                uint32_t p0 = packUnorm8(src0[pix0]) | (packUnorm8(src1[pix0]) << 8) |
+                              (packUnorm8(src2[pix0]) << 16) | (packUnorm8(src3[pix0]) << 24);
+                uint32_t p1 = packUnorm8(src0[pix1]) | (packUnorm8(src1[pix1]) << 8) |
+                              (packUnorm8(src2[pix1]) << 16) | (packUnorm8(src3[pix1]) << 24);
+                std::memcpy(row0 + tx * 4, &p0, 4);
+                std::memcpy(row1 + tx * 4, &p1, 4);
             }
         }
-        return;
-    }
-
-    if (rtv.format == DXGI_FORMAT_B8G8R8A8_UNORM) {
-        for (uint32_t ty = 0; ty < tileH; ++ty) {
+        for (; ty < tileH; ++ty) {
             uint8_t* row = base + static_cast<size_t>(tileOriginY + ty) * rowPitch + static_cast<size_t>(tileOriginX) * 4;
             for (uint32_t tx = 0; tx < tileW; ++tx) {
                 uint32_t pixIdx = quadSwizzlePixel(tx, ty);
-                uint8_t* p = row + tx * 4;
-                p[2] = static_cast<uint8_t>(std::clamp(srcSOA[0 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[1] = static_cast<uint8_t>(std::clamp(srcSOA[1 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[0] = static_cast<uint8_t>(std::clamp(srcSOA[2 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[3] = static_cast<uint8_t>(std::clamp(srcSOA[3 * kTilePixels + pixIdx], 0.0f, 1.0f) * 255.0f + 0.5f);
+                uint32_t p = packUnorm8(src0[pixIdx]) | (packUnorm8(src1[pixIdx]) << 8) |
+                             (packUnorm8(src2[pixIdx]) << 16) | (packUnorm8(src3[pixIdx]) << 24);
+                std::memcpy(row + tx * 4, &p, 4);
             }
         }
         return;
@@ -351,6 +379,19 @@ inline bool blockOverlapsTriangle(const SetupTriangle& tri, int32_t bx, int32_t 
     for (int k = 0; k < 3; ++k) {
         int32_t rx = (tri.stepX[k] >= 0) ? xMax : bx;
         int32_t ry = (tri.stepY[k] >= 0) ? yMax : by;
+        int64_t val = tri.stepX[k] * rx + tri.stepY[k] * ry + tri.base[k] + tri.bias[k];
+        if (val < 0) return false;
+    }
+    return true;
+}
+
+inline bool triangleCoversRect(const SetupTriangle& tri, int32_t bx, int32_t by, int32_t w, int32_t h) {
+    if (tri.isLine) return false;
+    int32_t xMax = bx + w - 1;
+    int32_t yMax = by + h - 1;
+    for (int k = 0; k < 3; ++k) {
+        int32_t rx = (tri.stepX[k] >= 0) ? bx : xMax;
+        int32_t ry = (tri.stepY[k] >= 0) ? by : yMax;
         int64_t val = tri.stepX[k] * rx + tri.stepY[k] * ry + tri.base[k] + tri.bias[k];
         if (val < 0) return false;
     }
@@ -671,12 +712,41 @@ void rasterizeTiles(
         uint32_t tileW = std::min<uint32_t>(kTileSize, scene.fbWidth - tileOriginX);
         uint32_t tileH = std::min<uint32_t>(kTileSize, scene.fbHeight - tileOriginY);
 
+        const auto& psoDesc = state.pso->graphicsDesc();
+        bool tileFullyCoveredNoDiscard = false;
+        if (!compiled->psUsesDiscard &&
+            !psoDesc.BlendState.AlphaToCoverageEnable &&
+            !psoDesc.DepthStencilState.DepthEnable &&
+            !psoDesc.DepthStencilState.StencilEnable &&
+            sampleCount == 1) {
+            for (uint32_t triIdx : bins[tileIdx].triIndices) {
+                const SetupTriangle& tri = scene.triangles[triIdx];
+                const uint32_t scIdx = (tri.viewportIndex < scene.numScissors) ? tri.viewportIndex : 0u;
+                const D3D12_RECT& vpScissor = scene.scissors[scIdx];
+                if (vpScissor.left <= static_cast<LONG>(tileOriginX) &&
+                    vpScissor.top <= static_cast<LONG>(tileOriginY) &&
+                    vpScissor.right >= static_cast<LONG>(tileOriginX + tileW) &&
+                    vpScissor.bottom >= static_cast<LONG>(tileOriginY + tileH) &&
+                    triangleCoversRect(tri, static_cast<int32_t>(tileOriginX), static_cast<int32_t>(tileOriginY),
+                                       static_cast<int32_t>(tileW), static_cast<int32_t>(tileH))) {
+                    tileFullyCoveredNoDiscard = true;
+                    break;
+                }
+            }
+        }
+
         for (uint32_t sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
             int32_t dx16 = 0;
             int32_t dy16 = 0;
             msaaSampleOffset16ths(sampleCount, sampleIdx, dx16, dy16);
 
             for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                const auto& rtBlend = psoDesc.BlendState.RenderTarget[psoDesc.BlendState.IndependentBlendEnable ? rt : 0];
+                const bool rtOpaqueOverwrite = !rtBlend.BlendEnable && !rtBlend.LogicOpEnable &&
+                                               ((rtBlend.RenderTargetWriteMask & 0xFu) == 0xFu);
+                if (tileFullyCoveredNoDiscard && rtOpaqueOverwrite) {
+                    continue;
+                }
                 uint32_t rtSample = (state.rtvs[rt].resource &&
                                      state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
                                         ? sampleIdx
