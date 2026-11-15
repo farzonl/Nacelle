@@ -1940,7 +1940,8 @@ private:
 
     // --- Resource Handle Resolution ---
     SimdVal resolveStaticBinding(mlir::Location loc, uint32_t resClass, uint32_t space, uint32_t lowerBound,
-                                 uint32_t resourceKind, uint32_t stride, mlir::Value indexVal, mlir::Type origTy) {
+                                 uint32_t resourceKind, uint32_t stride, mlir::Value indexVal, mlir::Type origTy,
+                                 mlir::Value execMask) {
         RootBindingTarget tgt = rootLayout_.resolveBinding(resClass, space, lowerBound);
         SimdVal h;
         h.kind = SimdVal::Kind::Handle;
@@ -1980,15 +1981,57 @@ private:
                 h.lanes.push_back(gepByteOffset(loc, tblBase, tableIdx * 64));
                 return h;
             }
+            bool isSamp = (resClass == 3);
+            int64_t heapBaseOff = isSamp ? static_cast<int64_t>(offsetof(DriverRootContext, sampler_heap_base))
+                                         : static_cast<int64_t>(offsetof(DriverRootContext, resource_heap_base));
+            int64_t heapCntOff = isSamp ? static_cast<int64_t>(offsetof(DriverRootContext, sampler_heap_count))
+                                        : static_cast<int64_t>(offsetof(DriverRootContext, resource_heap_count));
+            mlir::Value heapBase = loadInvariantScalar(loc, ptrTy(), gepByteOffset(loc, rootCtxPtr_, heapBaseOff));
+            mlir::Value heapCnt = loadInvariantScalar(loc, i32Ty(), gepByteOffset(loc, rootCtxPtr_, heapCntOff));
+            mlir::Value heapI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), heapBase);
+            mlir::Value tblI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), tblBase);
+            mlir::Value heapBytes = mlir::arith::MulIOp::create(
+                b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), heapCnt), cInt(loc, i64Ty(), 64));
+            mlir::Value heapEnd = mlir::arith::AddIOp::create(b_, loc, heapI64, heapBytes);
+            mlir::Value heapNonNull = mlir::arith::CmpIOp::create(
+                b_, loc, mlir::arith::CmpIPredicate::ne, heapI64, cInt(loc, i64Ty(), 0));
+            mlir::Value tblInHeap = mlir::arith::AndIOp::create(
+                b_, loc, heapNonNull,
+                mlir::arith::AndIOp::create(
+                    b_, loc,
+                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::uge, tblI64, heapI64),
+                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, tblI64, heapEnd)));
+
+            mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
             SimdVal idxSimd = getMapped(loc, indexVal);
             mlir::Value idxVec = asVec(loc, idxSimd);
             int64_t bias = static_cast<int64_t>(tgt.tableOffsetOrConstStart) - static_cast<int64_t>(lowerBound);
             for (uint32_t l = 0; l < W_; ++l) {
+                if (execMask && isLaneMaskConstFalse(execMask, l)) {
+                    h.lanes.push_back(nullPtr);
+                    continue;
+                }
                 mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
                 mlir::Value idx64 = mlir::arith::ExtSIOp::create(b_, loc, i64Ty(), idxL);
                 mlir::Value slot = mlir::arith::AddIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), bias));
                 mlir::Value byteOff = mlir::arith::MulIOp::create(b_, loc, slot, cInt(loc, i64Ty(), 64));
-                h.lanes.push_back(gepDynByteOffset(loc, tblBase, byteOff));
+                mlir::Value candPtr = gepDynByteOffset(loc, tblBase, byteOff);
+
+                mlir::Value slotNonNeg = mlir::arith::CmpIOp::create(
+                    b_, loc, mlir::arith::CmpIPredicate::sge, slot, cInt(loc, i64Ty(), 0));
+                mlir::Value candI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), candPtr);
+                mlir::Value inHeap = mlir::arith::AndIOp::create(
+                    b_, loc,
+                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::uge, candI64, heapI64),
+                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, candI64, heapEnd));
+                // If tblBase is inside the descriptor heap, enforce [heapBase, heapEnd);
+                // otherwise allow non-negative slot offsets (e.g. standalone test tables).
+                mlir::Value boundsOk = mlir::arith::SelectOp::create(b_, loc, tblInHeap, inHeap, slotNonNeg);
+                if (execMask) {
+                    mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                    boundsOk = mlir::arith::AndIOp::create(b_, loc, mL, boundsOk);
+                }
+                h.lanes.push_back(mlir::arith::SelectOp::create(b_, loc, boundsOk, candPtr, nullPtr));
             }
             return h;
         }
@@ -1996,6 +2039,19 @@ private:
         // Unbound fallback -> null descriptor pointer (bounds checks return 0 safely)
         h.lanes.push_back(mlir::LLVM::ZeroOp::create(b_, loc, ptrTy()));
         return h;
+    }
+
+    mlir::Value maskDescPtrForLane(mlir::Location loc, const SimdVal& h, mlir::Value maskVec, uint32_t lane) {
+        mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
+        if (maskVec && isLaneMaskConstFalse(maskVec, lane)) {
+            return nullPtr;
+        }
+        mlir::Value descP = laneValue(loc, h, lane);
+        if (maskVec && h.lanes.size() > 1) {
+            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, maskVec, static_cast<int64_t>(lane));
+            descP = mlir::arith::SelectOp::create(b_, loc, mL, descP, nullPtr);
+        }
+        return descP;
     }
 
     // Loads NacelleDescriptor fields safely (if descPtr is null, returns 0)
@@ -2078,7 +2134,7 @@ private:
             uint32_t lower = rec ? rec->lowerBound : rangeId;
             uint32_t kind = rec ? rec->resourceKind : 0;
             uint32_t stride = rec ? rec->structuredStride : 0;
-            setMapped(call.getResult(), resolveStaticBinding(loc, resClass, space, lower, kind, stride, arg(3), resTy()));
+            setMapped(call.getResult(), resolveStaticBinding(loc, resClass, space, lower, kind, stride, arg(3), resTy(), execMask));
             return true;
         }
         if (op == 217) {
@@ -2108,7 +2164,7 @@ private:
                     break;
                 }
             }
-            setMapped(call.getResult(), resolveStaticBinding(loc, resClass, space, lower, kind, stride, arg(2), resTy()));
+            setMapped(call.getResult(), resolveStaticBinding(loc, resClass, space, lower, kind, stride, arg(2), resTy(), execMask));
             return true;
         }
         if (op == 218) {
@@ -2210,7 +2266,7 @@ private:
             }
             setMapped(call.getResult(),
                       resolveStaticBinding(loc, rec->resClass, rec->space, rec->lowerBound,
-                                           rec->resourceKind, rec->structuredStride, regIdx, resTy()));
+                                           rec->resourceKind, rec->structuredStride, regIdx, resTy(), execMask));
             return true;
         }
         if (op == 216) {
@@ -4064,7 +4120,7 @@ private:
             mlir::Value o1L = mlir::vector::ExtractOp::create(b_, loc, off1, static_cast<int64_t>(l));
             mlir::Value byteOff;
             if (isTexAtomic) {
-                descP = laneValue(loc, h, l);
+                descP = maskDescPtrForLane(loc, h, realMask, l);
                 basePtr = loadDescBasePtr(loc, descP);
                 isReserved = cInt(loc, i1Ty(), 0);
                 byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
@@ -4082,7 +4138,7 @@ private:
             } else {
                 BufferDescInfo info = uniformBufInfo.has_value()
                                           ? *uniformBufInfo
-                                          : loadBufferDescInfo(loc, b_, h, laneValue(loc, h, l), /*needElemStride=*/false, needAtomicStride);
+                                          : loadBufferDescInfo(loc, b_, h, maskDescPtrForLane(loc, h, realMask, l), /*needElemStride=*/false, needAtomicStride);
                 descP = info.descP;
                 basePtr = info.basePtr;
                 isReserved = info.isReserved;
