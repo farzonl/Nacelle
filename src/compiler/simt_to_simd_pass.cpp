@@ -284,6 +284,76 @@ public:
         return createFp<OpT>(b_, loc, std::forward<Args>(args)...);
     }
 
+    static std::optional<double> getConstFltSplat(mlir::Value v) {
+        if (auto c = v.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+            if (auto fa = llvm::dyn_cast<mlir::FloatAttr>(c.getValue())) {
+                return fa.getValueAsDouble();
+            }
+            if (auto da = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
+                if (da.isSplat()) {
+                    return da.getSplatValue<llvm::APFloat>().convertToDouble();
+                }
+            }
+        } else if (auto c = v.getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto fa = llvm::dyn_cast<mlir::FloatAttr>(c.getValue())) {
+                return fa.getValueAsDouble();
+            }
+            if (auto da = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
+                if (da.isSplat()) {
+                    return da.getSplatValue<llvm::APFloat>().convertToDouble();
+                }
+            }
+        } else if (auto shuf = v.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
+            if (auto ins = shuf.getV1().getDefiningOp<mlir::LLVM::InsertElementOp>()) {
+                return getConstFltSplat(ins.getValue());
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Strength-reduce exp2(C * log2(x)) for small positive integer constants C into fmul chains.
+    mlir::Value tryStrengthReduceExp2OfLog2(mlir::Location loc, mlir::Value expArg) {
+        if (strictFp_) return mlir::Value();
+        auto fmul = expArg.getDefiningOp<mlir::LLVM::FMulOp>();
+        if (!fmul) return mlir::Value();
+
+        std::optional<double> cOpt = getConstFltSplat(fmul.getRhs());
+        mlir::Value logVal = fmul.getLhs();
+        if (!cOpt.has_value()) {
+            cOpt = getConstFltSplat(fmul.getLhs());
+            logVal = fmul.getRhs();
+        }
+        if (!cOpt.has_value()) return mlir::Value();
+        double c = *cOpt;
+        if (!(c >= 1.0 && c <= 32.0 && std::floor(c) == c)) return mlir::Value();
+
+        mlir::Value base;
+        if (auto logOp = logVal.getDefiningOp<mlir::LLVM::Log2Op>()) {
+            base = logOp.getIn();
+        } else if (auto callOp = logVal.getDefiningOp<mlir::func::CallOp>()) {
+            llvm::StringRef callee = callOp.getCallee();
+            if (callee.starts_with("nacelle_math_v") && callee.ends_with("_log2f") &&
+                callOp.getNumOperands() == 1) {
+                base = callOp.getOperand(0);
+            }
+        }
+        if (!base || base.getType() != expArg.getType()) return mlir::Value();
+
+        uint32_t exp = static_cast<uint32_t>(c);
+        mlir::Value res;
+        mlir::Value p = base;
+        while (exp > 0) {
+            if (exp & 1u) {
+                res = res ? createFp<mlir::LLVM::FMulOp>(loc, base.getType(), res, p) : p;
+            }
+            exp >>= 1u;
+            if (exp > 0) {
+                p = createFp<mlir::LLVM::FMulOp>(loc, base.getType(), p, p);
+            }
+        }
+        return res;
+    }
+
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
@@ -1753,8 +1823,12 @@ private:
             return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "sin", a); });
         if (llvm::isa<mlir::LLVM::CosOp>(&op))
             return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "cos", a); });
-        if (llvm::isa<mlir::LLVM::Exp2Op>(&op))
-            return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "exp2", a); });
+        if (llvm::isa<mlir::LLVM::Exp2Op>(&op)) {
+            return vecUnary([&](mlir::Type, mlir::Value a) {
+                if (auto sr = tryStrengthReduceExp2OfLog2(loc, a)) return sr;
+                return emitMathUnary(loc, "exp2", a);
+            });
+        }
         if (llvm::isa<mlir::LLVM::Log2Op>(&op))
             return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "log2", a); });
         if (llvm::isa<mlir::LLVM::FFloorOp>(&op))
@@ -6017,7 +6091,13 @@ private:
         case 18: return store(emitMathUnary(loc, "cosh", flushDenormF(argV(1))));
         case 19: return store(emitMathUnary(loc, "sinh", flushDenormF(argV(1))));
         case 20: return store(emitMathUnary(loc, "tanh", flushDenormF(argV(1))));
-        case 21: return store(emitMathUnary(loc, "exp2", flushDenormF(argV(1)))); // DXIL Exp is base-2!
+        case 21: { // DXIL Exp is base-2!
+            mlir::Value expArg = argV(1);
+            if (auto sr = tryStrengthReduceExp2OfLog2(loc, expArg)) {
+                return store(sr);
+            }
+            return store(emitMathUnary(loc, "exp2", flushDenormF(expArg)));
+        }
         case 22: { // Frc = x - floor(x)
             mlir::Value x = argV(1);
             return store(createFp<mlir::LLVM::FSubOp>(loc, vT, x, createFp<mlir::LLVM::FFloorOp>(loc, vT, x)));
