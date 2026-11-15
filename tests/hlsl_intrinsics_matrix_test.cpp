@@ -317,11 +317,13 @@ bool testMathDenormsBits(testutil::TestRuntime& rt) {
             std::cout << names[i] << " denorm mismatch: " << outF[i][0] << ", " << outF[i][1] << "\n";
         }
     }
-    // rsqrt(-denorm) == -inf, rsqrt(+denorm) == +inf
+    // rsqrt(-denorm) == -inf, rsqrt(+denorm) == +inf, rsqrt(-0.0) == -inf
     if (outF[3][0] != -std::numeric_limits<float>::infinity() ||
-        outF[3][1] != std::numeric_limits<float>::infinity()) {
+        outF[3][1] != std::numeric_limits<float>::infinity() ||
+        outF[3][2] != -std::numeric_limits<float>::infinity()) {
         ok = false;
-        std::cout << "rsqrt denorm mismatch: " << outF[3][0] << ", " << outF[3][1] << "\n";
+        std::cout << "rsqrt denorm mismatch: " << outF[3][0] << ", " << outF[3][1]
+                  << ", " << outF[3][2] << "\n";
     }
     // log/log10(±denorm) == -inf
     for (int i = 4; i < 6; ++i) {

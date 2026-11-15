@@ -286,6 +286,12 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
     fmf.setApproxFunc(true);
     for (llvm::Function& fn : mod) {
         if (fn.isDeclaration()) continue;
+        // Disable hardware reciprocal/rsqrt estimate + Newton-Raphson expansion
+        // (e.g. x86 vrsqrtps + NR), which lacks zero/infinity masking for rsqrt
+        // and evaluates 0.0 * inf -> -NaN on ±0.0 / flushed-denorm / +inf inputs
+        // instead of D3D12-required ±inf / +0.0. Keep AllowReciprocal on instructions
+        // so constant divisors still fold to multiplies.
+        fn.addFnAttr("reciprocal-estimates", "none");
         for (llvm::BasicBlock& bb : fn) {
             for (llvm::Instruction& inst : bb) {
                 if (llvm::isa<llvm::FPMathOperator>(&inst)) {
