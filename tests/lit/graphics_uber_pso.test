@@ -35,7 +35,8 @@ float4 PSMain(PSIn input) : SV_Target {
 // DEPTHONLY: func.func @nacelle_ps_test
 
 // VSVEC-LABEL: func.func @nacelle_vs_test
-// VSVEC-NOT: scf.if
-// VSVEC: llvm.intr.masked.gather
-// VSVEC-NOT: scf.if
+// VSVEC: llvm.intr.vector.reduce.and
+// VSVEC: scf.if
+// VSVEC: llvm.load
+// VSVEC-NOT: llvm.intr.masked.gather
 // VSVEC-LABEL: func.func @nacelle_ps_test
