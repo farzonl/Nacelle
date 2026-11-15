@@ -245,6 +245,8 @@ target_link_libraries(nacelle
 )
 if(UNIX AND NOT APPLE)
     target_link_libraries(nacelle PRIVATE pthread dl)
+elseif(APPLE)
+    target_link_libraries(nacelle PRIVATE "-framework Accelerate")
 endif()
 
 # Shared D3D12/DXCore drop-in library: libnacelle_d3d12
@@ -280,6 +282,8 @@ target_link_libraries(nacelle_d3d12
 )
 if(UNIX AND NOT APPLE)
     target_link_libraries(nacelle_d3d12 PRIVATE pthread dl)
+elseif(APPLE)
+    target_link_libraries(nacelle_d3d12 PRIVATE "-framework Accelerate")
 endif()
 
 # 5. CLI Tools

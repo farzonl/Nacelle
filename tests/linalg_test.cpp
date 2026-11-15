@@ -709,6 +709,92 @@ entry:
     return true;
 }
 
+bool testLargeMatMulAccelerate(testutil::TestRuntime& rt) {
+    std::cout << "=== Test: Large 32x32 MatMul (Accelerate/AMX path on macOS) ===\n";
+    const std::string ir = R"IR(
+%dx.types.Handle = type { i8* }
+%dx.types.LinAlgMatrixC9M32N32U0S1 = type { i8* }
+%dx.types.LinAlgMatrixC9M32N32U1S1 = type { i8* }
+%dx.types.LinAlgMatrixC9M32N32U2S1 = type { i8* }
+
+declare %dx.types.Handle @dx.op.createHandle(i32, i8, i32, i32, i1)
+declare %dx.types.LinAlgMatrixC9M32N32U0S1 @dx.op.linAlgMatrixLoadFromDescriptor.C9M32N32U0S1(i32, %dx.types.Handle, i32, i32, i32, i32)
+declare %dx.types.LinAlgMatrixC9M32N32U1S1 @dx.op.linAlgMatrixLoadFromDescriptor.C9M32N32U1S1(i32, %dx.types.Handle, i32, i32, i32, i32)
+declare %dx.types.LinAlgMatrixC9M32N32U2S1 @dx.op.linAlgFillMatrix.C9M32N32U2S1(i32, i1, float)
+declare %dx.types.LinAlgMatrixC9M32N32U2S1 @dx.op.linAlgMatrixMultiplyAccumulate.C9M32N32U2S1.C9M32N32U0S1.C9M32N32U1S1.C9M32N32U2S1(i32, %dx.types.LinAlgMatrixC9M32N32U0S1, %dx.types.LinAlgMatrixC9M32N32U1S1, %dx.types.LinAlgMatrixC9M32N32U2S1)
+declare void @dx.op.linAlgMatrixStoreToDescriptor.C9M32N32U2S1(i32, %dx.types.LinAlgMatrixC9M32N32U2S1, %dx.types.Handle, i32, i32, i32, i32)
+
+define void @main() {
+entry:
+  %srv = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 0, i32 0, i1 false)
+  %uav = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 0, i32 0, i1 false)
+  %matA = call %dx.types.LinAlgMatrixC9M32N32U0S1 @dx.op.linAlgMatrixLoadFromDescriptor.C9M32N32U0S1(i32 325, %dx.types.Handle %srv, i32 0, i32 128, i32 0, i32 4)
+  %matB = call %dx.types.LinAlgMatrixC9M32N32U1S1 @dx.op.linAlgMatrixLoadFromDescriptor.C9M32N32U1S1(i32 325, %dx.types.Handle %srv, i32 4096, i32 128, i32 0, i32 4)
+  %matC = call %dx.types.LinAlgMatrixC9M32N32U2S1 @dx.op.linAlgFillMatrix.C9M32N32U2S1(i32 323, i1 false, float 5.0)
+  %abc = call %dx.types.LinAlgMatrixC9M32N32U2S1 @dx.op.linAlgMatrixMultiplyAccumulate.C9M32N32U2S1.C9M32N32U0S1.C9M32N32U1S1.C9M32N32U2S1(i32 322, %dx.types.LinAlgMatrixC9M32N32U0S1 %matA, %dx.types.LinAlgMatrixC9M32N32U1S1 %matB, %dx.types.LinAlgMatrixC9M32N32U2S1 %matC)
+  call void @dx.op.linAlgMatrixStoreToDescriptor.C9M32N32U2S1(i32 331, %dx.types.LinAlgMatrixC9M32N32U2S1 %abc, %dx.types.Handle %uav, i32 0, i32 128, i32 0, i32 4)
+  ret void
+}
+
+!dx.shaderModel = !{!0}
+!dx.resources = !{!1}
+!dx.entryPoints = !{!6}
+!0 = !{!"cs", i32 6, i32 10}
+!1 = !{!2, !4, null, null}
+!2 = !{!3}
+!3 = !{i32 0, i32 0, !"", i32 0, i32 0, i32 1, i32 11, i32 0, null}
+!4 = !{!5}
+!5 = !{i32 0, i32 0, !"", i32 0, i32 0, i32 1, i32 11, i1 false, i1 false, i1 false, null}
+!6 = !{void ()* @main, !"main", null, !1, !7}
+!7 = !{i32 4, !8}
+!8 = !{i32 4, i32 1, i32 1}
+)IR";
+
+    auto rs = createUavSrvRS(rt.device.Get(), 1, 1);
+    auto pso = createComputePSOFromIR(rt.device.Get(), rs.Get(), ir);
+    auto bufIn = rt.createBuffer(8192, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE);
+    auto bufOut = rt.createBuffer(4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    std::vector<float> inBuf(2048, 0.0f);
+    for (int r = 0; r < 32; ++r) {
+        for (int c = 0; c < 32; ++c) {
+            inBuf[r * 32 + c] = float((r + c) % 7) * 0.5f;
+            inBuf[1024 + r * 32 + c] = (r == c) ? 2.0f : 0.0f;
+        }
+    }
+    rt.uploadBuffer(bufIn.Get(), inBuf.data(), 8192);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    testutil::checkHR(rt.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "Heap");
+    const UINT inc = rt.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    createRawBufferSrv(rt.device.Get(), bufIn.Get(), 8192, cpu);
+    createRawBufferUav(rt.device.Get(), bufOut.Get(), 4096, {cpu.ptr + inc});
+
+    rt.resetCmd();
+    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+    rt.cmdList->SetDescriptorHeaps(1, heaps);
+    rt.cmdList->SetComputeRootSignature(rs.Get());
+    rt.cmdList->SetPipelineState(pso.Get());
+    rt.cmdList->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    rt.cmdList->Dispatch(1, 1, 1);
+    rt.executeAndWait();
+
+    auto raw = rt.readbackBuffer(bufOut.Get(), 4096);
+    std::vector<float> out(1024);
+    std::memcpy(out.data(), raw.data(), 4096);
+    for (int i = 0; i < 1024; ++i) {
+        float expected = 2.0f * inBuf[i] + 5.0f;
+        if (!nearF(out[i], expected)) {
+            std::cerr << "Large 32x32 MatMul mismatch at " << i << ": got " << out[i] << " expected " << expected << "\n";
+            return false;
+        }
+    }
+    std::cout << "PASS\n";
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -723,5 +809,6 @@ int main() {
     ok &= testConversion(rt);
     ok &= testMatrixArithmetic(rt);
     ok &= testMatVecAndOuterProduct(rt);
+    ok &= testLargeMatMulAccelerate(rt);
     return ok ? 0 : 1;
 }
