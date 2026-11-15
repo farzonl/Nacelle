@@ -287,6 +287,11 @@ public:
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
+        if (elemTy.isF16()) {
+            mlir::Value f32Arg = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), vecArg);
+            mlir::Value f32Res = emitMathUnary(loc, baseName, f32Arg);
+            return mlir::LLVM::FPTruncOp::create(b_, loc, vt, f32Res);
+        }
         if (!strictFp_ && elemTy.isF32() && (W_ == 4 || W_ == 8 || W_ == 16)) {
             std::string fnName = ("nacelle_math_v" + std::to_string(W_) + "_" + baseName + "f").str();
             mlir::func::FuncOp callee = mod_.lookupSymbol<mlir::func::FuncOp>(fnName);
