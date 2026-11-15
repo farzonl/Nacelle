@@ -7,11 +7,12 @@
 
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/Value.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
 
 #include "dxil_loader.h"
+#include "shader_compiler.h"
+#include "structured_cfg.h"
 
 namespace nacelle {
 
@@ -19,7 +20,7 @@ namespace nacelle {
 struct SimdVal {
     enum class Kind : uint8_t {
         Invalid = 0,
-        Vector, // `vec` has type vector<W x ScalarTy>
+        Vector, // `vec` has type <W x ScalarTy>
         Lanes,  // `lanes` has 1 (uniform) or W (divergent) scalar values (used for pointers / structs)
         Struct, // `fields` recursively hold struct members
         Handle  // Resolved DXIL resource/sampler handle
@@ -32,9 +33,9 @@ struct SimdVal {
     };
 
     Kind kind = Kind::Invalid;
-    mlir::Type origType;
-    mlir::Value vec;
-    llvm::SmallVector<mlir::Value, 16> lanes;
+    llvm::Type* origType = nullptr;
+    llvm::Value* vec = nullptr;
+    llvm::SmallVector<llvm::Value*, 16> lanes;
     std::vector<SimdVal> fields;
 
     // Handle metadata (for Kind::Handle)
@@ -50,79 +51,96 @@ struct SimdVal {
     }
     bool isUnitStride() const { return pattern == LanePattern::UnitStride; }
     bool valid() const { return kind != Kind::Invalid; }
+
+    static SimdVal makeVector(llvm::Value* v, llvm::Type* origT, LanePattern pat = LanePattern::Divergent) {
+        SimdVal sv;
+        sv.kind = Kind::Vector;
+        sv.origType = origT;
+        sv.vec = v;
+        sv.pattern = pat;
+        return sv;
+    }
+
+    static SimdVal makeLanes(llvm::SmallVector<llvm::Value*, 16> l, llvm::Type* origT) {
+        SimdVal sv;
+        sv.kind = Kind::Lanes;
+        sv.origType = origT;
+        sv.lanes = std::move(l);
+        return sv;
+    }
 };
 
 /// Stage-specific bindings supplied to the SIMT packetizer (Compute, Vertex, or Pixel).
 struct StageHooks {
     bool isPixelShader = false;
-    llvm::SmallVector<mlir::Value, 3> threadId;        // vector<W x i32>
-    llvm::SmallVector<mlir::Value, 3> dispatchRaysDim; // vector<W x i32>
-    llvm::SmallVector<mlir::Value, 3> groupId;         // vector<W x i32>
-    llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
-    mlir::Value flatGroupId;                           // vector<W x i32>
-    mlir::Value groupSharedBase;                       // !llvm.ptr
-    mlir::Value meshPayloadBase;                       // !llvm.ptr (for Mesh Shader GetMeshPayload)
-    mlir::Block* entryBlock = nullptr;                 // function entry block for hoisted allocas
-    mlir::Value waveIdx;                               // index (optional, set in multi-wave compute/MS/AS)
+    llvm::SmallVector<llvm::Value*, 3> threadId;        // <W x i32>
+    llvm::SmallVector<llvm::Value*, 3> dispatchRaysDim; // <W x i32>
+    llvm::SmallVector<llvm::Value*, 3> groupId;         // <W x i32>
+    llvm::SmallVector<llvm::Value*, 3> threadIdInGroup; // <W x i32>
+    llvm::Value* flatGroupId = nullptr;                 // <W x i32>
+    llvm::Value* groupSharedBase = nullptr;             // ptr
+    llvm::Value* meshPayloadBase = nullptr;             // ptr (for Mesh Shader GetMeshPayload)
+    llvm::BasicBlock* entryBlock = nullptr;             // function entry block for hoisted allocas
+    llvm::Value* waveIdx = nullptr;                     // i32 (optional, set in multi-wave compute/MS/AS)
     uint32_t numWaves = 1;
 
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
-                       const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadInput;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, llvm::Type* scalarTy, SimdVal& out)> loadInput;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
                        const SimdVal& row, uint32_t col, const SimdVal& vertexAxis,
-                       mlir::Type scalarTy, SimdVal& out)> loadInputWithVertex;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
-                       const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value realMask)> storeOutput;
-    std::function<void(mlir::OpBuilder&, mlir::Location, mlir::Value condVec,
-                       mlir::Value execMask, mlir::Value& realMask)> onDiscard;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t streamId, mlir::Value realMask)> emitStream;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t streamId, mlir::Value realMask)> cutStream;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadPrimitiveId;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadGSInstanceId;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, mlir::Type scalarTy, SimdVal& out)> loadOutputControlPointId;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadDomainLocation;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
+                       llvm::Type* scalarTy, SimdVal& out)> loadInputWithVertex;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, const SimdVal& val, llvm::Value* realMask)> storeOutput;
+    std::function<void(llvm::IRBuilder<>&, llvm::Value* condVec,
+                       llvm::Value* execMask, llvm::Value*& realMask)> onDiscard;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t streamId, llvm::Value* realMask)> emitStream;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t streamId, llvm::Value* realMask)> cutStream;
+    std::function<bool(llvm::IRBuilder<>&, llvm::Type* scalarTy, SimdVal& out)> loadPrimitiveId;
+    std::function<bool(llvm::IRBuilder<>&, llvm::Type* scalarTy, SimdVal& out)> loadGSInstanceId;
+    std::function<bool(llvm::IRBuilder<>&, llvm::Type* scalarTy, SimdVal& out)> loadOutputControlPointId;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t col, llvm::Type* scalarTy, SimdVal& out)> loadDomainLocation;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
                        const SimdVal& row, uint32_t col, const SimdVal& cpId,
-                       mlir::Type scalarTy, SimdVal& out)> loadOutputControlPoint;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
-                       const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out)> loadPatchConstant;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId,
-                       const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value realMask)> storePatchConstant;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& countX, const SimdVal& countY,
-                       const SimdVal& countZ, const SimdVal& payloadPtr, mlir::Value realMask)> dispatchMesh;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& numVerts, const SimdVal& numPrims,
-                       mlir::Value realMask)> setMeshOutputCounts;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, const SimdVal& primIdx, const SimdVal& v0,
-                       const SimdVal& v1, const SimdVal& v2, mlir::Value realMask)> emitIndices;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId, const SimdVal& row, uint32_t col,
-                       const SimdVal& val, const SimdVal& vertIdx, mlir::Value realMask)> storeVertexOutput;
-    std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId, const SimdVal& row, uint32_t col,
-                       const SimdVal& val, const SimdVal& primIdx, mlir::Value realMask)> storePrimitiveOutput;
+                       llvm::Type* scalarTy, SimdVal& out)> loadOutputControlPoint;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, llvm::Type* scalarTy, SimdVal& out)> loadPatchConstant;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId,
+                       const SimdVal& row, uint32_t col, const SimdVal& val, llvm::Value* realMask)> storePatchConstant;
+    std::function<bool(llvm::IRBuilder<>&, const SimdVal& countX, const SimdVal& countY,
+                       const SimdVal& countZ, const SimdVal& payloadPtr, llvm::Value* realMask)> dispatchMesh;
+    std::function<bool(llvm::IRBuilder<>&, const SimdVal& numVerts, const SimdVal& numPrims,
+                       llvm::Value* realMask)> setMeshOutputCounts;
+    std::function<bool(llvm::IRBuilder<>&, const SimdVal& primIdx, const SimdVal& v0,
+                       const SimdVal& v1, const SimdVal& v2, llvm::Value* realMask)> emitIndices;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId, const SimdVal& row, uint32_t col,
+                       const SimdVal& val, const SimdVal& vertIdx, llvm::Value* realMask)> storeVertexOutput;
+    std::function<bool(llvm::IRBuilder<>&, uint32_t sigId, const SimdVal& row, uint32_t col,
+                       const SimdVal& val, const SimdVal& primIdx, llvm::Value* realMask)> storePrimitiveOutput;
 };
 
 /// Packetizes a threadgroup-based shader body (Compute, Amplification, or Mesh) across all waves in
 /// the threadgroup, supporting barriers, groupshared memory, and stage-specific `baseHooks`.
 bool packetizeThreadGroupRegion(
-    mlir::OpBuilder& builder,
-    mlir::Location loc,
-    mlir::ModuleOp mod,
-    mlir::Region& srcRegion,
+    llvm::IRBuilder<>& builder,
+    llvm::Module& mod,
+    const SeqNode& srcRegion,
     const DxilLoadedShader& shader,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
-    mlir::Value rootCtxPtr,
-    mlir::Value gsBase,
-    mlir::Value gx,
-    mlir::Value gy,
-    mlir::Value gz,
-    mlir::Block* entryBlock,
+    llvm::Value* rootCtxPtr,
+    llvm::Value* gsBase,
+    llvm::Value* gx,
+    llvm::Value* gy,
+    llvm::Value* gz,
+    llvm::BasicBlock* entryBlock,
     const StageHooks& baseHooks,
     std::string& outError);
 
-/// Packetizes a lifted Compute entry function (`func.func @entryName`) into
-/// `func.func @nacelle_cs_entry(ptr %rootCtx, ptr %gsBase, i32 %gx, i32 %gy, i32 %gz, i32 %ngx, i32 %ngy, i32 %ngz)`.
+/// Packetizes a lifted Compute entry function into
+/// `define void @symbolName(ptr %rootCtx, ptr %gsBase, i32 %gx, i32 %gy, i32 %gz, i32 %ngx, i32 %ngy, i32 %ngz)`.
 bool packetizeComputeEntry(
-    mlir::ModuleOp mod,
+    llvm::Module& mod,
+    const StructuredFunction& srcTree,
     const DxilLoadedShader& shader,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
@@ -130,23 +148,23 @@ bool packetizeComputeEntry(
     std::string& outError);
 
 /// Packetizes a barrier-free shader body (e.g. VS or PS) inside the caller's builder scope,
-/// initializing `rootCtxPtr`, `execMask` (`vector<Wxi1>`), and `realMask` (`vector<Wxi1>`).
+/// initializing `rootCtxPtr`, `execMask` (`<W x i1>`), and `realMask` (`<W x i1>`).
 bool packetizeRegionWithHooks(
-    mlir::OpBuilder& builder,
-    mlir::Location loc,
-    mlir::ModuleOp mod,
-    mlir::Region& srcRegion,
+    llvm::IRBuilder<>& builder,
+    llvm::Module& mod,
+    const SeqNode& srcRegion,
     const DxilLoadedShader& shader,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
-    mlir::Value rootCtxPtr,
-    mlir::Value initExecMask,
-    mlir::Value& inoutRealMask,
+    llvm::Value* rootCtxPtr,
+    llvm::Value* initExecMask,
+    llvm::Value*& inoutRealMask,
     StageHooks& hooks,
     std::string& outError);
 
 bool packetizeDxrEntry(
-    mlir::ModuleOp mod,
+    llvm::Module& mod,
+    const StructuredFunction& srcTree,
     const DxilLoadedShader& shader,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,

@@ -5,33 +5,24 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Auto-detect LLVM/MLIR if not explicitly provided
+# Auto-detect LLVM if not explicitly provided
 if(APPLE AND NOT LLVM_DIR)
     if(EXISTS "/opt/homebrew/opt/llvm/lib/cmake/llvm/LLVMConfig.cmake")
         set(LLVM_DIR "/opt/homebrew/opt/llvm/lib/cmake/llvm")
-        set(MLIR_DIR "/opt/homebrew/opt/llvm/lib/cmake/mlir")
     elseif(EXISTS "/usr/local/opt/llvm/lib/cmake/llvm/LLVMConfig.cmake")
         set(LLVM_DIR "/usr/local/opt/llvm/lib/cmake/llvm")
-        set(MLIR_DIR "/usr/local/opt/llvm/lib/cmake/mlir")
     endif()
 elseif(UNIX AND NOT APPLE AND NOT LLVM_DIR)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/llvm/LLVMConfig.cmake" AND
-       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/mlir/MLIRConfig.cmake")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/llvm/LLVMConfig.cmake")
         set(LLVM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/llvm")
-        set(MLIR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/mlir")
     else()
         foreach(_nacelle_llvm_ver IN ITEMS 24 23 22 21)
-            if(EXISTS "/usr/lib/llvm-${_nacelle_llvm_ver}/lib/cmake/llvm/LLVMConfig.cmake" AND
-               EXISTS "/usr/lib/llvm-${_nacelle_llvm_ver}/lib/cmake/mlir/MLIRConfig.cmake")
+            if(EXISTS "/usr/lib/llvm-${_nacelle_llvm_ver}/lib/cmake/llvm/LLVMConfig.cmake")
                 set(LLVM_DIR "/usr/lib/llvm-${_nacelle_llvm_ver}/lib/cmake/llvm")
-                set(MLIR_DIR "/usr/lib/llvm-${_nacelle_llvm_ver}/lib/cmake/mlir")
                 break()
             endif()
         endforeach()
     endif()
-endif()
-if(LLVM_DIR AND NOT MLIR_DIR AND EXISTS "${LLVM_DIR}/../mlir/MLIRConfig.cmake")
-    get_filename_component(MLIR_DIR "${LLVM_DIR}/../mlir" REALPATH)
 endif()
 
 # 1. DirectX-Headers (cross-platform: Win32 SDK on Windows, wsl/stubs on macOS/Linux)
@@ -40,12 +31,10 @@ set(DXHEADERS_BUILD_GOOGLE_TEST OFF CACHE BOOL "" FORCE)
 set(DXHEADERS_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/DirectX-Headers)
 
-# 2. LLVM & MLIR
+# 2. LLVM
 find_package(LLVM REQUIRED CONFIG)
-find_package(MLIR REQUIRED CONFIG)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} (${LLVM_DIR}), dylib=${LLVM_LINK_LLVM_DYLIB}")
-message(STATUS "Found MLIR (${MLIR_DIR})")
 
 if(LLVM_LINK_LLVM_DYLIB)
     set(NACELLE_LLVM_LIBS LLVM)
@@ -57,28 +46,6 @@ else()
         Support Target TargetParser native
     )
 endif()
-
-set(NACELLE_MLIR_LIBS
-    MLIRIR
-    MLIRPass
-    MLIRTransforms
-    MLIRDLTIDialect
-    MLIRLLVMDialect
-    MLIRSCFDialect
-    MLIRControlFlowDialect
-    MLIRFuncDialect
-    MLIRArithDialect
-    MLIRTargetLLVMIRImport
-    MLIRTargetLLVMIRExport
-    MLIRBuiltinToLLVMIRTranslation
-    MLIRLLVMToLLVMIRTranslation
-    MLIRLLVMIRToLLVMTranslation
-    MLIRControlFlowToSCF
-    MLIRSCFToControlFlow
-    MLIRArithToLLVM
-    MLIRFuncToLLVM
-    MLIRControlFlowToLLVM
-)
 
 # 3. Compile texture_sampler.cpp & math_simd.cpp to portable LLVM bitcode (.bc) and embed as C arrays
 set(TEX_SAMPLER_BC "${CMAKE_CURRENT_BINARY_DIR}/generated/texture_sampler.bc")
@@ -143,8 +110,8 @@ set(NACELLE_COMPILER_HASH_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/dxil_loader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/structured_cfg.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/structured_cfg.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/pso_synthesizer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/pso_synthesizer.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/shader_compiler.h"
@@ -187,7 +154,7 @@ set(NACELLE_SOURCES
     src/api/device.cpp
     src/api/dxcore.cpp
     src/compiler/dxil_loader.cpp
-    src/compiler/mlir_pipeline.cpp
+    src/compiler/structured_cfg.cpp
     src/compiler/simt_to_simd_pass.cpp
     src/compiler/jit_engine.cpp
     src/compiler/pso_synthesizer.cpp
@@ -223,7 +190,6 @@ endif()
 
 target_include_directories(nacelle_objs SYSTEM PRIVATE
     ${LLVM_INCLUDE_DIRS}
-    ${MLIR_INCLUDE_DIRS}
 )
 
 target_compile_definitions(nacelle_objs PRIVATE ${LLVM_DEFS_LIST})
@@ -240,7 +206,6 @@ target_link_libraries(nacelle
         Microsoft::DirectX-Headers
         Microsoft::DirectX-Guids
     PRIVATE
-        ${NACELLE_MLIR_LIBS}
         ${NACELLE_LLVM_LIBS}
 )
 if(UNIX AND NOT APPLE)
@@ -268,14 +233,13 @@ target_include_directories(nacelle_d3d12
 if(NOT WIN32)
     target_include_directories(nacelle_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/common/posix_sal")
 endif()
-target_include_directories(nacelle_d3d12 SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+target_include_directories(nacelle_d3d12 SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(nacelle_d3d12 PRIVATE ${LLVM_DEFS_LIST} NACELLE_EXPORT_D3D12_SYMBOLS)
 target_link_libraries(nacelle_d3d12
     PUBLIC
         Microsoft::DirectX-Headers
         Microsoft::DirectX-Guids
     PRIVATE
-        ${NACELLE_MLIR_LIBS}
         ${NACELLE_LLVM_LIBS}
 )
 if(UNIX AND NOT APPLE)
@@ -292,9 +256,9 @@ target_include_directories(nacelle-compile PRIVATE
 if(NOT WIN32)
     target_include_directories(nacelle-compile PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/common/posix_sal")
 endif()
-target_include_directories(nacelle-compile SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+target_include_directories(nacelle-compile SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(nacelle-compile PRIVATE ${LLVM_DEFS_LIST})
-target_link_libraries(nacelle-compile PRIVATE nacelle ${NACELLE_MLIR_LIBS} ${NACELLE_LLVM_LIBS})
+target_link_libraries(nacelle-compile PRIVATE nacelle ${NACELLE_LLVM_LIBS})
 
 if(APPLE)
     add_executable(nacelle-bench tools/nacelle_bench.cpp tools/metal_bench.mm)
@@ -425,7 +389,7 @@ target_include_directories(nacelle_viewer PRIVATE
 if(NOT WIN32)
     target_include_directories(nacelle_viewer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/common/posix_sal")
 endif()
-target_include_directories(nacelle_viewer SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+target_include_directories(nacelle_viewer SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(nacelle_viewer PRIVATE
     ${LLVM_DEFS_LIST}
     NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"

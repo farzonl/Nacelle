@@ -12,16 +12,12 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/raw_ostream.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/MLIRContext.h>
-#include <mlir/IR/OwningOpRef.h>
-
 #include "../src/compiler/dxil_loader.h"
 #include "../src/compiler/jit_engine.h"
-#include "../src/compiler/mlir_pipeline.h"
 #include "../src/compiler/pso_synthesizer.h"
 #include "../src/compiler/shader_compiler.h"
 #include "../src/compiler/simt_to_simd_pass.h"
+#include "../src/compiler/structured_cfg.h"
 
 namespace {
 
@@ -102,9 +98,9 @@ int main(int argc, char** argv) {
             depthLess = (arg.substr(8) == "less");
         } else if (arg == "--auto-input-layout") {
             autoInputLayout = true;
-        } else if (arg == "--emit-scf") {
+        } else if (arg == "--emit-scf" || arg == "--emit-structured") {
             emitSCF = true;
-        } else if (arg == "--emit-simd-mlir") {
+        } else if (arg == "--emit-simd-mlir" || arg == "--emit-simd-ir") {
             emitSIMD = true;
         } else if (arg == "--emit-llvm") {
             emitLLVM = true;
@@ -125,9 +121,6 @@ int main(int argc, char** argv) {
         nacelle::setSimdWidthOverride(simdWidth);
     }
     uint32_t effectiveW = nacelle::getTargetSimdWidth();
-
-    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    nacelle::configureNacelleMLIRContext(mlirCtx);
 
     if (!vsPath.empty() || !msPath.empty()) {
         std::vector<uint8_t> vsBytes, msBytes, asBytes, psBytes;
@@ -157,12 +150,17 @@ int main(int argc, char** argv) {
                 std::cerr << "Graphics DXIL load error: " << err << "\n";
                 return 1;
             }
-            auto scfMod = nacelle::importAndLiftDXILToSCF(std::move(loaded.module), loaded.entryName, mlirCtx, err);
-            if (!scfMod) {
-                std::cerr << "Graphics SCF lift error: " << err << "\n";
+            llvm::Function* entryFn = loaded.module->getFunction(loaded.entryName);
+            if (!entryFn) {
+                std::cerr << "Graphics entry function not found: " << loaded.entryName << "\n";
                 return 1;
             }
-            scfMod->print(llvm::outs());
+            nacelle::StructuredFunction tree;
+            if (!nacelle::structurizeAndBuildRegionTree(*entryFn, tree, err)) {
+                std::cerr << "Graphics structured CFG error: " << err << "\n";
+                return 1;
+            }
+            tree.print(llvm::outs());
             llvm::outs() << "\n";
         }
 
@@ -250,29 +248,28 @@ int main(int argc, char** argv) {
             }
 
             nacelle::RootSignatureLayout rootLayout{};
-            mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
+            llvm::LLVMContext lctx;
+            std::unique_ptr<llvm::Module> combinedMod;
             nacelle::CachedPSOMeta meta{};
             std::vector<nacelle::ShaderSigElement> vsIn, vsOut, psIn, psOut;
             std::string err;
-            if (!nacelle::synthesizeGraphicsPSOMLIR(
+            if (!nacelle::synthesizeGraphicsPSOLLVM(
                     desc, rootLayout, effectiveW,
                     "nacelle_vs_test", "nacelle_ps_test",
-                    mlirCtx, combinedMod, meta, vsIn, vsOut, psIn, psOut, err, meshStages)) {
+                    lctx, combinedMod, meta, vsIn, vsOut, psIn, psOut, err, meshStages)) {
                 std::cerr << "Graphics PSO synthesis error: " << err << "\n";
                 return 1;
             }
             if (emitSIMD) {
-                combinedMod->print(llvm::outs());
+                combinedMod->print(llvm::outs(), nullptr);
                 llvm::outs() << "\n";
             }
             if (emitLLVM) {
-                llvm::LLVMContext lctx;
-                auto llvmMod = nacelle::translateMLIRToLinkedLLVMIR(*combinedMod, lctx, err);
-                if (!llvmMod) {
-                    std::cerr << "LLVM IR translation error: " << err << "\n";
+                if (!nacelle::linkAndFinalizeLLVMModule(*combinedMod, err)) {
+                    std::cerr << "LLVM IR link error: " << err << "\n";
                     return 1;
                 }
-                llvmMod->print(llvm::outs(), nullptr);
+                combinedMod->print(llvm::outs(), nullptr);
             }
         }
         return 0;
@@ -297,14 +294,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto scfMod = nacelle::importAndLiftDXILToSCF(std::move(loaded.module), loaded.entryName, mlirCtx, err);
-    if (!scfMod) {
-        std::cerr << "CS SCF lift error: " << err << "\n";
+    llvm::Function* entryFn = loaded.module->getFunction(loaded.entryName);
+    if (!entryFn) {
+        std::cerr << "CS entry function not found: " << loaded.entryName << "\n";
+        return 1;
+    }
+    nacelle::StructuredFunction srcTree;
+    if (!nacelle::structurizeAndBuildRegionTree(*entryFn, srcTree, err)) {
+        std::cerr << "CS structured CFG error: " << err << "\n";
         return 1;
     }
 
     if (emitSCF) {
-        scfMod->print(llvm::outs());
+        srcTree.print(llvm::outs());
         llvm::outs() << "\n";
     }
 
@@ -312,22 +314,21 @@ int main(int argc, char** argv) {
         nacelle::RootSignatureLayout layout = loaded.hasEmbeddedRootSig
                                                  ? loaded.embeddedRootSig
                                                  : nacelle::RootSignatureLayout{};
-        if (!nacelle::packetizeComputeEntry(*scfMod, loaded, layout, effectiveW, "nacelle_cs_test", err)) {
+        if (!nacelle::packetizeComputeEntry(*loaded.module, srcTree, loaded, layout, effectiveW, "nacelle_cs_test", err)) {
             std::cerr << "Compute packetizer error: " << err << "\n";
             return 1;
         }
+        entryFn->eraseFromParent();
         if (emitSIMD) {
-            scfMod->print(llvm::outs());
+            loaded.module->print(llvm::outs(), nullptr);
             llvm::outs() << "\n";
         }
         if (emitLLVM) {
-            llvm::LLVMContext outCtx;
-            auto llvmMod = nacelle::translateMLIRToLinkedLLVMIR(*scfMod, outCtx, err);
-            if (!llvmMod) {
-                std::cerr << "LLVM IR translation error: " << err << "\n";
+            if (!nacelle::linkAndFinalizeLLVMModule(*loaded.module, err)) {
+                std::cerr << "LLVM IR link error: " << err << "\n";
                 return 1;
             }
-            llvmMod->print(llvm::outs(), nullptr);
+            loaded.module->print(llvm::outs(), nullptr);
         }
     }
 

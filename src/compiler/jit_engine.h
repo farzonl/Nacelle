@@ -15,10 +15,6 @@ class LLVMContext;
 class Module;
 } // namespace llvm
 
-namespace mlir {
-class ModuleOp;
-}
-
 namespace nacelle {
 
 struct DxilSigRecord;
@@ -127,10 +123,9 @@ void computeVertexStageHash(
     uint64_t& outLo,
     uint64_t& outHi);
 
-/// Converts lowered MLIR (SCF/Vector/Arith/Math/Func/LLVM) into LLVM IR and links texture_sampler.bc if referenced.
-std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
-    mlir::ModuleOp mlirMod,
-    llvm::LLVMContext& llvmCtx,
+/// Links runtime bitcode (`texture_sampler.bc` / `math_simd.bc` if referenced) and finalizes target triple/data layout.
+bool linkAndFinalizeLLVMModule(
+    llvm::Module& llvmMod,
     std::string& outError);
 
 /// Checks memory & disk ObjectCache (<cacheDir>/<hex32>.o + .meta). If found, loads into LLJIT and resolves symbol(s).

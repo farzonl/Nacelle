@@ -1,42 +1,48 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/MLIRContext.h>
-#include <mlir/IR/OwningOpRef.h>
-
+#include "common/platform.h"
 #include "jit_engine.h"
 #include "shader_compiler.h"
 
+namespace llvm {
+class LLVMContext;
+class Module;
+} // namespace llvm
+
 namespace nacelle {
 
-/// Synthesizes standalone Vertex Stage MLIR (`@<vsSym>`) with canonical VS output layout.
-bool synthesizeVertexStageMLIR(
+struct CachedVSMeta;
+struct DxilSigRecord;
+
+/// Synthesizes a standalone Vertex Stage LLVM module (`vsSym`) for split VS/PS caching.
+bool synthesizeVertexStageLLVM(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& vsSym,
-    mlir::MLIRContext& mlirCtx,
-    mlir::OwningOpRef<mlir::ModuleOp>& outVSMod,
+    llvm::LLVMContext& llvmCtx,
+    std::unique_ptr<llvm::Module>& outModule,
     CachedVSMeta& outVSMeta,
     std::vector<ShaderSigElement>& outVSInputs,
     std::vector<ShaderSigElement>& outVSOutputs,
     std::vector<DxilSigRecord>& outVSOutputRecs,
     std::string& outError);
 
-/// Synthesizes combined Vertex/Mesh + Pixel Uber-PSO MLIR (`@<vsSym>` / `@<vsSym>_ms` / `@<vsSym>_as` and `@<psSym>`) for a graphics PSO.
-/// When `skipVS` is true (for decoupled VS stage cache hits on `!hasMS && !hasTess && !hasGS` PSOs), only `@<psSym>`
-/// is emitted into `outCombinedMod` using `precompiledVSMeta` and `precompiledVSOutputRecs`.
-bool synthesizeGraphicsPSOMLIR(
+/// Synthesizes a combined Graphics PSO LLVM module containing the entrypoints
+/// `vsSym` (or mesh/amplification pipeline) and `psSym`.
+bool synthesizeGraphicsPSOLLVM(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& vsSym,
     const std::string& psSym,
-    mlir::MLIRContext& mlirCtx,
-    mlir::OwningOpRef<mlir::ModuleOp>& outCombinedMod,
+    llvm::LLVMContext& llvmCtx,
+    std::unique_ptr<llvm::Module>& outModule,
     CachedPSOMeta& outMeta,
     std::vector<ShaderSigElement>& outVSInputs,
     std::vector<ShaderSigElement>& outVSOutputs,
@@ -44,7 +50,7 @@ bool synthesizeGraphicsPSOMLIR(
     std::vector<ShaderSigElement>& outPSOutputs,
     std::string& outError,
     const MeshShaderStages& meshStages = {},
-    bool skipVS = false,
+    bool skipVertexStage = false,
     const CachedVSMeta* precompiledVSMeta = nullptr,
     const std::vector<DxilSigRecord>* precompiledVSOutputRecs = nullptr);
 

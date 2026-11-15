@@ -52,21 +52,8 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
-#include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
-#include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
-#include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
-#include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
-#include <mlir/Dialect/Func/IR/FuncOps.h>
-#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/SymbolTable.h>
-#include <mlir/Pass/PassManager.h>
-#include <mlir/Target/LLVMIR/Export.h>
-#include <mlir/Transforms/Passes.h>
-
 #include "dxil_loader.h"
-#include "mlir_pipeline.h"
+#include "structured_cfg.h"
 #include "simt_to_simd_pass.h"
 #include "compiler_version.h"
 #include "math_simd_bc.h"
@@ -806,70 +793,14 @@ void computeVertexStageHash(
     outHi = h.high64;
 }
 
-std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
-    mlir::ModuleOp mlirMod,
-    llvm::LLVMContext& llvmCtx,
+bool linkAndFinalizeLLVMModule(
+    llvm::Module& llvmModRef,
     std::string& outError) {
-    mlir::PassManager pm(mlirMod.getContext());
-    pm.addPass(mlir::createSCFToControlFlowPass());
-    pm.addPass(mlir::createArithToLLVMConversionPass());
-    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-    pm.addPass(mlir::createConvertFuncToLLVMPass());
-
-    if (mlir::failed(pm.run(mlirMod))) {
-        outError = "MLIR LLVM lowering pipeline failed";
-        return nullptr;
-    }
-
-    auto llvmMod = mlir::translateModuleToLLVMIR(mlirMod, llvmCtx);
-    if (!llvmMod) {
-        outError = "translateModuleToLLVMIR failed";
-        return nullptr;
-    }
+    llvm::Module* llvmMod = &llvmModRef;
+    llvm::LLVMContext& llvmCtx = llvmMod->getContext();
 
     llvmMod->setTargetTriple(llvm::Triple(getHostTargetTripleString()));
     llvmMod->setDataLayout(getHostDataLayoutString());
-
-    // Rewrite vector-by-value `nacelle_math_v<W>_*` declarations/calls to ABI-neutral
-    // `void(ptr out, ptr in)` so `AlwaysInlinerPass` matches `math_simd.bc` on all targets.
-    {
-        llvm::SmallVector<llvm::Function*, 16> mathDecls;
-        for (llvm::Function& f : *llvmMod) {
-            if (f.isDeclaration() && f.getName().starts_with("nacelle_math_")) {
-                mathDecls.push_back(&f);
-            }
-        }
-        if (!mathDecls.empty()) {
-            llvm::Type* voidTy = llvm::Type::getVoidTy(llvmCtx);
-            llvm::Type* ptrTy = llvm::PointerType::getUnqual(llvmCtx);
-            llvm::FunctionType* ptrFnTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
-            for (llvm::Function* oldDecl : mathDecls) {
-                std::string name = oldDecl->getName().str();
-                oldDecl->setName(name + ".vec_stub");
-                llvm::FunctionCallee newCallee = llvmMod->getOrInsertFunction(name, ptrFnTy);
-                llvm::SmallVector<llvm::CallInst*, 16> calls;
-                for (llvm::User* u : oldDecl->users()) {
-                    if (auto* ci = llvm::dyn_cast<llvm::CallInst>(u)) {
-                        calls.push_back(ci);
-                    }
-                }
-                for (llvm::CallInst* ci : calls) {
-                    llvm::Function* caller = ci->getFunction();
-                    llvm::IRBuilder<> eb(&caller->getEntryBlock().front());
-                    llvm::Type* vecTy = ci->getType();
-                    llvm::AllocaInst* inSlot = eb.CreateAlloca(vecTy, nullptr, "math.in");
-                    llvm::AllocaInst* outSlot = eb.CreateAlloca(vecTy, nullptr, "math.out");
-                    llvm::IRBuilder<> cb(ci);
-                    cb.CreateStore(ci->getArgOperand(0), inSlot);
-                    cb.CreateCall(newCallee, {outSlot, inSlot});
-                    llvm::Value* loaded = cb.CreateLoad(vecTy, outSlot, "math.res");
-                    ci->replaceAllUsesWith(loaded);
-                    ci->eraseFromParent();
-                }
-                oldDecl->eraseFromParent();
-            }
-        }
-    }
 
     auto linkRuntimeBitcode = [&](const unsigned char* bcData, size_t bcSize,
                                   llvm::StringRef modName, llvm::StringRef fnPrefix) -> bool {
@@ -913,10 +844,10 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     };
 
     if (!linkRuntimeBitcode(kTextureSamplerBitcode, kTextureSamplerBitcode_size, "texture_sampler.bc", "nacelle_tex_")) {
-        return nullptr;
+        return false;
     }
     if (!linkRuntimeBitcode(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
-        return nullptr;
+        return false;
     }
 
     bool needsAlwaysInline = false;
@@ -970,7 +901,7 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     }
 
-    return llvmMod;
+    return true;
 }
 
 bool tryLoadComputePSOFromCache(
@@ -1720,22 +1651,29 @@ bool compileComputePSO(
             ? shader.embeddedRootSig
             : rootLayout;
 
-    thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
-    if (!mlirMod) return false;
+    llvm::Function* entryFn = shader.module->getFunction(shader.entryName);
+    if (!entryFn) {
+        outError = "Compute entry function not found: " + shader.entryName;
+        return false;
+    }
+    StructuredFunction srcTree;
+    if (!structurizeAndBuildRegionTree(*entryFn, srcTree, outError)) {
+        return false;
+    }
     const auto tLift = Clock::now();
 
     const uint32_t effectiveWidth = (shader.waveSize > 0) ? shader.waveSize : simdWidth;
     if (!packetizeComputeEntry(
-            *mlirMod, shader, effectiveLayout, effectiveWidth, symbolName,
+            *shader.module, srcTree, shader, effectiveLayout, effectiveWidth, symbolName,
             outError)) {
         return false;
     }
+    entryFn->eraseFromParent();
     const auto tPacketize = Clock::now();
 
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
-    if (!linkedMod) return false;
+    if (!linkAndFinalizeLLVMModule(*shader.module, outError)) {
+        return false;
+    }
     const auto tTranslate = Clock::now();
 
     CachedPSOMeta meta;
@@ -1752,7 +1690,7 @@ bool compileComputePSO(
     outPSO.simdWidth = simdWidth;
 
     bool ok = jitCompileComputeTier1AndScheduleTier2(
-        std::move(linkedMod), std::move(outLlvmCtx), symbolName, meta, outPSO, outError);
+        std::move(shader.module), std::move(llvmCtx), symbolName, meta, outPSO, outError);
     const auto tTier1 = Clock::now();
 
     if (profileCompile) {
@@ -1925,18 +1863,25 @@ bool compileDxrShader(
             ? shader.embeddedRootSig
             : rootLayout;
 
-    thread_local mlir::MLIRContext mlirCtx;
-    auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
-    if (!mlirMod) return false;
-
-    const std::string symbolName = "nacelle_dxr_" + exportName;
-    if (!packetizeDxrEntry(*mlirMod, shader, effectiveLayout, simdWidth, symbolName, outError)) {
+    llvm::Function* entryFn = shader.module->getFunction(shader.entryName);
+    if (!entryFn) {
+        outError = "DXR entry function not found: " + shader.entryName;
+        return false;
+    }
+    StructuredFunction srcTree;
+    if (!structurizeAndBuildRegionTree(*entryFn, srcTree, outError)) {
         return false;
     }
 
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError);
-    if (!linkedMod) return false;
+    const std::string symbolName = "nacelle_dxr_" + exportName;
+    if (!packetizeDxrEntry(*shader.module, srcTree, shader, effectiveLayout, simdWidth, symbolName, outError)) {
+        return false;
+    }
+    entryFn->eraseFromParent();
+
+    if (!linkAndFinalizeLLVMModule(*shader.module, outError)) {
+        return false;
+    }
 
     auto& rt = getJitRuntime();
     std::lock_guard<std::mutex> lock(rt.mu);
@@ -1949,7 +1894,7 @@ bool compileDxrShader(
         return false;
     }
     llvm::orc::JITDylib& jd = *jdOrErr;
-    if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(linkedMod), std::move(outLlvmCtx)))) {
+    if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(shader.module), std::move(llvmCtx)))) {
         outError = llvm::toString(std::move(err));
         return false;
     }

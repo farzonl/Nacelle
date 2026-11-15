@@ -6,23 +6,93 @@
 #include <cstring>
 #include <unordered_map>
 
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <mlir/Dialect/Func/IR/FuncOps.h>
-#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
-#include <mlir/Dialect/SCF/IR/SCF.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/Verifier.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/Linker/Linker.h>
 
 #include "dxil_loader.h"
 #include "jit_engine.h"
-#include "mlir_pipeline.h"
 #include "simt_to_simd_pass.h"
+#include "structured_cfg.h"
 #include "../common/format_utils.h"
 
 namespace nacelle {
 
 namespace {
+
+static llvm::Value* createAlignedAlloca(
+    llvm::IRBuilder<>& b,
+    llvm::Type* elemTy,
+    llvm::Value* arraySize,
+    uint64_t alignBytes) {
+    auto* ai = b.CreateAlloca(elemTy, arraySize);
+    if (alignBytes > 0) ai->setAlignment(llvm::Align(alignBytes));
+    return ai;
+}
+
+template <typename ThenFn>
+static void emitIf(llvm::IRBuilder<>& b, llvm::Value* cond, ThenFn&& thenFn) {
+    llvm::Function* fn = b.GetInsertBlock()->getParent();
+    llvm::LLVMContext& ctx = b.getContext();
+    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(ctx, "if.then", fn);
+    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(ctx, "if.end", fn);
+    b.CreateCondBr(cond, thenBB, mergeBB);
+    b.SetInsertPoint(thenBB);
+    thenFn(b);
+    if (!b.GetInsertBlock()->getTerminatorOrNull()) b.CreateBr(mergeBB);
+    b.SetInsertPoint(mergeBB);
+}
+
+template <typename ThenFn, typename ElseFn>
+static void emitIfElse(llvm::IRBuilder<>& b, llvm::Value* cond, ThenFn&& thenFn, ElseFn&& elseFn) {
+    llvm::Function* fn = b.GetInsertBlock()->getParent();
+    llvm::LLVMContext& ctx = b.getContext();
+    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(ctx, "if.then", fn);
+    llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(ctx, "if.else", fn);
+    llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(ctx, "if.end", fn);
+    b.CreateCondBr(cond, thenBB, elseBB);
+    b.SetInsertPoint(thenBB);
+    thenFn(b);
+    if (!b.GetInsertBlock()->getTerminatorOrNull()) b.CreateBr(mergeBB);
+    b.SetInsertPoint(elseBB);
+    elseFn(b);
+    if (!b.GetInsertBlock()->getTerminatorOrNull()) b.CreateBr(mergeBB);
+    b.SetInsertPoint(mergeBB);
+}
+
+template <typename BodyFn>
+static void emitForLoop(
+    llvm::IRBuilder<>& b,
+    llvm::Value* lb,
+    llvm::Value* ub,
+    llvm::Value* step,
+    BodyFn&& bodyFn) {
+    llvm::Function* fn = b.GetInsertBlock()->getParent();
+    llvm::LLVMContext& ctx = b.getContext();
+    llvm::BasicBlock* preBB = b.GetInsertBlock();
+    llvm::BasicBlock* hdrBB = llvm::BasicBlock::Create(ctx, "for.hdr", fn);
+    llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(ctx, "for.body", fn);
+    llvm::BasicBlock* exitBB = llvm::BasicBlock::Create(ctx, "for.end", fn);
+    b.CreateBr(hdrBB);
+    b.SetInsertPoint(hdrBB);
+    llvm::PHINode* iv = b.CreatePHI(lb->getType(), 2, "for.iv");
+    iv->addIncoming(lb, preBB);
+    llvm::Value* cond = b.CreateICmpSLT(iv, ub);
+    b.CreateCondBr(cond, bodyBB, exitBB);
+    b.SetInsertPoint(bodyBB);
+    bodyFn(b, iv);
+    llvm::BasicBlock* latchBB = b.GetInsertBlock();
+    if (!latchBB->getTerminatorOrNull()) {
+        llvm::Value* nextIv = b.CreateAdd(iv, step);
+        iv->addIncoming(nextIv, latchBB);
+        b.CreateBr(hdrBB);
+    }
+    b.SetInsertPoint(exitBB);
+}
 
 std::string toLowerAscii(const std::string& s) {
     std::string out = s;
@@ -32,26 +102,23 @@ std::string toLowerAscii(const std::string& s) {
 
 std::optional<uint32_t> tryGetUniformConstUInt(const SimdVal& sv) {
     if (sv.kind != SimdVal::Kind::Vector || !sv.vec) return std::nullopt;
-    auto extractAttr = [](mlir::Attribute attr) -> std::optional<uint32_t> {
-        if (auto splat = llvm::dyn_cast<mlir::SplatElementsAttr>(attr)) {
-            if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(splat.getSplatValue<mlir::Attribute>())) {
-                return static_cast<uint32_t>(ia.getValue().getZExtValue());
-            }
+    if (auto* cdv = llvm::dyn_cast<llvm::ConstantDataVector>(sv.vec)) {
+        if (cdv->isSplat()) {
+            return static_cast<uint32_t>(cdv->getElementAsInteger(0));
         }
-        if (auto dense = llvm::dyn_cast<mlir::DenseElementsAttr>(attr); dense && dense.isSplat()) {
-            return static_cast<uint32_t>(dense.getSplatValue<llvm::APInt>().getZExtValue());
-        }
-        return std::nullopt;
-    };
-    if (auto c = sv.vec.getDefiningOp<mlir::LLVM::ConstantOp>()) {
-        if (auto v = extractAttr(c.getValue())) return v;
     }
-    if (auto shuf = sv.vec.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
-        if (auto ins = shuf.getV1().getDefiningOp<mlir::LLVM::InsertElementOp>()) {
-            if (auto c = ins.getValue().getDefiningOp<mlir::LLVM::ConstantOp>()) {
-                if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
-                    return static_cast<uint32_t>(ia.getValue().getZExtValue());
-                }
+    if (auto* cv = llvm::dyn_cast<llvm::ConstantVector>(sv.vec)) {
+        if (auto* splat = llvm::dyn_cast_or_null<llvm::ConstantInt>(cv->getSplatValue())) {
+            return static_cast<uint32_t>(splat->getZExtValue());
+        }
+    }
+    if (llvm::isa<llvm::ConstantAggregateZero>(sv.vec)) {
+        return 0u;
+    }
+    if (auto* shuf = llvm::dyn_cast<llvm::ShuffleVectorInst>(sv.vec)) {
+        if (auto* ins = llvm::dyn_cast<llvm::InsertElementInst>(shuf->getOperand(0))) {
+            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(ins->getOperand(1))) {
+                return static_cast<uint32_t>(ci->getZExtValue());
             }
         }
     }
@@ -155,99 +222,96 @@ bool isUnormRenderTargetFormat(DXGI_FORMAT fmt) {
     }
 }
 
-static mlir::Value llvmExtract(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, uint32_t idx) {
-    mlir::Type i32Ty = builder.getI32Type();
-    mlir::Value idxVal = mlir::LLVM::ConstantOp::create(builder, loc, i32Ty, builder.getI32IntegerAttr(idx));
-    return mlir::LLVM::ExtractElementOp::create(builder, loc, vec, idxVal);
+static llvm::Value* llvmExtract(llvm::IRBuilder<>& builder, llvm::Value* vec, uint32_t idx) {
+    llvm::Type* i32Ty = builder.getInt32Ty();
+    llvm::Value* idxVal = llvm::ConstantInt::get(i32Ty, idx);
+    return builder.CreateExtractElement(vec, idxVal);
 }
 
-static mlir::Value llvmInsert(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, mlir::Value elem, uint32_t idx) {
-    mlir::Type i32Ty = builder.getI32Type();
-    mlir::Value idxVal = mlir::LLVM::ConstantOp::create(builder, loc, i32Ty, builder.getI32IntegerAttr(idx));
-    return mlir::LLVM::InsertElementOp::create(builder, loc, vec, elem, idxVal);
+static llvm::Value* llvmInsert(llvm::IRBuilder<>& builder, llvm::Value* vec, llvm::Value* elem, uint32_t idx) {
+    llvm::Type* i32Ty = builder.getInt32Ty();
+    llvm::Value* idxVal = llvm::ConstantInt::get(i32Ty, idx);
+    return builder.CreateInsertElement(vec, elem, idxVal);
 }
 
-static mlir::Value llvmSplat(mlir::OpBuilder& builder, mlir::Location loc, mlir::Type elemTy, mlir::Value scalar, uint32_t W) {
-    auto vt = mlir::VectorType::get({W}, elemTy);
-    mlir::Value p = mlir::LLVM::PoisonOp::create(builder, loc, vt);
-    mlir::Value ins = llvmInsert(builder, loc, p, scalar, 0);
+static llvm::Value* llvmSplat(llvm::IRBuilder<>& builder, llvm::Type* elemTy, llvm::Value* scalar, uint32_t W) {
+    auto vt = llvm::FixedVectorType::get(elemTy, W);
+    llvm::Value* p = llvm::PoisonValue::get(vt);
+    llvm::Value* ins = llvmInsert(builder, p, scalar, 0);
     llvm::SmallVector<int32_t, 16> zeros(W, 0);
-    return mlir::LLVM::ShuffleVectorOp::create(builder, loc, ins, p, zeros);
+    return builder.CreateShuffleVector(ins, p, zeros);
 }
 
 struct IRHelpers {
-    mlir::OpBuilder& b;
-    mlir::Location loc;
+    llvm::IRBuilder<>& b;
+    ;
     uint32_t W;
 
-    mlir::Type i1Ty() const { return b.getI1Type(); }
-    mlir::Type i8Ty() const { return b.getIntegerType(8); }
-    mlir::Type i16Ty() const { return b.getIntegerType(16); }
-    mlir::Type i32Ty() const { return b.getI32Type(); }
-    mlir::Type i64Ty() const { return b.getI64Type(); }
-    mlir::Type f16Ty() const { return b.getF16Type(); }
-    mlir::FloatType f32Ty() const { return b.getF32Type(); }
-    mlir::Type ptrTy() const { return mlir::LLVM::LLVMPointerType::get(b.getContext()); }
-    mlir::VectorType vecTy(mlir::Type elem) const { return mlir::VectorType::get({W}, elem); }
+    llvm::Type* i1Ty() const { return b.getInt1Ty(); }
+    llvm::Type* i8Ty() const { return b.getInt8Ty(); }
+    llvm::Type* i16Ty() const { return b.getInt16Ty(); }
+    llvm::Type* i32Ty() const { return b.getInt32Ty(); }
+    llvm::Type* i64Ty() const { return b.getInt64Ty(); }
+    llvm::Type* f16Ty() const { return b.getHalfTy(); }
+    llvm::Type* f32Ty() const { return b.getFloatTy(); }
+    llvm::Type* ptrTy() const { return llvm::PointerType::getUnqual(b.getContext()); }
+    llvm::FixedVectorType* vecTy(llvm::Type* elem) const { return llvm::FixedVectorType::get(elem, W); }
 
-    mlir::Value cInt(mlir::Type ty, int64_t v) const {
-        return mlir::LLVM::ConstantOp::create(b, loc, ty, b.getIntegerAttr(ty, v));
+    llvm::Value* cInt(llvm::Type* ty, int64_t v) const {
+        return llvm::ConstantInt::get(ty, v);
     }
-    mlir::Value cFlt(double v) const {
-        return mlir::LLVM::ConstantOp::create(b, loc, f32Ty(), b.getF32FloatAttr(static_cast<float>(v)));
+    llvm::Value* cFlt(double v) const {
+        return llvm::ConstantFP::get(f32Ty(), static_cast<float>(v));
     }
-    mlir::Value splatInt(mlir::Type ty, int64_t v) const {
+    llvm::Value* splatInt(llvm::Type* ty, int64_t v) const {
         auto vt = vecTy(ty);
-        return mlir::LLVM::ConstantOp::create(b, loc, vt, mlir::DenseElementsAttr::get(vt, b.getIntegerAttr(ty, v)));
+        return llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(W), llvm::ConstantInt::get(ty, v));
     }
-    mlir::Value splatFlt(double v) const {
+    llvm::Value* splatFlt(double v) const {
         auto vt = vecTy(f32Ty());
-        return mlir::LLVM::ConstantOp::create(b, loc, vt, mlir::DenseElementsAttr::get(vt, b.getF32FloatAttr(static_cast<float>(v))));
+        return llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(W), llvm::ConstantFP::get(f32Ty(), static_cast<float>(v)));
     }
-    SimdVal splatScalar(mlir::Value scalar) const {
+    SimdVal splatScalar(llvm::Value* scalar) const {
         SimdVal sv;
         sv.kind = SimdVal::Kind::Vector;
-        sv.origType = scalar.getType();
-        sv.vec = llvmSplat(b, loc, scalar.getType(), scalar, W);
+        sv.origType = scalar->getType();
+        sv.vec = llvmSplat(b, scalar->getType(), scalar, W);
         return sv;
     }
-    mlir::Value allTrueMask() const { return splatInt(i1Ty(), 1); }
+    llvm::Value* allTrueMask() const { return splatInt(i1Ty(), 1); }
 
-    mlir::Value laneIota() const {
-        mlir::Value v = mlir::LLVM::PoisonOp::create(b, loc, vecTy(i32Ty()));
+    llvm::Value* laneIota() const {
+        llvm::Value* v = llvm::PoisonValue::get(vecTy(i32Ty()));
         for (uint32_t l = 0; l < W; ++l) {
-            v = llvmInsert(b, loc, v, cInt(i32Ty(), l), l);
+            v = llvmInsert(b, v, cInt(i32Ty(), l), l);
         }
         return v;
     }
 
-    mlir::Value gepBytes(mlir::Value ptr, int64_t byteOff) const {
+    llvm::Value* gepBytes(llvm::Value* ptr, int64_t byteOff) const {
         if (byteOff == 0) return ptr;
-        return mlir::LLVM::GEPOp::create(
-            b, loc, ptrTy(), i8Ty(), ptr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(byteOff)});
+        return b.CreateGEP(i8Ty(), ptr, b.getInt32(static_cast<int32_t>(byteOff)));
     }
-    mlir::Value gepBytesDyn(mlir::Value ptr, mlir::Value byteOffI64) const {
-        return mlir::LLVM::GEPOp::create(
-            b, loc, ptrTy(), i8Ty(), ptr, mlir::ValueRange{byteOffI64});
+    llvm::Value* gepBytesDyn(llvm::Value* ptr, llvm::Value* byteOffI64) const {
+        return b.CreateGEP(i8Ty(), ptr, llvm::ArrayRef<llvm::Value*>{byteOffI64});
     }
-    mlir::Value gepArray(mlir::Value basePtr, mlir::Type elemTy, mlir::Value idx) const {
-        return mlir::LLVM::GEPOp::create(
-            b, loc, ptrTy(), elemTy, basePtr, mlir::ValueRange{idx});
+    llvm::Value* gepArray(llvm::Value* basePtr, llvm::Type* elemTy, llvm::Value* idx) const {
+        return b.CreateGEP(elemTy, basePtr, llvm::ArrayRef<llvm::Value*>{idx});
     }
-    mlir::Value loadScalar(mlir::Type ty, mlir::Value ptr) const {
-        unsigned align = llvm::isa<mlir::VectorType>(ty) ? 4u : 0u;
-        return mlir::LLVM::LoadOp::create(b, loc, ty, ptr, align);
+    llvm::Value* loadScalar(llvm::Type* ty, llvm::Value* ptr) const {
+        unsigned align = llvm::isa<llvm::FixedVectorType>(ty) ? 4u : 1u;
+        return b.CreateAlignedLoad(ty, ptr, llvm::Align(align));
     }
-    void storeScalar(mlir::Value val, mlir::Value ptr) const {
-        unsigned align = llvm::isa<mlir::VectorType>(val.getType()) ? 4u : 0u;
-        mlir::LLVM::StoreOp::create(b, loc, val, ptr, align);
+    void storeScalar(llvm::Value* val, llvm::Value* ptr) const {
+        unsigned align = llvm::isa<llvm::FixedVectorType>(val->getType()) ? 4u : 1u;
+        b.CreateAlignedStore(val, ptr, llvm::Align(align));
     }
 
-    mlir::Value orReduce(mlir::Value maskVec) const {
-        return mlir::LLVM::vector_reduce_or::create(b, loc, b.getI1Type(), maskVec);
+    llvm::Value* orReduce(llvm::Value* maskVec) const {
+        return b.CreateOrReduce(maskVec);
     }
 
-    mlir::Value expandMaskQuads(mlir::Value mask) const {
+    llvm::Value* expandMaskQuads(llvm::Value* mask) const {
         llvm::SmallVector<int32_t, 16> s0, s1, s2, s3;
         for (uint32_t q = 0; q < W; q += 4) {
             for (uint32_t k = 0; k < 4; ++k) {
@@ -257,67 +321,66 @@ struct IRHelpers {
                 s3.push_back(q + 3);
             }
         }
-        mlir::Value m0 = mlir::LLVM::ShuffleVectorOp::create(b, loc, mask, mask, s0);
-        mlir::Value m1 = mlir::LLVM::ShuffleVectorOp::create(b, loc, mask, mask, s1);
-        mlir::Value m2 = mlir::LLVM::ShuffleVectorOp::create(b, loc, mask, mask, s2);
-        mlir::Value m3 = mlir::LLVM::ShuffleVectorOp::create(b, loc, mask, mask, s3);
-        mlir::Value o01 = mlir::LLVM::OrOp::create(b, loc, m0, m1);
-        mlir::Value o23 = mlir::LLVM::OrOp::create(b, loc, m2, m3);
-        return mlir::LLVM::OrOp::create(b, loc, o01, o23);
+        llvm::Value* m0 = b.CreateShuffleVector(mask, mask, s0);
+        llvm::Value* m1 = b.CreateShuffleVector(mask, mask, s1);
+        llvm::Value* m2 = b.CreateShuffleVector(mask, mask, s2);
+        llvm::Value* m3 = b.CreateShuffleVector(mask, mask, s3);
+        llvm::Value* o01 = b.CreateOr(m0, m1);
+        llvm::Value* o23 = b.CreateOr(m2, m3);
+        return b.CreateOr(o01, o23);
     }
 
-    mlir::Value clamp01(mlir::Value vVec) const {
-        mlir::Value zero = splatFlt(0.0);
-        mlir::Value one = splatFlt(1.0);
-        return mlir::LLVM::MinNumOp::create(
-            b, loc, mlir::LLVM::MaxNumOp::create(b, loc, vVec, zero), one);
+    llvm::Value* clamp01(llvm::Value* vVec) const {
+        llvm::Value* zero = splatFlt(0.0);
+        llvm::Value* one = splatFlt(1.0);
+        return b.CreateIntrinsic(llvm::Intrinsic::minnum, {b.CreateIntrinsic(llvm::Intrinsic::maxnum, {vVec->getType()}, {vVec, zero})->getType()}, {b.CreateIntrinsic(llvm::Intrinsic::maxnum, {vVec->getType()}, {vVec, zero}), one});
     }
 
-    mlir::Value evalDepthCmp(D3D12_COMPARISON_FUNC func, mlir::Value newZ, mlir::Value oldZ) const {
+    llvm::Value* evalDepthCmp(D3D12_COMPARISON_FUNC func, llvm::Value* newZ, llvm::Value* oldZ) const {
         switch (func) {
         case D3D12_COMPARISON_FUNC_NEVER:
             return splatInt(i1Ty(), 0);
         case D3D12_COMPARISON_FUNC_LESS:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::olt, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_OLT, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_EQUAL:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::oeq, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_OEQ, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_LESS_EQUAL:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::ole, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_OLE, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_GREATER:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::ogt, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_OGT, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_NOT_EQUAL:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::one, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_ONE, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_GREATER_EQUAL:
-            return mlir::LLVM::FCmpOp::create(b, loc, mlir::LLVM::FCmpPredicate::oge, newZ, oldZ);
+            return b.CreateFCmp(llvm::CmpInst::FCMP_OGE, newZ, oldZ);
         case D3D12_COMPARISON_FUNC_ALWAYS:
         default:
             return allTrueMask();
         }
     }
 
-    mlir::Value evalStencilCmp(D3D12_COMPARISON_FUNC func, mlir::Value refVec, mlir::Value bufVec) const {
+    llvm::Value* evalStencilCmp(D3D12_COMPARISON_FUNC func, llvm::Value* refVec, llvm::Value* bufVec) const {
         switch (func) {
         case D3D12_COMPARISON_FUNC_NEVER:
             return splatInt(i1Ty(), 0);
         case D3D12_COMPARISON_FUNC_LESS:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::ult, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_ULT, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_EQUAL:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_EQ, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_LESS_EQUAL:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::ule, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_ULE, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_GREATER:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::ugt, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_UGT, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_NOT_EQUAL:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::ne, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_NE, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_GREATER_EQUAL:
-            return mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::uge, refVec, bufVec);
+            return b.CreateICmp(llvm::CmpInst::ICMP_UGE, refVec, bufVec);
         case D3D12_COMPARISON_FUNC_ALWAYS:
         default:
             return allTrueMask();
         }
     }
 
-    mlir::Value applyStencilOp(D3D12_STENCIL_OP sop, mlir::Value oldVal, mlir::Value refVal) const {
+    llvm::Value* applyStencilOp(D3D12_STENCIL_OP sop, llvm::Value* oldVal, llvm::Value* refVal) const {
         switch (sop) {
         case D3D12_STENCIL_OP_KEEP:
             return oldVal;
@@ -326,74 +389,123 @@ struct IRHelpers {
         case D3D12_STENCIL_OP_REPLACE:
             return refVal;
         case D3D12_STENCIL_OP_INCR_SAT: {
-            mlir::Value sat = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, oldVal, splatInt(i8Ty(), 255));
-            mlir::Value inc = mlir::LLVM::AddOp::create(b, loc, oldVal, splatInt(i8Ty(), 1));
-            return mlir::LLVM::SelectOp::create(b, loc, sat, oldVal, inc);
+            llvm::Value* sat = b.CreateICmp(llvm::CmpInst::ICMP_EQ, oldVal, splatInt(i8Ty(), 255));
+            llvm::Value* inc = b.CreateAdd(oldVal, splatInt(i8Ty(), 1));
+            return b.CreateSelect(sat, oldVal, inc);
         }
         case D3D12_STENCIL_OP_DECR_SAT: {
-            mlir::Value z = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, oldVal, splatInt(i8Ty(), 0));
-            mlir::Value dec = mlir::LLVM::SubOp::create(b, loc, oldVal, splatInt(i8Ty(), 1));
-            return mlir::LLVM::SelectOp::create(b, loc, z, oldVal, dec);
+            llvm::Value* z = b.CreateICmp(llvm::CmpInst::ICMP_EQ, oldVal, splatInt(i8Ty(), 0));
+            llvm::Value* dec = b.CreateSub(oldVal, splatInt(i8Ty(), 1));
+            return b.CreateSelect(z, oldVal, dec);
         }
         case D3D12_STENCIL_OP_INVERT:
-            return mlir::LLVM::XOrOp::create(b, loc, oldVal, splatInt(i8Ty(), -1));
+            return b.CreateXor(oldVal, splatInt(i8Ty(), -1));
         case D3D12_STENCIL_OP_INCR:
-            return mlir::LLVM::AddOp::create(b, loc, oldVal, splatInt(i8Ty(), 1));
+            return b.CreateAdd(oldVal, splatInt(i8Ty(), 1));
         case D3D12_STENCIL_OP_DECR:
-            return mlir::LLVM::SubOp::create(b, loc, oldVal, splatInt(i8Ty(), 1));
+            return b.CreateSub(oldVal, splatInt(i8Ty(), 1));
         default:
             return oldVal;
         }
     }
 
-    mlir::Value evalBlendFactorRGB(
+    llvm::Value* evalBlendFactorRGB(
         D3D12_BLEND factor,
-        const mlir::Value src[4],
-        const mlir::Value dst[4],
-        const mlir::Value blendFactor[4],
+        llvm::Value* const src[4],
+        llvm::Value* const dst[4],
+        llvm::Value* const blendFactor[4],
         int comp) const {
-        mlir::Value one = splatFlt(1.0);
+        llvm::Value* one = splatFlt(1.0);
         switch (factor) {
         case D3D12_BLEND_ZERO: return splatFlt(0.0);
         case D3D12_BLEND_ONE: return one;
         case D3D12_BLEND_SRC_COLOR: return src[comp];
-        case D3D12_BLEND_INV_SRC_COLOR: return mlir::LLVM::FSubOp::create(b, loc, one, src[comp]);
+        case D3D12_BLEND_INV_SRC_COLOR: return b.CreateFSub(one, src[comp]);
         case D3D12_BLEND_SRC_ALPHA: return src[3];
-        case D3D12_BLEND_INV_SRC_ALPHA: return mlir::LLVM::FSubOp::create(b, loc, one, src[3]);
+        case D3D12_BLEND_INV_SRC_ALPHA: return b.CreateFSub(one, src[3]);
         case D3D12_BLEND_DEST_ALPHA: return dst[3];
-        case D3D12_BLEND_INV_DEST_ALPHA: return mlir::LLVM::FSubOp::create(b, loc, one, dst[3]);
+        case D3D12_BLEND_INV_DEST_ALPHA: return b.CreateFSub(one, dst[3]);
         case D3D12_BLEND_DEST_COLOR: return dst[comp];
-        case D3D12_BLEND_INV_DEST_COLOR: return mlir::LLVM::FSubOp::create(b, loc, one, dst[comp]);
+        case D3D12_BLEND_INV_DEST_COLOR: return b.CreateFSub(one, dst[comp]);
         case D3D12_BLEND_SRC_ALPHA_SAT: {
             if (comp == 3) return one;
-            mlir::Value invDstA = mlir::LLVM::FSubOp::create(b, loc, one, dst[3]);
-            return mlir::LLVM::MinNumOp::create(b, loc, src[3], invDstA);
+            llvm::Value* invDstA = b.CreateFSub(one, dst[3]);
+            return b.CreateIntrinsic(llvm::Intrinsic::minnum, {src[3]->getType()}, {src[3], invDstA});
         }
         case D3D12_BLEND_BLEND_FACTOR: return blendFactor[comp];
-        case D3D12_BLEND_INV_BLEND_FACTOR: return mlir::LLVM::FSubOp::create(b, loc, one, blendFactor[comp]);
+        case D3D12_BLEND_INV_BLEND_FACTOR: return b.CreateFSub(one, blendFactor[comp]);
         default: return one;
         }
     }
 
-    mlir::Value evalBlendOp(D3D12_BLEND_OP op, mlir::Value sTerm, mlir::Value dTerm) const {
+    llvm::Value* evalBlendOp(D3D12_BLEND_OP op, llvm::Value* sTerm, llvm::Value* dTerm) const {
         switch (op) {
-        case D3D12_BLEND_OP_ADD: return mlir::LLVM::FAddOp::create(b, loc, sTerm, dTerm);
-        case D3D12_BLEND_OP_SUBTRACT: return mlir::LLVM::FSubOp::create(b, loc, sTerm, dTerm);
-        case D3D12_BLEND_OP_REV_SUBTRACT: return mlir::LLVM::FSubOp::create(b, loc, dTerm, sTerm);
-        case D3D12_BLEND_OP_MIN: return mlir::LLVM::MinNumOp::create(b, loc, sTerm, dTerm);
-        case D3D12_BLEND_OP_MAX: return mlir::LLVM::MaxNumOp::create(b, loc, sTerm, dTerm);
-        default: return mlir::LLVM::FAddOp::create(b, loc, sTerm, dTerm);
+        case D3D12_BLEND_OP_ADD: return b.CreateFAdd(sTerm, dTerm);
+        case D3D12_BLEND_OP_SUBTRACT: return b.CreateFSub(sTerm, dTerm);
+        case D3D12_BLEND_OP_REV_SUBTRACT: return b.CreateFSub(dTerm, sTerm);
+        case D3D12_BLEND_OP_MIN: return b.CreateIntrinsic(llvm::Intrinsic::minnum, {sTerm->getType()}, {sTerm, dTerm});
+        case D3D12_BLEND_OP_MAX: return b.CreateIntrinsic(llvm::Intrinsic::maxnum, {sTerm->getType()}, {sTerm, dTerm});
+        default: return b.CreateFAdd(sTerm, dTerm);
         }
     }
 };
 
-void cloneGlobalsIntoModule(mlir::ModuleOp srcMod, mlir::ModuleOp dstMod) {
-    mlir::OpBuilder dstBuilder(dstMod.getBody(), dstMod.getBody()->begin());
-    for (auto gv : srcMod.getOps<mlir::LLVM::GlobalOp>()) {
-        if (!dstMod.lookupSymbol(gv.getSymName())) {
-            dstBuilder.clone(*gv.getOperation());
+bool structurizeAndLinkStage(
+    std::unique_ptr<llvm::Module> stageMod,
+    const std::string& entryName,
+    const std::string& tempTag,
+    llvm::Module& dstMod,
+    StructuredFunction& outTree,
+    llvm::Function*& outLinkedFn,
+    std::string& outError,
+    const std::string& extraEntryName = "",
+    StructuredFunction* outExtraTree = nullptr,
+    llvm::Function** outExtraLinkedFn = nullptr) {
+    if (!stageMod) return false;
+    llvm::Function* fn = stageMod->getFunction(entryName);
+    if (!fn) {
+        outError = "Stage entry function not found: " + entryName;
+        return false;
+    }
+    std::string renamedEntry = "__nacelle_src_" + tempTag;
+    fn->setName(renamedEntry);
+    if (!structurizeAndBuildRegionTree(*fn, outTree, outError)) {
+        return false;
+    }
+
+    std::string renamedExtra;
+    if (!extraEntryName.empty() && outExtraTree) {
+        llvm::Function* extraFn = stageMod->getFunction(extraEntryName);
+        if (!extraFn) {
+            outError = "Stage extra entry function not found: " + extraEntryName;
+            return false;
+        }
+        renamedExtra = "__nacelle_src_" + tempTag + "_extra";
+        extraFn->setName(renamedExtra);
+        if (!structurizeAndBuildRegionTree(*extraFn, *outExtraTree, outError)) {
+            return false;
         }
     }
+
+    if (llvm::Linker::linkModules(dstMod, std::move(stageMod))) {
+        outError = "llvm::Linker failed linking stage " + tempTag;
+        return false;
+    }
+    outLinkedFn = dstMod.getFunction(renamedEntry);
+    if (outExtraLinkedFn && !renamedExtra.empty()) {
+        *outExtraLinkedFn = dstMod.getFunction(renamedExtra);
+    }
+    return true;
+}
+
+void eraseUnusedDxOps(llvm::Module& mod) {
+    llvm::SmallVector<llvm::Function*, 16> deadDxOps;
+    for (llvm::Function& f : mod) {
+        if (f.isDeclaration() && f.getName().starts_with("dx.op.") && f.use_empty()) {
+            deadDxOps.push_back(&f);
+        }
+    }
+    for (llvm::Function* f : deadDxOps) f->eraseFromParent();
 }
 
 struct LinkedVSSigSlot {
@@ -403,24 +515,23 @@ struct LinkedVSSigSlot {
 
 struct PredecodedVertexElement {
     bool valid = false;
-    mlir::Value compsF32[4]{};
-    mlir::Value compsI32[4]{};
+    llvm::Value* compsF32[4]{};
+    llvm::Value* compsI32[4]{};
 };
 
 PredecodedVertexElement predecodeVertexElementSIMD(
     IRHelpers& h,
     const D3D12_INPUT_ELEMENT_DESC& el,
-    mlir::Value activeMask,
-    mlir::Value vbBasePtr,
-    mlir::Value vbStrideVec,
-    mlir::Value vbSizeVec,
-    mlir::Value idxVec,
+    llvm::Value* activeMask,
+    llvm::Value* vbBasePtr,
+    llvm::Value* vbStrideVec,
+    llvm::Value* vbSizeVec,
+    llvm::Value* idxVec,
     uint32_t byteOffsetInElem,
     uint8_t neededColsMask) {
     PredecodedVertexElement res;
     res.valid = true;
-    mlir::OpBuilder& b = h.b;
-    mlir::Location loc = h.loc;
+    llvm::IRBuilder<>& b = h.b;
     auto i8Ty = h.i8Ty();
     auto i16Ty = h.i16Ty();
     auto i32Ty = h.i32Ty();
@@ -429,9 +540,9 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     auto f32Ty = h.f32Ty();
     auto ptrTy = h.ptrTy();
 
-    mlir::Value zeroI32 = h.splatInt(i32Ty, 0);
-    mlir::Value zeroF32 = h.splatFlt(0.0);
-    mlir::Value oneF32 = h.splatFlt(1.0);
+    llvm::Value* zeroI32 = h.splatInt(i32Ty, 0);
+    llvm::Value* zeroF32 = h.splatFlt(0.0);
+    llvm::Value* oneF32 = h.splatFlt(1.0);
     for (uint32_t c = 0; c < 4; ++c) {
         res.compsF32[c] = (c == 3) ? oneF32 : zeroF32;
         res.compsI32[c] = zeroI32;
@@ -439,43 +550,35 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     if (neededColsMask == 0) return res;
 
     uint32_t fmtBytes = formatByteSizeForVertex(el.Format);
-    mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), idxVec);
-    mlir::Value str64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbStrideVec);
-    mlir::Value off64Vec = mlir::LLVM::AddOp::create(
-        b, loc,
-        mlir::LLVM::MulOp::create(b, loc, idx64Vec, str64Vec),
-        h.splatInt(i64Ty, byteOffsetInElem));
-    mlir::Value end64Vec = mlir::LLVM::AddOp::create(b, loc, off64Vec, h.splatInt(i64Ty, fmtBytes));
-    mlir::Value sz64Vec = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i64Ty), vbSizeVec);
-    mlir::Value inBoundsVec = mlir::LLVM::ICmpOp::create(
-        b, loc, mlir::LLVM::ICmpPredicate::ule, end64Vec, sz64Vec);
-    mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
-        b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtr, mlir::LLVM::ZeroOp::create(b, loc, ptrTy));
-    mlir::Value ptrNotNullVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getElementType(), ptrNotNull, llvm::cast<mlir::VectorType>(h.vecTy(h.i1Ty())).getNumElements());
-    mlir::Value laneOkMask = mlir::LLVM::AndOp::create(
-        b, loc, mlir::LLVM::AndOp::create(b, loc, activeMask, ptrNotNullVec), inBoundsVec);
+    llvm::Value* idx64Vec = b.CreateZExt(idxVec, h.vecTy(i64Ty));
+    llvm::Value* str64Vec = b.CreateZExt(vbStrideVec, h.vecTy(i64Ty));
+    llvm::Value* off64Vec = b.CreateAdd(b.CreateMul(idx64Vec, str64Vec), h.splatInt(i64Ty, byteOffsetInElem));
+    llvm::Value* end64Vec = b.CreateAdd(off64Vec, h.splatInt(i64Ty, fmtBytes));
+    llvm::Value* sz64Vec = b.CreateZExt(vbSizeVec, h.vecTy(i64Ty));
+    llvm::Value* inBoundsVec = b.CreateICmp(llvm::CmpInst::ICMP_ULE, end64Vec, sz64Vec);
+    llvm::Value* ptrNotNull = b.CreateICmp(llvm::CmpInst::ICMP_NE, vbBasePtr, llvm::Constant::getNullValue(ptrTy));
+    llvm::Value* ptrNotNullVec = llvmSplat(b, h.i1Ty(), ptrNotNull, h.W);
+    llvm::Value* laneOkMask = b.CreateAnd(b.CreateAnd(activeMask, ptrNotNullVec), inBoundsVec);
 
-    auto gatherElem = [&](mlir::Type elemTy, int64_t deltaBytes, mlir::Value passThruVec) -> mlir::Value {
-        mlir::Value compBase = h.gepBytes(vbBasePtr, deltaBytes);
-        mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
-            b, loc, h.vecTy(ptrTy), i8Ty, compBase, mlir::ValueRange{off64Vec});
-        return mlir::LLVM::masked_gather::create(
-            b, loc, h.vecTy(elemTy), ptrVec, laneOkMask, mlir::ValueRange{passThruVec}, /*alignment=*/1);
+    auto gatherElem = [&](llvm::Type* elemTy, int64_t deltaBytes, llvm::Value* passThruVec) -> llvm::Value* {
+        llvm::Value* compBase = h.gepBytes(vbBasePtr, deltaBytes);
+        llvm::Value* ptrVec = b.CreateGEP(i8Ty, compBase, llvm::ArrayRef<llvm::Value*>{off64Vec});
+        return b.CreateMaskedGather(h.vecTy(elemTy), ptrVec, llvm::Align(1), laneOkMask, passThruVec);
     };
 
-    auto setFromFloat = [&](uint32_t c, mlir::Value fv, bool applyOobAlphaDefault) {
+    auto setFromFloat = [&](uint32_t c, llvm::Value* fv, bool applyOobAlphaDefault) {
         if (c == 3 && applyOobAlphaDefault) {
-            fv = mlir::LLVM::SelectOp::create(b, loc, laneOkMask, fv, oneF32);
+            fv = b.CreateSelect(laneOkMask, fv, oneF32);
         }
         res.compsF32[c] = fv;
-        mlir::Value asInt = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(i32Ty), fv);
-        res.compsI32[c] = mlir::LLVM::SelectOp::create(b, loc, laneOkMask, asInt, zeroI32);
+        llvm::Value* asInt = b.CreateBitCast(fv, h.vecTy(i32Ty));
+        res.compsI32[c] = b.CreateSelect(laneOkMask, asInt, zeroI32);
     };
 
-    auto setFromInt = [&](uint32_t c, mlir::Value iv) {
+    auto setFromInt = [&](uint32_t c, llvm::Value* iv) {
         res.compsI32[c] = iv;
-        mlir::Value asFlt = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(f32Ty), iv);
-        res.compsF32[c] = (c == 3) ? mlir::LLVM::SelectOp::create(b, loc, laneOkMask, asFlt, oneF32).getResult() : asFlt;
+        llvm::Value* asFlt = b.CreateBitCast(iv, h.vecTy(f32Ty));
+        res.compsF32[c] = (c == 3) ? b.CreateSelect(laneOkMask, asFlt, oneF32) : asFlt;
     };
 
     switch (el.Format) {
@@ -486,8 +589,8 @@ PredecodedVertexElement predecodeVertexElementSIMD(
         uint32_t maxComps = fmtBytes / 4;
         for (uint32_t c = 0; c < maxComps; ++c) {
             if (!(neededColsMask & (1u << c))) continue;
-            mlir::Value defF = (c == 3) ? oneF32 : zeroF32;
-            mlir::Value fv = gatherElem(f32Ty, static_cast<int64_t>(c * 4), defF);
+            llvm::Value* defF = (c == 3) ? oneF32 : zeroF32;
+            llvm::Value* fv = gatherElem(f32Ty, static_cast<int64_t>(c * 4), defF);
             setFromFloat(c, fv, /*applyOobAlphaDefault=*/false);
         }
         break;
@@ -503,7 +606,7 @@ PredecodedVertexElement predecodeVertexElementSIMD(
         uint32_t maxComps = fmtBytes / 4;
         for (uint32_t c = 0; c < maxComps; ++c) {
             if (!(neededColsMask & (1u << c))) continue;
-            mlir::Value iv = gatherElem(i32Ty, static_cast<int64_t>(c * 4), zeroI32);
+            llvm::Value* iv = gatherElem(i32Ty, static_cast<int64_t>(c * 4), zeroI32);
             setFromInt(c, iv);
         }
         break;
@@ -513,22 +616,22 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     case DXGI_FORMAT_R16_FLOAT: {
         if (el.Format == DXGI_FORMAT_R16_FLOAT) {
             if (neededColsMask & 1u) {
-                mlir::Value zeroF16 = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(f16Ty), h.splatInt(i16Ty, 0));
-                mlir::Value hv = gatherElem(f16Ty, 0, zeroF16);
-                setFromFloat(0, mlir::LLVM::FPExtOp::create(b, loc, h.vecTy(f32Ty), hv), false);
+                llvm::Value* zeroF16 = b.CreateBitCast(h.splatInt(i16Ty, 0), h.vecTy(f16Ty));
+                llvm::Value* hv = gatherElem(f16Ty, 0, zeroF16);
+                setFromFloat(0, b.CreateFPExt(hv, h.vecTy(f32Ty)), false);
             }
         } else {
-            auto unpackPair = [&](mlir::Value raw32, uint32_t c0, uint32_t c1) {
+            auto unpackPair = [&](llvm::Value* raw32, uint32_t c0, uint32_t c1) {
                 if (neededColsMask & (1u << c0)) {
-                    mlir::Value lo16 = mlir::LLVM::TruncOp::create(b, loc, h.vecTy(i16Ty), raw32);
-                    mlir::Value hv0 = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(f16Ty), lo16);
-                    setFromFloat(c0, mlir::LLVM::FPExtOp::create(b, loc, h.vecTy(f32Ty), hv0), c0 == 3);
+                    llvm::Value* lo16 = b.CreateTrunc(raw32, h.vecTy(i16Ty));
+                    llvm::Value* hv0 = b.CreateBitCast(lo16, h.vecTy(f16Ty));
+                    setFromFloat(c0, b.CreateFPExt(hv0, h.vecTy(f32Ty)), c0 == 3);
                 }
                 if (neededColsMask & (1u << c1)) {
-                    mlir::Value hi32 = mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, 16));
-                    mlir::Value hi16 = mlir::LLVM::TruncOp::create(b, loc, h.vecTy(i16Ty), hi32);
-                    mlir::Value hv1 = mlir::LLVM::BitcastOp::create(b, loc, h.vecTy(f16Ty), hi16);
-                    setFromFloat(c1, mlir::LLVM::FPExtOp::create(b, loc, h.vecTy(f32Ty), hv1), c1 == 3);
+                    llvm::Value* hi32 = b.CreateLShr(raw32, h.splatInt(i32Ty, 16));
+                    llvm::Value* hi16 = b.CreateTrunc(hi32, h.vecTy(i16Ty));
+                    llvm::Value* hv1 = b.CreateBitCast(hi16, h.vecTy(f16Ty));
+                    setFromFloat(c1, b.CreateFPExt(hv1, h.vecTy(f32Ty)), c1 == 3);
                 }
             };
             if (neededColsMask & 0x3u) {
@@ -558,21 +661,21 @@ PredecodedVertexElement predecodeVertexElementSIMD(
         bool isNorm = (el.Format == DXGI_FORMAT_R16G16B16A16_UNORM || el.Format == DXGI_FORMAT_R16G16_UNORM ||
                        el.Format == DXGI_FORMAT_R16_UNORM || el.Format == DXGI_FORMAT_R16G16B16A16_SNORM ||
                        el.Format == DXGI_FORMAT_R16G16_SNORM || el.Format == DXGI_FORMAT_R16_SNORM);
-        auto decode16 = [&](uint32_t c, mlir::Value raw32, bool highHalf) {
-            mlir::Value v32;
+        auto decode16 = [&](uint32_t c, llvm::Value* raw32, bool highHalf) {
+            llvm::Value* v32;
             if (isSigned) {
-                mlir::Value shl = highHalf ? raw32 : mlir::LLVM::ShlOp::create(b, loc, raw32, h.splatInt(i32Ty, 16)).getResult();
-                v32 = mlir::LLVM::AShrOp::create(b, loc, shl, h.splatInt(i32Ty, 16));
+                llvm::Value* shl = highHalf ? raw32 : b.CreateShl(raw32, h.splatInt(i32Ty, 16));
+                v32 = b.CreateAShr(shl, h.splatInt(i32Ty, 16));
             } else {
-                v32 = highHalf ? mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, 16)).getResult()
-                               : mlir::LLVM::AndOp::create(b, loc, raw32, h.splatInt(i32Ty, 0xFFFF)).getResult();
+                v32 = highHalf ? b.CreateLShr(raw32, h.splatInt(i32Ty, 16))
+                               : b.CreateAnd(raw32, h.splatInt(i32Ty, 0xFFFF));
             }
             if (isNorm) {
-                mlir::Value fv = isSigned
-                                     ? mlir::LLVM::SIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult()
-                                     : mlir::LLVM::UIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult();
-                fv = mlir::LLVM::FMulOp::create(b, loc, fv, h.splatFlt(isSigned ? (1.0 / 32767.0) : (1.0 / 65535.0)));
-                if (isSigned) fv = mlir::LLVM::MaxNumOp::create(b, loc, fv, h.splatFlt(-1.0));
+                llvm::Value* fv = isSigned
+                                     ? b.CreateSIToFP(v32, h.vecTy(f32Ty))
+                                     : b.CreateUIToFP(v32, h.vecTy(f32Ty));
+                fv = b.CreateFMul(fv, h.splatFlt(isSigned ? (1.0 / 32767.0) : (1.0 / 65535.0)));
+                if (isSigned) fv = b.CreateIntrinsic(llvm::Intrinsic::maxnum, {fv->getType()}, {fv, h.splatFlt(-1.0)});
                 setFromFloat(c, fv, c == 3);
             } else {
                 setFromInt(c, v32);
@@ -580,18 +683,18 @@ PredecodedVertexElement predecodeVertexElementSIMD(
         };
         if (fmtBytes == 2) {
             if (neededColsMask & 1u) {
-                mlir::Value u16 = gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0));
-                mlir::Value raw32 = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i32Ty), u16);
+                llvm::Value* u16 = gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0));
+                llvm::Value* raw32 = b.CreateZExt(u16, h.vecTy(i32Ty));
                 decode16(0, raw32, false);
             }
         } else {
             if (neededColsMask & 0x3u) {
-                mlir::Value rawLo = gatherElem(i32Ty, 0, zeroI32);
+                llvm::Value* rawLo = gatherElem(i32Ty, 0, zeroI32);
                 if (neededColsMask & 1u) decode16(0, rawLo, false);
                 if (neededColsMask & 2u) decode16(1, rawLo, true);
             }
             if (fmtBytes == 8 && (neededColsMask & 0xCu)) {
-                mlir::Value rawHi = gatherElem(i32Ty, 4, zeroI32);
+                llvm::Value* rawHi = gatherElem(i32Ty, 4, zeroI32);
                 if (neededColsMask & 4u) decode16(2, rawHi, false);
                 if (neededColsMask & 8u) decode16(3, rawHi, true);
             }
@@ -622,13 +725,13 @@ PredecodedVertexElement predecodeVertexElementSIMD(
                        el.Format == DXGI_FORMAT_R8_UNORM || el.Format == DXGI_FORMAT_R8G8B8A8_SNORM ||
                        el.Format == DXGI_FORMAT_R8G8_SNORM || el.Format == DXGI_FORMAT_R8_SNORM);
         uint32_t maxComps = fmtBytes;
-        mlir::Value raw32;
+        llvm::Value* raw32;
         if (fmtBytes == 4) {
             raw32 = gatherElem(i32Ty, 0, zeroI32);
         } else if (fmtBytes == 2) {
-            raw32 = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i32Ty), gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0)));
+            raw32 = b.CreateZExt(gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0)), h.vecTy(i32Ty));
         } else {
-            raw32 = mlir::LLVM::ZExtOp::create(b, loc, h.vecTy(i32Ty), gatherElem(i8Ty, 0, h.splatInt(i8Ty, 0)));
+            raw32 = b.CreateZExt(gatherElem(i8Ty, 0, h.splatInt(i8Ty, 0)), h.vecTy(i32Ty));
         }
         for (uint32_t c = 0; c < maxComps; ++c) {
             if (!(neededColsMask & (1u << c))) continue;
@@ -637,25 +740,25 @@ PredecodedVertexElement predecodeVertexElementSIMD(
                 continue;
             }
             uint32_t byteIdx = (isBGRA && c == 0) ? 2u : ((isBGRA && c == 2) ? 0u : c);
-            mlir::Value v32;
+            llvm::Value* v32;
             if (isSigned) {
                 uint32_t shlAmt = 24u - byteIdx * 8u;
-                mlir::Value shl = (shlAmt > 0)
-                                      ? mlir::LLVM::ShlOp::create(b, loc, raw32, h.splatInt(i32Ty, shlAmt)).getResult()
+                llvm::Value* shl = (shlAmt > 0)
+                                      ? b.CreateShl(raw32, h.splatInt(i32Ty, shlAmt))
                                       : raw32;
-                v32 = mlir::LLVM::AShrOp::create(b, loc, shl, h.splatInt(i32Ty, 24));
+                v32 = b.CreateAShr(shl, h.splatInt(i32Ty, 24));
             } else {
-                mlir::Value shr = (byteIdx > 0)
-                                      ? mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, byteIdx * 8u)).getResult()
+                llvm::Value* shr = (byteIdx > 0)
+                                      ? b.CreateLShr(raw32, h.splatInt(i32Ty, byteIdx * 8u))
                                       : raw32;
-                v32 = (byteIdx == 3) ? shr : mlir::LLVM::AndOp::create(b, loc, shr, h.splatInt(i32Ty, 0xFF)).getResult();
+                v32 = (byteIdx == 3) ? shr : b.CreateAnd(shr, h.splatInt(i32Ty, 0xFF));
             }
             if (isNorm) {
-                mlir::Value fv = isSigned
-                                     ? mlir::LLVM::SIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult()
-                                     : mlir::LLVM::UIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult();
-                fv = mlir::LLVM::FMulOp::create(b, loc, fv, h.splatFlt(isSigned ? (1.0 / 127.0) : (1.0 / 255.0)));
-                if (isSigned) fv = mlir::LLVM::MaxNumOp::create(b, loc, fv, h.splatFlt(-1.0));
+                llvm::Value* fv = isSigned
+                                     ? b.CreateSIToFP(v32, h.vecTy(f32Ty))
+                                     : b.CreateUIToFP(v32, h.vecTy(f32Ty));
+                fv = b.CreateFMul(fv, h.splatFlt(isSigned ? (1.0 / 127.0) : (1.0 / 255.0)));
+                if (isSigned) fv = b.CreateIntrinsic(llvm::Intrinsic::maxnum, {fv->getType()}, {fv, h.splatFlt(-1.0)});
                 setFromFloat(c, fv, c == 3);
             } else {
                 setFromInt(c, v32);
@@ -666,23 +769,23 @@ PredecodedVertexElement predecodeVertexElementSIMD(
     case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R10G10B10A2_UINT: {
         bool isNorm = (el.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
-        mlir::Value raw32 = gatherElem(i32Ty, 0, zeroI32);
-        mlir::Value mask10 = h.splatInt(i32Ty, 0x3FF);
+        llvm::Value* raw32 = gatherElem(i32Ty, 0, zeroI32);
+        llvm::Value* mask10 = h.splatInt(i32Ty, 0x3FF);
         for (uint32_t c = 0; c < 4; ++c) {
             if (!(neededColsMask & (1u << c))) continue;
-            mlir::Value u32;
+            llvm::Value* u32;
             if (c == 0) {
-                u32 = mlir::LLVM::AndOp::create(b, loc, raw32, mask10);
+                u32 = b.CreateAnd(raw32, mask10);
             } else if (c == 1) {
-                u32 = mlir::LLVM::AndOp::create(b, loc, mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, 10)), mask10);
+                u32 = b.CreateAnd(b.CreateLShr(raw32, h.splatInt(i32Ty, 10)), mask10);
             } else if (c == 2) {
-                u32 = mlir::LLVM::AndOp::create(b, loc, mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, 20)), mask10);
+                u32 = b.CreateAnd(b.CreateLShr(raw32, h.splatInt(i32Ty, 20)), mask10);
             } else {
-                u32 = mlir::LLVM::LShrOp::create(b, loc, raw32, h.splatInt(i32Ty, 30));
+                u32 = b.CreateLShr(raw32, h.splatInt(i32Ty, 30));
             }
             if (isNorm) {
-                mlir::Value fv = mlir::LLVM::UIToFPOp::create(b, loc, h.vecTy(f32Ty), u32);
-                fv = mlir::LLVM::FMulOp::create(b, loc, fv, h.splatFlt(c == 3 ? (1.0 / 3.0) : (1.0 / 1023.0)));
+                llvm::Value* fv = b.CreateUIToFP(u32, h.vecTy(f32Ty));
+                fv = b.CreateFMul(fv, h.splatFlt(c == 3 ? (1.0 / 3.0) : (1.0 / 1023.0)));
                 setFromFloat(c, fv, c == 3);
             } else {
                 setFromInt(c, u32);
@@ -768,8 +871,8 @@ CanonicalVSLayoutInfo computeCanonicalVSLayout(const std::vector<DxilSigRecord>&
 }
 
 bool emitVertexStageFunction(
-    mlir::ModuleOp targetMod,
-    mlir::func::FuncOp vsSrcFunc,
+    llvm::Module& targetMod,
+    const StructuredFunction& vsTree,
     const DxilLoadedShader& vsLoaded,
     const RootSignatureLayout& vsEffectiveLayout,
     const D3D12_INPUT_LAYOUT_DESC& inputLayout,
@@ -780,37 +883,34 @@ bool emitVertexStageFunction(
     const CanonicalVSLayoutInfo* canonicalLayout,
     const std::unordered_map<uint32_t, LinkedVSSigSlot>* vsToNextMap,
     std::string& outError) {
-    if (!vsSrcFunc || vsSrcFunc.getBody().empty()) {
-        outError = "Vertex shader entry function missing after MLIR SCF lift";
+    if (!vsTree.root) {
+        outError = "Vertex shader structured region tree missing";
         return false;
     }
 
-    mlir::Location loc = targetMod.getLoc();
-    mlir::OpBuilder b(targetMod.getBody(), targetMod.getBody()->end());
-    IRHelpers h{b, loc, simdWidth};
-    auto ptrTy = h.ptrTy();
-    auto i32Ty = h.i32Ty();
-    auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
-    auto vsFn = mlir::func::FuncOp::create(b, loc, vsSym, fnTy);
-    mlir::Block* entry = vsFn.addEntryBlock();
-    b.setInsertionPointToEnd(entry);
+    auto ptrTy = llvm::PointerType::getUnqual(targetMod.getContext());
+    auto i32Ty = llvm::Type::getInt32Ty(targetMod.getContext());
+    auto fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(targetMod.getContext()), {ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, false);
+    auto* vsFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym, targetMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(targetMod.getContext(), "entry", vsFn);
+    llvm::IRBuilder<> b(entry);
+    IRHelpers h{b, simdWidth};
 
-    mlir::Value rootCtx = entry->getArgument(0);
-    mlir::Value vertexIdsPtr = entry->getArgument(1);
-    mlir::Value instanceIdsPtr = entry->getArgument(2);
-    mlir::Value activeCount = entry->getArgument(3);
-    mlir::Value outPosXYZW = entry->getArgument(4);
-    mlir::Value outAttrs = entry->getArgument(5);
+    llvm::Value* rootCtx = entry->getParent()->getArg(0);
+    llvm::Value* vertexIdsPtr = entry->getParent()->getArg(1);
+    llvm::Value* instanceIdsPtr = entry->getParent()->getArg(2);
+    llvm::Value* activeCount = entry->getParent()->getArg(3);
+    llvm::Value* outPosXYZW = entry->getParent()->getArg(4);
+    llvm::Value* outAttrs = entry->getParent()->getArg(5);
 
-    mlir::Value acVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), activeCount, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-    mlir::Value activeMask = mlir::LLVM::ICmpOp::create(
-        b, loc, mlir::LLVM::ICmpPredicate::ult, h.laneIota(), acVec);
+    llvm::Value* acVec = llvmSplat(b, i32Ty, activeCount, h.W);
+    llvm::Value* activeMask = b.CreateICmp(llvm::CmpInst::ICMP_ULT, h.laneIota(), acVec);
 
     // Callers pad tail lanes of vertexIdsPtr & instanceIdsPtr to W; load directly without SelectOp
     // so LLVM does not scalarize into W conditional scalar loads.
-    mlir::Value zeroI32Vec = h.splatInt(i32Ty, 0);
-    mlir::Value vidVec = h.loadScalar(h.vecTy(i32Ty), vertexIdsPtr);
-    mlir::Value iidVec = h.loadScalar(h.vecTy(i32Ty), instanceIdsPtr);
+    llvm::Value* zeroI32Vec = h.splatInt(i32Ty, 0);
+    llvm::Value* vidVec = h.loadScalar(h.vecTy(i32Ty), vertexIdsPtr);
+    llvm::Value* iidVec = h.loadScalar(h.vecTy(i32Ty), instanceIdsPtr);
 
     // Resolve InputLayout offsets per slot and match against VS input signatures.
     std::vector<uint32_t> elementByteOffsets(inputLayout.NumElements, 0);
@@ -847,34 +947,33 @@ bool emitVertexStageFunction(
 
     // Preload referenced vertex buffer descriptors and pre-decode all referenced InputLayout elements
     // once in the entry block so SSA values dominate all control flow and gathers are never duplicated.
-    mlir::Value vbBasePtrs[16]{};
-    mlir::Value vbStrideVecs[16]{};
-    mlir::Value vbSizeVecs[16]{};
+    llvm::Value* vbBasePtrs[16]{};
+    llvm::Value* vbStrideVecs[16]{};
+    llvm::Value* vbSizeVecs[16]{};
     std::vector<PredecodedVertexElement> predecodedElems(inputLayout.NumElements);
     for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
         if (elemNeededCols[i] == 0) continue;
         const auto& el = inputLayout.pInputElementDescs[i];
         UINT slot = std::min<UINT>(el.InputSlot, 15);
         if (!vbBasePtrs[slot]) {
-            mlir::Value addrInt = h.loadScalar(
+            llvm::Value* addrInt = h.loadScalar(
                 h.i64Ty(), h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_buffers) + slot * 8)));
-            vbBasePtrs[slot] = mlir::LLVM::IntToPtrOp::create(b, loc, ptrTy, addrInt);
-            mlir::Value str32 = h.loadScalar(
+            vbBasePtrs[slot] = b.CreateIntToPtr(addrInt, ptrTy);
+            llvm::Value* str32 = h.loadScalar(
                 i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_strides) + slot * 4)));
-            mlir::Value sz32 = h.loadScalar(
+            llvm::Value* sz32 = h.loadScalar(
                 i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_sizes) + slot * 4)));
-            vbStrideVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), str32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-            vbSizeVecs[slot] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), sz32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
+            vbStrideVecs[slot] = llvmSplat(b, i32Ty, str32, h.W);
+            vbSizeVecs[slot] = llvmSplat(b, i32Ty, sz32, h.W);
         }
-        mlir::Value idxVec = vidVec;
+        llvm::Value* idxVec = vidVec;
         if (el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) {
             if (el.InstanceDataStepRate == 0) {
                 idxVec = zeroI32Vec;
             } else if (el.InstanceDataStepRate == 1) {
                 idxVec = iidVec;
             } else {
-                idxVec = mlir::LLVM::UDivOp::create(
-                    b, loc, iidVec, h.splatInt(i32Ty, el.InstanceDataStepRate));
+                idxVec = b.CreateUDiv(iidVec, h.splatInt(i32Ty, el.InstanceDataStepRate));
             }
         }
         predecodedElems[i] = predecodeVertexElementSIMD(
@@ -884,22 +983,22 @@ bool emitVertexStageFunction(
 
     StageHooks vsHooks;
     vsHooks.isPixelShader = false;
-    vsHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
-                            const SimdVal&, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
+    vsHooks.loadInput = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
+                            const SimdVal&, uint32_t col, llvm::Type* scalarTy, SimdVal& out) -> bool {
         const DxilSigRecord* sig = vsLoaded.findInputSig(sigId);
         if (!sig) return false;
-        IRHelpers lh{lb, lloc, simdWidth};
-        bool wantInt = mlir::isa<mlir::IntegerType>(scalarTy);
+        IRHelpers lh{lb, simdWidth};
+        bool wantInt = scalarTy->isIntegerTy();
 
         if (sig->systemValueType == 1) { // SV_VertexID
-            mlir::Value v = wantInt ? vidVec : mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), vidVec).getResult();
-            if (wantInt && scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+            llvm::Value* v = wantInt ? vidVec : lb.CreateBitCast(vidVec, lh.vecTy(scalarTy));
+            if (wantInt && scalarTy != i32Ty) v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
             out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
             return true;
         }
         if (sig->systemValueType == 2) { // SV_InstanceID
-            mlir::Value v = wantInt ? iidVec : mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), iidVec).getResult();
-            if (wantInt && scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+            llvm::Value* v = wantInt ? iidVec : lb.CreateBitCast(iidVec, lh.vecTy(scalarTy));
+            if (wantInt && scalarTy != i32Ty) v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
             out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
             return true;
         }
@@ -907,11 +1006,11 @@ bool emitVertexStageFunction(
         auto eit = sigToElemIdx.find(sigId);
         if (eit != sigToElemIdx.end() && col < 4 && predecodedElems[eit->second].valid) {
             const auto& pe = predecodedElems[eit->second];
-            mlir::Value decoded = wantInt ? pe.compsI32[col] : pe.compsF32[col];
+            llvm::Value* decoded = wantInt ? pe.compsI32[col] : pe.compsF32[col];
             if (wantInt && scalarTy != i32Ty) {
-                decoded = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
+                decoded = lb.CreateTrunc(decoded, lh.vecTy(scalarTy));
             } else if (!wantInt && scalarTy != lh.f32Ty()) {
-                decoded = mlir::LLVM::FPTruncOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
+                decoded = lb.CreateFPTrunc(decoded, lh.vecTy(scalarTy));
             }
             out = {SimdVal::Kind::Vector, scalarTy, decoded, {}, {}};
             return true;
@@ -919,31 +1018,31 @@ bool emitVertexStageFunction(
         return false;
     };
 
-    vsHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
-                              const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value writeMask) -> bool {
+    vsHooks.storeOutput = [&](llvm::IRBuilder<>& sb, uint32_t sigId,
+                              const SimdVal& row, uint32_t col, const SimdVal& val, llvm::Value* writeMask) -> bool {
         const DxilSigRecord* sig = vsLoaded.findOutputSig(sigId);
         if (!sig || val.kind != SimdVal::Kind::Vector) return true;
-        IRHelpers sh{sb, sloc, simdWidth};
-        mlir::Value vVec = val.vec;
-        mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+        IRHelpers sh{sb, simdWidth};
+        llvm::Value* vVec = val.vec;
+        llvm::Type* elemTy = llvm::cast<llvm::FixedVectorType>(vVec->getType())->getElementType();
         if (elemTy != sh.f32Ty()) {
-            if (mlir::isa<mlir::IntegerType>(elemTy)) {
-                if (elemTy.getIntOrFloatBitWidth() < 32) {
-                    vVec = mlir::LLVM::ZExtOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
+            if (elemTy->isIntegerTy()) {
+                if (elemTy->getScalarSizeInBits() < 32) {
+                    vVec = sb.CreateZExt(vVec, sh.vecTy(i32Ty));
                 }
-                vVec = mlir::LLVM::BitcastOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
+                vVec = sb.CreateBitCast(vVec, sh.vecTy(sh.f32Ty()));
             } else {
-                vVec = mlir::LLVM::FPExtOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
+                vVec = sb.CreateFPExt(vVec, sh.vecTy(sh.f32Ty()));
             }
         }
 
-        auto storeVecSOA = [&](mlir::Value dstPtr) {
+        auto storeVecSOA = [&](llvm::Value* dstPtr) {
             if (!writeMask || writeMask == activeMask) {
-                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dstPtr, /*alignment=*/4);
+                sb.CreateStore(vVec, dstPtr);
             } else {
-                mlir::Value prev = sh.loadScalar(sh.vecTy(sh.f32Ty()), dstPtr);
-                mlir::Value merged = mlir::LLVM::SelectOp::create(sb, sloc, writeMask, vVec, prev);
-                mlir::LLVM::StoreOp::create(sb, sloc, merged, dstPtr, /*alignment=*/4);
+                llvm::Value* prev = sh.loadScalar(sh.vecTy(sh.f32Ty()), dstPtr);
+                llvm::Value* merged = sb.CreateSelect(writeMask, vVec, prev);
+                sb.CreateStore(merged, dstPtr);
             }
         };
 
@@ -951,28 +1050,22 @@ bool emitVertexStageFunction(
             auto rowConst = tryGetUniformConstUInt(row);
             if (rowConst.has_value()) {
                 uint32_t scalarSlot = baseSlot + (*rowConst) * 4 + col;
-                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(scalarSlot * simdWidth * 4));
+                llvm::Value* dst = sh.gepBytes(outAttrs, static_cast<int64_t>(scalarSlot * simdWidth * 4));
                 storeVecSOA(dst);
             } else {
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value mL = llvmExtract(sb, sloc, writeMask ? writeMask : activeMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(sb, sloc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        IRHelpers nh{nb, nloc, simdWidth};
-                        mlir::Value rL = llvmExtract(nb, nloc, row.vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value r32 = (rL.getType() == i32Ty)
+                    llvm::Value* mL = llvmExtract(sb, writeMask ? writeMask : activeMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(sb, mL, [&](llvm::IRBuilder<>& nb) {
+                        IRHelpers nh{nb, simdWidth};
+                        llvm::Value* rL = llvmExtract(nb, row.vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* r32 = (rL->getType() == i32Ty)
                                               ? rL
-                                              : mlir::LLVM::ZExtOp::create(nb, nloc, i32Ty, rL).getResult();
-                        mlir::Value slot32 = mlir::LLVM::AddOp::create(
-                            nb, nloc, nh.cInt(i32Ty, static_cast<int64_t>(baseSlot + col)),
-                            mlir::LLVM::MulOp::create(nb, nloc, r32, nh.cInt(i32Ty, 4)));
-                        mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                            nb, nloc, mlir::LLVM::MulOp::create(nb, nloc, slot32, nh.cInt(i32Ty, simdWidth)),
-                            nh.cInt(i32Ty, static_cast<int64_t>(l)));
-                        mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                            nb, nloc, mlir::LLVM::ZExtOp::create(nb, nloc, nh.i64Ty(), elemIdx), nh.cInt(nh.i64Ty(), 4));
-                        mlir::Value vL = llvmExtract(nb, nloc, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::LLVM::StoreOp::create(nb, nloc, vL, nh.gepBytesDyn(outAttrs, byteOff));
-                        mlir::scf::YieldOp::create(nb, nloc);
+                                              : nb.CreateZExt(rL, i32Ty);
+                        llvm::Value* slot32 = nb.CreateAdd(nh.cInt(i32Ty, static_cast<int64_t>(baseSlot + col)), nb.CreateMul(r32, nh.cInt(i32Ty, 4)));
+                        llvm::Value* elemIdx = nb.CreateAdd(nb.CreateMul(slot32, nh.cInt(i32Ty, simdWidth)), nh.cInt(i32Ty, static_cast<int64_t>(l)));
+                        llvm::Value* byteOff = nb.CreateMul(nb.CreateZExt(elemIdx, nh.i64Ty()), nh.cInt(nh.i64Ty(), 4));
+                        llvm::Value* vL = llvmExtract(nb, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        nb.CreateStore(vL, nh.gepBytesDyn(outAttrs, byteOff));
                     });
                 }
             }
@@ -980,7 +1073,7 @@ bool emitVertexStageFunction(
 
         if (sig->systemValueType == 3) { // SV_Position -> outPosXYZW[col * W + lane]
             if (col < 4) {
-                mlir::Value dst = sh.gepBytes(outPosXYZW, static_cast<int64_t>(col * simdWidth * 4));
+                llvm::Value* dst = sh.gepBytes(outPosXYZW, static_cast<int64_t>(col * simdWidth * 4));
                 storeVecSOA(dst);
             }
             if (!hasTess) return true;
@@ -1034,24 +1127,24 @@ bool emitVertexStageFunction(
         return true;
     };
 
-    mlir::Value vsRealMask = activeMask;
-    if (!packetizeRegionWithHooks(b, loc, targetMod, vsSrcFunc.getBody(), vsLoaded, vsEffectiveLayout,
+    llvm::Value* vsRealMask = activeMask;
+    if (!packetizeRegionWithHooks(b, targetMod, *vsTree.root, vsLoaded, vsEffectiveLayout,
                                   simdWidth, rootCtx, activeMask, vsRealMask, vsHooks, outError)) {
         return false;
     }
-    mlir::func::ReturnOp::create(b, loc);
+    b.CreateRetVoid();
     return true;
 }
 
 } // namespace
 
-bool synthesizeVertexStageMLIR(
+bool synthesizeVertexStageLLVM(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& vsSym,
-    mlir::MLIRContext& mlirCtx,
-    mlir::OwningOpRef<mlir::ModuleOp>& outVSMod,
+    llvm::LLVMContext& llvmCtx,
+    std::unique_ptr<llvm::Module>& outVSMod,
     CachedVSMeta& outVSMeta,
     std::vector<ShaderSigElement>& outVSInputs,
     std::vector<ShaderSigElement>& outVSOutputs,
@@ -1062,9 +1155,8 @@ bool synthesizeVertexStageMLIR(
         return false;
     }
 
-    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader vsLoaded;
-    if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+    if (!loadAndUpgradeDXIL(desc.VS, llvmCtx, vsLoaded, outError)) {
         return false;
     }
 
@@ -1073,37 +1165,29 @@ bool synthesizeVertexStageMLIR(
             ? vsLoaded.embeddedRootSig
             : rootLayout;
 
-    auto vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
-    if (!vsMlirMod) return false;
-
-    configureNacelleMLIRContext(mlirCtx);
-    mlir::Location loc = mlir::UnknownLoc::get(&mlirCtx);
-    outVSMod = mlir::ModuleOp::create(loc);
-    mlir::ModuleOp vsMod = *outVSMod;
-    cloneGlobalsIntoModule(*vsMlirMod, vsMod);
+    outVSMod = std::make_unique<llvm::Module>("nacelle_vs", llvmCtx);
+    llvm::Module& vsMod = *outVSMod;
+    StructuredFunction vsTree;
+    llvm::Function* vsSrcFn = nullptr;
+    if (!structurizeAndLinkStage(std::move(vsLoaded.module), vsLoaded.entryName, "vs", vsMod, vsTree, vsSrcFn, outError)) {
+        return false;
+    }
 
     outVSInputs = convertSigElements(vsLoaded.inputSigs);
     outVSOutputs = convertSigElements(vsLoaded.outputSigs);
     outVSOutputRecs = vsLoaded.outputSigs;
 
     CanonicalVSLayoutInfo canonical = computeCanonicalVSLayout(vsLoaded.outputSigs);
-    auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
     if (!emitVertexStageFunction(
-            vsMod, vsSrcFunc, vsLoaded, vsEffectiveLayout, desc.InputLayout,
+            vsMod, vsTree, vsLoaded, vsEffectiveLayout, desc.InputLayout,
             simdWidth, vsSym, /*hasTess=*/false, /*hasGS=*/false, &canonical, nullptr, outError)) {
         return false;
     }
+    if (vsSrcFn) vsSrcFn->eraseFromParent();
+    eraseUnusedDxOps(vsMod);
 
-    llvm::SmallVector<mlir::LLVM::LLVMFuncOp, 16> deadDxOps;
-    for (auto fnOp : vsMod.getOps<mlir::LLVM::LLVMFuncOp>()) {
-        if (fnOp.isDeclaration() && fnOp.getName().starts_with("dx.op.") && fnOp.use_empty()) {
-            deadDxOps.push_back(fnOp);
-        }
-    }
-    for (auto fnOp : deadDxOps) fnOp.erase();
-
-    if (mlir::failed(mlir::verify(vsMod))) {
-        outError = "MLIR verification failed after Vertex Stage synthesis";
+    if (llvm::verifyModule(vsMod, &llvm::errs())) {
+        outError = "LLVM verification failed after Vertex Stage synthesis";
         return false;
     }
 
@@ -1123,14 +1207,14 @@ bool synthesizeVertexStageMLIR(
     return true;
 }
 
-bool synthesizeGraphicsPSOMLIR(
+bool synthesizeGraphicsPSOLLVM(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& vsSym,
     const std::string& psSym,
-    mlir::MLIRContext& mlirCtx,
-    mlir::OwningOpRef<mlir::ModuleOp>& outCombinedMod,
+    llvm::LLVMContext& llvmCtx,
+    std::unique_ptr<llvm::Module>& outCombinedMod,
     CachedPSOMeta& outMeta,
     std::vector<ShaderSigElement>& outVSInputs,
     std::vector<ShaderSigElement>& outVSOutputs,
@@ -1155,24 +1239,29 @@ bool synthesizeGraphicsPSOMLIR(
         skipVS = false;
     }
 
-    auto msLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    outCombinedMod = std::make_unique<llvm::Module>("nacelle_pso", llvmCtx);
+    llvm::Module& combinedMod = *outCombinedMod;
+
     DxilLoadedShader msLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> msMlirMod;
-    auto asLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    StructuredFunction msTree;
+    llvm::Function* msSrcFn = nullptr;
     DxilLoadedShader asLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> asMlirMod;
+    StructuredFunction asTree;
+    llvm::Function* asSrcFn = nullptr;
     if (hasMS) {
-        if (!loadAndUpgradeDXIL(meshStages.MS, *msLlvmCtx, msLoaded, outError)) {
+        if (!loadAndUpgradeDXIL(meshStages.MS, llvmCtx, msLoaded, outError)) {
             return false;
         }
-        msMlirMod = importAndLiftDXILToSCF(std::move(msLoaded.module), msLoaded.entryName, mlirCtx, outError);
-        if (!msMlirMod) return false;
+        if (!structurizeAndLinkStage(std::move(msLoaded.module), msLoaded.entryName, "ms", combinedMod, msTree, msSrcFn, outError)) {
+            return false;
+        }
         if (hasAS) {
-            if (!loadAndUpgradeDXIL(meshStages.AS, *asLlvmCtx, asLoaded, outError)) {
+            if (!loadAndUpgradeDXIL(meshStages.AS, llvmCtx, asLoaded, outError)) {
                 return false;
             }
-            asMlirMod = importAndLiftDXILToSCF(std::move(asLoaded.module), asLoaded.entryName, mlirCtx, outError);
-            if (!asMlirMod) return false;
+            if (!structurizeAndLinkStage(std::move(asLoaded.module), asLoaded.entryName, "as", combinedMod, asTree, asSrcFn, outError)) {
+                return false;
+            }
         }
     }
 
@@ -1184,20 +1273,21 @@ bool synthesizeGraphicsPSOMLIR(
     const RootSignatureLayout& asEffectiveLayout =
         (hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : msEffectiveLayout;
 
-    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader vsLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> vsMlirMod;
+    StructuredFunction vsTree;
+    llvm::Function* vsSrcFn = nullptr;
     bool loadedVSFromDXIL = false;
     if (!hasMS) {
         if (!skipVS || !precompiledVSOutputRecs || precompiledVSOutputRecs->empty() || emptyRoot) {
-            if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+            if (!loadAndUpgradeDXIL(desc.VS, llvmCtx, vsLoaded, outError)) {
                 return false;
             }
             loadedVSFromDXIL = true;
         }
         if (!skipVS) {
-            vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
-            if (!vsMlirMod) return false;
+            if (!structurizeAndLinkStage(std::move(vsLoaded.module), vsLoaded.entryName, "vs", combinedMod, vsTree, vsSrcFn, outError)) {
+                return false;
+            }
         }
     }
 
@@ -1211,25 +1301,30 @@ bool synthesizeGraphicsPSOMLIR(
             ? *precompiledVSOutputRecs
             : vsLoaded.outputSigs;
 
-    auto hsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader hsLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> hsMlirMod;
-    auto dsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    StructuredFunction hsTree;
+    StructuredFunction hspcTree;
+    llvm::Function* hsSrcFn = nullptr;
+    llvm::Function* hspcSrcFn = nullptr;
     DxilLoadedShader dsLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> dsMlirMod;
+    StructuredFunction dsTree;
+    llvm::Function* dsSrcFn = nullptr;
     if (hasTess) {
-        if (!loadAndUpgradeDXIL(desc.HS, *hsLlvmCtx, hsLoaded, outError)) {
+        if (!loadAndUpgradeDXIL(desc.HS, llvmCtx, hsLoaded, outError)) {
             return false;
         }
-        hsMlirMod = importAndLiftDXILToSCF(
-            std::move(hsLoaded.module), hsLoaded.entryName, mlirCtx, outError, hsLoaded.hsPatchConstFnName);
-        if (!hsMlirMod) return false;
+        if (!structurizeAndLinkStage(
+                std::move(hsLoaded.module), hsLoaded.entryName, "hs", combinedMod, hsTree, hsSrcFn, outError,
+                hsLoaded.hsPatchConstFnName, &hspcTree, &hspcSrcFn)) {
+            return false;
+        }
 
-        if (!loadAndUpgradeDXIL(desc.DS, *dsLlvmCtx, dsLoaded, outError)) {
+        if (!loadAndUpgradeDXIL(desc.DS, llvmCtx, dsLoaded, outError)) {
             return false;
         }
-        dsMlirMod = importAndLiftDXILToSCF(std::move(dsLoaded.module), dsLoaded.entryName, mlirCtx, outError);
-        if (!dsMlirMod) return false;
+        if (!structurizeAndLinkStage(std::move(dsLoaded.module), dsLoaded.entryName, "ds", combinedMod, dsTree, dsSrcFn, outError)) {
+            return false;
+        }
     }
 
     const RootSignatureLayout& hsEffectiveLayout =
@@ -1241,15 +1336,16 @@ bool synthesizeGraphicsPSOMLIR(
             ? dsLoaded.embeddedRootSig
             : vsEffectiveLayout;
 
-    auto gsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader gsLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> gsMlirMod;
+    StructuredFunction gsTree;
+    llvm::Function* gsSrcFn = nullptr;
     if (hasGS) {
-        if (!loadAndUpgradeDXIL(desc.GS, *gsLlvmCtx, gsLoaded, outError)) {
+        if (!loadAndUpgradeDXIL(desc.GS, llvmCtx, gsLoaded, outError)) {
             return false;
         }
-        gsMlirMod = importAndLiftDXILToSCF(std::move(gsLoaded.module), gsLoaded.entryName, mlirCtx, outError);
-        if (!gsMlirMod) return false;
+        if (!structurizeAndLinkStage(std::move(gsLoaded.module), gsLoaded.entryName, "gs", combinedMod, gsTree, gsSrcFn, outError)) {
+            return false;
+        }
     }
 
     const RootSignatureLayout& gsEffectiveLayout =
@@ -1258,15 +1354,16 @@ bool synthesizeGraphicsPSOMLIR(
             : vsEffectiveLayout;
 
     bool hasPS = (desc.PS.pShaderBytecode && desc.PS.BytecodeLength > 0);
-    auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader psLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> psMlirMod;
+    StructuredFunction psTree;
+    llvm::Function* psSrcFn = nullptr;
     if (hasPS) {
-        if (!loadAndUpgradeDXIL(desc.PS, *psLlvmCtx, psLoaded, outError)) {
+        if (!loadAndUpgradeDXIL(desc.PS, llvmCtx, psLoaded, outError)) {
             return false;
         }
-        psMlirMod = importAndLiftDXILToSCF(std::move(psLoaded.module), psLoaded.entryName, mlirCtx, outError);
-        if (!psMlirMod) return false;
+        if (!structurizeAndLinkStage(std::move(psLoaded.module), psLoaded.entryName, "ps", combinedMod, psTree, psSrcFn, outError)) {
+            return false;
+        }
     }
 
     const RootSignatureLayout& psEffectiveLayout =
@@ -1274,27 +1371,7 @@ bool synthesizeGraphicsPSOMLIR(
             ? psLoaded.embeddedRootSig
             : vsEffectiveLayout;
 
-    configureNacelleMLIRContext(mlirCtx);
-    mlir::Location loc = mlir::UnknownLoc::get(&mlirCtx);
-    outCombinedMod = mlir::ModuleOp::create(loc);
-    mlir::ModuleOp combinedMod = *outCombinedMod;
-
-    if (hasMS) {
-        cloneGlobalsIntoModule(*msMlirMod, combinedMod);
-        if (hasAS) cloneGlobalsIntoModule(*asMlirMod, combinedMod);
-    } else if (!skipVS && vsMlirMod) {
-        cloneGlobalsIntoModule(*vsMlirMod, combinedMod);
-    }
-    if (hasTess) {
-        cloneGlobalsIntoModule(*hsMlirMod, combinedMod);
-        cloneGlobalsIntoModule(*dsMlirMod, combinedMod);
-    }
-    if (hasGS) {
-        cloneGlobalsIntoModule(*gsMlirMod, combinedMod);
-    }
-    if (hasPS) {
-        cloneGlobalsIntoModule(*psMlirMod, combinedMod);
-    }
+    llvm::IRBuilder<> b(llvmCtx);
 
     if (hasMS) {
         outVSInputs.clear();
@@ -1667,9 +1744,8 @@ bool synthesizeGraphicsPSOMLIR(
 
     // --- 1. Emit @<vsSym> unless skipped by VS stage cache hit or Mesh Shader PSO ---
     if (!hasMS && !skipVS) {
-        auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
         if (!emitVertexStageFunction(
-                combinedMod, vsSrcFunc, vsLoaded, vsEffectiveLayout, desc.InputLayout,
+                combinedMod, vsTree, vsLoaded, vsEffectiveLayout, desc.InputLayout,
                 simdWidth, vsSym, hasTess, hasGS,
                 (!hasTess && !hasGS) ? &canonicalVS : nullptr,
                 (hasTess || hasGS) ? &vsToNextMap : nullptr,
@@ -1680,159 +1756,150 @@ bool synthesizeGraphicsPSOMLIR(
 
     // --- 1-mesh. Emit @<vsSym>_as (optional) and @<vsSym>_ms ---
     if (hasMS) {
-        auto extractLaneI32 = [](mlir::OpBuilder& lb, mlir::Location lloc, const SimdVal& sv, uint32_t lane) -> mlir::Value {
-            mlir::Type i32 = lb.getI32Type();
-            mlir::Value v = (sv.kind == SimdVal::Kind::Vector)
-                                ? llvmExtract(lb, lloc, sv.vec, static_cast<uint32_t>(static_cast<int64_t>(lane)))
+        auto extractLaneI32 = [](llvm::IRBuilder<>& lb, const SimdVal& sv, uint32_t lane) -> llvm::Value* {
+            llvm::Type* i32 = lb.getInt32Ty();
+            llvm::Value* v = (sv.kind == SimdVal::Kind::Vector)
+                                ? llvmExtract(lb, sv.vec, static_cast<uint32_t>(static_cast<int64_t>(lane)))
                                 : (sv.isUniform() ? sv.lanes[0] : sv.lanes[lane]);
-            if (v.getType() != i32) {
-                if (mlir::isa<mlir::FloatType>(v.getType())) {
-                    if (v.getType().getIntOrFloatBitWidth() != 32) {
-                        v = mlir::LLVM::FPExtOp::create(lb, lloc, lb.getF32Type(), v);
+            if (v->getType() != i32) {
+                if (v->getType()->isFloatingPointTy()) {
+                    if (v->getType()->getScalarSizeInBits() != 32) {
+                        v = lb.CreateFPExt(v, lb.getFloatTy());
                     }
-                    v = mlir::LLVM::BitcastOp::create(lb, lloc, i32, v);
-                } else if (v.getType().getIntOrFloatBitWidth() < 32) {
-                    v = mlir::LLVM::ZExtOp::create(lb, lloc, i32, v);
+                    v = lb.CreateBitCast(v, i32);
+                } else if (v->getType()->getScalarSizeInBits() < 32) {
+                    v = lb.CreateZExt(v, i32);
                 } else {
-                    v = mlir::LLVM::TruncOp::create(lb, lloc, i32, v);
+                    v = lb.CreateTrunc(v, i32);
                 }
             }
             return v;
         };
 
-        auto convertSimdValToF32Vec = [&](mlir::OpBuilder& lb, mlir::Location lloc, const SimdVal& val) -> mlir::Value {
-            IRHelpers lh{lb, lloc, simdWidth};
-            mlir::Value vVec = val.vec;
-            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+        auto convertSimdValToF32Vec = [&](llvm::IRBuilder<>& lb, const SimdVal& val) -> llvm::Value* {
+            IRHelpers lh{lb, simdWidth};
+            llvm::Value* vVec = val.vec;
+            llvm::Type* elemTy = llvm::cast<llvm::FixedVectorType>(vVec->getType())->getElementType();
             if (elemTy != lh.f32Ty()) {
-                if (mlir::isa<mlir::IntegerType>(elemTy)) {
-                    if (elemTy.getIntOrFloatBitWidth() < 32) {
-                        vVec = mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(lh.i32Ty()), vVec);
+                if (elemTy->isIntegerTy()) {
+                    if (elemTy->getScalarSizeInBits() < 32) {
+                        vVec = lb.CreateZExt(vVec, lh.vecTy(lh.i32Ty()));
                     }
-                    vVec = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(lh.f32Ty()), vVec);
+                    vVec = lb.CreateBitCast(vVec, lh.vecTy(lh.f32Ty()));
                 } else {
-                    vVec = mlir::LLVM::FPExtOp::create(lb, lloc, lh.vecTy(lh.f32Ty()), vVec);
+                    vVec = lb.CreateFPExt(vVec, lh.vecTy(lh.f32Ty()));
                 }
             }
             return vVec;
         };
 
         if (hasAS) {
-            auto asSrcFunc = asMlirMod->lookupSymbol<mlir::func::FuncOp>(asLoaded.entryName);
-            if (!asSrcFunc || asSrcFunc.getBody().empty()) {
-                outError = "Amplification shader entry function missing after MLIR SCF lift";
+            if (!asTree.root) {
+                outError = "Amplification shader entry function missing after structured CFG lift";
                 return false;
             }
 
-            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-            IRHelpers h{b, loc, simdWidth};
+            llvm::IRBuilder<> b(combinedMod.getContext());
+            IRHelpers h{b, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
-            auto fnTy = b.getFunctionType({ptrTy}, {});
-            auto asFn = mlir::func::FuncOp::create(b, loc, vsSym + "_as", fnTy);
-            mlir::Block* entry = asFn.addEntryBlock();
-            b.setInsertionPointToEnd(entry);
+            auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy}, false);
+            auto* asFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_as", combinedMod);
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", asFn);
+            b.SetInsertPoint(entry);
 
-            mlir::Value argsPtr = entry->getArgument(0);
-            mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, rootCtx)));
-            mlir::Value gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, groupSharedScratch)));
-            mlir::Value gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gx)));
-            mlir::Value gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gy)));
-            mlir::Value gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gz)));
-            mlir::Value outDispatchDims = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outDispatchDims)));
-            mlir::Value outPayload = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outPayload)));
+            llvm::Value* argsPtr = entry->getParent()->getArg(0);
+            llvm::Value* rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, rootCtx)));
+            llvm::Value* gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, groupSharedScratch)));
+            llvm::Value* gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gx)));
+            llvm::Value* gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gy)));
+            llvm::Value* gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, gz)));
+            llvm::Value* outDispatchDims = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outDispatchDims)));
+            llvm::Value* outPayload = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outPayload)));
 
             StageHooks asHooks;
-            asHooks.dispatchMesh = [&](mlir::OpBuilder& db, mlir::Location dloc,
+            asHooks.dispatchMesh = [&](llvm::IRBuilder<>& db,
                                        const SimdVal& countX, const SimdVal& countY, const SimdVal& countZ,
-                                       const SimdVal& payloadArg, mlir::Value realMask) -> bool {
+                                       const SimdVal& payloadArg, llvm::Value* realMask) -> bool {
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value actL = llvmExtract(db, dloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(db, dloc, actL, [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                        IRHelpers lh{lb, lloc, simdWidth};
-                        mlir::Value already = lh.loadScalar(i32Ty, lh.gepBytes(outDispatchDims, 12));
-                        mlir::Value notYet = mlir::LLVM::ICmpOp::create(
-                            lb, lloc, mlir::LLVM::ICmpPredicate::eq, already, lh.cInt(i32Ty, 0));
-                        mlir::scf::IfOp::create(lb, lloc, notYet, [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            IRHelpers ch{cb, cloc, simdWidth};
+                    llvm::Value* actL = llvmExtract(db, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(db, actL, [&](llvm::IRBuilder<>& lb) {
+                        IRHelpers lh{lb, simdWidth};
+                        llvm::Value* already = lh.loadScalar(i32Ty, lh.gepBytes(outDispatchDims, 12));
+                        llvm::Value* notYet = lb.CreateICmp(llvm::CmpInst::ICMP_EQ, already, lh.cInt(i32Ty, 0));
+                        emitIf(lb, notYet, [&](llvm::IRBuilder<>& cb) {
+                            IRHelpers ch{cb, simdWidth};
                             ch.storeScalar(ch.cInt(i32Ty, 1), ch.gepBytes(outDispatchDims, 12));
-                            ch.storeScalar(extractLaneI32(cb, cloc, countX, l), ch.gepBytes(outDispatchDims, 0));
-                            ch.storeScalar(extractLaneI32(cb, cloc, countY, l), ch.gepBytes(outDispatchDims, 4));
-                            ch.storeScalar(extractLaneI32(cb, cloc, countZ, l), ch.gepBytes(outDispatchDims, 8));
+                            ch.storeScalar(extractLaneI32(cb, countX, l), ch.gepBytes(outDispatchDims, 0));
+                            ch.storeScalar(extractLaneI32(cb, countY, l), ch.gepBytes(outDispatchDims, 4));
+                            ch.storeScalar(extractLaneI32(cb, countZ, l), ch.gepBytes(outDispatchDims, 8));
                             if (asLoaded.asPayloadBytes > 0 && payloadArg.kind == SimdVal::Kind::Lanes && !payloadArg.lanes.empty()) {
-                                mlir::Value srcPtr = payloadArg.isUniform() ? payloadArg.lanes[0] : payloadArg.lanes[l];
-                                mlir::Value nullP = mlir::LLVM::ZeroOp::create(cb, cloc, ptrTy);
-                                mlir::Value srcOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, srcPtr, nullP);
-                                mlir::Value dstOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, outPayload, nullP);
-                                mlir::scf::IfOp::create(cb, cloc, mlir::LLVM::AndOp::create(cb, cloc, srcOk, dstOk),
-                                                        [&](mlir::OpBuilder& mb, mlir::Location mloc) {
-                                                            mlir::Type i64T = mb.getI64Type();
-                                                            mlir::Value c0 = mlir::LLVM::ConstantOp::create(mb, mloc, i64T, mb.getI64IntegerAttr(0));
-                                                            mlir::Value c1 = mlir::LLVM::ConstantOp::create(mb, mloc, i64T, mb.getI64IntegerAttr(1));
-                                                            mlir::Value cN = mlir::LLVM::ConstantOp::create(mb, mloc, i64T, mb.getI64IntegerAttr(asLoaded.asPayloadBytes));
-                                                            mlir::scf::ForOp::create(
-                                                                mb, mloc, c0, cN, c1, mlir::ValueRange{},
-                                                                [&](mlir::OpBuilder& fb, mlir::Location floc, mlir::Value bi, mlir::ValueRange) {
-                                                                    mlir::Value bi64 = bi;
-                                                                    mlir::Value sp = mlir::LLVM::GEPOp::create(fb, floc, ptrTy, fb.getI8Type(), srcPtr, mlir::ValueRange{bi64});
-                                                                    mlir::Value dp = mlir::LLVM::GEPOp::create(fb, floc, ptrTy, fb.getI8Type(), outPayload, mlir::ValueRange{bi64});
-                                                                    mlir::Value bv = mlir::LLVM::LoadOp::create(fb, floc, fb.getI8Type(), sp);
-                                                                    mlir::LLVM::StoreOp::create(fb, floc, bv, dp);
-                                                                    mlir::scf::YieldOp::create(fb, floc);
+                                llvm::Value* srcPtr = payloadArg.isUniform() ? payloadArg.lanes[0] : payloadArg.lanes[l];
+                                llvm::Value* nullP = llvm::Constant::getNullValue(cb.getPtrTy());
+                                llvm::Value* srcOk = cb.CreateICmp(llvm::CmpInst::ICMP_NE, srcPtr, nullP);
+                                llvm::Value* dstOk = cb.CreateICmp(llvm::CmpInst::ICMP_NE, outPayload, nullP);
+                                emitIf(cb, cb.CreateAnd(srcOk, dstOk),
+                                                        [&](llvm::IRBuilder<>& mb) {
+                                                            llvm::Type* i64T = mb.getInt64Ty();
+                                                            llvm::Value* c0 = llvm::ConstantInt::get(i64T, 0);
+                                                            llvm::Value* c1 = llvm::ConstantInt::get(i64T, 1);
+                                                            llvm::Value* cN = llvm::ConstantInt::get(i64T, asLoaded.asPayloadBytes);
+                                                            emitForLoop(mb, c0, cN, c1, [&](llvm::IRBuilder<>& fb, llvm::Value* bi) {
+                                                                    llvm::Value* bi64 = bi;
+                                                                    llvm::Value* sp = fb.CreateGEP(fb.getInt8Ty(), srcPtr, llvm::ArrayRef<llvm::Value*>{bi64});
+                                                                    llvm::Value* dp = fb.CreateGEP(fb.getInt8Ty(), outPayload, llvm::ArrayRef<llvm::Value*>{bi64});
+                                                                    llvm::Value* bv = fb.CreateLoad(fb.getInt8Ty(), sp);
+                                                                    fb.CreateStore(bv, dp);
                                                                 });
-                                                            mlir::scf::YieldOp::create(mb, mloc);
                                                         });
                             }
-                            mlir::scf::YieldOp::create(cb, cloc);
                         });
-                        mlir::scf::YieldOp::create(lb, lloc);
                     });
                 }
                 return true;
             };
 
-            if (!packetizeThreadGroupRegion(b, loc, combinedMod, asSrcFunc.getBody(), asLoaded, asEffectiveLayout,
+            if (!packetizeThreadGroupRegion(b, combinedMod, *asTree.root, asLoaded, asEffectiveLayout,
                                             simdWidth, rootCtx, gsBase, gx, gy, gz, entry, asHooks, outError)) {
                 return false;
             }
-            mlir::func::ReturnOp::create(b, loc);
+            b.CreateRetVoid();
         }
 
         // Emit @<vsSym>_ms(const MeshThreadGroupArgs* args)
         {
-            auto msSrcFunc = msMlirMod->lookupSymbol<mlir::func::FuncOp>(msLoaded.entryName);
-            if (!msSrcFunc || msSrcFunc.getBody().empty()) {
+            if (!msTree.root) {
                 outError = "Mesh shader entry function missing after MLIR SCF lift";
                 return false;
             }
 
-            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-            IRHelpers h{b, loc, simdWidth};
+            llvm::IRBuilder<> b(combinedMod.getContext());
+            IRHelpers h{b, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
             auto f32Ty = h.f32Ty();
             auto i8Ty = h.i8Ty();
-            auto fnTy = b.getFunctionType({ptrTy}, {});
-            auto msFn = mlir::func::FuncOp::create(b, loc, vsSym + "_ms", fnTy);
-            mlir::Block* entry = msFn.addEntryBlock();
-            b.setInsertionPointToEnd(entry);
+            auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy}, false);
+            auto* msFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_ms", combinedMod);
+            llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", msFn);
+            b.SetInsertPoint(entry);
 
-            mlir::Value argsPtr = entry->getArgument(0);
-            mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, rootCtx)));
-            mlir::Value gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, groupSharedScratch)));
-            mlir::Value payloadPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, payloadPtr)));
-            mlir::Value gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gx)));
-            mlir::Value gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gy)));
-            mlir::Value gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gz)));
-            mlir::Value outCounts = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outCounts)));
-            mlir::Value outVertPosXYZW = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertPosXYZW)));
-            mlir::Value outVertAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertAttrs)));
-            mlir::Value outPrimIndices = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimIndices)));
-            mlir::Value outPrimAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimAttrs)));
-            mlir::Value outPrimCull = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimCull)));
-            mlir::Value outPrimId = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimId)));
+            llvm::Value* argsPtr = entry->getParent()->getArg(0);
+            llvm::Value* rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, rootCtx)));
+            llvm::Value* gsBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, groupSharedScratch)));
+            llvm::Value* payloadPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, payloadPtr)));
+            llvm::Value* gx = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gx)));
+            llvm::Value* gy = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gy)));
+            llvm::Value* gz = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, gz)));
+            llvm::Value* outCounts = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outCounts)));
+            llvm::Value* outVertPosXYZW = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertPosXYZW)));
+            llvm::Value* outVertAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outVertAttrs)));
+            llvm::Value* outPrimIndices = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimIndices)));
+            llvm::Value* outPrimAttrs = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimAttrs)));
+            llvm::Value* outPrimCull = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimCull)));
+            llvm::Value* outPrimId = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(MeshThreadGroupArgs, outPrimId)));
 
-            mlir::Value countsSetPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, i32Ty, h.cInt(i32Ty, 1), 4);
+            llvm::Value* countsSetPtr = createAlignedAlloca(b, i32Ty, h.cInt(i32Ty, 1), 4);
             h.storeScalar(h.cInt(i32Ty, 0), countsSetPtr);
 
             const uint32_t maxVerts = msLoaded.msMaxVertexCount;
@@ -1841,79 +1908,68 @@ bool synthesizeGraphicsPSOMLIR(
             StageHooks msHooks;
             msHooks.meshPayloadBase = payloadPtr;
 
-            msHooks.setMeshOutputCounts = [&](mlir::OpBuilder& sb, mlir::Location sloc,
+            msHooks.setMeshOutputCounts = [&](llvm::IRBuilder<>& sb,
                                               const SimdVal& numVerts, const SimdVal& numPrims,
-                                              mlir::Value realMask) -> bool {
+                                              llvm::Value* realMask) -> bool {
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(sb, sloc, actL, [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                        IRHelpers lh{lb, lloc, simdWidth};
-                        mlir::Value already = lh.loadScalar(i32Ty, countsSetPtr);
-                        mlir::Value notYet = mlir::LLVM::ICmpOp::create(
-                            lb, lloc, mlir::LLVM::ICmpPredicate::eq, already, lh.cInt(i32Ty, 0));
-                        mlir::scf::IfOp::create(lb, lloc, notYet, [&](mlir::OpBuilder& cb, mlir::Location cloc) {
-                            IRHelpers ch{cb, cloc, simdWidth};
+                    llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(sb, actL, [&](llvm::IRBuilder<>& lb) {
+                        IRHelpers lh{lb, simdWidth};
+                        llvm::Value* already = lh.loadScalar(i32Ty, countsSetPtr);
+                        llvm::Value* notYet = lb.CreateICmp(llvm::CmpInst::ICMP_EQ, already, lh.cInt(i32Ty, 0));
+                        emitIf(lb, notYet, [&](llvm::IRBuilder<>& cb) {
+                            IRHelpers ch{cb, simdWidth};
                             ch.storeScalar(ch.cInt(i32Ty, 1), countsSetPtr);
-                            ch.storeScalar(extractLaneI32(cb, cloc, numVerts, l), ch.gepBytes(outCounts, 0));
-                            ch.storeScalar(extractLaneI32(cb, cloc, numPrims, l), ch.gepBytes(outCounts, 4));
-                            mlir::scf::YieldOp::create(cb, cloc);
+                            ch.storeScalar(extractLaneI32(cb, numVerts, l), ch.gepBytes(outCounts, 0));
+                            ch.storeScalar(extractLaneI32(cb, numPrims, l), ch.gepBytes(outCounts, 4));
                         });
-                        mlir::scf::YieldOp::create(lb, lloc);
                     });
                 }
                 return true;
             };
 
-            msHooks.emitIndices = [&](mlir::OpBuilder& sb, mlir::Location sloc,
+            msHooks.emitIndices = [&](llvm::IRBuilder<>& sb,
                                       const SimdVal& primIdx, const SimdVal& v0,
                                       const SimdVal& v1, const SimdVal& v2,
-                                      mlir::Value realMask) -> bool {
+                                      llvm::Value* realMask) -> bool {
                 if (maxPrims == 0) return true;
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
-                    mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                        sb, sloc, mlir::LLVM::ICmpPredicate::ult, pIdx,
-                        mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxPrims)));
-                    mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                            [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                IRHelpers lh{lb, lloc, simdWidth};
-                                                mlir::Value base3 = mlir::LLVM::MulOp::create(lb, lloc, pIdx, lh.cInt(i32Ty, 3));
-                                                lh.storeScalar(extractLaneI32(lb, lloc, v0, l), lh.gepArray(outPrimIndices, i32Ty, base3));
-                                                lh.storeScalar(extractLaneI32(lb, lloc, v1, l),
-                                                               lh.gepArray(outPrimIndices, i32Ty, mlir::LLVM::AddOp::create(lb, lloc, base3, lh.cInt(i32Ty, 1))));
-                                                lh.storeScalar(extractLaneI32(lb, lloc, v2, l),
-                                                               lh.gepArray(outPrimIndices, i32Ty, mlir::LLVM::AddOp::create(lb, lloc, base3, lh.cInt(i32Ty, 2))));
-                                                mlir::scf::YieldOp::create(lb, lloc);
+                    llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    llvm::Value* pIdx = extractLaneI32(sb, primIdx, l);
+                    llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, pIdx, llvm::ConstantInt::get(i32Ty, maxPrims));
+                    emitIf(sb, sb.CreateAnd(actL, inB),
+                                            [&](llvm::IRBuilder<>& lb) {
+                                                IRHelpers lh{lb, simdWidth};
+                                                llvm::Value* base3 = lb.CreateMul(pIdx, lh.cInt(i32Ty, 3));
+                                                lh.storeScalar(extractLaneI32(lb, v0, l), lh.gepArray(outPrimIndices, i32Ty, base3));
+                                                lh.storeScalar(extractLaneI32(lb, v1, l),
+                                                               lh.gepArray(outPrimIndices, i32Ty, lb.CreateAdd(base3, lh.cInt(i32Ty, 1))));
+                                                lh.storeScalar(extractLaneI32(lb, v2, l),
+                                                               lh.gepArray(outPrimIndices, i32Ty, lb.CreateAdd(base3, lh.cInt(i32Ty, 2))));
                                             });
                 }
                 return true;
             };
 
-            msHooks.storeVertexOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
+            msHooks.storeVertexOutput = [&](llvm::IRBuilder<>& sb, uint32_t sigId,
                                             const SimdVal& row, uint32_t col, const SimdVal& val,
-                                            const SimdVal& vertIdx, mlir::Value realMask) -> bool {
+                                            const SimdVal& vertIdx, llvm::Value* realMask) -> bool {
                 const DxilSigRecord* sig = msLoaded.findOutputSig(sigId);
                 if (!sig || val.kind != SimdVal::Kind::Vector || maxVerts == 0) return true;
-                mlir::Value vVec = convertSimdValToF32Vec(sb, sloc, val);
+                llvm::Value* vVec = convertSimdValToF32Vec(sb, val);
 
                 if (sig->systemValueType == 3) { // SV_Position
                     if (col < 4) {
                         for (uint32_t l = 0; l < simdWidth; ++l) {
-                            mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                            mlir::Value vIdx = extractLaneI32(sb, sloc, vertIdx, l);
-                            mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                                sb, sloc, mlir::LLVM::ICmpPredicate::ult, vIdx,
-                                mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxVerts)));
-                            mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                                    [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                        IRHelpers lh{lb, lloc, simdWidth};
-                                                        mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                                                            lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, vIdx, lh.cInt(i32Ty, 4)),
-                                                            lh.cInt(i32Ty, static_cast<int64_t>(col)));
-                                                        mlir::Value vL = llvmExtract(lb, lloc, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                            llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                            llvm::Value* vIdx = extractLaneI32(sb, vertIdx, l);
+                            llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, vIdx, llvm::ConstantInt::get(i32Ty, maxVerts));
+                            emitIf(sb, sb.CreateAnd(actL, inB),
+                                                    [&](llvm::IRBuilder<>& lb) {
+                                                        IRHelpers lh{lb, simdWidth};
+                                                        llvm::Value* elemIdx = lb.CreateAdd(lb.CreateMul(vIdx, lh.cInt(i32Ty, 4)), lh.cInt(i32Ty, static_cast<int64_t>(col)));
+                                                        llvm::Value* vL = llvmExtract(lb, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                                                         lh.storeScalar(vL, lh.gepArray(outVertPosXYZW, f32Ty, elemIdx));
-                                                        mlir::scf::YieldOp::create(lb, lloc);
                                                     });
                         }
                     }
@@ -1960,67 +2016,55 @@ bool synthesizeGraphicsPSOMLIR(
 
                 if (hasTarget && totalVSScalarAttrs > 0) {
                     for (uint32_t l = 0; l < simdWidth; ++l) {
-                        mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value vIdx = extractLaneI32(sb, sloc, vertIdx, l);
-                        mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                            sb, sloc, mlir::LLVM::ICmpPredicate::ult, vIdx,
-                            mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxVerts)));
-                        mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                    IRHelpers lh{lb, lloc, simdWidth};
-                                                    mlir::Value slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
+                        llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* vIdx = extractLaneI32(sb, vertIdx, l);
+                        llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, vIdx, llvm::ConstantInt::get(i32Ty, maxVerts));
+                        emitIf(sb, sb.CreateAnd(actL, inB),
+                                                [&](llvm::IRBuilder<>& lb) {
+                                                    IRHelpers lh{lb, simdWidth};
+                                                    llvm::Value* slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
                                                     if (useDynRow) {
                                                         if (auto rc = tryGetUniformConstUInt(row)) {
                                                             if (*rc != 0) {
                                                                 slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot + (*rc) * 4));
                                                             }
                                                         } else {
-                                                            mlir::Value r32 = extractLaneI32(lb, lloc, row, l);
-                                                            slot32 = mlir::LLVM::AddOp::create(
-                                                                lb, lloc, slot32, mlir::LLVM::MulOp::create(lb, lloc, r32, lh.cInt(i32Ty, 4)));
+                                                            llvm::Value* r32 = extractLaneI32(lb, row, l);
+                                                            slot32 = lb.CreateAdd(slot32, lb.CreateMul(r32, lh.cInt(i32Ty, 4)));
                                                         }
                                                     }
-                                                    mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                                                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, vIdx, lh.cInt(i32Ty, totalVSScalarAttrs)),
-                                                        slot32);
-                                                    mlir::Value vL = llvmExtract(lb, lloc, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                                                    llvm::Value* elemIdx = lb.CreateAdd(lb.CreateMul(vIdx, lh.cInt(i32Ty, totalVSScalarAttrs)), slot32);
+                                                    llvm::Value* vL = llvmExtract(lb, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                                                     lh.storeScalar(vL, lh.gepArray(outVertAttrs, f32Ty, elemIdx));
-                                                    mlir::scf::YieldOp::create(lb, lloc);
                                                 });
                     }
                 }
                 return true;
             };
 
-            msHooks.storePrimitiveOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
+            msHooks.storePrimitiveOutput = [&](llvm::IRBuilder<>& sb, uint32_t sigId,
                                                const SimdVal& row, uint32_t col, const SimdVal& val,
-                                               const SimdVal& primIdx, mlir::Value realMask) -> bool {
+                                               const SimdVal& primIdx, llvm::Value* realMask) -> bool {
                 const DxilSigRecord* sig = msLoaded.findPatchConstSig(sigId);
                 if (!sig || val.kind != SimdVal::Kind::Vector || maxPrims == 0) return true;
 
                 if (sig->systemValueType == 30) { // SV_CullPrimitive
                     for (uint32_t l = 0; l < simdWidth; ++l) {
-                        mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
-                        mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                            sb, sloc, mlir::LLVM::ICmpPredicate::ult, pIdx,
-                            mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxPrims)));
-                        mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                    IRHelpers lh{lb, lloc, simdWidth};
-                                                    mlir::Value vL = llvmExtract(lb, lloc, val.vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                                                    mlir::Value nz;
-                                                    if (mlir::isa<mlir::IntegerType>(vL.getType())) {
-                                                        nz = mlir::LLVM::ICmpOp::create(
-                                                            lb, lloc, mlir::LLVM::ICmpPredicate::ne, vL, lh.cInt(vL.getType(), 0));
+                        llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* pIdx = extractLaneI32(sb, primIdx, l);
+                        llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, pIdx, llvm::ConstantInt::get(i32Ty, maxPrims));
+                        emitIf(sb, sb.CreateAnd(actL, inB),
+                                                [&](llvm::IRBuilder<>& lb) {
+                                                    IRHelpers lh{lb, simdWidth};
+                                                    llvm::Value* vL = llvmExtract(lb, val.vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                                                    llvm::Value* nz;
+                                                    if (vL->getType()->isIntegerTy()) {
+                                                        nz = lb.CreateICmp(llvm::CmpInst::ICMP_NE, vL, lh.cInt(vL->getType(), 0));
                                                     } else {
-                                                        nz = mlir::LLVM::FCmpOp::create(
-                                                            lb, lloc, mlir::LLVM::FCmpPredicate::one, vL, lh.cFlt(0.0));
+                                                        nz = lb.CreateFCmp(llvm::CmpInst::FCMP_ONE, vL, lh.cFlt(0.0));
                                                     }
-                                                    mlir::Value cByte = mlir::LLVM::SelectOp::create(
-                                                        lb, lloc, nz, lh.cInt(i8Ty, 1), lh.cInt(i8Ty, 0));
+                                                    llvm::Value* cByte = lb.CreateSelect(nz, lh.cInt(i8Ty, 1), lh.cInt(i8Ty, 0));
                                                     lh.storeScalar(cByte, lh.gepArray(outPrimCull, i8Ty, pIdx));
-                                                    mlir::scf::YieldOp::create(lb, lloc);
                                                 });
                     }
                     return true;
@@ -2028,22 +2072,19 @@ bool synthesizeGraphicsPSOMLIR(
 
                 if (sig->systemValueType == 10) { // SV_PrimitiveID
                     for (uint32_t l = 0; l < simdWidth; ++l) {
-                        mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
-                        mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                            sb, sloc, mlir::LLVM::ICmpPredicate::ult, pIdx,
-                            mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxPrims)));
-                        mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                    IRHelpers lh{lb, lloc, simdWidth};
-                                                    lh.storeScalar(extractLaneI32(lb, lloc, val, l), lh.gepArray(outPrimId, i32Ty, pIdx));
-                                                    mlir::scf::YieldOp::create(lb, lloc);
+                        llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* pIdx = extractLaneI32(sb, primIdx, l);
+                        llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, pIdx, llvm::ConstantInt::get(i32Ty, maxPrims));
+                        emitIf(sb, sb.CreateAnd(actL, inB),
+                                                [&](llvm::IRBuilder<>& lb) {
+                                                    IRHelpers lh{lb, simdWidth};
+                                                    lh.storeScalar(extractLaneI32(lb, val, l), lh.gepArray(outPrimId, i32Ty, pIdx));
                                                 });
                     }
                     return true;
                 }
 
-                mlir::Value vVec = convertSimdValToF32Vec(sb, sloc, val);
+                llvm::Value* vVec = convertSimdValToF32Vec(sb, val);
                 bool hasTarget = false;
                 uint32_t baseSlot = 0;
                 bool useDynRow = false;
@@ -2064,133 +2105,124 @@ bool synthesizeGraphicsPSOMLIR(
 
                 if (hasTarget && totalVSScalarAttrs > 0) {
                     for (uint32_t l = 0; l < simdWidth; ++l) {
-                        mlir::Value actL = llvmExtract(sb, sloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value pIdx = extractLaneI32(sb, sloc, primIdx, l);
-                        mlir::Value inB = mlir::LLVM::ICmpOp::create(
-                            sb, sloc, mlir::LLVM::ICmpPredicate::ult, pIdx,
-                            mlir::LLVM::ConstantOp::create(sb, sloc, i32Ty, sb.getIntegerAttr(i32Ty, maxPrims)));
-                        mlir::scf::IfOp::create(sb, sloc, mlir::LLVM::AndOp::create(sb, sloc, actL, inB),
-                                                [&](mlir::OpBuilder& lb, mlir::Location lloc) {
-                                                    IRHelpers lh{lb, lloc, simdWidth};
-                                                    mlir::Value slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
+                        llvm::Value* actL = llvmExtract(sb, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* pIdx = extractLaneI32(sb, primIdx, l);
+                        llvm::Value* inB = sb.CreateICmp(llvm::CmpInst::ICMP_ULT, pIdx, llvm::ConstantInt::get(i32Ty, maxPrims));
+                        emitIf(sb, sb.CreateAnd(actL, inB),
+                                                [&](llvm::IRBuilder<>& lb) {
+                                                    IRHelpers lh{lb, simdWidth};
+                                                    llvm::Value* slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
                                                     if (useDynRow) {
                                                         if (auto rc = tryGetUniformConstUInt(row)) {
                                                             if (*rc != 0) {
                                                                 slot32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot + (*rc) * 4));
                                                             }
                                                         } else {
-                                                            mlir::Value r32 = extractLaneI32(lb, lloc, row, l);
-                                                            slot32 = mlir::LLVM::AddOp::create(
-                                                                lb, lloc, slot32, mlir::LLVM::MulOp::create(lb, lloc, r32, lh.cInt(i32Ty, 4)));
+                                                            llvm::Value* r32 = extractLaneI32(lb, row, l);
+                                                            slot32 = lb.CreateAdd(slot32, lb.CreateMul(r32, lh.cInt(i32Ty, 4)));
                                                         }
                                                     }
-                                                    mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                                                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, pIdx, lh.cInt(i32Ty, totalVSScalarAttrs)),
-                                                        slot32);
-                                                    mlir::Value vL = llvmExtract(lb, lloc, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                                                    llvm::Value* elemIdx = lb.CreateAdd(lb.CreateMul(pIdx, lh.cInt(i32Ty, totalVSScalarAttrs)), slot32);
+                                                    llvm::Value* vL = llvmExtract(lb, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                                                     lh.storeScalar(vL, lh.gepArray(outPrimAttrs, f32Ty, elemIdx));
-                                                    mlir::scf::YieldOp::create(lb, lloc);
                                                 });
                     }
                 }
                 return true;
             };
 
-            if (!packetizeThreadGroupRegion(b, loc, combinedMod, msSrcFunc.getBody(), msLoaded, msEffectiveLayout,
+            if (!packetizeThreadGroupRegion(b, combinedMod, *msTree.root, msLoaded, msEffectiveLayout,
                                             simdWidth, rootCtx, gsBase, gx, gy, gz, entry, msHooks, outError)) {
                 return false;
             }
-            mlir::func::ReturnOp::create(b, loc);
+            b.CreateRetVoid();
         }
     }
 
     // --- 1a-tess. Emit @<vsSym>_hs, @<vsSym>_hspc, and @<vsSym>_ds ---
     if (hasTess) {
-        auto computeScalarPtr = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
-                                   mlir::Value basePtr, uint32_t cpStride,
-                                   const SimdVal* vAxis, const SimdVal& row, uint32_t baseSlot) -> mlir::Value {
-            IRHelpers lh{lb, lloc, simdW};
+        auto computeScalarPtr = [](llvm::IRBuilder<>& lb, uint32_t simdW,
+                                   llvm::Value* basePtr, uint32_t cpStride,
+                                   const SimdVal* vAxis, const SimdVal& row, uint32_t baseSlot) -> llvm::Value* {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
             auto i64Ty = lh.i64Ty();
 
-            mlir::Value idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
+            llvm::Value* idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseSlot));
             if (vAxis && cpStride > 0) {
                 if (auto vc = tryGetUniformConstUInt(*vAxis)) {
                     idx32 = lh.cInt(i32Ty, static_cast<int64_t>((*vc) * cpStride + baseSlot));
                 } else {
-                    mlir::Value v0 = llvmExtract(lb, lloc, vAxis->vec, static_cast<uint32_t>(0));
-                    if (v0.getType() != i32Ty) v0 = mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty, v0);
-                    idx32 = mlir::LLVM::AddOp::create(
-                        lb, lloc, idx32, mlir::LLVM::MulOp::create(lb, lloc, v0, lh.cInt(i32Ty, cpStride)));
+                    llvm::Value* v0 = llvmExtract(lb, vAxis->vec, static_cast<uint32_t>(0));
+                    if (v0->getType() != i32Ty) v0 = lb.CreateZExt(v0, i32Ty);
+                    idx32 = lb.CreateAdd(idx32, lb.CreateMul(v0, lh.cInt(i32Ty, cpStride)));
                 }
             }
             if (auto rc = tryGetUniformConstUInt(row)) {
                 if (*rc != 0) {
-                    idx32 = mlir::LLVM::AddOp::create(lb, lloc, idx32, lh.cInt(i32Ty, static_cast<int64_t>((*rc) * 4)));
+                    idx32 = lb.CreateAdd(idx32, lh.cInt(i32Ty, static_cast<int64_t>((*rc) * 4)));
                 }
             } else {
-                mlir::Value r0 = llvmExtract(lb, lloc, row.vec, static_cast<uint32_t>(0));
-                if (r0.getType() != i32Ty) r0 = mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty, r0);
-                idx32 = mlir::LLVM::AddOp::create(
-                    lb, lloc, idx32, mlir::LLVM::MulOp::create(lb, lloc, r0, lh.cInt(i32Ty, 4)));
+                llvm::Value* r0 = llvmExtract(lb, row.vec, static_cast<uint32_t>(0));
+                if (r0->getType() != i32Ty) r0 = lb.CreateZExt(r0, i32Ty);
+                idx32 = lb.CreateAdd(idx32, lb.CreateMul(r0, lh.cInt(i32Ty, 4)));
             }
-            mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                lb, lloc, mlir::LLVM::ZExtOp::create(lb, lloc, i64Ty, idx32), lh.cInt(i64Ty, 4));
+            llvm::Value* byteOff = lb.CreateMul(lb.CreateZExt(idx32, i64Ty), lh.cInt(i64Ty, 4));
             return lh.gepBytesDyn(basePtr, byteOff);
         };
 
-        auto convertLoadedF32ToSimd = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
-                                         mlir::Value f32Scalar, mlir::Type scalarTy) -> SimdVal {
-            IRHelpers lh{lb, lloc, simdW};
+        auto convertLoadedF32ToSimd = [](llvm::IRBuilder<>& lb, uint32_t simdW,
+                                         llvm::Value* f32Scalar, llvm::Type* scalarTy) -> SimdVal {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
             auto f32Ty = lh.f32Ty();
-            mlir::Value outVal = f32Scalar;
+            llvm::Value* outVal = f32Scalar;
             if (scalarTy != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(scalarTy)) {
-                    outVal = mlir::LLVM::BitcastOp::create(lb, lloc, i32Ty, outVal);
-                    if (scalarTy != i32Ty) outVal = mlir::LLVM::TruncOp::create(lb, lloc, scalarTy, outVal);
-                } else if (mlir::isa<mlir::FloatType>(scalarTy)) {
-                    outVal = mlir::LLVM::FPTruncOp::create(lb, lloc, scalarTy, outVal);
+                if (scalarTy->isIntegerTy()) {
+                    outVal = lb.CreateBitCast(outVal, i32Ty);
+                    if (scalarTy != i32Ty) outVal = lb.CreateTrunc(outVal, scalarTy);
+                } else if (scalarTy->isFloatingPointTy()) {
+                    outVal = lb.CreateFPTrunc(outVal, scalarTy);
                 }
             }
             return lh.splatScalar(outVal);
         };
 
-        auto convertF32VecToSimd = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
-                                      mlir::Value fVec, mlir::Type scalarTy) -> SimdVal {
-            IRHelpers lh{lb, lloc, simdW};
+        auto convertF32VecToSimd = [](llvm::IRBuilder<>& lb, uint32_t simdW,
+                                      llvm::Value* fVec, llvm::Type* scalarTy) -> SimdVal {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
             auto f32Ty = lh.f32Ty();
-            mlir::Value outVec = fVec;
+            llvm::Value* outVec = fVec;
             if (scalarTy != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(scalarTy)) {
-                    outVec = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(i32Ty), outVec);
+                if (scalarTy->isIntegerTy()) {
+                    outVec = lb.CreateBitCast(outVec, lh.vecTy(i32Ty));
                     if (scalarTy != i32Ty) {
-                        outVec = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), outVec);
+                        outVec = lb.CreateTrunc(outVec, lh.vecTy(scalarTy));
                     }
-                } else if (mlir::isa<mlir::FloatType>(scalarTy)) {
-                    outVec = mlir::LLVM::FPTruncOp::create(lb, lloc, lh.vecTy(scalarTy), outVec);
+                } else if (scalarTy->isFloatingPointTy()) {
+                    outVec = lb.CreateFPTrunc(outVec, lh.vecTy(scalarTy));
                 }
             }
             return {SimdVal::Kind::Vector, scalarTy, outVec, {}, {}};
         };
 
-        auto toI32Vec = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW, const SimdVal& sv) -> mlir::Value {
-            IRHelpers lh{lb, lloc, simdW};
+        auto toI32Vec = [](llvm::IRBuilder<>& lb, uint32_t simdW, const SimdVal& sv) -> llvm::Value* {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
-            mlir::Type et = llvm::cast<mlir::VectorType>(sv.vec.getType()).getElementType();
+            llvm::Type* et = llvm::cast<llvm::FixedVectorType>(sv.vec->getType())->getElementType();
             if (et == i32Ty) return sv.vec;
-            if (et.getIntOrFloatBitWidth() < 32) {
-                return mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+            if (et->getScalarSizeInBits() < 32) {
+                return lb.CreateZExt(sv.vec, lh.vecTy(i32Ty));
             }
-            return mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+            return lb.CreateTrunc(sv.vec, lh.vecTy(i32Ty));
         };
 
-        auto loadPatchInputSIMD = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
-                                      mlir::Value basePtr, uint32_t cpStride,
+        auto loadPatchInputSIMD = [&](llvm::IRBuilder<>& lb, uint32_t simdW,
+                                      llvm::Value* basePtr, uint32_t cpStride,
                                       const SimdVal* vAxis, const SimdVal& row, uint32_t rowStride,
-                                      uint32_t baseSlot, mlir::Type scalarTy, mlir::Value gatherMask) -> SimdVal {
-            IRHelpers lh{lb, lloc, simdW};
+                                      uint32_t baseSlot, llvm::Type* scalarTy, llvm::Value* gatherMask) -> SimdVal {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
             auto i64Ty = lh.i64Ty();
             auto f32Ty = lh.f32Ty();
@@ -2199,227 +2231,205 @@ bool synthesizeGraphicsPSOMLIR(
             std::optional<uint32_t> rc = tryGetUniformConstUInt(row);
             if (vc.has_value() && rc.has_value()) {
                 int64_t offBytes = static_cast<int64_t>((*vc) * cpStride + baseSlot + (*rc) * rowStride) * 4;
-                mlir::Value fVal = lh.loadScalar(f32Ty, lh.gepBytes(basePtr, offBytes));
-                return convertLoadedF32ToSimd(lb, lloc, simdW, fVal, scalarTy);
+                llvm::Value* fVal = lh.loadScalar(f32Ty, lh.gepBytes(basePtr, offBytes));
+                return convertLoadedF32ToSimd(lb, simdW, fVal, scalarTy);
             }
 
-            mlir::Value idxVec = lh.splatInt(i32Ty, static_cast<int64_t>(baseSlot));
+            llvm::Value* idxVec = lh.splatInt(i32Ty, static_cast<int64_t>(baseSlot));
             if (vAxis && cpStride > 0) {
-                idxVec = mlir::LLVM::AddOp::create(
-                    lb, lloc, idxVec,
-                    mlir::LLVM::MulOp::create(lb, lloc, toI32Vec(lb, lloc, simdW, *vAxis), lh.splatInt(i32Ty, cpStride)));
+                idxVec = lb.CreateAdd(idxVec, lb.CreateMul(toI32Vec(lb, simdW, *vAxis), lh.splatInt(i32Ty, cpStride)));
             }
             if (rowStride > 0) {
-                idxVec = mlir::LLVM::AddOp::create(
-                    lb, lloc, idxVec,
-                    mlir::LLVM::MulOp::create(lb, lloc, toI32Vec(lb, lloc, simdW, row), lh.splatInt(i32Ty, rowStride)));
+                idxVec = lb.CreateAdd(idxVec, lb.CreateMul(toI32Vec(lb, simdW, row), lh.splatInt(i32Ty, rowStride)));
             }
-            mlir::Value byteOffVec = mlir::LLVM::MulOp::create(
-                lb, lloc, mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(i64Ty), idxVec), lh.splatInt(i64Ty, 4));
-            mlir::Value basePtrVec = llvmSplat(lb, lloc, llvm::cast<mlir::VectorType>(lh.vecTy(lh.ptrTy())).getElementType(), basePtr, llvm::cast<mlir::VectorType>(lh.vecTy(lh.ptrTy())).getNumElements());
-            mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
-                lb, lloc, lh.vecTy(lh.ptrTy()), lh.i8Ty(), basePtrVec, mlir::ValueRange{byteOffVec});
-            mlir::Value fVec = mlir::LLVM::masked_gather::create(
-                lb, lloc, lh.vecTy(f32Ty), ptrVec, gatherMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
-            return convertF32VecToSimd(lb, lloc, simdW, fVec, scalarTy);
+            llvm::Value* byteOffVec = lb.CreateMul(lb.CreateZExt(idxVec, lh.vecTy(i64Ty)), lh.splatInt(i64Ty, 4));
+            llvm::Value* basePtrVec = llvmSplat(lb, lh.ptrTy(), basePtr, lh.W);
+            llvm::Value* ptrVec = lb.CreateGEP(lh.i8Ty(), basePtrVec, byteOffVec);
+            llvm::Value* fVec = lb.CreateMaskedGather(lh.vecTy(f32Ty), ptrVec, llvm::Align(1), gatherMask, lh.splatFlt(0.0));
+            return convertF32VecToSimd(lb, simdW, fVec, scalarTy);
         };
 
-        auto storeVecToSOA = [](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t simdW,
-                                const SimdVal& val, mlir::Value writeMask, mlir::Value activeMask,
-                                mlir::Value outBasePtr, uint32_t baseSlotWithCol, const SimdVal* dynRow) {
+        auto storeVecToSOA = [](llvm::IRBuilder<>& sb, uint32_t simdW,
+                                const SimdVal& val, llvm::Value* writeMask, llvm::Value* activeMask,
+                                llvm::Value* outBasePtr, uint32_t baseSlotWithCol, const SimdVal* dynRow) {
             if (val.kind != SimdVal::Kind::Vector) return;
-            IRHelpers sh{sb, sloc, simdW};
+            IRHelpers sh{sb, simdW};
             auto i32Ty = sh.i32Ty();
             auto f32Ty = sh.f32Ty();
-            mlir::Value vVec = val.vec;
-            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+            llvm::Value* vVec = val.vec;
+            llvm::Type* elemTy = llvm::cast<llvm::FixedVectorType>(vVec->getType())->getElementType();
             if (elemTy != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(elemTy)) {
-                    if (elemTy.getIntOrFloatBitWidth() < 32) {
-                        vVec = mlir::LLVM::ZExtOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
+                if (elemTy->isIntegerTy()) {
+                    if (elemTy->getScalarSizeInBits() < 32) {
+                        vVec = sb.CreateZExt(vVec, sh.vecTy(i32Ty));
                     }
-                    vVec = mlir::LLVM::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vVec);
+                    vVec = sb.CreateBitCast(vVec, sh.vecTy(f32Ty));
                 } else {
-                    vVec = mlir::LLVM::FPExtOp::create(sb, sloc, sh.vecTy(f32Ty), vVec);
+                    vVec = sb.CreateFPExt(vVec, sh.vecTy(f32Ty));
                 }
             }
 
             std::optional<uint32_t> rc = dynRow ? tryGetUniformConstUInt(*dynRow) : std::optional<uint32_t>(0u);
             if (rc.has_value()) {
                 uint32_t scalarSlot = baseSlotWithCol + (*rc) * 4;
-                mlir::Value dstPtr = sh.gepBytes(outBasePtr, static_cast<int64_t>(scalarSlot * simdW * 4));
+                llvm::Value* dstPtr = sh.gepBytes(outBasePtr, static_cast<int64_t>(scalarSlot * simdW * 4));
                 if (!writeMask || writeMask == activeMask) {
-                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dstPtr, /*alignment=*/4);
+                    sb.CreateStore(vVec, dstPtr);
                 } else {
-                    mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), dstPtr);
-                    mlir::Value merged = mlir::LLVM::SelectOp::create(sb, sloc, writeMask, vVec, prev);
-                    mlir::LLVM::StoreOp::create(sb, sloc, merged, dstPtr, /*alignment=*/4);
+                    llvm::Value* prev = sh.loadScalar(sh.vecTy(f32Ty), dstPtr);
+                    llvm::Value* merged = sb.CreateSelect(writeMask, vVec, prev);
+                    sb.CreateStore(merged, dstPtr);
                 }
             } else {
-                mlir::Value effMask = writeMask ? writeMask : activeMask;
+                llvm::Value* effMask = writeMask ? writeMask : activeMask;
                 for (uint32_t l = 0; l < simdW; ++l) {
-                    mlir::Value mL = llvmExtract(sb, sloc, effMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(sb, sloc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        IRHelpers nh{nb, nloc, simdW};
-                        mlir::Value rL = llvmExtract(nb, nloc, dynRow->vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value r32 = (rL.getType() == i32Ty)
+                    llvm::Value* mL = llvmExtract(sb, effMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(sb, mL, [&](llvm::IRBuilder<>& nb) {
+                        IRHelpers nh{nb, simdW};
+                        llvm::Value* rL = llvmExtract(nb, dynRow->vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* r32 = (rL->getType() == i32Ty)
                                               ? rL
-                                              : mlir::LLVM::ZExtOp::create(nb, nloc, i32Ty, rL).getResult();
-                        mlir::Value slot32 = mlir::LLVM::AddOp::create(
-                            nb, nloc, nh.cInt(i32Ty, static_cast<int64_t>(baseSlotWithCol)),
-                            mlir::LLVM::MulOp::create(nb, nloc, r32, nh.cInt(i32Ty, 4)));
-                        mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                            nb, nloc, mlir::LLVM::MulOp::create(nb, nloc, slot32, nh.cInt(i32Ty, simdW)),
-                            nh.cInt(i32Ty, static_cast<int64_t>(l)));
-                        mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                            nb, nloc, mlir::LLVM::ZExtOp::create(nb, nloc, nh.i64Ty(), elemIdx), nh.cInt(nh.i64Ty(), 4));
-                        mlir::Value vL = llvmExtract(nb, nloc, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::LLVM::StoreOp::create(nb, nloc, vL, nh.gepBytesDyn(outBasePtr, byteOff));
-                        mlir::scf::YieldOp::create(nb, nloc);
+                                              : nb.CreateZExt(rL, i32Ty);
+                        llvm::Value* slot32 = nb.CreateAdd(nh.cInt(i32Ty, static_cast<int64_t>(baseSlotWithCol)), nb.CreateMul(r32, nh.cInt(i32Ty, 4)));
+                        llvm::Value* elemIdx = nb.CreateAdd(nb.CreateMul(slot32, nh.cInt(i32Ty, simdW)), nh.cInt(i32Ty, static_cast<int64_t>(l)));
+                        llvm::Value* byteOff = nb.CreateMul(nb.CreateZExt(elemIdx, nh.i64Ty()), nh.cInt(nh.i64Ty(), 4));
+                        llvm::Value* vL = llvmExtract(nb, vVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        nb.CreateStore(vL, nh.gepBytesDyn(outBasePtr, byteOff));
                     });
                 }
             }
         };
 
-        auto storeLane0ToF32Ptr = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
-                                     const SimdVal& val, mlir::Value realMask, mlir::Value dstPtr) {
-            IRHelpers lh{lb, lloc, simdW};
+        auto storeLane0ToF32Ptr = [](llvm::IRBuilder<>& lb, uint32_t simdW,
+                                     const SimdVal& val, llvm::Value* realMask, llvm::Value* dstPtr) {
+            IRHelpers lh{lb, simdW};
             auto i32Ty = lh.i32Ty();
             auto f32Ty = lh.f32Ty();
-            mlir::Value v0 = llvmExtract(lb, lloc, val.vec, static_cast<uint32_t>(0));
-            if (v0.getType() != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(v0.getType())) {
-                    if (v0.getType() != i32Ty) v0 = mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty, v0);
-                    v0 = mlir::LLVM::BitcastOp::create(lb, lloc, f32Ty, v0);
+            llvm::Value* v0 = llvmExtract(lb, val.vec, static_cast<uint32_t>(0));
+            if (v0->getType() != f32Ty) {
+                if (v0->getType()->isIntegerTy()) {
+                    if (v0->getType() != i32Ty) v0 = lb.CreateZExt(v0, i32Ty);
+                    v0 = lb.CreateBitCast(v0, f32Ty);
                 } else {
-                    v0 = mlir::LLVM::FPExtOp::create(lb, lloc, f32Ty, v0);
+                    v0 = lb.CreateFPExt(v0, f32Ty);
                 }
             }
-            mlir::Value l0Active = llvmExtract(lb, lloc, realMask, static_cast<uint32_t>(0));
-            mlir::scf::IfOp::create(lb, lloc, l0Active, [&](mlir::OpBuilder& sb, mlir::Location sloc) {
-                mlir::LLVM::StoreOp::create(sb, sloc, v0, dstPtr, /*alignment=*/4);
-                mlir::scf::YieldOp::create(sb, sloc);
+            llvm::Value* l0Active = llvmExtract(lb, realMask, static_cast<uint32_t>(0));
+            emitIf(lb, l0Active, [&](llvm::IRBuilder<>& sb) {
+                sb.CreateStore(v0, dstPtr);
             });
         };
 
         // 1) @<vsSym>_hs(rootCtx, inCPAttrs, patchId, baseOutCpId, activeCount, outCPAttrsSOA)
         {
-            auto hsSrcFunc = hsMlirMod->lookupSymbol<mlir::func::FuncOp>(hsLoaded.entryName);
-            if (!hsSrcFunc || hsSrcFunc.getBody().empty()) {
+            if (!hsTree.root) {
                 outError = "Hull shader control-point entry function missing after MLIR SCF lift";
                 return false;
             }
-            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-            IRHelpers h{b, loc, simdWidth};
+            llvm::IRBuilder<> b(combinedMod.getContext());
+            IRHelpers h{b, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
-            auto fnTy = b.getFunctionType({ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, ptrTy}, {});
-            auto hsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_hs", fnTy);
-            mlir::Block* entry = hsFn.addEntryBlock();
-            b.setInsertionPointToEnd(entry);
+            auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, ptrTy}, false);
+            auto* hsFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_hs", combinedMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", hsFn);
+            b.SetInsertPoint(entry);
 
-            mlir::Value rootCtx = entry->getArgument(0);
-            mlir::Value inCPAttrs = entry->getArgument(1);
-            mlir::Value patchIdArg = entry->getArgument(2);
-            mlir::Value baseOutCpIdArg = entry->getArgument(3);
-            mlir::Value activeCountArg = entry->getArgument(4);
-            mlir::Value outCPAttrsSOA = entry->getArgument(5);
+            llvm::Value* rootCtx = entry->getParent()->getArg(0);
+            llvm::Value* inCPAttrs = entry->getParent()->getArg(1);
+            llvm::Value* patchIdArg = entry->getParent()->getArg(2);
+            llvm::Value* baseOutCpIdArg = entry->getParent()->getArg(3);
+            llvm::Value* activeCountArg = entry->getParent()->getArg(4);
+            llvm::Value* outCPAttrsSOA = entry->getParent()->getArg(5);
 
-            mlir::Value acVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), activeCountArg, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-            mlir::Value activeMask = mlir::LLVM::ICmpOp::create(
-                b, loc, mlir::LLVM::ICmpPredicate::ult, h.laneIota(), acVec);
-            mlir::Value outCpIdVec = mlir::LLVM::SelectOp::create(
-                b, loc, activeMask,
-                mlir::LLVM::AddOp::create(
-                    b, loc, llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), baseOutCpIdArg, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements()), h.laneIota()),
-                h.splatInt(i32Ty, 0));
+            llvm::Value* acVec = llvmSplat(b, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getElementType(), activeCountArg, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getNumElements());
+            llvm::Value* activeMask = b.CreateICmp(llvm::CmpInst::ICMP_ULT, h.laneIota(), acVec);
+            llvm::Value* outCpIdVec = b.CreateSelect(activeMask, b.CreateAdd(llvmSplat(b, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getElementType(), baseOutCpIdArg, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getNumElements()), h.laneIota()), h.splatInt(i32Ty, 0));
 
             StageHooks hsHooks;
-            mlir::Value hsRealMask = activeMask;
-            hsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            llvm::Value* hsRealMask = activeMask;
+            hsHooks.loadInputWithVertex = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                               const SimdVal& row, uint32_t col, const SimdVal& vAxis,
-                                              mlir::Type scalarTy, SimdVal& out) -> bool {
+                                              llvm::Type* scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = hsLoaded.findInputSig(sigId);
                 if (!sig) return false;
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
                 out = loadPatchInputSIMD(
-                    lb, lloc, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, 4u, baseSlot, scalarTy, activeMask);
+                    lb, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
-            hsHooks.storeOutput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            hsHooks.storeOutput = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                       const SimdVal& row, uint32_t col, const SimdVal& val,
-                                      mlir::Value realMask) -> bool {
+                                      llvm::Value* realMask) -> bool {
                 auto it = hsToDsMap.find(sigId);
                 if (it == hsToDsMap.end() || it->second.psTargetRow < 0) return true;
                 uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
-                storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outCPAttrsSOA, baseSlot, &row);
+                storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outCPAttrsSOA, baseSlot, &row);
                 return true;
             };
-            hsHooks.loadOutputControlPointId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = (scalarTy == i32Ty)
+            hsHooks.loadOutputControlPointId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+                IRHelpers lh{lb, simdWidth};
+                llvm::Value* v = (scalarTy == i32Ty)
                                     ? outCpIdVec
-                                    : mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), outCpIdVec).getResult();
+                                    : lb.CreateTrunc(outCpIdVec, lh.vecTy(scalarTy));
                 out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                 return true;
             };
-            hsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = patchIdArg;
-                if (scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, scalarTy, v);
+            hsHooks.loadPrimitiveId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+                IRHelpers lh{lb, simdWidth};
+                llvm::Value* v = patchIdArg;
+                if (scalarTy != i32Ty) v = lb.CreateTrunc(v, scalarTy);
                 out = lh.splatScalar(v);
                 return true;
             };
 
-            if (!packetizeRegionWithHooks(b, loc, combinedMod, hsSrcFunc.getBody(), hsLoaded, hsEffectiveLayout,
+            if (!packetizeRegionWithHooks(b, combinedMod, *hsTree.root, hsLoaded, hsEffectiveLayout,
                                           simdWidth, rootCtx, activeMask, hsRealMask, hsHooks, outError)) {
                 return false;
             }
-            mlir::func::ReturnOp::create(b, loc);
+            b.CreateRetVoid();
         }
 
         // 2) @<vsSym>_hspc(rootCtx, inCPAttrs, outCPAttrs, patchId, outPatchConsts, outTessFactors)
         {
-            auto hspcSrcFunc = hsMlirMod->lookupSymbol<mlir::func::FuncOp>(hsLoaded.hsPatchConstFnName);
-            if (!hspcSrcFunc || hspcSrcFunc.getBody().empty()) {
+            if (!hspcTree.root) {
                 outError = "Hull shader patch-constant function missing after MLIR SCF lift";
                 return false;
             }
-            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-            IRHelpers h{b, loc, simdWidth};
+            llvm::IRBuilder<> b(combinedMod.getContext());
+            IRHelpers h{b, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
             auto f32Ty = h.f32Ty();
-            auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
-            auto hspcFn = mlir::func::FuncOp::create(b, loc, vsSym + "_hspc", fnTy);
-            mlir::Block* entry = hspcFn.addEntryBlock();
-            b.setInsertionPointToEnd(entry);
+            auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, false);
+            auto* hspcFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_hspc", combinedMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", hspcFn);
+            b.SetInsertPoint(entry);
 
-            mlir::Value rootCtx = entry->getArgument(0);
-            mlir::Value inCPAttrs = entry->getArgument(1);
-            mlir::Value outCPAttrs = entry->getArgument(2);
-            mlir::Value patchIdArg = entry->getArgument(3);
-            mlir::Value outPatchConsts = entry->getArgument(4);
-            mlir::Value outTessFactors = entry->getArgument(5);
+            llvm::Value* rootCtx = entry->getParent()->getArg(0);
+            llvm::Value* inCPAttrs = entry->getParent()->getArg(1);
+            llvm::Value* outCPAttrs = entry->getParent()->getArg(2);
+            llvm::Value* patchIdArg = entry->getParent()->getArg(3);
+            llvm::Value* outPatchConsts = entry->getParent()->getArg(4);
+            llvm::Value* outTessFactors = entry->getParent()->getArg(5);
 
-            mlir::Value activeMask = mlir::LLVM::ICmpOp::create(
-                b, loc, mlir::LLVM::ICmpPredicate::eq, h.laneIota(), h.splatInt(i32Ty, 0));
+            llvm::Value* activeMask = b.CreateICmp(llvm::CmpInst::ICMP_EQ, h.laneIota(), h.splatInt(i32Ty, 0));
 
             StageHooks hspcHooks;
-            hspcHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            hspcHooks.loadInputWithVertex = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                                 const SimdVal& row, uint32_t col, const SimdVal& vAxis,
-                                                mlir::Type scalarTy, SimdVal& out) -> bool {
+                                                llvm::Type* scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = hsLoaded.findInputSig(sigId);
                 if (!sig) return false;
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, baseSlot);
-                mlir::Value fVal = IRHelpers{lb, lloc, simdWidth}.loadScalar(f32Ty, ptr);
-                out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                llvm::Value* ptr = computeScalarPtr(lb, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, baseSlot);
+                llvm::Value* fVal = IRHelpers{lb, simdWidth}.loadScalar(f32Ty, ptr);
+                out = convertLoadedF32ToSimd(lb, simdWidth, fVal, scalarTy);
                 return true;
             };
-            hspcHooks.loadOutputControlPoint = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            hspcHooks.loadOutputControlPoint = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                                    const SimdVal& row, uint32_t col, const SimdVal& cpIdx,
-                                                   mlir::Type scalarTy, SimdVal& out) -> bool {
+                                                   llvm::Type* scalarTy, SimdVal& out) -> bool {
                 auto it = hsToDsMap.find(sigId);
                 uint32_t baseSlot = 0;
                 if (it != hsToDsMap.end() && it->second.psTargetRow >= 0) {
@@ -2429,145 +2439,142 @@ bool synthesizeGraphicsPSOMLIR(
                     if (!sig) return false;
                     baseSlot = sig->startRow * 4 + sig->startCol + col;
                 }
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, outCPAttrs, numHSOutputScalars, &cpIdx, row, baseSlot);
-                mlir::Value fVal = IRHelpers{lb, lloc, simdWidth}.loadScalar(f32Ty, ptr);
-                out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                llvm::Value* ptr = computeScalarPtr(lb, simdWidth, outCPAttrs, numHSOutputScalars, &cpIdx, row, baseSlot);
+                llvm::Value* fVal = IRHelpers{lb, simdWidth}.loadScalar(f32Ty, ptr);
+                out = convertLoadedF32ToSimd(lb, simdWidth, fVal, scalarTy);
                 return true;
             };
-            hspcHooks.storePatchConstant = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            hspcHooks.storePatchConstant = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                                const SimdVal& row, uint32_t col, const SimdVal& val,
-                                               mlir::Value realMask) -> bool {
+                                               llvm::Value* realMask) -> bool {
                 const DxilSigRecord* sig = hsLoaded.findPatchConstSig(sigId);
                 if (!sig) return false;
                 if (sig->systemValueType == 25 || sig->systemValueType == 26) {
                     // SV_TessFactor -> outTessFactors[0..3], SV_InsideTessFactor -> outTessFactors[4..5]
-                    IRHelpers lh{lb, lloc, simdWidth};
+                    IRHelpers lh{lb, simdWidth};
                     uint32_t baseIdx = (sig->systemValueType == 25) ? 0u : 4u;
-                    mlir::Value idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseIdx));
+                    llvm::Value* idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseIdx));
                     if (auto rc = tryGetUniformConstUInt(row)) {
                         idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseIdx + *rc));
                     } else {
-                        mlir::Value r0 = llvmExtract(lb, lloc, row.vec, static_cast<uint32_t>(0));
-                        if (r0.getType() != i32Ty) r0 = mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty, r0);
-                        idx32 = mlir::LLVM::AddOp::create(lb, lloc, idx32, r0);
+                        llvm::Value* r0 = llvmExtract(lb, row.vec, static_cast<uint32_t>(0));
+                        if (r0->getType() != i32Ty) r0 = lb.CreateZExt(r0, i32Ty);
+                        idx32 = lb.CreateAdd(idx32, r0);
                     }
-                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                        lb, lloc, mlir::LLVM::ZExtOp::create(lb, lloc, lh.i64Ty(), idx32), lh.cInt(lh.i64Ty(), 4));
-                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, lh.gepBytesDyn(outTessFactors, byteOff));
+                    llvm::Value* byteOff = lb.CreateMul(lb.CreateZExt(idx32, lh.i64Ty()), lh.cInt(lh.i64Ty(), 4));
+                    storeLane0ToF32Ptr(lb, simdWidth, val, realMask, lh.gepBytesDyn(outTessFactors, byteOff));
                     return true;
                 }
                 auto it = hsPcToDsMap.find(sigId);
                 if (it == hsPcToDsMap.end() || it->second.psTargetRow < 0) return true;
                 uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, outPatchConsts, 0, nullptr, row, baseSlot);
-                storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, ptr);
+                llvm::Value* ptr = computeScalarPtr(lb, simdWidth, outPatchConsts, 0, nullptr, row, baseSlot);
+                storeLane0ToF32Ptr(lb, simdWidth, val, realMask, ptr);
                 return true;
             };
-            hspcHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = patchIdArg;
-                if (scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, scalarTy, v);
+            hspcHooks.loadPrimitiveId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+                IRHelpers lh{lb, simdWidth};
+                llvm::Value* v = patchIdArg;
+                if (scalarTy != i32Ty) v = lb.CreateTrunc(v, scalarTy);
                 out = lh.splatScalar(v);
                 return true;
             };
 
-            mlir::Value hspcRealMask = activeMask;
-            if (!packetizeRegionWithHooks(b, loc, combinedMod, hspcSrcFunc.getBody(), hsLoaded, hsEffectiveLayout,
+            llvm::Value* hspcRealMask = activeMask;
+            if (!packetizeRegionWithHooks(b, combinedMod, *hspcTree.root, hsLoaded, hsEffectiveLayout,
                                           simdWidth, rootCtx, activeMask, hspcRealMask, hspcHooks, outError)) {
                 return false;
             }
-            mlir::func::ReturnOp::create(b, loc);
+            b.CreateRetVoid();
         }
 
         // 3) @<vsSym>_ds(rootCtx, inCPAttrs, inPatchConsts, inTessFactors, patchId, domUPtr, domVPtr, domWPtr, activeCount, outPosXYZW, outAttrs)
         {
-            auto dsSrcFunc = dsMlirMod->lookupSymbol<mlir::func::FuncOp>(dsLoaded.entryName);
-            if (!dsSrcFunc || dsSrcFunc.getBody().empty()) {
+            if (!dsTree.root) {
                 outError = "Domain shader entry function missing after MLIR SCF lift";
                 return false;
             }
-            mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-            IRHelpers h{b, loc, simdWidth};
+            llvm::IRBuilder<> b(combinedMod.getContext());
+            IRHelpers h{b, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
             auto f32Ty = h.f32Ty();
-            auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
-            auto dsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_ds", fnTy);
-            mlir::Block* entry = dsFn.addEntryBlock();
-            b.setInsertionPointToEnd(entry);
+            auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, false);
+            auto* dsFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_ds", combinedMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", dsFn);
+            b.SetInsertPoint(entry);
 
-            mlir::Value rootCtx = entry->getArgument(0);
-            mlir::Value inCPAttrs = entry->getArgument(1);
-            mlir::Value inPatchConsts = entry->getArgument(2);
-            mlir::Value inTessFactors = entry->getArgument(3);
-            mlir::Value patchIdArg = entry->getArgument(4);
-            mlir::Value domUPtr = entry->getArgument(5);
-            mlir::Value domVPtr = entry->getArgument(6);
-            mlir::Value domWPtr = entry->getArgument(7);
-            mlir::Value activeCountArg = entry->getArgument(8);
-            mlir::Value outPosXYZW = entry->getArgument(9);
-            mlir::Value outAttrs = entry->getArgument(10);
+            llvm::Value* rootCtx = entry->getParent()->getArg(0);
+            llvm::Value* inCPAttrs = entry->getParent()->getArg(1);
+            llvm::Value* inPatchConsts = entry->getParent()->getArg(2);
+            llvm::Value* inTessFactors = entry->getParent()->getArg(3);
+            llvm::Value* patchIdArg = entry->getParent()->getArg(4);
+            llvm::Value* domUPtr = entry->getParent()->getArg(5);
+            llvm::Value* domVPtr = entry->getParent()->getArg(6);
+            llvm::Value* domWPtr = entry->getParent()->getArg(7);
+            llvm::Value* activeCountArg = entry->getParent()->getArg(8);
+            llvm::Value* outPosXYZW = entry->getParent()->getArg(9);
+            llvm::Value* outAttrs = entry->getParent()->getArg(10);
 
-            mlir::Value acVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), activeCountArg, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-            mlir::Value activeMask = mlir::LLVM::ICmpOp::create(
-                b, loc, mlir::LLVM::ICmpPredicate::ult, h.laneIota(), acVec);
-            mlir::Value zeroFltVec = h.splatFlt(0.0);
-            mlir::Value domUVec = mlir::LLVM::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domUPtr), zeroFltVec);
-            mlir::Value domVVec = mlir::LLVM::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domVPtr), zeroFltVec);
-            mlir::Value domWVec = mlir::LLVM::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domWPtr), zeroFltVec);
+            llvm::Value* acVec = llvmSplat(b, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getElementType(), activeCountArg, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getNumElements());
+            llvm::Value* activeMask = b.CreateICmp(llvm::CmpInst::ICMP_ULT, h.laneIota(), acVec);
+            llvm::Value* zeroFltVec = h.splatFlt(0.0);
+            llvm::Value* domUVec = b.CreateSelect(activeMask, h.loadScalar(h.vecTy(f32Ty), domUPtr), zeroFltVec);
+            llvm::Value* domVVec = b.CreateSelect(activeMask, h.loadScalar(h.vecTy(f32Ty), domVPtr), zeroFltVec);
+            llvm::Value* domWVec = b.CreateSelect(activeMask, h.loadScalar(h.vecTy(f32Ty), domWPtr), zeroFltVec);
 
             StageHooks dsHooks;
-            dsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            dsHooks.loadInputWithVertex = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                               const SimdVal& row, uint32_t col, const SimdVal& cpIdx,
-                                              mlir::Type scalarTy, SimdVal& out) -> bool {
+                                              llvm::Type* scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = dsLoaded.findInputSig(sigId);
                 if (!sig) return false;
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
                 out = loadPatchInputSIMD(
-                    lb, lloc, simdWidth, inCPAttrs, numHSOutputScalars, &cpIdx, row, 4u, baseSlot, scalarTy, activeMask);
+                    lb, simdWidth, inCPAttrs, numHSOutputScalars, &cpIdx, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
-            dsHooks.loadPatchConstant = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            dsHooks.loadPatchConstant = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                             const SimdVal& row, uint32_t col,
-                                            mlir::Type scalarTy, SimdVal& out) -> bool {
+                                            llvm::Type* scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = dsLoaded.findPatchConstSig(sigId);
                 if (!sig) return false;
                 if (sig->systemValueType == 25 || sig->systemValueType == 26) {
                     uint32_t baseIdx = (sig->systemValueType == 25) ? 0u : 4u;
                     out = loadPatchInputSIMD(
-                        lb, lloc, simdWidth, inTessFactors, 0u, nullptr, row, 1u, baseIdx, scalarTy, activeMask);
+                        lb, simdWidth, inTessFactors, 0u, nullptr, row, 1u, baseIdx, scalarTy, activeMask);
                     return true;
                 }
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
                 out = loadPatchInputSIMD(
-                    lb, lloc, simdWidth, inPatchConsts, 0u, nullptr, row, 4u, baseSlot, scalarTy, activeMask);
+                    lb, simdWidth, inPatchConsts, 0u, nullptr, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
-            dsHooks.loadDomainLocation = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t comp,
-                                             mlir::Type scalarTy, SimdVal& out) -> bool {
-                IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = (comp == 0) ? domUVec : ((comp == 1) ? domVVec : ((comp == 2) ? domWVec : lh.splatFlt(0.0)));
+            dsHooks.loadDomainLocation = [&](llvm::IRBuilder<>& lb, uint32_t comp,
+                                             llvm::Type* scalarTy, SimdVal& out) -> bool {
+                IRHelpers lh{lb, simdWidth};
+                llvm::Value* v = (comp == 0) ? domUVec : ((comp == 1) ? domVVec : ((comp == 2) ? domWVec : lh.splatFlt(0.0)));
                 if (scalarTy != f32Ty) {
-                    v = mlir::LLVM::FPTruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                    v = lb.CreateFPTrunc(v, lh.vecTy(scalarTy));
                 }
                 out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                 return true;
             };
-            dsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = patchIdArg;
-                if (scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, scalarTy, v);
+            dsHooks.loadPrimitiveId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+                IRHelpers lh{lb, simdWidth};
+                llvm::Value* v = patchIdArg;
+                if (scalarTy != i32Ty) v = lb.CreateTrunc(v, scalarTy);
                 out = lh.splatScalar(v);
                 return true;
             };
-            dsHooks.storeOutput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+            dsHooks.storeOutput = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                       const SimdVal& row, uint32_t col, const SimdVal& val,
-                                      mlir::Value realMask) -> bool {
+                                      llvm::Value* realMask) -> bool {
                 const DxilSigRecord* sig = dsLoaded.findOutputSig(sigId);
                 if (!sig) return false;
                 if (sig->systemValueType == 3) {
                     if (col < 4) {
-                        storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outPosXYZW, col, nullptr);
+                        storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outPosXYZW, col, nullptr);
                     }
                     return true;
                 }
@@ -2577,7 +2584,7 @@ bool synthesizeGraphicsPSOMLIR(
                         uint32_t r = tryGetUniformConstUInt(row).value_or(0);
                         uint32_t idx = cit->second + r * sig->cols + col;
                         if (idx < 8 && (clipDistMask & (1u << idx))) {
-                            storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, clipAttrOffset + idx, nullptr);
+                            storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outAttrs, clipAttrOffset + idx, nullptr);
                         }
                     }
                     return true;
@@ -2588,80 +2595,76 @@ bool synthesizeGraphicsPSOMLIR(
                         uint32_t r = tryGetUniformConstUInt(row).value_or(0);
                         uint32_t idx = cit->second + r * sig->cols + col;
                         if (idx < 8 && (cullDistMask & (1u << idx))) {
-                            storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, cullAttrOffset + idx, nullptr);
+                            storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outAttrs, cullAttrOffset + idx, nullptr);
                         }
                     }
                     return true;
                 }
                 if (!hasGS && sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
-                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, vpIndexAttrOffset, nullptr);
+                    storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outAttrs, vpIndexAttrOffset, nullptr);
                     return true;
                 }
                 if (!hasGS && sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
-                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, shadingRateAttrOffset, nullptr);
+                    storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outAttrs, shadingRateAttrOffset, nullptr);
                     return true;
                 }
                 auto it = dsToNextMap.find(sigId);
                 if (it != dsToNextMap.end() && it->second.psTargetRow >= 0) {
                     uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
-                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, baseSlot, &row);
+                    storeVecToSOA(lb, simdWidth, val, realMask, activeMask, outAttrs, baseSlot, &row);
                 }
                 return true;
             };
 
-            mlir::Value dsRealMask = activeMask;
-            if (!packetizeRegionWithHooks(b, loc, combinedMod, dsSrcFunc.getBody(), dsLoaded, dsEffectiveLayout,
+            llvm::Value* dsRealMask = activeMask;
+            if (!packetizeRegionWithHooks(b, combinedMod, *dsTree.root, dsLoaded, dsEffectiveLayout,
                                           simdWidth, rootCtx, activeMask, dsRealMask, dsHooks, outError)) {
                 return false;
             }
-            mlir::func::ReturnOp::create(b, loc);
+            b.CreateRetVoid();
         }
     }
 
     // --- 1b. Emit @<vsSym>_gs(rootCtx, inPosXYZW, inAttrs, primIdsPtr, gsInstId, activeCount, outPosXYZW, outAttrs, outStripCounts, outTotalVerts, outNumStrips) ---
     uint32_t numGSInputScalars = numGSInputRegs * 4;
     if (hasGS) {
-        auto gsSrcFunc = gsMlirMod->lookupSymbol<mlir::func::FuncOp>(gsLoaded.entryName);
-        if (!gsSrcFunc || gsSrcFunc.getBody().empty()) {
+        if (!gsTree.root) {
             outError = "Geometry shader entry function missing after MLIR SCF lift";
             return false;
         }
 
-        mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-        IRHelpers h{b, loc, simdWidth};
+        llvm::IRBuilder<> b(combinedMod.getContext());
+        IRHelpers h{b, simdWidth};
         auto ptrTy = h.ptrTy();
         auto i32Ty = h.i32Ty();
         auto f32Ty = h.f32Ty();
-        auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy}, {});
-        auto gsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_gs", fnTy);
-        mlir::Block* entry = gsFn.addEntryBlock();
-        b.setInsertionPointToEnd(entry);
+        auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy}, false);
+        auto* gsFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, vsSym + "_gs", combinedMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", gsFn);
+        b.SetInsertPoint(entry);
 
-        mlir::Value rootCtx = entry->getArgument(0);
-        mlir::Value inPosXYZW = entry->getArgument(1);
-        mlir::Value inAttrs = entry->getArgument(2);
-        mlir::Value primIdsPtr = entry->getArgument(3);
-        mlir::Value gsInstIdArg = entry->getArgument(4);
-        mlir::Value activeCountArg = entry->getArgument(5);
-        mlir::Value outPosXYZW = entry->getArgument(6);
-        mlir::Value outAttrs = entry->getArgument(7);
-        mlir::Value outStripCounts = entry->getArgument(8);
-        mlir::Value outTotalVerts = entry->getArgument(9);
-        mlir::Value outNumStrips = entry->getArgument(10);
+        llvm::Value* rootCtx = entry->getParent()->getArg(0);
+        llvm::Value* inPosXYZW = entry->getParent()->getArg(1);
+        llvm::Value* inAttrs = entry->getParent()->getArg(2);
+        llvm::Value* primIdsPtr = entry->getParent()->getArg(3);
+        llvm::Value* gsInstIdArg = entry->getParent()->getArg(4);
+        llvm::Value* activeCountArg = entry->getParent()->getArg(5);
+        llvm::Value* outPosXYZW = entry->getParent()->getArg(6);
+        llvm::Value* outAttrs = entry->getParent()->getArg(7);
+        llvm::Value* outStripCounts = entry->getParent()->getArg(8);
+        llvm::Value* outTotalVerts = entry->getParent()->getArg(9);
+        llvm::Value* outNumStrips = entry->getParent()->getArg(10);
 
-        mlir::Value acVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), activeCountArg, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-        mlir::Value activeMask = mlir::LLVM::ICmpOp::create(
-            b, loc, mlir::LLVM::ICmpPredicate::ult, h.laneIota(), acVec);
-        mlir::Value primIdVec = mlir::LLVM::SelectOp::create(
-            b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), primIdsPtr), h.splatInt(i32Ty, 0));
+        llvm::Value* acVec = llvmSplat(b, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getElementType(), activeCountArg, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getNumElements());
+        llvm::Value* activeMask = b.CreateICmp(llvm::CmpInst::ICMP_ULT, h.laneIota(), acVec);
+        llvm::Value* primIdVec = b.CreateSelect(activeMask, h.loadScalar(h.vecTy(i32Ty), primIdsPtr), h.splatInt(i32Ty, 0));
 
         uint32_t maxVerts = std::max<uint32_t>(1, gsLoaded.gsMaxVertexCount);
         uint32_t outAttrScalars = totalPostGSVertexAttrs;
         uint32_t vecAlign = std::max<uint32_t>(64, simdWidth * 4);
 
-        mlir::Value stagingPos = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(f32Ty), h.cInt(i32Ty, 4), vecAlign);
-        mlir::Value stagingAttrs = mlir::LLVM::AllocaOp::create(
-            b, loc, ptrTy, h.vecTy(f32Ty), h.cInt(i32Ty, std::max<uint32_t>(1, outAttrScalars)), vecAlign);
+        llvm::Value* stagingPos = createAlignedAlloca(b, h.vecTy(f32Ty), h.cInt(i32Ty, 4), vecAlign);
+        llvm::Value* stagingAttrs = createAlignedAlloca(b, h.vecTy(f32Ty), h.cInt(i32Ty, std::max<uint32_t>(1, outAttrScalars)), vecAlign);
         for (uint32_t c = 0; c < 4; ++c) {
             h.storeScalar(h.splatFlt(0.0), h.gepBytes(stagingPos, static_cast<int64_t>(c * simdWidth * 4)));
         }
@@ -2669,32 +2672,32 @@ bool synthesizeGraphicsPSOMLIR(
             h.storeScalar(h.splatFlt(0.0), h.gepBytes(stagingAttrs, static_cast<int64_t>(s * simdWidth * 4)));
         }
 
-        mlir::Value emitCountPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
-        mlir::Value curStripPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
-        mlir::Value numStripsPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        llvm::Value* emitCountPtr = createAlignedAlloca(b, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        llvm::Value* curStripPtr = createAlignedAlloca(b, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        llvm::Value* numStripsPtr = createAlignedAlloca(b, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
         h.storeScalar(h.splatInt(i32Ty, 0), emitCountPtr);
         h.storeScalar(h.splatInt(i32Ty, 0), curStripPtr);
         h.storeScalar(h.splatInt(i32Ty, 0), numStripsPtr);
 
         StageHooks gsHooks;
-        gsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+        gsHooks.loadInputWithVertex = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
                                           const SimdVal& row, uint32_t col, const SimdVal& vAxis,
-                                          mlir::Type scalarTy, SimdVal& out) -> bool {
+                                          llvm::Type* scalarTy, SimdVal& out) -> bool {
             const DxilSigRecord* sig = gsLoaded.findInputSig(sigId);
             if (!sig) return false;
-            IRHelpers lh{lb, lloc, simdWidth};
-            auto toI32V = [&](const SimdVal& sv) -> mlir::Value {
-                mlir::Type et = llvm::cast<mlir::VectorType>(sv.vec.getType()).getElementType();
+            IRHelpers lh{lb, simdWidth};
+            auto toI32V = [&](const SimdVal& sv) -> llvm::Value* {
+                llvm::Type* et = llvm::cast<llvm::FixedVectorType>(sv.vec->getType())->getElementType();
                 if (et == i32Ty) return sv.vec;
-                if (et.getIntOrFloatBitWidth() < 32) {
-                    return mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+                if (et->getScalarSizeInBits() < 32) {
+                    return lb.CreateZExt(sv.vec, lh.vecTy(i32Ty));
                 }
-                return mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+                return lb.CreateTrunc(sv.vec, lh.vecTy(i32Ty));
             };
 
             auto vcOpt = tryGetUniformConstUInt(vAxis);
             auto rcOpt = tryGetUniformConstUInt(row);
-            mlir::Value vecVal;
+            llvm::Value* vecVal;
             if (vcOpt.has_value() && rcOpt.has_value()) {
                 uint32_t vIdx = *vcOpt;
                 uint32_t r = *rcOpt;
@@ -2713,104 +2716,78 @@ bool synthesizeGraphicsPSOMLIR(
                     }
                 }
             } else {
-                mlir::Value vVec32 = toI32V(vAxis);
+                llvm::Value* vVec32 = toI32V(vAxis);
                 if (sig->systemValueType == 3) {
-                    mlir::Value planeIdx = mlir::LLVM::AddOp::create(
-                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, vVec32, lh.splatInt(i32Ty, 4)),
-                        lh.splatInt(i32Ty, col));
-                    mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, planeIdx, lh.splatInt(i32Ty, simdWidth)),
-                        lh.laneIota());
-                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                        lb, lloc, mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(lh.i64Ty()), elemIdx),
-                        lh.splatInt(lh.i64Ty(), 4));
-                    mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
-                        lb, lloc, lh.vecTy(ptrTy), lh.i8Ty(),
-                        llvmSplat(lb, lloc, llvm::cast<mlir::VectorType>(lh.vecTy(ptrTy)).getElementType(), inPosXYZW, llvm::cast<mlir::VectorType>(lh.vecTy(ptrTy)).getNumElements()),
-                        mlir::ValueRange{byteOff});
-                    vecVal = mlir::LLVM::masked_gather::create(
-                        lb, lloc, lh.vecTy(f32Ty), ptrVec, activeMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
+                    llvm::Value* planeIdx = lb.CreateAdd(lb.CreateMul(vVec32, lh.splatInt(i32Ty, 4)), lh.splatInt(i32Ty, col));
+                    llvm::Value* elemIdx = lb.CreateAdd(lb.CreateMul(planeIdx, lh.splatInt(i32Ty, simdWidth)), lh.laneIota());
+                    llvm::Value* byteOff = lb.CreateMul(lb.CreateZExt(elemIdx, lh.vecTy(lh.i64Ty())), lh.splatInt(lh.i64Ty(), 4));
+                    llvm::Value* ptrVec = lb.CreateGEP(lh.i8Ty(), llvmSplat(lb, ptrTy, inPosXYZW, lh.W), byteOff);
+                    vecVal = lb.CreateMaskedGather(lh.vecTy(f32Ty), ptrVec, llvm::Align(1), activeMask, lh.splatFlt(0.0));
                 } else {
-                    mlir::Value rVec32 = toI32V(row);
-                    mlir::Value slotVec = mlir::LLVM::AddOp::create(
-                        lb, lloc,
-                        mlir::LLVM::MulOp::create(
-                            lb, lloc, mlir::LLVM::AddOp::create(lb, lloc, lh.splatInt(i32Ty, sig->startRow), rVec32),
-                            lh.splatInt(i32Ty, 4)),
-                        lh.splatInt(i32Ty, sig->startCol + col));
-                    mlir::Value inBounds = mlir::LLVM::ICmpOp::create(
-                        lb, lloc, mlir::LLVM::ICmpPredicate::ult, slotVec, lh.splatInt(i32Ty, numGSInputScalars));
-                    mlir::Value gatherMask = mlir::LLVM::AndOp::create(lb, lloc, activeMask, inBounds);
-                    mlir::Value planeIdx = mlir::LLVM::AddOp::create(
-                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, vVec32, lh.splatInt(i32Ty, numGSInputScalars)),
-                        slotVec);
-                    mlir::Value elemIdx = mlir::LLVM::AddOp::create(
-                        lb, lloc, mlir::LLVM::MulOp::create(lb, lloc, planeIdx, lh.splatInt(i32Ty, simdWidth)),
-                        lh.laneIota());
-                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                        lb, lloc, mlir::LLVM::ZExtOp::create(lb, lloc, lh.vecTy(lh.i64Ty()), elemIdx),
-                        lh.splatInt(lh.i64Ty(), 4));
-                    mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
-                        lb, lloc, lh.vecTy(ptrTy), lh.i8Ty(),
-                        llvmSplat(lb, lloc, llvm::cast<mlir::VectorType>(lh.vecTy(ptrTy)).getElementType(), inAttrs, llvm::cast<mlir::VectorType>(lh.vecTy(ptrTy)).getNumElements()),
-                        mlir::ValueRange{byteOff});
-                    vecVal = mlir::LLVM::masked_gather::create(
-                        lb, lloc, lh.vecTy(f32Ty), ptrVec, gatherMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
+                    llvm::Value* rVec32 = toI32V(row);
+                    llvm::Value* slotVec = lb.CreateAdd(lb.CreateMul(lb.CreateAdd(lh.splatInt(i32Ty, sig->startRow), rVec32), lh.splatInt(i32Ty, 4)), lh.splatInt(i32Ty, sig->startCol + col));
+                    llvm::Value* inBounds = lb.CreateICmp(llvm::CmpInst::ICMP_ULT, slotVec, lh.splatInt(i32Ty, numGSInputScalars));
+                    llvm::Value* gatherMask = lb.CreateAnd(activeMask, inBounds);
+                    llvm::Value* planeIdx = lb.CreateAdd(lb.CreateMul(vVec32, lh.splatInt(i32Ty, numGSInputScalars)), slotVec);
+                    llvm::Value* elemIdx = lb.CreateAdd(lb.CreateMul(planeIdx, lh.splatInt(i32Ty, simdWidth)), lh.laneIota());
+                    llvm::Value* byteOff = lb.CreateMul(lb.CreateZExt(elemIdx, lh.vecTy(lh.i64Ty())), lh.splatInt(lh.i64Ty(), 4));
+                    llvm::Value* ptrVec = lb.CreateGEP(lh.i8Ty(), llvmSplat(lb, ptrTy, inAttrs, lh.W), byteOff);
+                    vecVal = lb.CreateMaskedGather(lh.vecTy(f32Ty), ptrVec, llvm::Align(1), gatherMask, lh.splatFlt(0.0));
                 }
             }
             if (scalarTy != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(scalarTy)) {
-                    vecVal = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(i32Ty), vecVal);
+                if (scalarTy->isIntegerTy()) {
+                    vecVal = lb.CreateBitCast(vecVal, lh.vecTy(i32Ty));
                     if (scalarTy != i32Ty) {
-                        vecVal = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), vecVal);
+                        vecVal = lb.CreateTrunc(vecVal, lh.vecTy(scalarTy));
                     }
                 } else {
-                    vecVal = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), vecVal);
+                    vecVal = lb.CreateBitCast(vecVal, lh.vecTy(scalarTy));
                 }
             }
             out = {SimdVal::Kind::Vector, scalarTy, vecVal, {}, {}};
             return true;
         };
 
-        gsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-            IRHelpers lh{lb, lloc, simdWidth};
-            mlir::Value v = (scalarTy == i32Ty)
+        gsHooks.loadPrimitiveId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+            IRHelpers lh{lb, simdWidth};
+            llvm::Value* v = (scalarTy == i32Ty)
                                 ? primIdVec
-                                : mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), primIdVec).getResult();
+                                : lb.CreateTrunc(primIdVec, lh.vecTy(scalarTy));
             out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
             return true;
         };
 
-        gsHooks.loadGSInstanceId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-            IRHelpers lh{lb, lloc, simdWidth};
-            mlir::Value v = gsInstIdArg;
-            if (scalarTy != i32Ty) v = mlir::LLVM::TruncOp::create(lb, lloc, scalarTy, v);
-            out = {SimdVal::Kind::Vector, scalarTy, llvmSplat(lb, lloc, llvm::cast<mlir::VectorType>(lh.vecTy(scalarTy)).getElementType(), v, llvm::cast<mlir::VectorType>(lh.vecTy(scalarTy)).getNumElements()), {}, {}};
+        gsHooks.loadGSInstanceId = [&](llvm::IRBuilder<>& lb, llvm::Type* scalarTy, SimdVal& out) -> bool {
+            IRHelpers lh{lb, simdWidth};
+            llvm::Value* v = gsInstIdArg;
+            if (scalarTy != i32Ty) v = lb.CreateTrunc(v, scalarTy);
+            out = {SimdVal::Kind::Vector, scalarTy, llvmSplat(lb, llvm::cast<llvm::FixedVectorType>(lh.vecTy(scalarTy))->getElementType(), v, llvm::cast<llvm::FixedVectorType>(lh.vecTy(scalarTy))->getNumElements()), {}, {}};
             return true;
         };
 
-        gsHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
-                                  const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value writeMask) -> bool {
+        gsHooks.storeOutput = [&](llvm::IRBuilder<>& sb, uint32_t sigId,
+                                  const SimdVal& row, uint32_t col, const SimdVal& val, llvm::Value* writeMask) -> bool {
             const DxilSigRecord* sig = gsLoaded.findOutputSig(sigId);
             if (!sig || val.kind != SimdVal::Kind::Vector) return true;
-            IRHelpers sh{sb, sloc, simdWidth};
-            mlir::Value vF32 = val.vec;
-            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vF32.getType()).getElementType();
+            IRHelpers sh{sb, simdWidth};
+            llvm::Value* vF32 = val.vec;
+            llvm::Type* elemTy = llvm::cast<llvm::FixedVectorType>(vF32->getType())->getElementType();
             if (elemTy != f32Ty) {
-                if (mlir::isa<mlir::IntegerType>(elemTy)) {
-                    if (elemTy.getIntOrFloatBitWidth() < 32) {
-                        vF32 = mlir::LLVM::ZExtOp::create(sb, sloc, sh.vecTy(i32Ty), vF32);
+                if (elemTy->isIntegerTy()) {
+                    if (elemTy->getScalarSizeInBits() < 32) {
+                        vF32 = sb.CreateZExt(vF32, sh.vecTy(i32Ty));
                     }
-                    vF32 = mlir::LLVM::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vF32);
+                    vF32 = sb.CreateBitCast(vF32, sh.vecTy(f32Ty));
                 } else {
-                    vF32 = mlir::LLVM::FPExtOp::create(sb, sloc, sh.vecTy(f32Ty), vF32);
+                    vF32 = sb.CreateFPExt(vF32, sh.vecTy(f32Ty));
                 }
             }
-            auto storeStaged = [&](mlir::Value basePtr, uint32_t slotIdx) {
-                mlir::Value slotPtr = sh.gepBytes(basePtr, static_cast<int64_t>(slotIdx * simdWidth * 4));
-                mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), slotPtr);
-                mlir::Value effMask = writeMask ? writeMask : activeMask;
-                sh.storeScalar(mlir::LLVM::SelectOp::create(sb, sloc, effMask, vF32, prev), slotPtr);
+            auto storeStaged = [&](llvm::Value* basePtr, uint32_t slotIdx) {
+                llvm::Value* slotPtr = sh.gepBytes(basePtr, static_cast<int64_t>(slotIdx * simdWidth * 4));
+                llvm::Value* prev = sh.loadScalar(sh.vecTy(f32Ty), slotPtr);
+                llvm::Value* effMask = writeMask ? writeMask : activeMask;
+                sh.storeScalar(sb.CreateSelect(effMask, vF32, prev), slotPtr);
             };
             if (sig->systemValueType == 3) {
                 if (col < 4) storeStaged(stagingPos, col);
@@ -2855,330 +2832,296 @@ bool synthesizeGraphicsPSOMLIR(
             return true;
         };
 
-        gsHooks.emitStream = [&](mlir::OpBuilder& eb, mlir::Location eloc, uint32_t streamId, mlir::Value realMask) -> bool {
+        gsHooks.emitStream = [&](llvm::IRBuilder<>& eb, uint32_t streamId, llvm::Value* realMask) -> bool {
             if (streamId != 0) return true;
-            IRHelpers eh{eb, eloc, simdWidth};
-            mlir::Value curCountVec = eh.loadScalar(eh.vecTy(i32Ty), emitCountPtr);
-            mlir::Value hasRoomVec = mlir::LLVM::ICmpOp::create(
-                eb, eloc, mlir::LLVM::ICmpPredicate::ult, curCountVec, eh.splatInt(i32Ty, maxVerts));
-            mlir::Value doEmitMask = mlir::LLVM::AndOp::create(eb, eloc, realMask, hasRoomVec);
-            mlir::Value anyEmit = eh.orReduce(doEmitMask);
-            mlir::scf::IfOp::create(eb, eloc, anyEmit, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                IRHelpers nh{nb, nloc, simdWidth};
-                mlir::Value posVecs[4];
+            IRHelpers eh{eb, simdWidth};
+            llvm::Value* curCountVec = eh.loadScalar(eh.vecTy(i32Ty), emitCountPtr);
+            llvm::Value* hasRoomVec = eb.CreateICmp(llvm::CmpInst::ICMP_ULT, curCountVec, eh.splatInt(i32Ty, maxVerts));
+            llvm::Value* doEmitMask = eb.CreateAnd(realMask, hasRoomVec);
+            llvm::Value* anyEmit = eh.orReduce(doEmitMask);
+            emitIf(eb, anyEmit, [&](llvm::IRBuilder<>& nb) {
+                IRHelpers nh{nb, simdWidth};
+                llvm::Value* posVecs[4];
                 for (uint32_t c = 0; c < 4; ++c) {
                     posVecs[c] = nh.loadScalar(nh.vecTy(f32Ty), nh.gepBytes(stagingPos, static_cast<int64_t>(c * simdWidth * 4)));
                 }
-                llvm::SmallVector<mlir::Value, 16> attrVecs(outAttrScalars);
+                llvm::SmallVector<llvm::Value*, 16> attrVecs(outAttrScalars);
                 for (uint32_t s = 0; s < outAttrScalars; ++s) {
                     attrVecs[s] = nh.loadScalar(nh.vecTy(f32Ty), nh.gepBytes(stagingAttrs, static_cast<int64_t>(s * simdWidth * 4)));
                 }
 
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value laneDo = llvmExtract(nb, nloc, doEmitMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(nb, nloc, laneDo, [&](mlir::OpBuilder& lb2, mlir::Location lloc2) {
-                        IRHelpers lh2{lb2, lloc2, simdWidth};
-                        mlir::Value cL = llvmExtract(lb2, lloc2, curCountVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value vIdx = mlir::LLVM::AddOp::create(
-                            lb2, lloc2, lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), cL);
-                        mlir::Value vIdx64 = mlir::LLVM::ZExtOp::create(lb2, lloc2, lh2.i64Ty(), vIdx);
-                        mlir::Value posBase = mlir::LLVM::MulOp::create(lb2, lloc2, vIdx64, lh2.cInt(lh2.i64Ty(), 16));
+                    llvm::Value* laneDo = llvmExtract(nb, doEmitMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(nb, laneDo, [&](llvm::IRBuilder<>& lb2) {
+                        IRHelpers lh2{lb2, simdWidth};
+                        llvm::Value* cL = llvmExtract(lb2, curCountVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* vIdx = lb2.CreateAdd(lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), cL);
+                        llvm::Value* vIdx64 = lb2.CreateZExt(vIdx, lh2.i64Ty());
+                        llvm::Value* posBase = lb2.CreateMul(vIdx64, lh2.cInt(lh2.i64Ty(), 16));
                         for (uint32_t c = 0; c < 4; ++c) {
-                            mlir::Value pv = llvmExtract(lb2, lloc2, posVecs[c], static_cast<uint32_t>(static_cast<int64_t>(l)));
-                            mlir::Value off = mlir::LLVM::AddOp::create(
-                                lb2, lloc2, posBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(c * 4)));
+                            llvm::Value* pv = llvmExtract(lb2, posVecs[c], static_cast<uint32_t>(static_cast<int64_t>(l)));
+                            llvm::Value* off = lb2.CreateAdd(posBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(c * 4)));
                             lh2.storeScalar(pv, lh2.gepBytesDyn(outPosXYZW, off));
                         }
                         if (outAttrScalars > 0) {
-                            mlir::Value attrBase = mlir::LLVM::MulOp::create(
-                                lb2, lloc2, vIdx64, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(outAttrScalars * 4)));
+                            llvm::Value* attrBase = lb2.CreateMul(vIdx64, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(outAttrScalars * 4)));
                             for (uint32_t s = 0; s < outAttrScalars; ++s) {
-                                mlir::Value av = llvmExtract(lb2, lloc2, attrVecs[s], static_cast<uint32_t>(static_cast<int64_t>(l)));
-                                mlir::Value off = mlir::LLVM::AddOp::create(
-                                    lb2, lloc2, attrBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(s * 4)));
+                                llvm::Value* av = llvmExtract(lb2, attrVecs[s], static_cast<uint32_t>(static_cast<int64_t>(l)));
+                                llvm::Value* off = lb2.CreateAdd(attrBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(s * 4)));
                                 lh2.storeScalar(av, lh2.gepBytesDyn(outAttrs, off));
                             }
                         }
-                        mlir::scf::YieldOp::create(lb2, lloc2);
                     });
                 }
 
-                mlir::Value nextCount = mlir::LLVM::SelectOp::create(
-                    nb, nloc, doEmitMask, mlir::LLVM::AddOp::create(nb, nloc, curCountVec, nh.splatInt(i32Ty, 1)), curCountVec);
+                llvm::Value* nextCount = nb.CreateSelect(doEmitMask, nb.CreateAdd(curCountVec, nh.splatInt(i32Ty, 1)), curCountVec);
                 nh.storeScalar(nextCount, emitCountPtr);
-                mlir::Value csVec = nh.loadScalar(nh.vecTy(i32Ty), curStripPtr);
-                mlir::Value nextCS = mlir::LLVM::SelectOp::create(
-                    nb, nloc, doEmitMask, mlir::LLVM::AddOp::create(nb, nloc, csVec, nh.splatInt(i32Ty, 1)), csVec);
+                llvm::Value* csVec = nh.loadScalar(nh.vecTy(i32Ty), curStripPtr);
+                llvm::Value* nextCS = nb.CreateSelect(doEmitMask, nb.CreateAdd(csVec, nh.splatInt(i32Ty, 1)), csVec);
                 nh.storeScalar(nextCS, curStripPtr);
-                mlir::scf::YieldOp::create(nb, nloc);
             });
             return true;
         };
 
-        auto emitCutForMask = [&](mlir::OpBuilder& cb, mlir::Location cloc, mlir::Value maskVec) {
-            IRHelpers ch{cb, cloc, simdWidth};
-            mlir::Value csVec = ch.loadScalar(ch.vecTy(i32Ty), curStripPtr);
-            mlir::Value hasVertsVec = mlir::LLVM::ICmpOp::create(
-                cb, cloc, mlir::LLVM::ICmpPredicate::ugt, csVec, ch.splatInt(i32Ty, 0));
-            mlir::Value doCutMask = mlir::LLVM::AndOp::create(cb, cloc, maskVec, hasVertsVec);
-            mlir::Value anyCut = ch.orReduce(doCutMask);
-            mlir::scf::IfOp::create(cb, cloc, anyCut, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                IRHelpers nh{nb, nloc, simdWidth};
-                mlir::Value nsVec = nh.loadScalar(nh.vecTy(i32Ty), numStripsPtr);
+        auto emitCutForMask = [&](llvm::IRBuilder<>& cb, llvm::Value* maskVec) {
+            IRHelpers ch{cb, simdWidth};
+            llvm::Value* csVec = ch.loadScalar(ch.vecTy(i32Ty), curStripPtr);
+            llvm::Value* hasVertsVec = cb.CreateICmp(llvm::CmpInst::ICMP_UGT, csVec, ch.splatInt(i32Ty, 0));
+            llvm::Value* doCutMask = cb.CreateAnd(maskVec, hasVertsVec);
+            llvm::Value* anyCut = ch.orReduce(doCutMask);
+            emitIf(cb, anyCut, [&](llvm::IRBuilder<>& nb) {
+                IRHelpers nh{nb, simdWidth};
+                llvm::Value* nsVec = nh.loadScalar(nh.vecTy(i32Ty), numStripsPtr);
                 for (uint32_t l = 0; l < simdWidth; ++l) {
-                    mlir::Value laneCut = llvmExtract(nb, nloc, doCutMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                    mlir::scf::IfOp::create(nb, nloc, laneCut, [&](mlir::OpBuilder& lb2, mlir::Location lloc2) {
-                        IRHelpers lh2{lb2, lloc2, simdWidth};
-                        mlir::Value nsL = llvmExtract(lb2, lloc2, nsVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value csL = llvmExtract(lb2, lloc2, csVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                        mlir::Value stripIdx = mlir::LLVM::AddOp::create(
-                            lb2, lloc2, lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), nsL);
-                        mlir::Value off = mlir::LLVM::MulOp::create(
-                            lb2, lloc2, mlir::LLVM::ZExtOp::create(lb2, lloc2, lh2.i64Ty(), stripIdx),
-                            lh2.cInt(lh2.i64Ty(), 4));
+                    llvm::Value* laneCut = llvmExtract(nb, doCutMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    emitIf(nb, laneCut, [&](llvm::IRBuilder<>& lb2) {
+                        IRHelpers lh2{lb2, simdWidth};
+                        llvm::Value* nsL = llvmExtract(lb2, nsVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* csL = llvmExtract(lb2, csVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        llvm::Value* stripIdx = lb2.CreateAdd(lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), nsL);
+                        llvm::Value* off = lb2.CreateMul(lb2.CreateZExt(stripIdx, lh2.i64Ty()), lh2.cInt(lh2.i64Ty(), 4));
                         lh2.storeScalar(csL, lh2.gepBytesDyn(outStripCounts, off));
-                        mlir::scf::YieldOp::create(lb2, lloc2);
                     });
                 }
                 nh.storeScalar(
-                    mlir::LLVM::SelectOp::create(
-                        nb, nloc, doCutMask, mlir::LLVM::AddOp::create(nb, nloc, nsVec, nh.splatInt(i32Ty, 1)), nsVec),
+                    nb.CreateSelect(doCutMask, nb.CreateAdd(nsVec, nh.splatInt(i32Ty, 1)), nsVec),
                     numStripsPtr);
                 nh.storeScalar(
-                    mlir::LLVM::SelectOp::create(nb, nloc, doCutMask, nh.splatInt(i32Ty, 0), csVec),
+                    nb.CreateSelect(doCutMask, nh.splatInt(i32Ty, 0), csVec),
                     curStripPtr);
-                mlir::scf::YieldOp::create(nb, nloc);
             });
         };
 
-        gsHooks.cutStream = [&](mlir::OpBuilder& cb, mlir::Location cloc, uint32_t streamId, mlir::Value realMask) -> bool {
+        gsHooks.cutStream = [&](llvm::IRBuilder<>& cb, uint32_t streamId, llvm::Value* realMask) -> bool {
             if (streamId != 0) return true;
-            emitCutForMask(cb, cloc, realMask);
+            emitCutForMask(cb, realMask);
             return true;
         };
 
-        mlir::Value gsRealMask = activeMask;
-        if (!packetizeRegionWithHooks(b, loc, combinedMod, gsSrcFunc.getBody(), gsLoaded, gsEffectiveLayout,
+        llvm::Value* gsRealMask = activeMask;
+        if (!packetizeRegionWithHooks(b, combinedMod, *gsTree.root, gsLoaded, gsEffectiveLayout,
                                       simdWidth, rootCtx, activeMask, gsRealMask, gsHooks, outError)) {
             return false;
         }
 
         // Flush any remaining vertices in current strip across all active lanes
-        emitCutForMask(b, loc, activeMask);
+        emitCutForMask(b, activeMask);
 
-        mlir::LLVM::StoreOp::create(b, loc, h.loadScalar(h.vecTy(i32Ty), emitCountPtr), outTotalVerts, /*alignment=*/4);
-        mlir::LLVM::StoreOp::create(b, loc, h.loadScalar(h.vecTy(i32Ty), numStripsPtr), outNumStrips, /*alignment=*/4);
-        mlir::func::ReturnOp::create(b, loc);
+        b.CreateAlignedStore(h.loadScalar(h.vecTy(i32Ty), emitCountPtr), outTotalVerts, llvm::Align(/*alignment=*/4));
+        b.CreateAlignedStore(h.loadScalar(h.vecTy(i32Ty), numStripsPtr), outNumStrips, llvm::Align(/*alignment=*/4));
+        b.CreateRetVoid();
     }
 
     // --- 2. Emit @<psSym>(const PixelBatchArgs* args) ---
     {
-        mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-        IRHelpers h{b, loc, simdWidth};
+        llvm::IRBuilder<> b(combinedMod.getContext());
+        IRHelpers h{b, simdWidth};
         auto ptrTy = h.ptrTy();
         auto i32Ty = h.i32Ty();
         auto f32Ty = h.f32Ty();
-        auto fnTy = b.getFunctionType({ptrTy}, {});
-        auto psFn = mlir::func::FuncOp::create(b, loc, psSym, fnTy);
-        mlir::Block* entry = psFn.addEntryBlock();
-        b.setInsertionPointToEnd(entry);
+        auto fnTy = llvm::FunctionType::get(b.getVoidTy(), {ptrTy}, false);
+        auto* psFn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, psSym, combinedMod);
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(b.getContext(), "entry", psFn);
+        b.SetInsertPoint(entry);
 
-        mlir::Value argsPtr = entry->getArgument(0);
-        mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, rootCtx)));
-        mlir::Value covMask32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMask)));
-        mlir::Value isFront32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, isFrontFace)));
-        mlir::Value primId32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, primitiveId)));
+        llvm::Value* argsPtr = entry->getParent()->getArg(0);
+        llvm::Value* rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, rootCtx)));
+        llvm::Value* covMask32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMask)));
+        llvm::Value* isFront32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, isFrontFace)));
+        llvm::Value* primId32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, primitiveId)));
 
-        mlir::Value covVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), covMask32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-        mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, covVec, h.laneIota());
-        mlir::Value bitOne = mlir::LLVM::AndOp::create(b, loc, shifted, h.splatInt(i32Ty, 1));
-        mlir::Value initRealMask = mlir::LLVM::ICmpOp::create(
-            b, loc, mlir::LLVM::ICmpPredicate::ne, bitOne, h.splatInt(i32Ty, 0));
+        llvm::Value* covVec = llvmSplat(b, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getElementType(), covMask32, llvm::cast<llvm::FixedVectorType>(h.vecTy(i32Ty))->getNumElements());
+        llvm::Value* shifted = b.CreateLShr(covVec, h.laneIota());
+        llvm::Value* bitOne = b.CreateAnd(shifted, h.splatInt(i32Ty, 1));
+        llvm::Value* initRealMask = b.CreateICmp(llvm::CmpInst::ICMP_NE, bitOne, h.splatInt(i32Ty, 0));
 
         // Load PixelBatchArgs vectors
-        auto loadVecFromArgField = [&](size_t fieldOffset) -> mlir::Value {
-            mlir::Value p = h.loadScalar(ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(fieldOffset)));
-            return mlir::LLVM::LoadOp::create(b, loc, h.vecTy(f32Ty), p, /*alignment=*/4);
+        auto loadVecFromArgField = [&](size_t fieldOffset) -> llvm::Value* {
+            llvm::Value* p = h.loadScalar(ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(fieldOffset)));
+            return b.CreateAlignedLoad(h.vecTy(f32Ty), p, llvm::Align(/*alignment=*/4));
         };
-        mlir::Value pixelX = loadVecFromArgField(offsetof(PixelBatchArgs, pixelX));
-        mlir::Value pixelY = loadVecFromArgField(offsetof(PixelBatchArgs, pixelY));
-        mlir::Value baryI = loadVecFromArgField(offsetof(PixelBatchArgs, baryI));
-        mlir::Value baryJ = loadVecFromArgField(offsetof(PixelBatchArgs, baryJ));
+        llvm::Value* pixelX = loadVecFromArgField(offsetof(PixelBatchArgs, pixelX));
+        llvm::Value* pixelY = loadVecFromArgField(offsetof(PixelBatchArgs, pixelY));
+        llvm::Value* baryI = loadVecFromArgField(offsetof(PixelBatchArgs, baryI));
+        llvm::Value* baryJ = loadVecFromArgField(offsetof(PixelBatchArgs, baryJ));
 
         // Load quad offsets (W/4 elements)
         uint32_t numQuads = simdWidth / 4;
-        mlir::Value quadOffPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, quadOffsets)));
-        llvm::SmallVector<mlir::Value, 4> quadOffsets(numQuads);
+        llvm::Value* quadOffPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, quadOffsets)));
+        llvm::SmallVector<llvm::Value*, 4> quadOffsets(numQuads);
         for (uint32_t q = 0; q < numQuads; ++q) {
             quadOffsets[q] = h.loadScalar(i32Ty, h.gepBytes(quadOffPtr, static_cast<int64_t>(q * 4)));
         }
 
         // Interpolate Z from triDepth[0..2]
-        mlir::Value triDepthPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triDepth)));
-        mlir::Value z0 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, triDepthPtr), simdWidth);
-        mlir::Value dz1 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 4)), simdWidth);
-        mlir::Value dz2 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 8)), simdWidth);
-        mlir::Value interpZ = mlir::LLVM::FAddOp::create(
-            b, loc, z0,
-            mlir::LLVM::FAddOp::create(
-                b, loc, mlir::LLVM::FMulOp::create(b, loc, baryI, dz1),
-                mlir::LLVM::FMulOp::create(b, loc, baryJ, dz2)));
+        llvm::Value* triDepthPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triDepth)));
+        llvm::Value* z0 = llvmSplat(b, f32Ty, h.loadScalar(f32Ty, triDepthPtr), simdWidth);
+        llvm::Value* dz1 = llvmSplat(b, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 4)), simdWidth);
+        llvm::Value* dz2 = llvmSplat(b, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 8)), simdWidth);
+        llvm::Value* interpZ = b.CreateFAdd(z0, b.CreateFAdd(
+                b.CreateFMul(baryI, dz1),
+                b.CreateFMul(baryJ, dz2)));
         if (!desc.RasterizerState.DepthClipEnable) {
             interpZ = h.clamp01(interpZ);
         }
 
-        mlir::Value tileDepthBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileDepthSOA)));
-        mlir::Value tileStencilBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileStencilSOA)));
-        mlir::Value tileColorBases[8]{};
+        llvm::Value* tileDepthBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileDepthSOA)));
+        llvm::Value* tileStencilBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileStencilSOA)));
+        llvm::Value* tileColorBases[8]{};
         for (uint32_t rt = 0; rt < 8; ++rt) {
             tileColorBases[rt] = h.loadScalar(
                 ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(offsetof(PixelBatchArgs, tileColorSOA) + rt * 8)));
         }
 
         // Helper lambdas for quad-swizzled depth & stencil SOA access (zero branches on loads, masked on writes)
-        auto loadDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc) -> mlir::Value {
-            IRHelpers dh{db, dloc, simdWidth};
-            mlir::Value out = dh.splatFlt(1.0);
-            auto v4f = mlir::VectorType::get({4}, f32Ty);
+        auto loadDepthVec = [&](llvm::IRBuilder<>& db) -> llvm::Value* {
+            IRHelpers dh{db, simdWidth};
+            llvm::Value* out = dh.splatFlt(1.0);
+            auto v4f = llvm::FixedVectorType::get(f32Ty, 4);
             for (uint32_t q = 0; q < numQuads; ++q) {
-                mlir::Value qByte = mlir::LLVM::MulOp::create(
-                    db, dloc, mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), quadOffsets[q]), dh.cInt(dh.i64Ty(), 4));
-                mlir::Value qp = dh.gepBytesDyn(tileDepthBase, qByte);
-                mlir::Value q4 = dh.loadScalar(v4f, qp);
+                llvm::Value* qByte = db.CreateMul(db.CreateZExt(quadOffsets[q], dh.i64Ty()), dh.cInt(dh.i64Ty(), 4));
+                llvm::Value* qp = dh.gepBytesDyn(tileDepthBase, qByte);
+                llvm::Value* q4 = dh.loadScalar(v4f, qp);
                 for (uint32_t s = 0; s < 4; ++s) {
-                    mlir::Value sc = llvmExtract(db, dloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
-                    out = llvmInsert(db, dloc, out, sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                    llvm::Value* sc = llvmExtract(db, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
+                    out = llvmInsert(db, out, sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
                 }
             }
             return out;
         };
 
-        auto storeDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newZ, mlir::Value oldZ) {
-            IRHelpers dh{db, dloc, simdWidth};
-            mlir::Value merged = mlir::LLVM::SelectOp::create(db, dloc, maskVec, newZ, oldZ);
-            auto v4f = mlir::VectorType::get({4}, f32Ty);
+        auto storeDepthVec = [&](llvm::IRBuilder<>& db, llvm::Value* maskVec, llvm::Value* newZ, llvm::Value* oldZ) {
+            IRHelpers dh{db, simdWidth};
+            llvm::Value* merged = db.CreateSelect(maskVec, newZ, oldZ);
+            auto v4f = llvm::FixedVectorType::get(f32Ty, 4);
             for (uint32_t q = 0; q < numQuads; ++q) {
                 llvm::SmallVector<int32_t, 4> qIdx{static_cast<int32_t>(q * 4), static_cast<int32_t>(q * 4 + 1), static_cast<int32_t>(q * 4 + 2), static_cast<int32_t>(q * 4 + 3)};
-                mlir::Value qMask = mlir::LLVM::ShuffleVectorOp::create(db, dloc, maskVec, maskVec, qIdx);
-                mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(db, dloc, db.getI1Type(), qMask);
-                mlir::scf::IfOp::create(db, dloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
-                    IRHelpers qh{qb, qloc, simdWidth};
-                    mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
-                    mlir::Value qByte = mlir::LLVM::MulOp::create(
-                        qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), quadOffsets[q]), qh.cInt(qh.i64Ty(), 4));
-                    mlir::Value qp = qh.gepBytesDyn(tileDepthBase, qByte);
-                    mlir::LLVM::StoreOp::create(qb, qloc, q4, qp);
-                    mlir::scf::YieldOp::create(qb, qloc);
+                llvm::Value* qMask = db.CreateShuffleVector(maskVec, maskVec, qIdx);
+                llvm::Value* anyQ = db.CreateOrReduce(qMask);
+                emitIf(db, anyQ, [&](llvm::IRBuilder<>& qb) {
+                    IRHelpers qh{qb, simdWidth};
+                    llvm::Value* q4 = qb.CreateShuffleVector(merged, merged, qIdx);
+                    llvm::Value* qByte = qb.CreateMul(qb.CreateZExt(quadOffsets[q], qh.i64Ty()), qh.cInt(qh.i64Ty(), 4));
+                    llvm::Value* qp = qh.gepBytesDyn(tileDepthBase, qByte);
+                    qb.CreateStore(q4, qp);
                 });
             }
         };
 
-        auto loadStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc) -> mlir::Value {
-            IRHelpers dh{db, dloc, simdWidth};
-            mlir::Value out = dh.splatInt(dh.i8Ty(), 0);
-            auto v4i8 = mlir::VectorType::get({4}, dh.i8Ty());
+        auto loadStencilVec = [&](llvm::IRBuilder<>& db) -> llvm::Value* {
+            IRHelpers dh{db, simdWidth};
+            llvm::Value* out = dh.splatInt(dh.i8Ty(), 0);
+            auto v4i8 = llvm::FixedVectorType::get(dh.i8Ty(), 4);
             for (uint32_t q = 0; q < numQuads; ++q) {
-                mlir::Value q64 = mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), quadOffsets[q]);
-                mlir::Value qp = dh.gepBytesDyn(tileStencilBase, q64);
-                mlir::Value q4 = dh.loadScalar(v4i8, qp);
+                llvm::Value* q64 = db.CreateZExt(quadOffsets[q], dh.i64Ty());
+                llvm::Value* qp = dh.gepBytesDyn(tileStencilBase, q64);
+                llvm::Value* q4 = dh.loadScalar(v4i8, qp);
                 for (uint32_t s = 0; s < 4; ++s) {
-                    mlir::Value sc = llvmExtract(db, dloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
-                    out = llvmInsert(db, dloc, out, sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                    llvm::Value* sc = llvmExtract(db, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
+                    out = llvmInsert(db, out, sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
                 }
             }
             return out;
         };
 
-        auto storeStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newS, mlir::Value oldS) {
-            IRHelpers dh{db, dloc, simdWidth};
-            mlir::Value merged = mlir::LLVM::SelectOp::create(db, dloc, maskVec, newS, oldS);
+        auto storeStencilVec = [&](llvm::IRBuilder<>& db, llvm::Value* maskVec, llvm::Value* newS, llvm::Value* oldS) {
+            IRHelpers dh{db, simdWidth};
+            llvm::Value* merged = db.CreateSelect(maskVec, newS, oldS);
             for (uint32_t q = 0; q < numQuads; ++q) {
                 llvm::SmallVector<int32_t, 4> qIdx{static_cast<int32_t>(q * 4), static_cast<int32_t>(q * 4 + 1), static_cast<int32_t>(q * 4 + 2), static_cast<int32_t>(q * 4 + 3)};
-                mlir::Value qMask = mlir::LLVM::ShuffleVectorOp::create(db, dloc, maskVec, maskVec, qIdx);
-                mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(db, dloc, db.getI1Type(), qMask);
-                mlir::scf::IfOp::create(db, dloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
-                    IRHelpers qh{qb, qloc, simdWidth};
-                    mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
-                    mlir::Value q64 = mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), quadOffsets[q]);
-                    mlir::Value qp = qh.gepBytesDyn(tileStencilBase, q64);
-                    mlir::LLVM::StoreOp::create(qb, qloc, q4, qp);
-                    mlir::scf::YieldOp::create(qb, qloc);
+                llvm::Value* qMask = db.CreateShuffleVector(maskVec, maskVec, qIdx);
+                llvm::Value* anyQ = db.CreateOrReduce(qMask);
+                emitIf(db, anyQ, [&](llvm::IRBuilder<>& qb) {
+                    IRHelpers qh{qb, simdWidth};
+                    llvm::Value* q4 = qb.CreateShuffleVector(merged, merged, qIdx);
+                    llvm::Value* q64 = qb.CreateZExt(quadOffsets[q], qh.i64Ty());
+                    llvm::Value* qp = qh.gepBytesDyn(tileStencilBase, q64);
+                    qb.CreateStore(q4, qp);
                 });
             }
         };
 
-        auto runDepthStencil = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value curRealMask, mlir::Value candZ,
-                                   mlir::Value candStencilRef8 = mlir::Value()) -> mlir::Value {
-            IRHelpers dh{db, dloc, simdWidth};
+        auto runDepthStencil = [&](llvm::IRBuilder<>& db, llvm::Value* curRealMask, llvm::Value* candZ,
+                                   llvm::Value* candStencilRef8 = nullptr) -> llvm::Value* {
+            IRHelpers dh{db, simdWidth};
             const auto& ds = desc.DepthStencilState;
             bool depthOn = ds.DepthEnable && (desc.DSVFormat != DXGI_FORMAT_UNKNOWN);
             bool stencilOn = ds.StencilEnable && (desc.DSVFormat != DXGI_FORMAT_UNKNOWN);
             if (!depthOn && !stencilOn) return curRealMask;
 
-            mlir::Value nextMask = curRealMask;
-            mlir::Value stencilPassMask = dh.allTrueMask();
-            mlir::Value oldStencil;
-            mlir::Value ref8;
-            mlir::Value writeMask8;
+            llvm::Value* nextMask = curRealMask;
+            llvm::Value* stencilPassMask = dh.allTrueMask();
+            llvm::Value* oldStencil;
+            llvm::Value* ref8;
+            llvm::Value* writeMask8;
             D3D12_DEPTH_STENCILOP_DESC activeSOp = ds.FrontFace;
 
             if (stencilOn) {
-                oldStencil = loadStencilVec(db, dloc);
+                oldStencil = loadStencilVec(db);
                 if (candStencilRef8) {
                     ref8 = candStencilRef8;
                 } else {
-                    mlir::Value ref32 = dh.loadScalar(i32Ty, dh.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
-                    mlir::Value refScalar8 = mlir::LLVM::TruncOp::create(db, dloc, dh.i8Ty(), ref32);
-                    ref8 = llvmSplat(db, dloc, llvm::cast<mlir::VectorType>(dh.vecTy(dh.i8Ty())).getElementType(), refScalar8, llvm::cast<mlir::VectorType>(dh.vecTy(dh.i8Ty())).getNumElements());
+                    llvm::Value* ref32 = dh.loadScalar(i32Ty, dh.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
+                    llvm::Value* refScalar8 = db.CreateTrunc(ref32, dh.i8Ty());
+                    ref8 = llvmSplat(db, llvm::cast<llvm::FixedVectorType>(dh.vecTy(dh.i8Ty()))->getElementType(), refScalar8, llvm::cast<llvm::FixedVectorType>(dh.vecTy(dh.i8Ty()))->getNumElements());
                 }
-                mlir::Value rMask8 = dh.splatInt(dh.i8Ty(), ds.StencilReadMask);
+                llvm::Value* rMask8 = dh.splatInt(dh.i8Ty(), ds.StencilReadMask);
                 writeMask8 = dh.splatInt(dh.i8Ty(), ds.StencilWriteMask);
-                mlir::Value refMasked = mlir::LLVM::AndOp::create(db, dloc, ref8, rMask8);
-                mlir::Value bufMasked = mlir::LLVM::AndOp::create(db, dloc, oldStencil, rMask8);
-                mlir::Value isFrontBool = mlir::LLVM::ICmpOp::create(
-                    db, dloc, mlir::LLVM::ICmpPredicate::ne, isFront32, dh.cInt(i32Ty, 0));
-                mlir::Value frontPass = dh.evalStencilCmp(ds.FrontFace.StencilFunc, refMasked, bufMasked);
-                mlir::Value backPass = dh.evalStencilCmp(ds.BackFace.StencilFunc, refMasked, bufMasked);
-                stencilPassMask = mlir::LLVM::SelectOp::create(
-                    db, dloc, llvmSplat(db, dloc, llvm::cast<mlir::VectorType>(dh.vecTy(dh.i1Ty())).getElementType(), isFrontBool, llvm::cast<mlir::VectorType>(dh.vecTy(dh.i1Ty())).getNumElements()),
-                    frontPass, backPass);
-                nextMask = mlir::LLVM::AndOp::create(db, dloc, nextMask, stencilPassMask);
+                llvm::Value* refMasked = db.CreateAnd(ref8, rMask8);
+                llvm::Value* bufMasked = db.CreateAnd(oldStencil, rMask8);
+                llvm::Value* isFrontBool = db.CreateICmp(llvm::CmpInst::ICMP_NE, isFront32, dh.cInt(i32Ty, 0));
+                llvm::Value* frontPass = dh.evalStencilCmp(ds.FrontFace.StencilFunc, refMasked, bufMasked);
+                llvm::Value* backPass = dh.evalStencilCmp(ds.BackFace.StencilFunc, refMasked, bufMasked);
+                stencilPassMask = db.CreateSelect(llvmSplat(db, llvm::cast<llvm::FixedVectorType>(dh.vecTy(dh.i1Ty()))->getElementType(), isFrontBool, llvm::cast<llvm::FixedVectorType>(dh.vecTy(dh.i1Ty()))->getNumElements()), frontPass, backPass);
+                nextMask = db.CreateAnd(nextMask, stencilPassMask);
             }
 
-            mlir::Value zPassMask = dh.allTrueMask();
+            llvm::Value* zPassMask = dh.allTrueMask();
             if (depthOn) {
-                mlir::Value oldZ = loadDepthVec(db, dloc);
+                llvm::Value* oldZ = loadDepthVec(db);
                 zPassMask = dh.evalDepthCmp(ds.DepthFunc, candZ, oldZ);
-                nextMask = mlir::LLVM::AndOp::create(db, dloc, nextMask, zPassMask);
+                nextMask = db.CreateAnd(nextMask, zPassMask);
                 if (ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL) {
-                    storeDepthVec(db, dloc, nextMask, candZ, oldZ);
+                    storeDepthVec(db, nextMask, candZ, oldZ);
                 }
             }
 
             if (stencilOn && ds.StencilWriteMask != 0) {
-                mlir::Value sFailMask = mlir::LLVM::AndOp::create(
-                    db, dloc, curRealMask, mlir::LLVM::XOrOp::create(db, dloc, stencilPassMask, dh.allTrueMask()));
-                mlir::Value zFailMask = mlir::LLVM::AndOp::create(
-                    db, dloc, mlir::LLVM::AndOp::create(db, dloc, curRealMask, stencilPassMask),
-                    mlir::LLVM::XOrOp::create(db, dloc, zPassMask, dh.allTrueMask()));
-                mlir::Value sUpdated = oldStencil;
+                llvm::Value* sFailMask = db.CreateAnd(curRealMask, db.CreateXor(stencilPassMask, dh.allTrueMask()));
+                llvm::Value* zFailMask = db.CreateAnd(db.CreateAnd(curRealMask, stencilPassMask), db.CreateXor(zPassMask, dh.allTrueMask()));
+                llvm::Value* sUpdated = oldStencil;
                 if (activeSOp.StencilFailOp != D3D12_STENCIL_OP_KEEP) {
-                    sUpdated = mlir::LLVM::SelectOp::create(
-                        db, dloc, sFailMask, dh.applyStencilOp(activeSOp.StencilFailOp, oldStencil, ref8), sUpdated);
+                    sUpdated = db.CreateSelect(sFailMask, dh.applyStencilOp(activeSOp.StencilFailOp, oldStencil, ref8), sUpdated);
                 }
                 if (activeSOp.StencilDepthFailOp != D3D12_STENCIL_OP_KEEP) {
-                    sUpdated = mlir::LLVM::SelectOp::create(
-                        db, dloc, zFailMask, dh.applyStencilOp(activeSOp.StencilDepthFailOp, oldStencil, ref8), sUpdated);
+                    sUpdated = db.CreateSelect(zFailMask, dh.applyStencilOp(activeSOp.StencilDepthFailOp, oldStencil, ref8), sUpdated);
                 }
                 if (activeSOp.StencilPassOp != D3D12_STENCIL_OP_KEEP) {
-                    sUpdated = mlir::LLVM::SelectOp::create(
-                        db, dloc, nextMask, dh.applyStencilOp(activeSOp.StencilPassOp, oldStencil, ref8), sUpdated);
+                    sUpdated = db.CreateSelect(nextMask, dh.applyStencilOp(activeSOp.StencilPassOp, oldStencil, ref8), sUpdated);
                 }
-                mlir::Value keepBits = dh.splatInt(dh.i8Ty(), static_cast<uint8_t>(~ds.StencilWriteMask));
-                mlir::Value maskedNewS = mlir::LLVM::OrOp::create(
-                    db, dloc, mlir::LLVM::AndOp::create(db, dloc, oldStencil, keepBits),
-                    mlir::LLVM::AndOp::create(db, dloc, sUpdated, writeMask8));
-                storeStencilVec(db, dloc, curRealMask, maskedNewS, oldStencil);
+                llvm::Value* keepBits = dh.splatInt(dh.i8Ty(), static_cast<uint8_t>(~ds.StencilWriteMask));
+                llvm::Value* maskedNewS = db.CreateOr(db.CreateAnd(oldStencil, keepBits), db.CreateAnd(sUpdated, writeMask8));
+                storeStencilVec(db, curRealMask, maskedNewS, oldStencil);
             }
             return nextMask;
         };
@@ -3197,28 +3140,27 @@ bool synthesizeGraphicsPSOMLIR(
         bool psHasSideEffects = hasPS && psLoaded.hasSideEffects;
         bool canEarlyZ = !psWritesDepth && !psWritesStencilRef && !psUsesDiscard && !psHasSideEffects;
 
-        mlir::Value realMaskAfterEarly = initRealMask;
+        llvm::Value* realMaskAfterEarly = initRealMask;
         if (canEarlyZ) {
-            realMaskAfterEarly = runDepthStencil(b, loc, initRealMask, interpZ);
+            realMaskAfterEarly = runDepthStencil(b, initRealMask, interpZ);
         }
 
         if (hasPS) {
-            mlir::func::FuncOp psSrcFunc = psMlirMod->lookupSymbol<mlir::func::FuncOp>(psLoaded.entryName);
-            if (!psSrcFunc || psSrcFunc.getBody().empty()) {
+            if (!psTree.root) {
                 outError = "Pixel shader entry function missing after MLIR SCF lift";
                 return false;
             }
 
-            auto emitPSBodyAndOM = [&](mlir::OpBuilder& pb, mlir::Location ploc, mlir::Value enterRealMask) {
-                IRHelpers ph{pb, ploc, simdWidth};
-                mlir::Value curRealMask = enterRealMask;
-                mlir::Value execMask = psLoaded.hasDerivativesOrImplicitSample
+            auto emitPSBodyAndOM = [&](llvm::IRBuilder<>& pb, llvm::Value* enterRealMask) {
+                IRHelpers ph{pb, simdWidth};
+                llvm::Value* curRealMask = enterRealMask;
+                llvm::Value* execMask = psLoaded.hasDerivativesOrImplicitSample
                                            ? ph.expandMaskQuads(curRealMask)
                                            : curRealMask;
 
                 // Interpolate PS inputs
-                mlir::Value wVec = ph.splatFlt(1.0);
-                mlir::Value invWVec = ph.splatFlt(1.0);
+                llvm::Value* wVec = ph.splatFlt(1.0);
+                llvm::Value* invWVec = ph.splatFlt(1.0);
                 bool needInvW = false;
                 for (const auto& pi : psLoaded.inputSigs) {
                     if (pi.systemValueType == 3 ||
@@ -3229,28 +3171,22 @@ bool synthesizeGraphicsPSOMLIR(
                     }
                 }
                 if (needInvW) {
-                    mlir::Value triInvWPtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triInvW)));
-                    mlir::Value iw0 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, triInvWPtr), simdWidth);
-                    mlir::Value diw1 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 4)), simdWidth);
-                    mlir::Value diw2 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 8)), simdWidth);
-                    invWVec = mlir::LLVM::FAddOp::create(
-                        pb, ploc, iw0,
-                        mlir::LLVM::FAddOp::create(
-                            pb, ploc, mlir::LLVM::FMulOp::create(pb, ploc, baryI, diw1),
-                            mlir::LLVM::FMulOp::create(pb, ploc, baryJ, diw2)));
-                    mlir::Value safeInvW = mlir::LLVM::SelectOp::create(
-                        pb, ploc,
-                        mlir::LLVM::FCmpOp::create(pb, ploc, mlir::LLVM::FCmpPredicate::ogt,
-                                                    mlir::LLVM::FAbsOp::create(pb, ploc, invWVec), ph.splatFlt(1e-20)),
-                        invWVec, ph.splatFlt(1.0));
-                    wVec = mlir::LLVM::FDivOp::create(pb, ploc, ph.splatFlt(1.0), safeInvW);
+                    llvm::Value* triInvWPtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triInvW)));
+                    llvm::Value* iw0 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, triInvWPtr), simdWidth);
+                    llvm::Value* diw1 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 4)), simdWidth);
+                    llvm::Value* diw2 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 8)), simdWidth);
+                    invWVec = pb.CreateFAdd(iw0, pb.CreateFAdd(
+                            pb.CreateFMul(baryI, diw1),
+                            pb.CreateFMul(baryJ, diw2)));
+                    llvm::Value* safeInvW = pb.CreateSelect(pb.CreateFCmp(llvm::CmpInst::FCMP_OGT, pb.CreateIntrinsic(llvm::Intrinsic::fabs, {invWVec->getType()}, {invWVec}), ph.splatFlt(1e-20)), invWVec, ph.splatFlt(1.0));
+                    wVec = pb.CreateFDiv(ph.splatFlt(1.0), safeInvW);
                 }
 
-                mlir::Value triAttrBasePtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrBase)));
-                mlir::Value triAttrFlatPtr = ph.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrFlat)));
+                llvm::Value* triAttrBasePtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrBase)));
+                llvm::Value* triAttrFlatPtr = ph.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrFlat)));
 
                 // Cache interpolated scalar registers (max 32 * 4 = 128 scalars)
-                std::array<mlir::Value, 128> interpScalars{};
+                std::array<llvm::Value*, 128> interpScalars{};
                 for (const auto& pi : psLoaded.inputSigs) {
                     if (pi.systemValueType != 0) continue;
                     for (uint32_t r = 0; r < pi.rows; ++r) {
@@ -3259,130 +3195,120 @@ bool synthesizeGraphicsPSOMLIR(
                             if (slot >= 128) continue;
                             bool isMsPrimAttr = (slot < 64) && ((msPrimAttrMask & (1ull << slot)) != 0);
                             if (pi.interpMode == 1 || isMsPrimAttr) { // nointerpolation or MS per-primitive
-                                mlir::Value fv = ph.loadScalar(f32Ty, ph.gepBytes(triAttrFlatPtr, static_cast<int64_t>(slot * 4)));
-                                interpScalars[slot] = llvmSplat(pb, ploc, llvm::cast<mlir::VectorType>(ph.vecTy(f32Ty)).getElementType(), fv, llvm::cast<mlir::VectorType>(ph.vecTy(f32Ty)).getNumElements());
+                                llvm::Value* fv = ph.loadScalar(f32Ty, ph.gepBytes(triAttrFlatPtr, static_cast<int64_t>(slot * 4)));
+                                interpScalars[slot] = llvmSplat(pb, llvm::cast<llvm::FixedVectorType>(ph.vecTy(f32Ty))->getElementType(), fv, llvm::cast<llvm::FixedVectorType>(ph.vecTy(f32Ty))->getNumElements());
                             } else {
                                 int64_t baseOff = static_cast<int64_t>(slot * 3 * 4);
-                                mlir::Value a0 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff)), simdWidth);
-                                mlir::Value da1 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 4)), simdWidth);
-                                mlir::Value da2 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 8)), simdWidth);
-                                mlir::Value lin = mlir::LLVM::FAddOp::create(
-                                    pb, ploc, a0,
-                                    mlir::LLVM::FAddOp::create(
-                                        pb, ploc, mlir::LLVM::FMulOp::create(pb, ploc, baryI, da1),
-                                        mlir::LLVM::FMulOp::create(pb, ploc, baryJ, da2)));
+                                llvm::Value* a0 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff)), simdWidth);
+                                llvm::Value* da1 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 4)), simdWidth);
+                                llvm::Value* da2 = llvmSplat(pb, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 8)), simdWidth);
+                                llvm::Value* lin = pb.CreateFAdd(a0, pb.CreateFAdd(
+                                        pb.CreateFMul(baryI, da1),
+                                        pb.CreateFMul(baryJ, da2)));
                                 interpScalars[slot] = (pi.interpMode == 4)
                                                           ? lin
-                                                          : mlir::LLVM::FMulOp::create(pb, ploc, lin, wVec).getResult();
+                                                          : pb.CreateFMul(lin, wVec);
                             }
                         }
                     }
                 }
 
                 // Allocate stack slots for PS outputs (SV_Target0..7 and optional SV_Depth) so writes inside scf.if work naturally
-                std::array<std::array<mlir::Value, 4>, 8> rtOutPtrs{};
+                std::array<std::array<llvm::Value*, 4>, 8> rtOutPtrs{};
                 for (uint32_t rt = 0; rt < 8; ++rt) {
                     if (rt < desc.NumRenderTargets && desc.RTVFormats[rt] != DXGI_FORMAT_UNKNOWN) {
                         for (uint32_t c = 0; c < 4; ++c) {
-                            rtOutPtrs[rt][c] = mlir::LLVM::AllocaOp::create(
-                                pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                            rtOutPtrs[rt][c] = createAlignedAlloca(pb, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), 64);
                             ph.storeScalar(ph.splatFlt(c == 3 ? 1.0 : 0.0), rtOutPtrs[rt][c]);
                         }
                     }
                 }
-                mlir::Value outDepthPtr = mlir::LLVM::AllocaOp::create(
-                    pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                llvm::Value* outDepthPtr = createAlignedAlloca(pb, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), 64);
                 ph.storeScalar(interpZ, outDepthPtr);
 
-                mlir::Value outStencilRefPtr;
+                llvm::Value* outStencilRefPtr = nullptr;
                 if (psWritesStencilRef) {
-                    outStencilRefPtr = mlir::LLVM::AllocaOp::create(
-                        pb, ploc, ptrTy, ph.vecTy(ph.i8Ty()), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
-                    mlir::Value initRef32 = ph.loadScalar(i32Ty, ph.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
-                    mlir::Value initRef8 = mlir::LLVM::TruncOp::create(pb, ploc, ph.i8Ty(), initRef32);
-                    ph.storeScalar(llvmSplat(pb, ploc, llvm::cast<mlir::VectorType>(ph.vecTy(ph.i8Ty())).getElementType(), initRef8, llvm::cast<mlir::VectorType>(ph.vecTy(ph.i8Ty())).getNumElements()), outStencilRefPtr);
+                    outStencilRefPtr = createAlignedAlloca(pb, ph.vecTy(ph.i8Ty()), ph.cInt(i32Ty, 1), 64);
+                    llvm::Value* initRef32 = ph.loadScalar(i32Ty, ph.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
+                    llvm::Value* initRef8 = pb.CreateTrunc(initRef32, ph.i8Ty());
+                    ph.storeScalar(llvmSplat(pb, llvm::cast<llvm::FixedVectorType>(ph.vecTy(ph.i8Ty()))->getElementType(), initRef8, llvm::cast<llvm::FixedVectorType>(ph.vecTy(ph.i8Ty()))->getNumElements()), outStencilRefPtr);
                 }
 
                 StageHooks psHooks;
                 psHooks.isPixelShader = true;
-                psHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
-                                        const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
+                psHooks.loadInput = [&](llvm::IRBuilder<>& lb, uint32_t sigId,
+                                        const SimdVal& row, uint32_t col, llvm::Type* scalarTy, SimdVal& out) -> bool {
                     const DxilSigRecord* sig = psLoaded.findInputSig(sigId);
                     if (!sig) return false;
-                    IRHelpers lh{lb, lloc, simdWidth};
+                    IRHelpers lh{lb, simdWidth};
                     if (sig->systemValueType == 3) { // SV_Position
-                        mlir::Value v = (col == 0) ? pixelX : ((col == 1) ? pixelY : ((col == 2) ? interpZ : invWVec));
+                        llvm::Value* v = (col == 0) ? pixelX : ((col == 1) ? pixelY : ((col == 2) ? interpZ : invWVec));
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     if (sig->systemValueType == 5) { // SV_ViewportArrayIndex
-                        mlir::Value vp32 = lh.loadScalar(
+                        llvm::Value* vp32 = lh.loadScalar(
                             i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, viewportArrayIndex)));
-                        mlir::Value v = llvmSplat(lb, lloc, i32Ty, vp32, simdWidth);
+                        llvm::Value* v = llvmSplat(lb, i32Ty, vp32, simdWidth);
                         if (scalarTy != i32Ty) {
-                            v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                            v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
                         }
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     if (sig->systemValueType == 10) { // SV_PrimitiveID
-                        mlir::Value v = llvmSplat(lb, lloc, i32Ty, primId32, simdWidth);
+                        llvm::Value* v = llvmSplat(lb, i32Ty, primId32, simdWidth);
                         if (scalarTy != i32Ty) {
-                            v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                            v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
                         }
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     if (sig->systemValueType == 28) { // SV_Barycentrics
-                        mlir::Value v = lh.splatFlt(0.0);
+                        llvm::Value* v = lh.splatFlt(0.0);
                         if (sig->interpMode == 4) { // noperspective
-                            mlir::Value b0 = mlir::LLVM::FSubOp::create(
-                                lb, lloc, lh.splatFlt(1.0),
-                                mlir::LLVM::FAddOp::create(lb, lloc, baryI, baryJ));
+                            llvm::Value* b0 = lb.CreateFSub(lh.splatFlt(1.0), lb.CreateFAdd(baryI, baryJ));
                             if (col == 0) v = b0;
                             else if (col == 1) v = baryI;
                             else if (col == 2) v = baryJ;
                         } else if (col < 3) { // perspective (linear) using original-primitive barycentrics
-                            mlir::Value triOrigBaryPtr = lh.loadScalar(
+                            llvm::Value* triOrigBaryPtr = lh.loadScalar(
                                 ptrTy, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, triOrigBary)));
                             int64_t baseOff = static_cast<int64_t>(col * 3 * 4);
-                            mlir::Value a0 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff)), simdWidth);
-                            mlir::Value da1 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 4)), simdWidth);
-                            mlir::Value da2 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 8)), simdWidth);
-                            mlir::Value lin = mlir::LLVM::FAddOp::create(
-                                lb, lloc, a0,
-                                mlir::LLVM::FAddOp::create(
-                                    lb, lloc, mlir::LLVM::FMulOp::create(lb, lloc, baryI, da1),
-                                    mlir::LLVM::FMulOp::create(lb, lloc, baryJ, da2)));
-                            v = mlir::LLVM::FMulOp::create(lb, lloc, lin, wVec);
+                            llvm::Value* a0 = llvmSplat(lb, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff)), simdWidth);
+                            llvm::Value* da1 = llvmSplat(lb, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 4)), simdWidth);
+                            llvm::Value* da2 = llvmSplat(lb, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 8)), simdWidth);
+                            llvm::Value* lin = lb.CreateFAdd(a0, lb.CreateFAdd(
+                                    lb.CreateFMul(baryI, da1),
+                                    lb.CreateFMul(baryJ, da2)));
+                            v = lb.CreateFMul(lin, wVec);
                         }
                         if (scalarTy != f32Ty) {
-                            v = mlir::LLVM::FPTruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                            v = lb.CreateFPTrunc(v, lh.vecTy(scalarTy));
                         }
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     if (sig->systemValueType == 29) { // SV_ShadingRate
-                        mlir::Value sr32 = lh.loadScalar(
+                        llvm::Value* sr32 = lh.loadScalar(
                             i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, shadingRate)));
-                        mlir::Value v = llvmSplat(lb, lloc, i32Ty, sr32, simdWidth);
+                        llvm::Value* v = llvmSplat(lb, i32Ty, sr32, simdWidth);
                         if (scalarTy != i32Ty) {
-                            v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                            v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
                         }
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     if (sig->systemValueType == 13) { // SV_IsFrontFace
-                        mlir::Value ffCond = mlir::LLVM::ICmpOp::create(
-                            lb, lloc, mlir::LLVM::ICmpPredicate::ne, isFront32, lh.cInt(i32Ty, 0));
-                        mlir::Value v = (scalarTy == lh.i1Ty())
-                                            ? llvmSplat(lb, lloc, lh.i1Ty(), ffCond, simdWidth)
-                                            : llvmSplat(lb, lloc, i32Ty, mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty, ffCond), simdWidth);
+                        llvm::Value* ffCond = lb.CreateICmp(llvm::CmpInst::ICMP_NE, isFront32, lh.cInt(i32Ty, 0));
+                        llvm::Value* v = (scalarTy == lh.i1Ty())
+                                            ? llvmSplat(lb, lh.i1Ty(), ffCond, simdWidth)
+                                            : llvmSplat(lb, i32Ty, lb.CreateZExt(ffCond, i32Ty), simdWidth);
                         out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                         return true;
                     }
                     auto rowConst = tryGetUniformConstUInt(row);
-                    mlir::Value v;
+                    llvm::Value* v;
                     if (rowConst.has_value() || sig->rows <= 1) {
                         uint32_t r = rowConst.value_or(0);
                         uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
@@ -3390,96 +3316,95 @@ bool synthesizeGraphicsPSOMLIR(
                     } else {
                         uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
                         v = (baseSlot < 128 && interpScalars[baseSlot]) ? interpScalars[baseSlot] : lh.splatFlt(0.0);
-                        mlir::Type rElemTy = llvm::cast<mlir::VectorType>(row.vec.getType()).getElementType();
+                        llvm::Type* rElemTy = llvm::cast<llvm::FixedVectorType>(row.vec->getType())->getElementType();
                         for (uint32_t r = 1; r < sig->rows; ++r) {
                             uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
                             if (slot >= 128 || !interpScalars[slot]) continue;
-                            mlir::Value cmp = mlir::LLVM::ICmpOp::create(
-                                lb, lloc, mlir::LLVM::ICmpPredicate::eq, row.vec, lh.splatInt(rElemTy, r));
-                            v = mlir::LLVM::SelectOp::create(lb, lloc, cmp, interpScalars[slot], v);
+                            llvm::Value* cmp = lb.CreateICmp(llvm::CmpInst::ICMP_EQ, row.vec, lh.splatInt(rElemTy, r));
+                            v = lb.CreateSelect(cmp, interpScalars[slot], v);
                         }
                     }
                     if (scalarTy != f32Ty) {
-                        if (mlir::isa<mlir::IntegerType>(scalarTy)) {
-                            v = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(i32Ty), v);
+                        if (scalarTy->isIntegerTy()) {
+                            v = lb.CreateBitCast(v, lh.vecTy(i32Ty));
                             if (scalarTy != i32Ty) {
-                                v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                                v = lb.CreateTrunc(v, lh.vecTy(scalarTy));
                             }
                         } else {
-                            v = mlir::LLVM::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                            v = lb.CreateBitCast(v, lh.vecTy(scalarTy));
                         }
                     }
                     out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                     return true;
                 };
 
-                psHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
-                                          const SimdVal&, uint32_t col, const SimdVal& val, mlir::Value writeMask) -> bool {
+                psHooks.storeOutput = [&](llvm::IRBuilder<>& sb, uint32_t sigId,
+                                          const SimdVal&, uint32_t col, const SimdVal& val, llvm::Value* writeMask) -> bool {
                     const DxilSigRecord* sig = psLoaded.findOutputSig(sigId);
                     if (!sig || val.kind != SimdVal::Kind::Vector) return true;
-                    IRHelpers sh{sb, sloc, simdWidth};
-                    mlir::Value vVec = val.vec;
-                    mlir::Type et = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+                    IRHelpers sh{sb, simdWidth};
+                    llvm::Value* vVec = val.vec;
+                    llvm::Type* et = llvm::cast<llvm::FixedVectorType>(vVec->getType())->getElementType();
                     if (sig->systemValueType == 20 && outStencilRefPtr) { // SV_StencilRef
-                        mlir::Value refVec8;
-                        if (mlir::isa<mlir::IntegerType>(et)) {
+                        llvm::Value* refVec8;
+                        if (llvm::isa<llvm::IntegerType>(et)) {
                             refVec8 = (et == sh.i8Ty())
                                           ? vVec
-                                          : mlir::LLVM::TruncOp::create(sb, sloc, sh.vecTy(sh.i8Ty()), vVec).getResult();
+                                          : sb.CreateTrunc(vVec, sh.vecTy(sh.i8Ty()));
                         } else {
-                            mlir::Value asI32 = mlir::LLVM::BitcastOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
-                            refVec8 = mlir::LLVM::TruncOp::create(sb, sloc, sh.vecTy(sh.i8Ty()), asI32);
+                            llvm::Value* asI32 = sb.CreateBitCast(vVec, sh.vecTy(i32Ty));
+                            refVec8 = sb.CreateTrunc(asI32, sh.vecTy(sh.i8Ty()));
                         }
-                        mlir::Value prev = sh.loadScalar(sh.vecTy(sh.i8Ty()), outStencilRefPtr);
-                        sh.storeScalar(mlir::LLVM::SelectOp::create(sb, sloc, writeMask, refVec8, prev), outStencilRefPtr);
+                        llvm::Value* prev = sh.loadScalar(sh.vecTy(sh.i8Ty()), outStencilRefPtr);
+                        sh.storeScalar(sb.CreateSelect(writeMask, refVec8, prev), outStencilRefPtr);
                         return true;
                     }
                     if (et != f32Ty) {
-                        vVec = mlir::isa<mlir::IntegerType>(et)
-                                   ? mlir::LLVM::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vVec).getResult()
-                                   : mlir::LLVM::FPExtOp::create(sb, sloc, sh.vecTy(f32Ty), vVec).getResult();
+                        vVec = llvm::isa<llvm::IntegerType>(et)
+                                   ? sb.CreateBitCast(vVec, sh.vecTy(f32Ty))
+                                   : sb.CreateFPExt(vVec, sh.vecTy(f32Ty));
                     }
                     if (sig->systemValueType == 17 || sig->systemValueType == 18 || sig->systemValueType == 19) { // SV_Depth*
-                        mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), outDepthPtr);
-                        sh.storeScalar(mlir::LLVM::SelectOp::create(sb, sloc, writeMask, vVec, prev), outDepthPtr);
+                        llvm::Value* prev = sh.loadScalar(sh.vecTy(f32Ty), outDepthPtr);
+                        sh.storeScalar(sb.CreateSelect(writeMask, vVec, prev), outDepthPtr);
                         return true;
                     }
                     if (sig->systemValueType == 16 && sig->semanticIndex < 8 && col < 4) { // SV_TargetN
-                        mlir::Value slotPtr = rtOutPtrs[sig->semanticIndex][col];
+                        llvm::Value* slotPtr = rtOutPtrs[sig->semanticIndex][col];
                         if (slotPtr) {
-                            mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), slotPtr);
-                            sh.storeScalar(mlir::LLVM::SelectOp::create(sb, sloc, writeMask, vVec, prev), slotPtr);
+                            llvm::Value* prev = sh.loadScalar(sh.vecTy(f32Ty), slotPtr);
+                            sh.storeScalar(sb.CreateSelect(writeMask, vVec, prev), slotPtr);
                         }
                     }
                     return true;
                 };
 
-                if (!packetizeRegionWithHooks(pb, ploc, combinedMod, psSrcFunc.getBody(), psLoaded, psEffectiveLayout,
+                if (!packetizeRegionWithHooks(pb, combinedMod, *psTree.root, psLoaded, psEffectiveLayout,
                                               simdWidth, rootCtx, execMask, curRealMask, psHooks, outError)) {
                     return;
                 }
 
                 // Late-Z if Early-Z was skipped
                 if (!canEarlyZ) {
-                    mlir::Value finalZ = ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr);
-                    mlir::Value finalStencilRef = psWritesStencilRef
+                    llvm::Value* finalZ = ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr);
+                    llvm::Value* finalStencilRef = psWritesStencilRef
                                                       ? ph.loadScalar(ph.vecTy(ph.i8Ty()), outStencilRefPtr)
-                                                      : mlir::Value();
-                    curRealMask = runDepthStencil(pb, ploc, curRealMask, finalZ, finalStencilRef);
+                                                      : nullptr;
+                    curRealMask = runDepthStencil(pb, curRealMask, finalZ, finalStencilRef);
                 }
 
                 // Fixed-function Output Merger Blending across active MRTs
-                mlir::Value anyWrite = ph.orReduce(curRealMask);
-                mlir::scf::IfOp::create(pb, ploc, anyWrite, [&](mlir::OpBuilder& ob, mlir::Location oloc) {
-                    IRHelpers oh{ob, oloc, simdWidth};
-                    mlir::Value blendFactors[4]{};
+                llvm::Value* anyWrite = ph.orReduce(curRealMask);
+                emitIf(pb, anyWrite, [&](llvm::IRBuilder<>& ob) {
+                    IRHelpers oh{ob, simdWidth};
+                    llvm::Value* blendFactors[4]{};
                     bool loadedBlendFactor = false;
                     auto ensureBlendFactor = [&]() {
                         if (loadedBlendFactor) return;
                         for (int c = 0; c < 4; ++c) {
-                            mlir::Value bf = oh.loadScalar(
+                            llvm::Value* bf = oh.loadScalar(
                                 f32Ty, oh.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, blend_factor) + c * 4)));
-                            blendFactors[c] = llvmSplat(ob, oloc, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getElementType(), bf, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getNumElements());
+                            blendFactors[c] = llvmSplat(ob, llvm::cast<llvm::FixedVectorType>(oh.vecTy(f32Ty))->getElementType(), bf, llvm::cast<llvm::FixedVectorType>(oh.vecTy(f32Ty))->getNumElements());
                         }
                         loadedBlendFactor = true;
                     };
@@ -3490,7 +3415,7 @@ bool synthesizeGraphicsPSOMLIR(
                         uint8_t writeMask = rtBlend.RenderTargetWriteMask;
                         if (writeMask == 0) continue;
 
-                        mlir::Value src[4];
+                        llvm::Value* src[4];
                         for (int c = 0; c < 4; ++c) {
                             src[c] = rtOutPtrs[rt][c] ? oh.loadScalar(oh.vecTy(f32Ty), rtOutPtrs[rt][c]) : oh.splatFlt(c == 3 ? 1.0 : 0.0);
                             if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) {
@@ -3499,24 +3424,22 @@ bool synthesizeGraphicsPSOMLIR(
                         }
 
                         // Load current tile color for all W lanes (needed for partial quad masking and blending)
-                        mlir::Value dst[4];
-                        auto v4f = mlir::VectorType::get({4}, f32Ty);
+                        llvm::Value* dst[4];
+                        auto v4f = llvm::FixedVectorType::get(f32Ty, 4);
                         for (int c = 0; c < 4; ++c) {
                             dst[c] = oh.splatFlt(0.0);
                             for (uint32_t q = 0; q < numQuads; ++q) {
-                                mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                    ob, oloc, quadOffsets[q], oh.cInt(i32Ty, c * 4096));
-                                mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                    ob, oloc, mlir::LLVM::ZExtOp::create(ob, oloc, oh.i64Ty(), pixIdx), oh.cInt(oh.i64Ty(), 4));
-                                mlir::Value q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
+                                llvm::Value* pixIdx = ob.CreateAdd(quadOffsets[q], oh.cInt(i32Ty, c * 4096));
+                                llvm::Value* byteOff = ob.CreateMul(ob.CreateZExt(pixIdx, oh.i64Ty()), oh.cInt(oh.i64Ty(), 4));
+                                llvm::Value* q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
                                 for (uint32_t s = 0; s < 4; ++s) {
-                                    mlir::Value sc = llvmExtract(ob, oloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
-                                    dst[c] = llvmInsert(ob, oloc, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                                    llvm::Value* sc = llvmExtract(ob, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
+                                    dst[c] = llvmInsert(ob, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
                                 }
                             }
                         }
 
-                        mlir::Value outColor[4]{src[0], src[1], src[2], src[3]};
+                        llvm::Value* outColor[4]{src[0], src[1], src[2], src[3]};
                         if (rtBlend.BlendEnable) {
                             if (rtBlend.SrcBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.SrcBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
                                 rtBlend.DestBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.DestBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
@@ -3525,75 +3448,66 @@ bool synthesizeGraphicsPSOMLIR(
                                 ensureBlendFactor();
                             }
                             for (int c = 0; c < 3; ++c) {
-                                mlir::Value sf = oh.evalBlendFactorRGB(rtBlend.SrcBlend, src, dst, blendFactors, c);
-                                mlir::Value df = oh.evalBlendFactorRGB(rtBlend.DestBlend, src, dst, blendFactors, c);
-                                mlir::Value sTerm = mlir::LLVM::FMulOp::create(ob, oloc, src[c], sf);
-                                mlir::Value dTerm = mlir::LLVM::FMulOp::create(ob, oloc, dst[c], df);
+                                llvm::Value* sf = oh.evalBlendFactorRGB(rtBlend.SrcBlend, src, dst, blendFactors, c);
+                                llvm::Value* df = oh.evalBlendFactorRGB(rtBlend.DestBlend, src, dst, blendFactors, c);
+                                llvm::Value* sTerm = ob.CreateFMul(src[c], sf);
+                                llvm::Value* dTerm = ob.CreateFMul(dst[c], df);
                                 outColor[c] = oh.evalBlendOp(rtBlend.BlendOp, sTerm, dTerm);
                                 if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[c] = oh.clamp01(outColor[c]);
                             }
-                            mlir::Value saf = oh.evalBlendFactorRGB(rtBlend.SrcBlendAlpha, src, dst, blendFactors, 3);
-                            mlir::Value daf = oh.evalBlendFactorRGB(rtBlend.DestBlendAlpha, src, dst, blendFactors, 3);
+                            llvm::Value* saf = oh.evalBlendFactorRGB(rtBlend.SrcBlendAlpha, src, dst, blendFactors, 3);
+                            llvm::Value* daf = oh.evalBlendFactorRGB(rtBlend.DestBlendAlpha, src, dst, blendFactors, 3);
                             outColor[3] = oh.evalBlendOp(
                                 rtBlend.BlendOpAlpha,
-                                mlir::LLVM::FMulOp::create(ob, oloc, src[3], saf),
-                                mlir::LLVM::FMulOp::create(ob, oloc, dst[3], daf));
+                                ob.CreateFMul(src[3], saf),
+                                ob.CreateFMul(dst[3], daf));
                             if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[3] = oh.clamp01(outColor[3]);
                         }
 
                         // Masked SOA quad write-back respecting RenderTargetWriteMask & curRealMask
                         for (uint32_t q = 0; q < numQuads; ++q) {
                             llvm::SmallVector<int32_t, 4> qIdx{static_cast<int32_t>(q * 4), static_cast<int32_t>(q * 4 + 1), static_cast<int32_t>(q * 4 + 2), static_cast<int32_t>(q * 4 + 3)};
-                            mlir::Value qMask = mlir::LLVM::ShuffleVectorOp::create(ob, oloc, curRealMask, curRealMask, qIdx);
-                            mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(ob, oloc, ob.getI1Type(), qMask);
-                            mlir::scf::IfOp::create(ob, oloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
-                                IRHelpers qh{qb, qloc, simdWidth};
+                            llvm::Value* qMask = ob.CreateShuffleVector(curRealMask, curRealMask, qIdx);
+                            llvm::Value* anyQ = ob.CreateOrReduce(qMask);
+                            emitIf(ob, anyQ, [&](llvm::IRBuilder<>& qb) {
+                                IRHelpers qh{qb, simdWidth};
                                 for (int c = 0; c < 4; ++c) {
                                     if (!(writeMask & (1u << c))) continue;
-                                    mlir::Value merged = mlir::LLVM::SelectOp::create(qb, qloc, curRealMask, outColor[c], dst[c]);
-                                    mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
-                                    mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                        qb, qloc, quadOffsets[q], qh.cInt(i32Ty, c * 4096));
-                                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                        qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), pixIdx), qh.cInt(qh.i64Ty(), 4));
-                                    mlir::LLVM::StoreOp::create(qb, qloc, q4, qh.gepBytesDyn(tileColorBases[rt], byteOff));
+                                    llvm::Value* merged = qb.CreateSelect(curRealMask, outColor[c], dst[c]);
+                                    llvm::Value* q4 = qb.CreateShuffleVector(merged, merged, qIdx);
+                                    llvm::Value* pixIdx = qb.CreateAdd(quadOffsets[q], qh.cInt(i32Ty, c * 4096));
+                                    llvm::Value* byteOff = qb.CreateMul(qb.CreateZExt(pixIdx, qh.i64Ty()), qh.cInt(qh.i64Ty(), 4));
+                                    qb.CreateStore(q4, qh.gepBytesDyn(tileColorBases[rt], byteOff));
                                 }
-                                mlir::scf::YieldOp::create(qb, qloc);
                             });
                         }
                     }
-                    mlir::scf::YieldOp::create(ob, oloc);
                 });
             };
 
             if (canEarlyZ) {
-                mlir::Value anySurvive = h.orReduce(realMaskAfterEarly);
-                mlir::scf::IfOp::create(b, loc, anySurvive, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    emitPSBodyAndOM(nb, nloc, realMaskAfterEarly);
-                    mlir::scf::YieldOp::create(nb, nloc);
+                llvm::Value* anySurvive = h.orReduce(realMaskAfterEarly);
+                emitIf(b, anySurvive, [&](llvm::IRBuilder<>& nb) {
+                    emitPSBodyAndOM(nb, realMaskAfterEarly);
                 });
                 if (!outError.empty()) return false;
             } else {
-                emitPSBodyAndOM(b, loc, realMaskAfterEarly);
+                emitPSBodyAndOM(b, realMaskAfterEarly);
                 if (!outError.empty()) return false;
             }
         }
 
-        mlir::func::ReturnOp::create(b, loc);
+        b.CreateRetVoid();
     }
 
 
-    // Remove dead dx.op.* declarations left over in combinedMod
-    llvm::SmallVector<mlir::LLVM::LLVMFuncOp, 16> deadDxOps;
-    for (auto fnOp : combinedMod.getOps<mlir::LLVM::LLVMFuncOp>()) {
-        if (fnOp.isDeclaration() && fnOp.getName().starts_with("dx.op.") && fnOp.use_empty()) {
-            deadDxOps.push_back(fnOp);
-        }
+    for (llvm::Function* srcFn : {vsSrcFn, msSrcFn, asSrcFn, hsSrcFn, hspcSrcFn, dsSrcFn, gsSrcFn, psSrcFn}) {
+        if (srcFn) srcFn->eraseFromParent();
     }
-    for (auto fnOp : deadDxOps) fnOp.erase();
+    eraseUnusedDxOps(combinedMod);
 
-    if (mlir::failed(mlir::verify(combinedMod))) {
-        outError = "MLIR verification failed after Graphics Uber-PSO synthesis";
+    if (llvm::verifyModule(combinedMod, &llvm::errs())) {
+        outError = "LLVM verification failed after Graphics Uber-PSO synthesis";
         return false;
     }
 
@@ -3739,7 +3653,6 @@ bool compileGraphicsPSO(
             return true;
         }
 
-        thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
         CachedVSMeta vsMeta{};
         CompiledVertexFn cachedVSFn = nullptr;
         std::vector<DxilSigRecord> vsOutputRecs;
@@ -3749,26 +3662,26 @@ bool compileGraphicsPSO(
             outPSO.vsSymbolName = vsSym;
             outPSO.vsFn.store(cachedVSFn, std::memory_order_release);
         } else {
-            mlir::OwningOpRef<mlir::ModuleOp> vsMod;
-            if (!synthesizeVertexStageMLIR(
-                    desc, rootLayout, simdWidth, vsSym, mlirCtx, vsMod, vsMeta,
+            auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            std::unique_ptr<llvm::Module> vsMod;
+            if (!synthesizeVertexStageLLVM(
+                    desc, rootLayout, simdWidth, vsSym, *vsLlvmCtx, vsMod, vsMeta,
                     outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outError)) {
                 return false;
             }
-            auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
-            auto vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError);
-            if (!vsLinkedMod) return false;
+            if (!linkAndFinalizeLLVMModule(*vsMod, outError)) return false;
             if (!jitCompileVertexStageTier1AndScheduleTier2(
-                    std::move(vsLinkedMod), std::move(vsLlvmCtx), vsHashLo, vsHashHi, vsSym,
+                    std::move(vsMod), std::move(vsLlvmCtx), vsHashLo, vsHashHi, vsSym,
                     vsMeta, outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outPSO, outError)) {
                 return false;
             }
         }
 
-        mlir::OwningOpRef<mlir::ModuleOp> psMod;
+        auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
+        std::unique_ptr<llvm::Module> psMod;
         CachedPSOMeta meta{};
-        if (!synthesizeGraphicsPSOMLIR(
-                desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, psMod, meta,
+        if (!synthesizeGraphicsPSOLLVM(
+                desc, rootLayout, simdWidth, vsSym, psSym, *psLlvmCtx, psMod, meta,
                 outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError,
                 meshStages, /*skipVS=*/true, &vsMeta, &vsOutputRecs)) {
             return false;
@@ -3777,13 +3690,11 @@ bool compileGraphicsPSO(
         meta.vsHashLo = vsHashLo;
         meta.vsHashHi = vsHashHi;
 
-        auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
-        auto psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError);
-        if (!psLinkedMod) return false;
+        if (!linkAndFinalizeLLVMModule(*psMod, outError)) return false;
 
         populatePSOFromMeta(meta);
         return jitCompilePixelStageTier1AndScheduleTier2(
-            std::move(psLinkedMod), std::move(psLlvmCtx), vsHashLo, vsHashHi, psSym, meta, outPSO, outError);
+            std::move(psMod), std::move(psLlvmCtx), vsHashLo, vsHashHi, psSym, meta, outPSO, outError);
     }
 
     std::string vsSym = "nacelle_vs_" + hex;
@@ -3791,22 +3702,20 @@ bool compileGraphicsPSO(
         return true;
     }
 
-    thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
+    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> combinedMod;
     CachedPSOMeta meta;
-    if (!synthesizeGraphicsPSOMLIR(
-            desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, combinedMod, meta,
+    if (!synthesizeGraphicsPSOLLVM(
+            desc, rootLayout, simdWidth, vsSym, psSym, *outLlvmCtx, combinedMod, meta,
             outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError, meshStages)) {
         return false;
     }
 
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError);
-    if (!linkedMod) return false;
+    if (!linkAndFinalizeLLVMModule(*combinedMod, outError)) return false;
 
     populatePSOFromMeta(meta);
     return jitCompileGraphicsTier1AndScheduleTier2(
-        std::move(linkedMod), std::move(outLlvmCtx), vsSym, psSym, meta, outPSO, outError);
+        std::move(combinedMod), std::move(outLlvmCtx), vsSym, psSym, meta, outPSO, outError);
 }
 
 } // namespace nacelle
