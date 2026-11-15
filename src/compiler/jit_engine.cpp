@@ -1,6 +1,7 @@
 #include "jit_engine.h"
 #include "../rasterizer/raytracing_bvh.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #define XXH_INLINE_ALL
@@ -150,6 +152,17 @@ struct HashFeed {
     }
 };
 
+struct InMemVSCacheEntry {
+    CachedVSMeta meta{};
+    uint64_t vsAddr = 0;
+    bool tier2Done = false;
+    std::vector<uint8_t> objBytes;
+    std::vector<ShaderSigElement> vsInputs;
+    std::vector<ShaderSigElement> vsOutputs;
+    std::vector<DxilSigRecord> vsOutputRecs;
+    std::vector<std::shared_ptr<PsoUpdateBox>> waiters;
+};
+
 struct InMemCacheEntry {
     CachedPSOMeta meta{};
     uint64_t addr0 = 0; // cs or vs
@@ -163,10 +176,13 @@ struct InMemCacheEntry {
     std::vector<uint8_t> objBytes;
 };
 
+static std::atomic<uint64_t> g_vertexStageCompileCount{0};
+
 struct JitRuntime {
     std::mutex mu;
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::unordered_map<std::string, InMemCacheEntry> memCache;
+    std::unordered_map<std::string, InMemVSCacheEntry> vsMemCache;
     std::atomic<uint64_t> dylibSeq{1};
     std::atomic<uint64_t> tmpSeq{1};
     std::unique_ptr<BS::thread_pool<>> tier2PoolOwned;
@@ -232,7 +248,9 @@ bool emitObjectBytesO3(
 BS::thread_pool<>& ensureTier2PoolReady(JitRuntime& rt) {
     static std::once_flag tier2Once;
     std::call_once(tier2Once, [&rt]() {
-        rt.tier2PoolOwned = std::make_unique<BS::thread_pool<>>(2);
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned poolThreads = std::clamp(hw / 2u, 2u, 8u);
+        rt.tier2PoolOwned = std::make_unique<BS::thread_pool<>>(poolThreads);
         rt.activeTier2Pool.store(rt.tier2PoolOwned.get(), std::memory_order_release);
 
         llvm::LLVMContext initCtx;
@@ -253,14 +271,44 @@ BS::thread_pool<>& ensureTier2PoolReady(JitRuntime& rt) {
     return *rt.activeTier2Pool.load(std::memory_order_acquire);
 }
 
+bool isStrictFloatingPointEnabled() {
+    const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
+    return strictFpEnv && strictFpEnv[0] == '1';
+}
+
+void applyShaderFastMathFlags(llvm::Module& mod) {
+    if (isStrictFloatingPointEnabled()) return;
+    llvm::FastMathFlags fmf;
+    fmf.setAllowContract(true);
+    fmf.setAllowReassoc(true);
+    fmf.setNoSignedZeros(true);
+    fmf.setAllowReciprocal(true);
+    fmf.setApproxFunc(true);
+    for (llvm::Function& fn : mod) {
+        if (fn.isDeclaration()) continue;
+        for (llvm::BasicBlock& bb : fn) {
+            for (llvm::Instruction& inst : bb) {
+                if (llvm::isa<llvm::FPMathOperator>(&inst)) {
+                    inst.setFastMathFlags(fmf);
+                }
+            }
+        }
+    }
+}
+
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Default);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
     }
+#if LLVM_VERSION_MAJOR < 24
+    if (!isStrictFloatingPointEnabled()) {
+        jtmbOrErr->getOptions().AllowFPOpFusion = llvm::FPOpFusion::Fast;
+    }
+#endif
 
     auto jitOrErr = llvm::orc::LLJITBuilder()
                         .setJITTargetMachineBuilder(std::move(*jtmbOrErr))
@@ -352,28 +400,11 @@ bool emitObjectBytesO3(
         return false;
     }
 
-    const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
-    const bool strictFp = strictFpEnv && strictFpEnv[0] == '1';
-    if (!strictFp) {
+    if (!isStrictFloatingPointEnabled()) {
 #if LLVM_VERSION_MAJOR < 24
         jtmbOrErr->getOptions().AllowFPOpFusion = llvm::FPOpFusion::Fast;
 #endif
-        llvm::FastMathFlags fmf;
-        fmf.setAllowContract(true);
-        fmf.setAllowReassoc(true);
-        fmf.setNoSignedZeros(true);
-        fmf.setAllowReciprocal(true);
-        fmf.setApproxFunc(true);
-        for (llvm::Function& fn : mod) {
-            if (fn.isDeclaration()) continue;
-            for (llvm::BasicBlock& bb : fn) {
-                for (llvm::Instruction& inst : bb) {
-                    if (llvm::isa<llvm::FPMathOperator>(&inst)) {
-                        inst.setFastMathFlags(fmf);
-                    }
-                }
-            }
-        }
+        applyShaderFastMathFlags(mod);
     }
 
     auto tmOrErr = jtmbOrErr->createTargetMachine();
@@ -421,6 +452,7 @@ bool emitObjectBytesO3(
 }
 
 void runTier1Optimize(llvm::Module& mod) {
+    applyShaderFastMathFlags(mod);
     llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
     llvm::CGSCCAnalysisManager cgam;
@@ -546,9 +578,13 @@ void applyGraphicsMeta(
     outPSO.msPrimAttrMask = meta.msPrimAttrMask;
     outPSO.asGroupSharedBytes = meta.asGroupSharedBytes;
     outPSO.asPayloadBytes = meta.asPayloadBytes;
+    outPSO.psInputFromVSSlot = meta.psInputFromVSSlot;
+    outPSO.psUsesPerspBarycentrics = meta.psUsesPerspBarycentrics != 0;
     outPSO.psWritesDepth = meta.psWritesDepth != 0;
     outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
     outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
+    outPSO.vsCacheHashLo = meta.vsHashLo;
+    outPSO.vsCacheHashHi = meta.vsHashHi;
     outPSO.vsSymbolName = vsSym;
     outPSO.psSymbolName = psSym;
     outPSO.gsSymbolName = meta.hasGS ? (vsSym + "_gs") : std::string{};
@@ -702,6 +738,40 @@ void computeGraphicsPSOHash(
     feed.addBytes(desc.RTVFormats, sizeof(desc.RTVFormats));
     feed.add(desc.DSVFormat);
     feed.add(desc.SampleDesc);
+
+    feed.add(desc.InputLayout.NumElements);
+    for (UINT i = 0; i < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++i) {
+        const auto& el = desc.InputLayout.pInputElementDescs[i];
+        feed.addStr(el.SemanticName);
+        feed.add(el.SemanticIndex);
+        feed.add(el.Format);
+        feed.add(el.InputSlot);
+        feed.add(el.AlignedByteOffset);
+        feed.add(el.InputSlotClass);
+        feed.add(el.InstanceDataStepRate);
+    }
+
+    XXH128_hash_t h = XXH3_128bits(feed.buf.data(), feed.buf.size());
+    outLo = h.low64;
+    outHi = h.high64;
+}
+
+void computeVertexStageHash(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    uint64_t& outLo,
+    uint64_t& outHi) {
+    HashFeed feed;
+    feed.addStr(kCompilerBuildHash);
+    feed.addStr(getHostTargetTripleString().c_str());
+    feed.add(simdWidth);
+    feed.add(rootLayout.hashLo);
+    feed.add(rootLayout.hashHi);
+
+    uint64_t vsLen = desc.VS.BytecodeLength;
+    feed.add(vsLen);
+    feed.addBytes(desc.VS.pShaderBytecode, static_cast<size_t>(vsLen));
 
     feed.add(desc.InputLayout.NumElements);
     for (UINT i = 0; i < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++i) {
@@ -885,6 +955,70 @@ bool tryLoadComputePSOFromCache(
     return true;
 }
 
+bool tryLoadVertexStageFromCache(
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& vsSym,
+    CachedVSMeta& outVSMeta,
+    CompiledVertexFn& outVSFn,
+    std::vector<ShaderSigElement>* outVSInputs,
+    std::vector<ShaderSigElement>* outVSOutputs,
+    std::vector<DxilSigRecord>* outVSOutputRecs) {
+    JitRuntime& rt = getJitRuntime();
+    std::filesystem::path dir = getCacheDirectory();
+    std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
+    std::string vsKey = (dir / vsHex).string();
+    uint32_t targetW = getTargetSimdWidth();
+
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto it = rt.vsMemCache.find(vsKey);
+        if (it != rt.vsMemCache.end() && it->second.vsAddr != 0 && it->second.meta.simdWidth == targetW) {
+            outVSMeta = it->second.meta;
+            outVSFn = reinterpret_cast<CompiledVertexFn>(it->second.vsAddr);
+            if (outVSInputs && !it->second.vsInputs.empty()) *outVSInputs = it->second.vsInputs;
+            if (outVSOutputs && !it->second.vsOutputs.empty()) *outVSOutputs = it->second.vsOutputs;
+            if (outVSOutputRecs && !it->second.vsOutputRecs.empty()) *outVSOutputRecs = it->second.vsOutputRecs;
+            return true;
+        }
+    }
+
+    std::filesystem::path metaPath = dir / (vsHex + ".vsmeta");
+    std::filesystem::path objPath = dir / (vsHex + ".vso");
+    std::vector<uint8_t> metaBytes, objBytes;
+    if (!readFileBytes(metaPath, metaBytes) || metaBytes.size() != sizeof(CachedVSMeta)) return false;
+    CachedVSMeta vsMeta{};
+    std::memcpy(&vsMeta, metaBytes.data(), sizeof(CachedVSMeta));
+    if (vsMeta.magic != CachedVSMeta{}.magic || vsMeta.simdWidth != targetW) return false;
+    if (!readFileBytes(objPath, objBytes) || objBytes.empty()) return false;
+
+    std::lock_guard<std::mutex> lock(rt.mu);
+    auto it = rt.vsMemCache.find(vsKey);
+    if (it != rt.vsMemCache.end() && it->second.vsAddr != 0 && it->second.meta.simdWidth == targetW) {
+        outVSMeta = it->second.meta;
+        outVSFn = reinterpret_cast<CompiledVertexFn>(it->second.vsAddr);
+        if (outVSInputs && !it->second.vsInputs.empty()) *outVSInputs = it->second.vsInputs;
+        if (outVSOutputs && !it->second.vsOutputs.empty()) *outVSOutputs = it->second.vsOutputs;
+        if (outVSOutputRecs && !it->second.vsOutputRecs.empty()) *outVSOutputRecs = it->second.vsOutputRecs;
+        return true;
+    }
+
+    uint64_t vsAddr = 0, dummy = 0;
+    std::string err;
+    if (!loadObjectIntoJitLocked(rt, objBytes.data(), objBytes.size(), vsKey + ".vso", vsSym, "", vsAddr, dummy, err)) {
+        return false;
+    }
+
+    InMemVSCacheEntry entry;
+    entry.meta = vsMeta;
+    entry.vsAddr = vsAddr;
+    entry.tier2Done = true;
+    entry.objBytes = std::move(objBytes);
+    rt.vsMemCache[vsKey] = std::move(entry);
+    outVSMeta = vsMeta;
+    outVSFn = reinterpret_cast<CompiledVertexFn>(vsAddr);
+    return true;
+}
+
 bool tryLoadGraphicsPSOFromCache(
     uint64_t hashLo, uint64_t hashHi,
     const std::string& vsSym,
@@ -902,7 +1036,10 @@ bool tryLoadGraphicsPSOFromCache(
             (it->second.meta.hasMS ? (it->second.msAddr != 0) : (it->second.addr0 != 0)) &&
             (psSym.empty() || it->second.addr1 != 0) &&
             it->second.meta.simdWidth == targetW) {
-            applyGraphicsMeta(it->second.meta, vsSym, psSym, it->second.addr0, it->second.addr1, it->second.gsAddr,
+            std::string effVsSym = (it->second.meta.separateVSObject != 0)
+                                       ? ("nacelle_vs_" + hashToHex128(it->second.meta.vsHashLo, it->second.meta.vsHashHi))
+                                       : vsSym;
+            applyGraphicsMeta(it->second.meta, effVsSym, psSym, it->second.addr0, it->second.addr1, it->second.gsAddr,
                               it->second.hsAddr, it->second.hsPcAddr, it->second.dsAddr,
                               it->second.msAddr, it->second.asAddr, outPSO);
             return true;
@@ -917,6 +1054,33 @@ bool tryLoadGraphicsPSOFromCache(
     std::memcpy(&meta, metaBytes.data(), sizeof(CachedPSOMeta));
     if (meta.magic != CachedPSOMeta{}.magic || meta.simdWidth != targetW) return false;
     if (!readFileBytes(objPath, objBytes) || objBytes.empty()) return false;
+
+    if (meta.separateVSObject != 0) {
+        std::string sepVsSym = "nacelle_vs_" + hashToHex128(meta.vsHashLo, meta.vsHashHi);
+        CachedVSMeta vsMeta{};
+        CompiledVertexFn vsFnPtr = nullptr;
+        if (!tryLoadVertexStageFromCache(meta.vsHashLo, meta.vsHashHi, sepVsSym, vsMeta, vsFnPtr)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto it = rt.memCache.find(key);
+        if (it != rt.memCache.end() && it->second.addr0 != 0 && (psSym.empty() || it->second.addr1 != 0) &&
+            it->second.meta.simdWidth == targetW) {
+            applyGraphicsMeta(it->second.meta, sepVsSym, psSym, it->second.addr0, it->second.addr1, 0, 0, 0, 0, 0, 0, outPSO);
+            return true;
+        }
+
+        uint64_t psAddr = 0, dummy = 0;
+        std::string err;
+        if (!loadObjectIntoJitLocked(rt, objBytes.data(), objBytes.size(), key + ".o", psSym, "", psAddr, dummy, err)) {
+            return false;
+        }
+        uint64_t vsAddr = reinterpret_cast<uint64_t>(vsFnPtr);
+        rt.memCache[key] = InMemCacheEntry{meta, vsAddr, psAddr, 0, 0, 0, 0, 0, 0, std::move(objBytes)};
+        applyGraphicsMeta(meta, sepVsSym, psSym, vsAddr, psAddr, 0, 0, 0, 0, 0, 0, outPSO);
+        return true;
+    }
 
     std::lock_guard<std::mutex> lock(rt.mu);
     auto it = rt.memCache.find(key);
@@ -1207,6 +1371,254 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     return true;
 }
 
+bool jitCompileVertexStageTier1AndScheduleTier2(
+    std::unique_ptr<llvm::Module> llvmMod,
+    std::unique_ptr<llvm::LLVMContext> llvmCtx,
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& vsSym,
+    const CachedVSMeta& vsMeta,
+    const std::vector<ShaderSigElement>& vsInputs,
+    const std::vector<ShaderSigElement>& vsOutputs,
+    const std::vector<DxilSigRecord>& vsOutputRecs,
+    CompiledGraphicsPSO& outPSO,
+    std::string& outError) {
+    g_vertexStageCompileCount.fetch_add(1, std::memory_order_relaxed);
+    JitRuntime& rt = getJitRuntime();
+    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
+    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+
+    llvm::SmallString<0> bcBytes;
+    if (scheduleTier2) {
+        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::WriteBitcodeToFile(*llvmMod, bcOS);
+    }
+
+    runTier1Optimize(*llvmMod);
+
+    std::filesystem::path cacheDir = getCacheDirectory();
+    std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
+    std::string vsKey = (cacheDir / vsHex).string();
+    uint64_t vsAddr = 0;
+    bool launchedTier2 = false;
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto existing = rt.vsMemCache.find(vsKey);
+        if (existing != rt.vsMemCache.end() && existing->second.vsAddr != 0) {
+            vsAddr = existing->second.vsAddr;
+        } else {
+            ensureLLJITLocked(rt, outError);
+            if (!rt.jit) return false;
+            auto jdOrErr = createIsolatedDylibLocked(rt);
+            if (!jdOrErr) {
+                outError = llvm::toString(jdOrErr.takeError());
+                return false;
+            }
+            llvm::orc::JITDylib& jd = *jdOrErr;
+            if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
+                outError = llvm::toString(std::move(err));
+                return false;
+            }
+            auto symOrErr = rt.jit->lookup(jd, vsSym);
+            if (!symOrErr) {
+                outError = llvm::toString(symOrErr.takeError());
+                return false;
+            }
+            vsAddr = symOrErr->getValue();
+
+            InMemVSCacheEntry entry;
+            entry.meta = vsMeta;
+            entry.vsAddr = vsAddr;
+            entry.tier2Done = !scheduleTier2;
+            entry.vsInputs = vsInputs;
+            entry.vsOutputs = vsOutputs;
+            entry.vsOutputRecs = vsOutputRecs;
+            rt.vsMemCache[vsKey] = std::move(entry);
+            launchedTier2 = scheduleTier2;
+        }
+    }
+
+    outPSO.vsSymbolName = vsSym;
+    outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
+
+    if (launchedTier2) {
+        std::string bcStr(bcBytes.data(), bcBytes.size());
+        ensureTier2PoolReady(rt).detach_task([vsMeta, vsHashLo, vsHashHi, vsSym, cacheDir, vsHex, vsKey, bcStr = std::move(bcStr)]() {
+            auto ctx2 = std::make_unique<llvm::LLVMContext>();
+            auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, vsHex + ".bc", false);
+            auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
+            if (!modOrErr) {
+                llvm::consumeError(modOrErr.takeError());
+                return;
+            }
+            std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
+            llvm::SmallVector<char, 0> objBytes;
+            std::string err;
+            if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+
+            JitRuntime& rt = getJitRuntime();
+            uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
+            writeFileAtomic(cacheDir / (vsHex + ".vso"), objBytes.data(), objBytes.size(), tId);
+            writeFileAtomic(cacheDir / (vsHex + ".vsmeta"), &vsMeta, sizeof(CachedVSMeta), tId);
+
+            uint64_t tier2VSAddr = 0, dummy = 0;
+            std::vector<std::shared_ptr<PsoUpdateBox>> waiters;
+            {
+                std::lock_guard<std::mutex> lock(rt.mu);
+                if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
+                                             objBytes.size(), vsKey + ".vso", vsSym, "", tier2VSAddr, dummy, err)) {
+                    return;
+                }
+                auto& entry = rt.vsMemCache[vsKey];
+                entry.meta = vsMeta;
+                entry.vsAddr = tier2VSAddr;
+                entry.tier2Done = true;
+                entry.objBytes.assign(reinterpret_cast<const uint8_t*>(objBytes.begin()),
+                                      reinterpret_cast<const uint8_t*>(objBytes.end()));
+                waiters.swap(entry.waiters);
+                for (auto& kv : rt.memCache) {
+                    if (kv.second.meta.separateVSObject != 0 &&
+                        kv.second.meta.vsHashLo == vsHashLo &&
+                        kv.second.meta.vsHashHi == vsHashHi) {
+                        kv.second.addr0 = tier2VSAddr;
+                    }
+                }
+            }
+
+            for (const auto& w : waiters) {
+                if (!w) continue;
+                std::lock_guard<std::mutex> psoLock(w->mu);
+                if (w->gs) {
+                    w->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(tier2VSAddr), std::memory_order_release);
+                }
+            }
+        });
+    }
+
+    return true;
+}
+
+bool jitCompilePixelStageTier1AndScheduleTier2(
+    std::unique_ptr<llvm::Module> llvmMod,
+    std::unique_ptr<llvm::LLVMContext> llvmCtx,
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& psSym,
+    const CachedPSOMeta& meta,
+    CompiledGraphicsPSO& outPSO,
+    std::string& outError) {
+    JitRuntime& rt = getJitRuntime();
+    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
+    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+
+    llvm::SmallString<0> bcBytes;
+    if (scheduleTier2) {
+        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::WriteBitcodeToFile(*llvmMod, bcOS);
+    }
+
+    runTier1Optimize(*llvmMod);
+
+    std::filesystem::path cacheDir = getCacheDirectory();
+    std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
+    std::string vsKey = (cacheDir / vsHex).string();
+
+    auto box = std::make_shared<PsoUpdateBox>();
+    box->gs = &outPSO;
+    outPSO.asyncBox = box;
+
+    uint64_t psAddr = 0;
+    uint64_t latestVSAddr = 0;
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        ensureLLJITLocked(rt, outError);
+        if (!rt.jit) return false;
+        auto jdOrErr = createIsolatedDylibLocked(rt);
+        if (!jdOrErr) {
+            outError = llvm::toString(jdOrErr.takeError());
+            return false;
+        }
+        llvm::orc::JITDylib& jd = *jdOrErr;
+        if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
+            outError = llvm::toString(std::move(err));
+            return false;
+        }
+        auto symOrErr = rt.jit->lookup(jd, psSym);
+        if (!symOrErr) {
+            outError = llvm::toString(symOrErr.takeError());
+            return false;
+        }
+        psAddr = symOrErr->getValue();
+
+        auto vsIt = rt.vsMemCache.find(vsKey);
+        if (vsIt != rt.vsMemCache.end()) {
+            latestVSAddr = vsIt->second.vsAddr;
+            if (!vsIt->second.tier2Done) {
+                vsIt->second.waiters.push_back(box);
+            }
+        }
+    }
+
+    if (latestVSAddr != 0) {
+        outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(latestVSAddr), std::memory_order_release);
+    }
+    outPSO.psSymbolName = psSym;
+    outPSO.psFn.store(reinterpret_cast<CompiledPixelQuadFn>(psAddr), std::memory_order_release);
+
+    if (!scheduleTier2) {
+        return true;
+    }
+
+    std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
+    std::string bcStr(bcBytes.data(), bcBytes.size());
+
+    ensureTier2PoolReady(rt).detach_task([box, meta, psSym, cacheDir, hex, vsKey, bcStr = std::move(bcStr)]() {
+        auto ctx2 = std::make_unique<llvm::LLVMContext>();
+        auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
+        auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
+        if (!modOrErr) {
+            llvm::consumeError(modOrErr.takeError());
+            return;
+        }
+        std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
+        llvm::SmallVector<char, 0> objBytes;
+        std::string err;
+        if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+
+        JitRuntime& rt = getJitRuntime();
+        uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
+        writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
+        writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+
+        uint64_t tier2PSAddr = 0, dummy = 0;
+        uint64_t curVSAddr = 0;
+        {
+            std::lock_guard<std::mutex> lock(rt.mu);
+            std::string key = (cacheDir / hex).string();
+            if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
+                                         objBytes.size(), key + ".o", psSym, "", tier2PSAddr, dummy, err)) {
+                return;
+            }
+            auto vsIt = rt.vsMemCache.find(vsKey);
+            if (vsIt != rt.vsMemCache.end()) {
+                curVSAddr = vsIt->second.vsAddr;
+            }
+            rt.memCache[key] = InMemCacheEntry{
+                meta, curVSAddr, tier2PSAddr, 0, 0, 0, 0, 0, 0,
+                std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(objBytes.begin()),
+                                     reinterpret_cast<const uint8_t*>(objBytes.end()))};
+        }
+
+        std::lock_guard<std::mutex> psoLock(box->mu);
+        if (box->gs) {
+            if (curVSAddr != 0) {
+                box->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(curVSAddr), std::memory_order_release);
+            }
+            box->gs->psFn.store(reinterpret_cast<CompiledPixelQuadFn>(tier2PSAddr), std::memory_order_release);
+        }
+    });
+
+    return true;
+}
+
 bool compileComputePSO(
     const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc,
     const RootSignatureLayout& rootLayout,
@@ -1305,6 +1717,12 @@ void clearInMemoryPSOCacheForTesting() {
     JitRuntime& rt = getJitRuntime();
     std::lock_guard<std::mutex> lock(rt.mu);
     rt.memCache.clear();
+    rt.vsMemCache.clear();
+    g_vertexStageCompileCount.store(0, std::memory_order_relaxed);
+}
+
+uint64_t getVertexStageCompileCount() {
+    return g_vertexStageCompileCount.load(std::memory_order_relaxed);
 }
 
 bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>& outBlob) {
@@ -1338,10 +1756,52 @@ bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>&
     }
 
     uint32_t objLen = static_cast<uint32_t>(objBytes.size());
-    outBlob.resize(sizeof(CachedPSOMeta) + sizeof(uint32_t) + objLen);
-    std::memcpy(outBlob.data(), &meta, sizeof(CachedPSOMeta));
-    std::memcpy(outBlob.data() + sizeof(CachedPSOMeta), &objLen, sizeof(uint32_t));
-    std::memcpy(outBlob.data() + sizeof(CachedPSOMeta) + sizeof(uint32_t), objBytes.data(), objLen);
+    if (meta.separateVSObject == 0) {
+        outBlob.resize(sizeof(CachedPSOMeta) + sizeof(uint32_t) + objLen);
+        std::memcpy(outBlob.data(), &meta, sizeof(CachedPSOMeta));
+        std::memcpy(outBlob.data() + sizeof(CachedPSOMeta), &objLen, sizeof(uint32_t));
+        std::memcpy(outBlob.data() + sizeof(CachedPSOMeta) + sizeof(uint32_t), objBytes.data(), objLen);
+        return true;
+    }
+
+    std::string vsHex = hashToHex128(meta.vsHashLo, meta.vsHashHi);
+    std::string vsKey = (dir / vsHex).string();
+    CachedVSMeta vsMeta{};
+    std::vector<uint8_t> vsObjBytes;
+    bool vsFound = false;
+    {
+        JitRuntime& rt = getJitRuntime();
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto vit = rt.vsMemCache.find(vsKey);
+        if (vit != rt.vsMemCache.end() && !vit->second.objBytes.empty()) {
+            vsMeta = vit->second.meta;
+            vsObjBytes = vit->second.objBytes;
+            vsFound = true;
+        }
+    }
+    if (!vsFound) {
+        std::vector<uint8_t> vsMetaBytes;
+        if (!readFileBytes(dir / (vsHex + ".vsmeta"), vsMetaBytes) || vsMetaBytes.size() != sizeof(CachedVSMeta)) {
+            return false;
+        }
+        std::memcpy(&vsMeta, vsMetaBytes.data(), sizeof(CachedVSMeta));
+        if (!readFileBytes(dir / (vsHex + ".vso"), vsObjBytes) || vsObjBytes.empty()) {
+            return false;
+        }
+    }
+
+    uint32_t vsObjLen = static_cast<uint32_t>(vsObjBytes.size());
+    size_t psoChunk = sizeof(CachedPSOMeta) + sizeof(uint32_t) + objLen;
+    size_t vsChunk = sizeof(CachedVSMeta) + sizeof(uint32_t) + vsObjLen;
+    outBlob.resize(psoChunk + vsChunk);
+    uint8_t* dst = outBlob.data();
+    std::memcpy(dst, &meta, sizeof(CachedPSOMeta));
+    std::memcpy(dst + sizeof(CachedPSOMeta), &objLen, sizeof(uint32_t));
+    std::memcpy(dst + sizeof(CachedPSOMeta) + sizeof(uint32_t), objBytes.data(), objLen);
+    dst += psoChunk;
+    std::memcpy(dst, &vsMeta, sizeof(CachedVSMeta));
+    std::memcpy(dst + sizeof(CachedVSMeta), &vsObjLen, sizeof(uint32_t));
+    std::memcpy(dst + sizeof(CachedVSMeta) + sizeof(uint32_t), vsObjBytes.data(), vsObjLen);
     return true;
 }
 
@@ -1352,12 +1812,32 @@ bool importCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, const uint8_t* data, 
     if (meta.magic != CachedPSOMeta{}.magic) return false;
     uint32_t objLen = 0;
     std::memcpy(&objLen, data + sizeof(CachedPSOMeta), sizeof(uint32_t));
-    if (sizeof(CachedPSOMeta) + sizeof(uint32_t) + objLen > size || objLen == 0) return false;
+    size_t psoChunk = sizeof(CachedPSOMeta) + sizeof(uint32_t) + objLen;
+    if (psoChunk > size || objLen == 0) return false;
 
     std::filesystem::path dir = getCacheDirectory();
     std::string hex = hashToHex128(hashLo, hashHi);
     uint64_t tId = getJitRuntime().tmpSeq.fetch_add(1, std::memory_order_relaxed);
     const uint8_t* objPtr = data + sizeof(CachedPSOMeta) + sizeof(uint32_t);
+
+    if (meta.separateVSObject != 0) {
+        if (psoChunk + sizeof(CachedVSMeta) + sizeof(uint32_t) > size) return false;
+        const uint8_t* vsBase = data + psoChunk;
+        CachedVSMeta vsMeta{};
+        std::memcpy(&vsMeta, vsBase, sizeof(CachedVSMeta));
+        if (vsMeta.magic != CachedVSMeta{}.magic) return false;
+        uint32_t vsObjLen = 0;
+        std::memcpy(&vsObjLen, vsBase + sizeof(CachedVSMeta), sizeof(uint32_t));
+        if (psoChunk + sizeof(CachedVSMeta) + sizeof(uint32_t) + vsObjLen > size || vsObjLen == 0) return false;
+
+        std::string vsHex = hashToHex128(meta.vsHashLo, meta.vsHashHi);
+        const uint8_t* vsObjPtr = vsBase + sizeof(CachedVSMeta) + sizeof(uint32_t);
+        if (!writeFileAtomic(dir / (vsHex + ".vsmeta"), &vsMeta, sizeof(CachedVSMeta), tId) ||
+            !writeFileAtomic(dir / (vsHex + ".vso"), vsObjPtr, vsObjLen, tId)) {
+            return false;
+        }
+    }
+
     bool ok1 = writeFileAtomic(dir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
     bool ok2 = writeFileAtomic(dir / (hex + ".o"), objPtr, objLen, tId);
     return ok1 && ok2;

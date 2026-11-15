@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -20,14 +21,33 @@ class ModuleOp;
 
 namespace nacelle {
 
+struct DxilSigRecord;
+
 struct PsoUpdateBox {
     std::mutex mu;
     CompiledComputePSO* cs = nullptr;
     CompiledGraphicsPSO* gs = nullptr;
 };
 
+struct CachedVSMeta {
+    uint32_t magic = 0x4E435653; // 'NCVS'
+    uint32_t simdWidth = 4;
+    uint32_t numVSOutputRegs = 0;
+    int32_t posOutputReg = 0;
+    uint32_t clipDistMask = 0;
+    uint32_t cullDistMask = 0;
+    uint32_t clipAttrOffset = 0;
+    uint32_t cullAttrOffset = 0;
+    uint8_t hasViewportArrayIndex = 0;
+    uint8_t hasPerPrimShadingRate = 0;
+    uint16_t reserved = 0;
+    uint32_t vpIndexAttrOffset = 0;
+    uint32_t shadingRateAttrOffset = 0;
+    uint32_t totalVSScalarAttrs = 0;
+};
+
 struct CachedPSOMeta {
-    uint32_t magic = 0x4E434C33; // 'NCL3'
+    uint32_t magic = 0x4E434C35; // 'NCL5'
     uint32_t simdWidth = 4;
     // Compute
     uint32_t threadGroupSize[3]{1, 1, 1};
@@ -73,10 +93,15 @@ struct CachedPSOMeta {
     uint32_t asThreadGroupSize[3]{1, 1, 1};
     uint32_t asGroupSharedBytes = 0;
     uint32_t asPayloadBytes = 0;
+    std::array<int16_t, 128> psInputFromVSSlot{};
+    uint8_t psUsesPerspBarycentrics = 0;
+    uint8_t separateVSObject = 0;
     uint8_t psWritesDepth = 0;
     uint8_t psUsesDiscard = 0;
     uint8_t psHasSideEffects = 0;
-    uint8_t reserved = 0;
+    uint8_t reserved[3]{};
+    uint64_t vsHashLo = 0;
+    uint64_t vsHashHi = 0;
 };
 
 /// Computes canonical 128-bit XXH3 hash (hex string + hi/lo) for compute or graphics PSO inputs.
@@ -95,6 +120,12 @@ void computeGraphicsPSOHash(
     uint64_t& outLo,
     uint64_t& outHi,
     const MeshShaderStages& meshStages = {});
+void computeVertexStageHash(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    uint64_t& outLo,
+    uint64_t& outHi);
 
 /// Converts lowered MLIR (SCF/Vector/Arith/Math/Func/LLVM) into LLVM IR and links texture_sampler.bc if referenced.
 std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
@@ -114,7 +145,16 @@ bool tryLoadGraphicsPSOFromCache(
     const std::string& psSym,
     CompiledGraphicsPSO& outPSO);
 
-/// Compiles `llvmMod` at Tier-1 (-O1) synchronously for immediate execution and schedules async Tier-2 (-O3)
+bool tryLoadVertexStageFromCache(
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& vsSym,
+    CachedVSMeta& outVSMeta,
+    CompiledVertexFn& outVSFn,
+    std::vector<ShaderSigElement>* outVSInputs = nullptr,
+    std::vector<ShaderSigElement>* outVSOutputs = nullptr,
+    std::vector<DxilSigRecord>* outVSOutputRecs = nullptr);
+
+/// Compiles `llvmMod` at Tier-1 synchronously for immediate execution and schedules async Tier-2 (-O3)
 /// optimization + disk cache `.o` emission on the JIT background thread pool.
 bool jitCompileComputeTier1AndScheduleTier2(
     std::unique_ptr<llvm::Module> llvmMod,
@@ -133,7 +173,29 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     CompiledGraphicsPSO& outPSO,
     std::string& outError);
 
+bool jitCompileVertexStageTier1AndScheduleTier2(
+    std::unique_ptr<llvm::Module> llvmMod,
+    std::unique_ptr<llvm::LLVMContext> llvmCtx,
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& vsSym,
+    const CachedVSMeta& vsMeta,
+    const std::vector<ShaderSigElement>& vsInputs,
+    const std::vector<ShaderSigElement>& vsOutputs,
+    const std::vector<DxilSigRecord>& vsOutputRecs,
+    CompiledGraphicsPSO& outPSO,
+    std::string& outError);
+
+bool jitCompilePixelStageTier1AndScheduleTier2(
+    std::unique_ptr<llvm::Module> llvmMod,
+    std::unique_ptr<llvm::LLVMContext> llvmCtx,
+    uint64_t vsHashLo, uint64_t vsHashHi,
+    const std::string& psSym,
+    const CachedPSOMeta& meta,
+    CompiledGraphicsPSO& outPSO,
+    std::string& outError);
+
 void clearInMemoryPSOCacheForTesting();
+uint64_t getVertexStageCompileCount();
 bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>& outBlob);
 bool importCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, const uint8_t* data, size_t size);
 

@@ -42,6 +42,7 @@ function(add_hlsl_spirv hlsl_name profile entry out_name)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fspv-target-env=vulkan1.1
                 -fvk-t-shift 0 0 -fvk-u-shift 8 0 -fvk-b-shift 16 0
+                ${ARGN}
                 -T ${profile} -E ${entry} -O3 -Fo "${dst}" "${src}"
         DEPENDS "${src}"
         COMMENT "Compiling HLSL -> SPIR-V: ${hlsl_name} (${profile}, ${entry}) -> ${out_name}"
@@ -118,7 +119,7 @@ add_hlsl_dxil(tiled_resources.hlsl cs_6_2 PartiallyMappedCS tiled_partially_mapp
 add_hlsl_dxil(tiled_resources.hlsl cs_6_2 DivergentTiledBufferCS tiled_divergent_buf_cs.dxil)
 add_hlsl_dxil(tiled_resources.hlsl cs_6_2 TiledTextureCS tiled_texture_cs.dxil)
 
-# Cross-backend benchmark shader (DXIL + SPIR-V)
+# Cross-backend benchmark shaders (DXIL + SPIR-V)
 add_hlsl_dxil(bench_raymarch.hlsl cs_6_0 main bench_raymarch.dxil)
 add_hlsl_spirv(bench_raymarch.hlsl cs_6_0 main bench_raymarch.spv)
 add_hlsl_spirv(matmul.hlsl cs_6_0 CSMain matmul.spv)
@@ -131,6 +132,10 @@ add_hlsl_dxil(bench_vertex_stress.hlsl vs_6_0 VSMain bench_vertex_stress_vs.dxil
 add_hlsl_dxil(bench_vertex_stress.hlsl ps_6_0 PSMain bench_vertex_stress_ps.dxil)
 add_hlsl_spirv(bench_vertex_stress.hlsl vs_6_0 VSMain bench_vertex_stress_vs.spv)
 add_hlsl_spirv(bench_vertex_stress.hlsl ps_6_0 PSMain bench_vertex_stress_ps.spv)
+add_hlsl_dxil(bench_vertex_mesh.hlsl vs_6_0 VSMain bench_vertex_mesh_vs.dxil)
+add_hlsl_dxil(bench_vertex_mesh.hlsl ps_6_0 PSMain bench_vertex_mesh_ps.dxil)
+add_hlsl_spirv(bench_vertex_mesh.hlsl vs_6_0 VSMain bench_vertex_mesh_vs.spv -fvk-invert-y)
+add_hlsl_spirv(bench_vertex_mesh.hlsl ps_6_0 PSMain bench_vertex_mesh_ps.spv)
 add_hlsl_dxil(bench_geometry_stress.hlsl vs_6_0 VSMain bench_geometry_stress_vs.dxil)
 add_hlsl_dxil(bench_geometry_stress.hlsl gs_6_0 GSMain bench_geometry_stress_gs.dxil)
 add_hlsl_dxil(bench_geometry_stress.hlsl ps_6_0 PSMain bench_geometry_stress_ps.dxil)
@@ -149,6 +154,9 @@ add_hlsl_spirv(disco_maze.hlsl ps_6_0 PSMain disco_maze.spv)
 # Graphics shaders (DXIL)
 add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSMain raster_basic_vs.dxil)
 add_hlsl_dxil(raster_basic.hlsl ps_6_0 PSMain raster_basic_ps.dxil)
+add_hlsl_dxil(raster_basic.hlsl ps_6_0 PSAltTintMain raster_alt_tint_ps.dxil)
+add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSPackedInstMain raster_packed_inst_vs.dxil)
+add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSHeavyTransformMain raster_heavy_transform_vs.dxil)
 add_hlsl_dxil(shadow_depth.hlsl vs_6_0 VSMain shadow_depth_vs.dxil)
 add_hlsl_dxil(pbr_mrt.hlsl vs_6_0 VSMain pbr_mrt_vs.dxil)
 add_hlsl_dxil(pbr_mrt.hlsl ps_6_0 PSMain pbr_mrt_ps.dxil)

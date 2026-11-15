@@ -99,6 +99,10 @@ uint32_t formatByteSizeForVertex(DXGI_FORMAT fmt) {
     case DXGI_FORMAT_R8G8B8A8_UINT:
     case DXGI_FORMAT_R8G8B8A8_SNORM:
     case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
     case DXGI_FORMAT_R16G16_FLOAT:
     case DXGI_FORMAT_R16G16_UNORM:
     case DXGI_FORMAT_R16G16_UINT:
@@ -110,11 +114,18 @@ uint32_t formatByteSizeForVertex(DXGI_FORMAT fmt) {
         return 4;
     case DXGI_FORMAT_R8G8_UNORM:
     case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8G8_SINT:
     case DXGI_FORMAT_R16_FLOAT:
     case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_SINT:
         return 2;
     case DXGI_FORMAT_R8_UNORM:
     case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
         return 1;
     default:
         return 16;
@@ -360,7 +371,18 @@ void cloneGlobalsIntoModule(mlir::ModuleOp srcMod, mlir::ModuleOp dstMod) {
     }
 }
 
-mlir::Value decodeVertexComponent(
+struct LinkedVSSigSlot {
+    int32_t psTargetRow = -1;
+    uint32_t psStartCol = 0;
+};
+
+struct PredecodedVertexElement {
+    bool valid = false;
+    mlir::Value compsF32[4]{};
+    mlir::Value compsI32[4]{};
+};
+
+PredecodedVertexElement predecodeVertexElementSIMD(
     IRHelpers& h,
     const D3D12_INPUT_ELEMENT_DESC& el,
     mlir::Value activeMask,
@@ -369,52 +391,66 @@ mlir::Value decodeVertexComponent(
     mlir::Value vbSizeVec,
     mlir::Value idxVec,
     uint32_t byteOffsetInElem,
-    uint32_t col,
-    bool wantInt) {
+    uint8_t neededColsMask) {
+    PredecodedVertexElement res;
+    res.valid = true;
     mlir::OpBuilder& b = h.b;
     mlir::Location loc = h.loc;
-    uint32_t W = h.W;
+    auto i8Ty = h.i8Ty();
+    auto i16Ty = h.i16Ty();
+    auto i32Ty = h.i32Ty();
+    auto i64Ty = h.i64Ty();
+    auto f16Ty = h.f16Ty();
+    auto f32Ty = h.f32Ty();
+    auto ptrTy = h.ptrTy();
+
+    mlir::Value zeroI32 = h.splatInt(i32Ty, 0);
+    mlir::Value zeroF32 = h.splatFlt(0.0);
+    mlir::Value oneF32 = h.splatFlt(1.0);
+    for (uint32_t c = 0; c < 4; ++c) {
+        res.compsF32[c] = (c == 3) ? oneF32 : zeroF32;
+        res.compsI32[c] = zeroI32;
+    }
+    if (neededColsMask == 0) return res;
+
     uint32_t fmtBytes = formatByteSizeForVertex(el.Format);
-    float defaultF = (col == 3) ? 1.0f : 0.0f;
-    mlir::Value outVec = wantInt ? h.splatInt(h.i32Ty(), 0) : h.splatFlt(defaultF);
+    mlir::Value idx64Vec = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i64Ty), idxVec);
+    mlir::Value str64Vec = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i64Ty), vbStrideVec);
+    mlir::Value off64Vec = mlir::arith::AddIOp::create(
+        b, loc,
+        mlir::arith::MulIOp::create(b, loc, idx64Vec, str64Vec),
+        h.splatInt(i64Ty, byteOffsetInElem));
+    mlir::Value end64Vec = mlir::arith::AddIOp::create(b, loc, off64Vec, h.splatInt(i64Ty, fmtBytes));
+    mlir::Value sz64Vec = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i64Ty), vbSizeVec);
+    mlir::Value inBoundsVec = mlir::arith::CmpIOp::create(
+        b, loc, mlir::arith::CmpIPredicate::ule, end64Vec, sz64Vec);
+    mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
+        b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtr, mlir::LLVM::ZeroOp::create(b, loc, ptrTy));
+    mlir::Value ptrNotNullVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(h.i1Ty()), ptrNotNull);
+    mlir::Value laneOkMask = mlir::arith::AndIOp::create(
+        b, loc, mlir::arith::AndIOp::create(b, loc, activeMask, ptrNotNullVec), inBoundsVec);
 
-    auto activePerLaneLoad = [&](auto loadScalarFn) -> mlir::Value {
-        mlir::Value res = outVec;
-        for (uint32_t l = 0; l < W; ++l) {
-            mlir::Value actL = mlir::vector::ExtractOp::create(b, loc, activeMask, static_cast<int64_t>(l));
-            mlir::Value idxL = mlir::vector::ExtractOp::create(b, loc, idxVec, static_cast<int64_t>(l));
-            mlir::Value strL = mlir::vector::ExtractOp::create(b, loc, vbStrideVec, static_cast<int64_t>(l));
-            mlir::Value szL = mlir::vector::ExtractOp::create(b, loc, vbSizeVec, static_cast<int64_t>(l));
+    auto gatherElem = [&](mlir::Type elemTy, int64_t deltaBytes, mlir::Value passThruVec) -> mlir::Value {
+        mlir::Value compBase = h.gepBytes(vbBasePtr, deltaBytes);
+        mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
+            b, loc, h.vecTy(ptrTy), i8Ty, compBase, mlir::ValueRange{off64Vec});
+        return mlir::LLVM::masked_gather::create(
+            b, loc, h.vecTy(elemTy), ptrVec, laneOkMask, mlir::ValueRange{passThruVec}, /*alignment=*/1);
+    };
 
-            mlir::Value idx64 = mlir::arith::ExtUIOp::create(b, loc, h.i64Ty(), idxL);
-            mlir::Value str64 = mlir::arith::ExtUIOp::create(b, loc, h.i64Ty(), strL);
-            mlir::Value off64 = mlir::arith::AddIOp::create(
-                b, loc,
-                mlir::arith::MulIOp::create(b, loc, idx64, str64),
-                h.cInt(h.i64Ty(), byteOffsetInElem));
-            mlir::Value end64 = mlir::arith::AddIOp::create(b, loc, off64, h.cInt(h.i64Ty(), fmtBytes));
-            mlir::Value sz64 = mlir::arith::ExtUIOp::create(b, loc, h.i64Ty(), szL);
-            mlir::Value inBounds = mlir::arith::CmpIOp::create(b, loc, mlir::arith::CmpIPredicate::ule, end64, sz64);
-            mlir::Value ptrNotNull = mlir::LLVM::ICmpOp::create(
-                b, loc, mlir::LLVM::ICmpPredicate::ne, vbBasePtr, mlir::LLVM::ZeroOp::create(b, loc, h.ptrTy()));
-            mlir::Value ok = mlir::arith::AndIOp::create(b, loc, mlir::arith::AndIOp::create(b, loc, actL, ptrNotNull), inBounds);
-
-            auto ifOp = mlir::scf::IfOp::create(
-                b, loc, ok,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value addr = mlir::LLVM::GEPOp::create(nb, nloc, h.ptrTy(), h.i8Ty(), vbBasePtr, mlir::ValueRange{off64});
-                    mlir::Value val = loadScalarFn(nb, nloc, addr);
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value defV = wantInt
-                                           ? mlir::arith::ConstantIntOp::create(nb, nloc, h.i32Ty(), 0).getResult()
-                                           : mlir::arith::ConstantFloatOp::create(nb, nloc, h.f32Ty(), llvm::APFloat(defaultF)).getResult();
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{defV});
-                });
-            res = mlir::vector::InsertOp::create(b, loc, ifOp.getResult(0), res, static_cast<int64_t>(l));
+    auto setFromFloat = [&](uint32_t c, mlir::Value fv, bool applyOobAlphaDefault) {
+        if (c == 3 && applyOobAlphaDefault) {
+            fv = mlir::arith::SelectOp::create(b, loc, laneOkMask, fv, oneF32);
         }
-        return res;
+        res.compsF32[c] = fv;
+        mlir::Value asInt = mlir::arith::BitcastOp::create(b, loc, h.vecTy(i32Ty), fv);
+        res.compsI32[c] = mlir::arith::SelectOp::create(b, loc, laneOkMask, asInt, zeroI32);
+    };
+
+    auto setFromInt = [&](uint32_t c, mlir::Value iv) {
+        res.compsI32[c] = iv;
+        mlir::Value asFlt = mlir::arith::BitcastOp::create(b, loc, h.vecTy(f32Ty), iv);
+        res.compsF32[c] = (c == 3) ? mlir::arith::SelectOp::create(b, loc, laneOkMask, asFlt, oneF32).getResult() : asFlt;
     };
 
     switch (el.Format) {
@@ -422,16 +458,14 @@ mlir::Value decodeVertexComponent(
     case DXGI_FORMAT_R32G32B32_FLOAT:
     case DXGI_FORMAT_R32G32_FLOAT:
     case DXGI_FORMAT_R32_FLOAT: {
-        uint32_t maxComps = (el.Format == DXGI_FORMAT_R32_FLOAT) ? 1 :
-                            (el.Format == DXGI_FORMAT_R32G32_FLOAT) ? 2 :
-                            (el.Format == DXGI_FORMAT_R32G32B32_FLOAT) ? 3 : 4;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col * 4)});
-            mlir::Value v = mlir::LLVM::LoadOp::create(nb, nloc, wantInt ? h.i32Ty() : h.f32Ty(), p);
-            return v;
-        });
+        uint32_t maxComps = fmtBytes / 4;
+        for (uint32_t c = 0; c < maxComps; ++c) {
+            if (!(neededColsMask & (1u << c))) continue;
+            mlir::Value defF = (c == 3) ? oneF32 : zeroF32;
+            mlir::Value fv = gatherElem(f32Ty, static_cast<int64_t>(c * 4), defF);
+            setFromFloat(c, fv, /*applyOobAlphaDefault=*/false);
+        }
+        break;
     }
     case DXGI_FORMAT_R32G32B32A32_UINT:
     case DXGI_FORMAT_R32G32B32A32_SINT:
@@ -442,79 +476,628 @@ mlir::Value decodeVertexComponent(
     case DXGI_FORMAT_R32_UINT:
     case DXGI_FORMAT_R32_SINT: {
         uint32_t maxComps = fmtBytes / 4;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col * 4)});
-            mlir::Value v = mlir::LLVM::LoadOp::create(nb, nloc, h.i32Ty(), p);
-            if (!wantInt) v = mlir::arith::BitcastOp::create(nb, nloc, h.f32Ty(), v);
-            return v;
-        });
+        for (uint32_t c = 0; c < maxComps; ++c) {
+            if (!(neededColsMask & (1u << c))) continue;
+            mlir::Value iv = gatherElem(i32Ty, static_cast<int64_t>(c * 4), zeroI32);
+            setFromInt(c, iv);
+        }
+        break;
     }
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
     case DXGI_FORMAT_R16G16_FLOAT:
     case DXGI_FORMAT_R16_FLOAT: {
-        uint32_t maxComps = fmtBytes / 2;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col * 2)});
-            mlir::Value hv = mlir::LLVM::LoadOp::create(nb, nloc, h.f16Ty(), p);
-            return mlir::arith::ExtFOp::create(nb, nloc, h.f32Ty(), hv).getResult();
-        });
+        if (el.Format == DXGI_FORMAT_R16_FLOAT) {
+            if (neededColsMask & 1u) {
+                mlir::Value zeroF16 = mlir::arith::BitcastOp::create(b, loc, h.vecTy(f16Ty), h.splatInt(i16Ty, 0));
+                mlir::Value hv = gatherElem(f16Ty, 0, zeroF16);
+                setFromFloat(0, mlir::arith::ExtFOp::create(b, loc, h.vecTy(f32Ty), hv, mlir::arith::FastMathFlagsAttr{}), false);
+            }
+        } else {
+            auto unpackPair = [&](mlir::Value raw32, uint32_t c0, uint32_t c1) {
+                if (neededColsMask & (1u << c0)) {
+                    mlir::Value lo16 = mlir::arith::TruncIOp::create(b, loc, h.vecTy(i16Ty), raw32);
+                    mlir::Value hv0 = mlir::arith::BitcastOp::create(b, loc, h.vecTy(f16Ty), lo16);
+                    setFromFloat(c0, mlir::arith::ExtFOp::create(b, loc, h.vecTy(f32Ty), hv0, mlir::arith::FastMathFlagsAttr{}), c0 == 3);
+                }
+                if (neededColsMask & (1u << c1)) {
+                    mlir::Value hi32 = mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, 16));
+                    mlir::Value hi16 = mlir::arith::TruncIOp::create(b, loc, h.vecTy(i16Ty), hi32);
+                    mlir::Value hv1 = mlir::arith::BitcastOp::create(b, loc, h.vecTy(f16Ty), hi16);
+                    setFromFloat(c1, mlir::arith::ExtFOp::create(b, loc, h.vecTy(f32Ty), hv1, mlir::arith::FastMathFlagsAttr{}), c1 == 3);
+                }
+            };
+            if (neededColsMask & 0x3u) {
+                unpackPair(gatherElem(i32Ty, 0, zeroI32), 0, 1);
+            }
+            if (fmtBytes == 8 && (neededColsMask & 0xCu)) {
+                unpackPair(gatherElem(i32Ty, 4, zeroI32), 2, 3);
+            }
+        }
+        break;
     }
     case DXGI_FORMAT_R16G16B16A16_UNORM:
     case DXGI_FORMAT_R16G16_UNORM:
-    case DXGI_FORMAT_R16_UNORM: {
-        uint32_t maxComps = fmtBytes / 2;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col * 2)});
-            mlir::Value u16 = mlir::LLVM::LoadOp::create(nb, nloc, h.i16Ty(), p);
-            mlir::Value fv = mlir::arith::UIToFPOp::create(nb, nloc, h.f32Ty(), u16);
-            mlir::Value scale = mlir::arith::ConstantFloatOp::create(nb, nloc, h.f32Ty(), llvm::APFloat(1.0f / 65535.0f));
-            return mlir::arith::MulFOp::create(nb, nloc, fv, scale).getResult();
-        });
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R16_SINT: {
+        bool isSigned = (el.Format == DXGI_FORMAT_R16G16B16A16_SNORM || el.Format == DXGI_FORMAT_R16G16_SNORM ||
+                         el.Format == DXGI_FORMAT_R16_SNORM || el.Format == DXGI_FORMAT_R16G16B16A16_SINT ||
+                         el.Format == DXGI_FORMAT_R16G16_SINT || el.Format == DXGI_FORMAT_R16_SINT);
+        bool isNorm = (el.Format == DXGI_FORMAT_R16G16B16A16_UNORM || el.Format == DXGI_FORMAT_R16G16_UNORM ||
+                       el.Format == DXGI_FORMAT_R16_UNORM || el.Format == DXGI_FORMAT_R16G16B16A16_SNORM ||
+                       el.Format == DXGI_FORMAT_R16G16_SNORM || el.Format == DXGI_FORMAT_R16_SNORM);
+        auto decode16 = [&](uint32_t c, mlir::Value raw32, bool highHalf) {
+            mlir::Value v32;
+            if (isSigned) {
+                mlir::Value shl = highHalf ? raw32 : mlir::arith::ShLIOp::create(b, loc, raw32, h.splatInt(i32Ty, 16)).getResult();
+                v32 = mlir::arith::ShRSIOp::create(b, loc, shl, h.splatInt(i32Ty, 16));
+            } else {
+                v32 = highHalf ? mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, 16)).getResult()
+                               : mlir::arith::AndIOp::create(b, loc, raw32, h.splatInt(i32Ty, 0xFFFF)).getResult();
+            }
+            if (isNorm) {
+                mlir::Value fv = isSigned
+                                     ? mlir::arith::SIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult()
+                                     : mlir::arith::UIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult();
+                fv = mlir::arith::MulFOp::create(b, loc, fv, h.splatFlt(isSigned ? (1.0 / 32767.0) : (1.0 / 65535.0)));
+                if (isSigned) fv = mlir::arith::MaximumFOp::create(b, loc, fv, h.splatFlt(-1.0));
+                setFromFloat(c, fv, c == 3);
+            } else {
+                setFromInt(c, v32);
+            }
+        };
+        if (fmtBytes == 2) {
+            if (neededColsMask & 1u) {
+                mlir::Value u16 = gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0));
+                mlir::Value raw32 = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i32Ty), u16);
+                decode16(0, raw32, false);
+            }
+        } else {
+            if (neededColsMask & 0x3u) {
+                mlir::Value rawLo = gatherElem(i32Ty, 0, zeroI32);
+                if (neededColsMask & 1u) decode16(0, rawLo, false);
+                if (neededColsMask & 2u) decode16(1, rawLo, true);
+            }
+            if (fmtBytes == 8 && (neededColsMask & 0xCu)) {
+                mlir::Value rawHi = gatherElem(i32Ty, 4, zeroI32);
+                if (neededColsMask & 4u) decode16(2, rawHi, false);
+                if (neededColsMask & 8u) decode16(3, rawHi, true);
+            }
+        }
+        break;
     }
     case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
     case DXGI_FORMAT_R8G8_UNORM:
-    case DXGI_FORMAT_R8_UNORM: {
-        uint32_t maxComps = fmtBytes;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col)});
-            mlir::Value u8 = mlir::LLVM::LoadOp::create(nb, nloc, h.i8Ty(), p);
-            mlir::Value fv = mlir::arith::UIToFPOp::create(nb, nloc, h.f32Ty(), u8);
-            mlir::Value scale = mlir::arith::ConstantFloatOp::create(nb, nloc, h.f32Ty(), llvm::APFloat(1.0f / 255.0f));
-            return mlir::arith::MulFOp::create(nb, nloc, fv, scale).getResult();
-        });
-    }
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8_SNORM:
     case DXGI_FORMAT_R8G8B8A8_UINT:
     case DXGI_FORMAT_R8G8_UINT:
-    case DXGI_FORMAT_R8_UINT: {
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R8_SINT: {
+        bool isBGRA = (el.Format == DXGI_FORMAT_B8G8R8A8_UNORM || el.Format == DXGI_FORMAT_B8G8R8X8_UNORM);
+        bool isBGRX = (el.Format == DXGI_FORMAT_B8G8R8X8_UNORM);
+        bool isSigned = (el.Format == DXGI_FORMAT_R8G8B8A8_SNORM || el.Format == DXGI_FORMAT_R8G8_SNORM ||
+                         el.Format == DXGI_FORMAT_R8_SNORM || el.Format == DXGI_FORMAT_R8G8B8A8_SINT ||
+                         el.Format == DXGI_FORMAT_R8G8_SINT || el.Format == DXGI_FORMAT_R8_SINT);
+        bool isNorm = (el.Format == DXGI_FORMAT_R8G8B8A8_UNORM || el.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                       el.Format == DXGI_FORMAT_B8G8R8X8_UNORM || el.Format == DXGI_FORMAT_R8G8_UNORM ||
+                       el.Format == DXGI_FORMAT_R8_UNORM || el.Format == DXGI_FORMAT_R8G8B8A8_SNORM ||
+                       el.Format == DXGI_FORMAT_R8G8_SNORM || el.Format == DXGI_FORMAT_R8_SNORM);
         uint32_t maxComps = fmtBytes;
-        if (col >= maxComps) return outVec;
-        return activePerLaneLoad([&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value addr) {
-            mlir::Value p = mlir::LLVM::GEPOp::create(
-                nb, nloc, h.ptrTy(), h.i8Ty(), addr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(col)});
-            mlir::Value u8 = mlir::LLVM::LoadOp::create(nb, nloc, h.i8Ty(), p);
-            mlir::Value u32 = mlir::arith::ExtUIOp::create(nb, nloc, h.i32Ty(), u8);
-            return wantInt ? u32 : mlir::arith::BitcastOp::create(nb, nloc, h.f32Ty(), u32).getResult();
-        });
+        mlir::Value raw32;
+        if (fmtBytes == 4) {
+            raw32 = gatherElem(i32Ty, 0, zeroI32);
+        } else if (fmtBytes == 2) {
+            raw32 = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i32Ty), gatherElem(i16Ty, 0, h.splatInt(i16Ty, 0)));
+        } else {
+            raw32 = mlir::arith::ExtUIOp::create(b, loc, h.vecTy(i32Ty), gatherElem(i8Ty, 0, h.splatInt(i8Ty, 0)));
+        }
+        for (uint32_t c = 0; c < maxComps; ++c) {
+            if (!(neededColsMask & (1u << c))) continue;
+            if (isBGRX && c == 3) {
+                setFromFloat(3, oneF32, false);
+                continue;
+            }
+            uint32_t byteIdx = (isBGRA && c == 0) ? 2u : ((isBGRA && c == 2) ? 0u : c);
+            mlir::Value v32;
+            if (isSigned) {
+                uint32_t shlAmt = 24u - byteIdx * 8u;
+                mlir::Value shl = (shlAmt > 0)
+                                      ? mlir::arith::ShLIOp::create(b, loc, raw32, h.splatInt(i32Ty, shlAmt)).getResult()
+                                      : raw32;
+                v32 = mlir::arith::ShRSIOp::create(b, loc, shl, h.splatInt(i32Ty, 24));
+            } else {
+                mlir::Value shr = (byteIdx > 0)
+                                      ? mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, byteIdx * 8u)).getResult()
+                                      : raw32;
+                v32 = (byteIdx == 3) ? shr : mlir::arith::AndIOp::create(b, loc, shr, h.splatInt(i32Ty, 0xFF)).getResult();
+            }
+            if (isNorm) {
+                mlir::Value fv = isSigned
+                                     ? mlir::arith::SIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult()
+                                     : mlir::arith::UIToFPOp::create(b, loc, h.vecTy(f32Ty), v32).getResult();
+                fv = mlir::arith::MulFOp::create(b, loc, fv, h.splatFlt(isSigned ? (1.0 / 127.0) : (1.0 / 255.0)));
+                if (isSigned) fv = mlir::arith::MaximumFOp::create(b, loc, fv, h.splatFlt(-1.0));
+                setFromFloat(c, fv, c == 3);
+            } else {
+                setFromInt(c, v32);
+            }
+        }
+        break;
+    }
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT: {
+        bool isNorm = (el.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+        mlir::Value raw32 = gatherElem(i32Ty, 0, zeroI32);
+        mlir::Value mask10 = h.splatInt(i32Ty, 0x3FF);
+        for (uint32_t c = 0; c < 4; ++c) {
+            if (!(neededColsMask & (1u << c))) continue;
+            mlir::Value u32;
+            if (c == 0) {
+                u32 = mlir::arith::AndIOp::create(b, loc, raw32, mask10);
+            } else if (c == 1) {
+                u32 = mlir::arith::AndIOp::create(b, loc, mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, 10)), mask10);
+            } else if (c == 2) {
+                u32 = mlir::arith::AndIOp::create(b, loc, mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, 20)), mask10);
+            } else {
+                u32 = mlir::arith::ShRUIOp::create(b, loc, raw32, h.splatInt(i32Ty, 30));
+            }
+            if (isNorm) {
+                mlir::Value fv = mlir::arith::UIToFPOp::create(b, loc, h.vecTy(f32Ty), u32);
+                fv = mlir::arith::MulFOp::create(b, loc, fv, h.splatFlt(c == 3 ? (1.0 / 3.0) : (1.0 / 1023.0)));
+                setFromFloat(c, fv, c == 3);
+            } else {
+                setFromInt(c, u32);
+            }
+        }
+        break;
     }
     default:
-        return outVec;
+        break;
     }
+    return res;
 }
 
-struct LinkedVSSigSlot {
-    int32_t psTargetRow = -1;
-    uint32_t psStartCol = 0;
+struct CanonicalVSLayoutInfo {
+    int32_t posOutputReg = 0;
+    uint32_t numVSOutputRegs = 0;
+    uint32_t numCanonicalAttrRegs = 0;
+    uint32_t clipDistMask = 0;
+    uint32_t cullDistMask = 0;
+    uint32_t clipAttrOffset = 0;
+    uint32_t cullAttrOffset = 0;
+    bool hasViewportArrayIndex = false;
+    uint32_t vpIndexAttrOffset = 0;
+    bool hasPerPrimShadingRate = false;
+    uint32_t shadingRateAttrOffset = 0;
+    uint32_t totalVSScalarAttrs = 0;
+    std::unordered_map<uint32_t, uint32_t> clipSigBaseIdx;
+    std::unordered_map<uint32_t, uint32_t> cullSigBaseIdx;
 };
 
+CanonicalVSLayoutInfo computeCanonicalVSLayout(const std::vector<DxilSigRecord>& vsOutputSigs) {
+    CanonicalVSLayoutInfo info;
+    for (const auto& vo : vsOutputSigs) {
+        if (vo.startRow < 64) {
+            info.numVSOutputRegs = std::max(info.numVSOutputRegs, vo.startRow + vo.rows);
+        }
+        if (vo.systemValueType == 3 && vo.startRow < 64) {
+            info.posOutputReg = static_cast<int32_t>(vo.startRow);
+        }
+        if (vo.systemValueType == 0 && vo.startRow < 32) {
+            info.numCanonicalAttrRegs = std::max(info.numCanonicalAttrRegs, vo.startRow + vo.rows);
+        }
+    }
+
+    uint32_t nextExtraAttr = info.numCanonicalAttrRegs * 4;
+    info.clipAttrOffset = nextExtraAttr;
+    uint32_t clipScalarCount = 0;
+    for (const auto& vo : vsOutputSigs) {
+        if (vo.systemValueType == 6) {
+            info.clipSigBaseIdx[vo.sigId] = clipScalarCount;
+            uint32_t count = std::min<uint32_t>(8u - clipScalarCount, vo.rows * vo.cols);
+            for (uint32_t k = 0; k < count; ++k) {
+                info.clipDistMask |= (1u << (clipScalarCount + k));
+            }
+            clipScalarCount += count;
+        }
+    }
+    nextExtraAttr += clipScalarCount;
+    info.cullAttrOffset = nextExtraAttr;
+    uint32_t cullScalarCount = 0;
+    for (const auto& vo : vsOutputSigs) {
+        if (vo.systemValueType == 7) {
+            info.cullSigBaseIdx[vo.sigId] = cullScalarCount;
+            uint32_t count = std::min<uint32_t>(8u - cullScalarCount, vo.rows * vo.cols);
+            for (uint32_t k = 0; k < count; ++k) {
+                info.cullDistMask |= (1u << (cullScalarCount + k));
+            }
+            cullScalarCount += count;
+        }
+    }
+    nextExtraAttr += cullScalarCount;
+    for (const auto& vo : vsOutputSigs) {
+        if (vo.systemValueType == 5 && !info.hasViewportArrayIndex) {
+            info.hasViewportArrayIndex = true;
+            info.vpIndexAttrOffset = nextExtraAttr++;
+        } else if (vo.systemValueType == 29 && !info.hasPerPrimShadingRate) {
+            info.hasPerPrimShadingRate = true;
+            info.shadingRateAttrOffset = nextExtraAttr++;
+        }
+    }
+    info.totalVSScalarAttrs = nextExtraAttr;
+    return info;
+}
+
+bool emitVertexStageFunction(
+    mlir::ModuleOp targetMod,
+    mlir::func::FuncOp vsSrcFunc,
+    const DxilLoadedShader& vsLoaded,
+    const RootSignatureLayout& vsEffectiveLayout,
+    const D3D12_INPUT_LAYOUT_DESC& inputLayout,
+    uint32_t simdWidth,
+    const std::string& vsSym,
+    bool hasTess,
+    bool hasGS,
+    const CanonicalVSLayoutInfo* canonicalLayout,
+    const std::unordered_map<uint32_t, LinkedVSSigSlot>* vsToNextMap,
+    std::string& outError) {
+    if (!vsSrcFunc || vsSrcFunc.getBody().empty()) {
+        outError = "Vertex shader entry function missing after MLIR SCF lift";
+        return false;
+    }
+
+    mlir::Location loc = targetMod.getLoc();
+    mlir::OpBuilder b(targetMod.getBody(), targetMod.getBody()->end());
+    IRHelpers h{b, loc, simdWidth};
+    auto ptrTy = h.ptrTy();
+    auto i32Ty = h.i32Ty();
+    auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
+    auto vsFn = mlir::func::FuncOp::create(b, loc, vsSym, fnTy);
+    mlir::Block* entry = vsFn.addEntryBlock();
+    b.setInsertionPointToEnd(entry);
+
+    mlir::Value rootCtx = entry->getArgument(0);
+    mlir::Value vertexIdsPtr = entry->getArgument(1);
+    mlir::Value instanceIdsPtr = entry->getArgument(2);
+    mlir::Value activeCount = entry->getArgument(3);
+    mlir::Value outPosXYZW = entry->getArgument(4);
+    mlir::Value outAttrs = entry->getArgument(5);
+
+    mlir::Value acVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), activeCount);
+    mlir::Value activeMask = mlir::arith::CmpIOp::create(
+        b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
+
+    // Branchless SIMD prologue: load padded W-lane vertexIds & instanceIds vectors and mask inactive lanes to 0.
+    mlir::Value zeroI32Vec = h.splatInt(i32Ty, 0);
+    mlir::Value vidVec = mlir::arith::SelectOp::create(
+        b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), vertexIdsPtr), zeroI32Vec);
+    mlir::Value iidVec = mlir::arith::SelectOp::create(
+        b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), instanceIdsPtr), zeroI32Vec);
+
+    // Resolve InputLayout offsets per slot and match against VS input signatures.
+    std::vector<uint32_t> elementByteOffsets(inputLayout.NumElements, 0);
+    uint32_t slotRunningOffset[16]{};
+    for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
+        const auto& el = inputLayout.pInputElementDescs[i];
+        UINT slot = std::min<UINT>(el.InputSlot, 15);
+        uint32_t off = (el.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT)
+                           ? slotRunningOffset[slot]
+                           : el.AlignedByteOffset;
+        elementByteOffsets[i] = off;
+        slotRunningOffset[slot] = off + formatByteSizeForVertex(el.Format);
+    }
+
+    std::unordered_map<uint32_t, UINT> sigToElemIdx;
+    std::vector<uint8_t> elemNeededCols(inputLayout.NumElements, 0);
+    for (const auto& sig : vsLoaded.inputSigs) {
+        if (sig.systemValueType != 0) continue;
+        std::string sigNameLower = toLowerAscii(sig.semanticName);
+        for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
+            const auto& el = inputLayout.pInputElementDescs[i];
+            if (el.SemanticName && toLowerAscii(el.SemanticName) == sigNameLower &&
+                el.SemanticIndex == sig.semanticIndex) {
+                sigToElemIdx[sig.sigId] = i;
+                uint8_t colMask = 0;
+                for (uint32_t c = 0; c < sig.cols && c < 4; ++c) {
+                    colMask |= static_cast<uint8_t>(1u << c);
+                }
+                elemNeededCols[i] |= (colMask != 0) ? colMask : 0xFu;
+                break;
+            }
+        }
+    }
+
+    // Preload referenced vertex buffer descriptors and pre-decode all referenced InputLayout elements
+    // once in the entry block so SSA values dominate all control flow and gathers are never duplicated.
+    mlir::Value vbBasePtrs[16]{};
+    mlir::Value vbStrideVecs[16]{};
+    mlir::Value vbSizeVecs[16]{};
+    std::vector<PredecodedVertexElement> predecodedElems(inputLayout.NumElements);
+    for (UINT i = 0; i < inputLayout.NumElements && inputLayout.pInputElementDescs; ++i) {
+        if (elemNeededCols[i] == 0) continue;
+        const auto& el = inputLayout.pInputElementDescs[i];
+        UINT slot = std::min<UINT>(el.InputSlot, 15);
+        if (!vbBasePtrs[slot]) {
+            mlir::Value addrInt = h.loadScalar(
+                h.i64Ty(), h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_buffers) + slot * 8)));
+            vbBasePtrs[slot] = mlir::LLVM::IntToPtrOp::create(b, loc, ptrTy, addrInt);
+            mlir::Value str32 = h.loadScalar(
+                i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_strides) + slot * 4)));
+            mlir::Value sz32 = h.loadScalar(
+                i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_sizes) + slot * 4)));
+            vbStrideVecs[slot] = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), str32);
+            vbSizeVecs[slot] = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), sz32);
+        }
+        mlir::Value idxVec = vidVec;
+        if (el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) {
+            if (el.InstanceDataStepRate == 0) {
+                idxVec = zeroI32Vec;
+            } else if (el.InstanceDataStepRate == 1) {
+                idxVec = iidVec;
+            } else {
+                idxVec = mlir::arith::DivUIOp::create(
+                    b, loc, iidVec, h.splatInt(i32Ty, el.InstanceDataStepRate));
+            }
+        }
+        predecodedElems[i] = predecodeVertexElementSIMD(
+            h, el, activeMask, vbBasePtrs[slot], vbStrideVecs[slot], vbSizeVecs[slot],
+            idxVec, elementByteOffsets[i], elemNeededCols[i]);
+    }
+
+    StageHooks vsHooks;
+    vsHooks.isPixelShader = false;
+    vsHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
+                            const SimdVal&, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
+        const DxilSigRecord* sig = vsLoaded.findInputSig(sigId);
+        if (!sig) return false;
+        IRHelpers lh{lb, lloc, simdWidth};
+        bool wantInt = mlir::isa<mlir::IntegerType>(scalarTy);
+
+        if (sig->systemValueType == 1) { // SV_VertexID
+            mlir::Value v = wantInt ? vidVec : mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), vidVec).getResult();
+            if (wantInt && scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+            out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
+            return true;
+        }
+        if (sig->systemValueType == 2) { // SV_InstanceID
+            mlir::Value v = wantInt ? iidVec : mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), iidVec).getResult();
+            if (wantInt && scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+            out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
+            return true;
+        }
+
+        auto eit = sigToElemIdx.find(sigId);
+        if (eit != sigToElemIdx.end() && col < 4 && predecodedElems[eit->second].valid) {
+            const auto& pe = predecodedElems[eit->second];
+            mlir::Value decoded = wantInt ? pe.compsI32[col] : pe.compsF32[col];
+            if (wantInt && scalarTy != i32Ty) {
+                decoded = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
+            } else if (!wantInt && scalarTy != lh.f32Ty()) {
+                decoded = mlir::arith::TruncFOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
+            }
+            out = {SimdVal::Kind::Vector, scalarTy, decoded, {}, {}};
+            return true;
+        }
+        return false;
+    };
+
+    vsHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
+                              const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value writeMask) -> bool {
+        const DxilSigRecord* sig = vsLoaded.findOutputSig(sigId);
+        if (!sig || val.kind != SimdVal::Kind::Vector) return true;
+        IRHelpers sh{sb, sloc, simdWidth};
+        mlir::Value vVec = val.vec;
+        mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+        if (elemTy != sh.f32Ty()) {
+            if (mlir::isa<mlir::IntegerType>(elemTy)) {
+                if (elemTy.getIntOrFloatBitWidth() < 32) {
+                    vVec = mlir::arith::ExtUIOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
+                }
+                vVec = mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
+            } else {
+                vVec = mlir::arith::ExtFOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
+            }
+        }
+
+        auto storeVecSOA = [&](mlir::Value dstPtr) {
+            if (!writeMask || writeMask == activeMask) {
+                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dstPtr, /*alignment=*/4);
+            } else {
+                mlir::Value prev = sh.loadScalar(sh.vecTy(sh.f32Ty()), dstPtr);
+                mlir::Value merged = mlir::arith::SelectOp::create(sb, sloc, writeMask, vVec, prev);
+                mlir::LLVM::StoreOp::create(sb, sloc, merged, dstPtr, /*alignment=*/4);
+            }
+        };
+
+        auto storeAttrAtSlot = [&](uint32_t baseSlot) {
+            auto rowConst = tryGetUniformConstUInt(row);
+            if (rowConst.has_value()) {
+                uint32_t scalarSlot = baseSlot + (*rowConst) * 4 + col;
+                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(scalarSlot * simdWidth * 4));
+                storeVecSOA(dst);
+            } else {
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value mL = mlir::vector::ExtractOp::create(sb, sloc, writeMask ? writeMask : activeMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(sb, sloc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        IRHelpers nh{nb, nloc, simdWidth};
+                        mlir::Value rL = mlir::vector::ExtractOp::create(nb, nloc, row.vec, static_cast<int64_t>(l));
+                        mlir::Value r32 = (rL.getType() == i32Ty)
+                                              ? rL
+                                              : mlir::arith::ExtUIOp::create(nb, nloc, i32Ty, rL).getResult();
+                        mlir::Value slot32 = mlir::arith::AddIOp::create(
+                            nb, nloc, nh.cInt(i32Ty, static_cast<int64_t>(baseSlot + col)),
+                            mlir::arith::MulIOp::create(nb, nloc, r32, nh.cInt(i32Ty, 4)));
+                        mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                            nb, nloc, mlir::arith::MulIOp::create(nb, nloc, slot32, nh.cInt(i32Ty, simdWidth)),
+                            nh.cInt(i32Ty, static_cast<int64_t>(l)));
+                        mlir::Value byteOff = mlir::arith::MulIOp::create(
+                            nb, nloc, mlir::arith::ExtUIOp::create(nb, nloc, nh.i64Ty(), elemIdx), nh.cInt(nh.i64Ty(), 4));
+                        mlir::Value vL = mlir::vector::ExtractOp::create(nb, nloc, vVec, static_cast<int64_t>(l));
+                        mlir::LLVM::StoreOp::create(nb, nloc, vL, nh.gepBytesDyn(outAttrs, byteOff));
+                        mlir::scf::YieldOp::create(nb, nloc);
+                    });
+                }
+            }
+        };
+
+        if (sig->systemValueType == 3) { // SV_Position -> outPosXYZW[col * W + lane]
+            if (col < 4) {
+                mlir::Value dst = sh.gepBytes(outPosXYZW, static_cast<int64_t>(col * simdWidth * 4));
+                storeVecSOA(dst);
+            }
+            if (!hasTess) return true;
+        }
+
+        if (!hasGS && !hasTess && canonicalLayout) {
+            if (sig->systemValueType == 6) { // SV_ClipDistance
+                auto cit = canonicalLayout->clipSigBaseIdx.find(sigId);
+                if (cit != canonicalLayout->clipSigBaseIdx.end()) {
+                    uint32_t r = tryGetUniformConstUInt(row).value_or(0);
+                    uint32_t idx = cit->second + r * sig->cols + col;
+                    if (idx < 8 && (canonicalLayout->clipDistMask & (1u << idx))) {
+                        storeVecSOA(sh.gepBytes(outAttrs, static_cast<int64_t>((canonicalLayout->clipAttrOffset + idx) * simdWidth * 4)));
+                    }
+                }
+                return true;
+            }
+            if (sig->systemValueType == 7) { // SV_CullDistance
+                auto cit = canonicalLayout->cullSigBaseIdx.find(sigId);
+                if (cit != canonicalLayout->cullSigBaseIdx.end()) {
+                    uint32_t r = tryGetUniformConstUInt(row).value_or(0);
+                    uint32_t idx = cit->second + r * sig->cols + col;
+                    if (idx < 8 && (canonicalLayout->cullDistMask & (1u << idx))) {
+                        storeVecSOA(sh.gepBytes(outAttrs, static_cast<int64_t>((canonicalLayout->cullAttrOffset + idx) * simdWidth * 4)));
+                    }
+                }
+                return true;
+            }
+            if (sig->systemValueType == 5 && canonicalLayout->hasViewportArrayIndex && col == 0) {
+                storeVecSOA(sh.gepBytes(outAttrs, static_cast<int64_t>(canonicalLayout->vpIndexAttrOffset * simdWidth * 4)));
+                return true;
+            }
+            if (sig->systemValueType == 29 && canonicalLayout->hasPerPrimShadingRate && col == 0) {
+                storeVecSOA(sh.gepBytes(outAttrs, static_cast<int64_t>(canonicalLayout->shadingRateAttrOffset * simdWidth * 4)));
+                return true;
+            }
+            if (sig->systemValueType == 0 && sig->startRow < 32) {
+                uint32_t baseSlot = sig->startRow * 4 + sig->startCol;
+                storeAttrAtSlot(baseSlot);
+            }
+            return true;
+        }
+
+        if (vsToNextMap) {
+            auto it = vsToNextMap->find(sigId);
+            if (it != vsToNextMap->end() && it->second.psTargetRow >= 0) {
+                uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol;
+                storeAttrAtSlot(baseSlot);
+            }
+        }
+        return true;
+    };
+
+    mlir::Value vsRealMask = activeMask;
+    if (!packetizeRegionWithHooks(b, loc, targetMod, vsSrcFunc.getBody(), vsLoaded, vsEffectiveLayout,
+                                  simdWidth, rootCtx, activeMask, vsRealMask, vsHooks, outError)) {
+        return false;
+    }
+    mlir::func::ReturnOp::create(b, loc);
+    return true;
+}
+
 } // namespace
+
+bool synthesizeVertexStageMLIR(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    const std::string& vsSym,
+    mlir::MLIRContext& mlirCtx,
+    mlir::OwningOpRef<mlir::ModuleOp>& outVSMod,
+    CachedVSMeta& outVSMeta,
+    std::vector<ShaderSigElement>& outVSInputs,
+    std::vector<ShaderSigElement>& outVSOutputs,
+    std::vector<DxilSigRecord>& outVSOutputRecs,
+    std::string& outError) {
+    if (!desc.VS.pShaderBytecode || desc.VS.BytecodeLength == 0) {
+        outError = "Graphics PSO requires a valid Vertex Shader bytecode";
+        return false;
+    }
+
+    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    DxilLoadedShader vsLoaded;
+    if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+        return false;
+    }
+
+    const RootSignatureLayout& vsEffectiveLayout =
+        (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && vsLoaded.hasEmbeddedRootSig)
+            ? vsLoaded.embeddedRootSig
+            : rootLayout;
+
+    auto vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
+    if (!vsMlirMod) return false;
+
+    configureNacelleMLIRContext(mlirCtx);
+    mlir::Location loc = mlir::UnknownLoc::get(&mlirCtx);
+    outVSMod = mlir::ModuleOp::create(loc);
+    mlir::ModuleOp vsMod = *outVSMod;
+    cloneGlobalsIntoModule(*vsMlirMod, vsMod);
+
+    outVSInputs = convertSigElements(vsLoaded.inputSigs);
+    outVSOutputs = convertSigElements(vsLoaded.outputSigs);
+    outVSOutputRecs = vsLoaded.outputSigs;
+
+    CanonicalVSLayoutInfo canonical = computeCanonicalVSLayout(vsLoaded.outputSigs);
+    auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
+    if (!emitVertexStageFunction(
+            vsMod, vsSrcFunc, vsLoaded, vsEffectiveLayout, desc.InputLayout,
+            simdWidth, vsSym, /*hasTess=*/false, /*hasGS=*/false, &canonical, nullptr, outError)) {
+        return false;
+    }
+
+    llvm::SmallVector<mlir::LLVM::LLVMFuncOp, 16> deadDxOps;
+    for (auto fnOp : vsMod.getOps<mlir::LLVM::LLVMFuncOp>()) {
+        if (fnOp.isDeclaration() && fnOp.getName().starts_with("dx.op.") && fnOp.use_empty()) {
+            deadDxOps.push_back(fnOp);
+        }
+    }
+    for (auto fnOp : deadDxOps) fnOp.erase();
+
+    if (mlir::failed(mlir::verify(vsMod))) {
+        outError = "MLIR verification failed after Vertex Stage synthesis";
+        return false;
+    }
+
+    outVSMeta = CachedVSMeta{};
+    outVSMeta.simdWidth = simdWidth;
+    outVSMeta.numVSOutputRegs = canonical.numVSOutputRegs;
+    outVSMeta.posOutputReg = canonical.posOutputReg;
+    outVSMeta.clipDistMask = canonical.clipDistMask;
+    outVSMeta.cullDistMask = canonical.cullDistMask;
+    outVSMeta.clipAttrOffset = canonical.clipAttrOffset;
+    outVSMeta.cullAttrOffset = canonical.cullAttrOffset;
+    outVSMeta.hasViewportArrayIndex = canonical.hasViewportArrayIndex ? 1 : 0;
+    outVSMeta.vpIndexAttrOffset = canonical.vpIndexAttrOffset;
+    outVSMeta.hasPerPrimShadingRate = canonical.hasPerPrimShadingRate ? 1 : 0;
+    outVSMeta.shadingRateAttrOffset = canonical.shadingRateAttrOffset;
+    outVSMeta.totalVSScalarAttrs = canonical.totalVSScalarAttrs;
+    return true;
+}
 
 bool synthesizeGraphicsPSOMLIR(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
@@ -530,7 +1113,10 @@ bool synthesizeGraphicsPSOMLIR(
     std::vector<ShaderSigElement>& outPSInputs,
     std::vector<ShaderSigElement>& outPSOutputs,
     std::string& outError,
-    const MeshShaderStages& meshStages) {
+    const MeshShaderStages& meshStages,
+    bool skipVS,
+    const CachedVSMeta* precompiledVSMeta,
+    const std::vector<DxilSigRecord>* precompiledVSOutputRecs) {
     const bool hasMS = (meshStages.MS.pShaderBytecode && meshStages.MS.BytecodeLength > 0);
     const bool hasAS = hasMS && (meshStages.AS.pShaderBytecode && meshStages.AS.BytecodeLength > 0);
     if (!hasMS && (!desc.VS.pShaderBytecode || desc.VS.BytecodeLength == 0)) {
@@ -538,15 +1124,11 @@ bool synthesizeGraphicsPSOMLIR(
         return false;
     }
 
-    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    DxilLoadedShader vsLoaded;
-    mlir::OwningOpRef<mlir::ModuleOp> vsMlirMod;
-    if (!hasMS) {
-        if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
-            return false;
-        }
-        vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
-        if (!vsMlirMod) return false;
+    bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
+                              desc.DS.pShaderBytecode && desc.DS.BytecodeLength > 0);
+    bool hasGS = !hasMS && (desc.GS.pShaderBytecode && desc.GS.BytecodeLength > 0);
+    if (hasMS || hasTess || hasGS) {
+        skipVS = false;
     }
 
     auto msLlvmCtx = std::make_unique<llvm::LLVMContext>();
@@ -577,20 +1159,34 @@ bool synthesizeGraphicsPSOMLIR(
             : ((hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : rootLayout);
     const RootSignatureLayout& asEffectiveLayout =
         (hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : msEffectiveLayout;
-    if (false) {
-        return false;
+
+    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+    DxilLoadedShader vsLoaded;
+    mlir::OwningOpRef<mlir::ModuleOp> vsMlirMod;
+    bool loadedVSFromDXIL = false;
+    if (!hasMS) {
+        if (!skipVS || !precompiledVSOutputRecs || precompiledVSOutputRecs->empty() || emptyRoot) {
+            if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
+                return false;
+            }
+            loadedVSFromDXIL = true;
+        }
+        if (!skipVS) {
+            vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
+            if (!vsMlirMod) return false;
+        }
     }
 
     const RootSignatureLayout& vsEffectiveLayout =
-        (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && vsLoaded.hasEmbeddedRootSig)
+        (loadedVSFromDXIL && emptyRoot && vsLoaded.hasEmbeddedRootSig)
             ? vsLoaded.embeddedRootSig
             : (hasMS ? msEffectiveLayout : rootLayout);
 
+    const std::vector<DxilSigRecord>& vsOutputSigsRef =
+        (skipVS && precompiledVSOutputRecs && !precompiledVSOutputRecs->empty())
+            ? *precompiledVSOutputRecs
+            : vsLoaded.outputSigs;
 
-
-
-    bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
-                    desc.DS.pShaderBytecode && desc.DS.BytecodeLength > 0);
     auto hsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader hsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> hsMlirMod;
@@ -621,7 +1217,6 @@ bool synthesizeGraphicsPSOMLIR(
             ? dsLoaded.embeddedRootSig
             : vsEffectiveLayout;
 
-    bool hasGS = !hasMS && (desc.GS.pShaderBytecode && desc.GS.BytecodeLength > 0);
     auto gsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader gsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> gsMlirMod;
@@ -660,11 +1255,11 @@ bool synthesizeGraphicsPSOMLIR(
     outCombinedMod = mlir::ModuleOp::create(loc);
     mlir::ModuleOp combinedMod = *outCombinedMod;
 
-    if (!hasMS) {
-        cloneGlobalsIntoModule(*vsMlirMod, combinedMod);
-    } else {
+    if (hasMS) {
         cloneGlobalsIntoModule(*msMlirMod, combinedMod);
         if (hasAS) cloneGlobalsIntoModule(*asMlirMod, combinedMod);
+    } else if (!skipVS && vsMlirMod) {
+        cloneGlobalsIntoModule(*vsMlirMod, combinedMod);
     }
     if (hasTess) {
         cloneGlobalsIntoModule(*hsMlirMod, combinedMod);
@@ -677,31 +1272,32 @@ bool synthesizeGraphicsPSOMLIR(
         cloneGlobalsIntoModule(*psMlirMod, combinedMod);
     }
 
-    outVSInputs = hasMS ? std::vector<ShaderSigElement>{} : convertSigElements(vsLoaded.inputSigs);
-    outVSOutputs = convertSigElements(hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs);
+    if (hasMS) {
+        outVSInputs.clear();
+        outVSOutputs = convertSigElements(msLoaded.outputSigs);
+    } else if (loadedVSFromDXIL) {
+        outVSInputs = convertSigElements(vsLoaded.inputSigs);
+        outVSOutputs = convertSigElements(vsLoaded.outputSigs);
+    }
     bool psWritesDepth = false;
-    bool psUsesDiscard = false;
-    bool psHasSideEffects = false;
+    bool psUsesDiscard = hasPS && psLoaded.usesDiscard;
+    bool psHasSideEffects = hasPS && psLoaded.hasSideEffects;
+    bool psUsesPerspBarycentrics = false;
     if (hasPS) {
         outPSInputs = convertSigElements(psLoaded.inputSigs);
         outPSOutputs = convertSigElements(psLoaded.outputSigs);
         for (const auto& po : psLoaded.outputSigs) {
             if (po.systemValueType >= 17 && po.systemValueType <= 19) psWritesDepth = true;
         }
+        for (const auto& pi : psLoaded.inputSigs) {
+            if (pi.systemValueType == 28 && pi.interpMode != 4) {
+                psUsesPerspBarycentrics = true;
+            }
+        }
     } else {
         outPSInputs.clear();
         outPSOutputs.clear();
     }
-
-    // Link VS output signatures -> PS input signatures by (semanticName, semanticIndex)
-    int32_t posOutputReg = 0;
-    uint32_t numVSOutputRegs = 0;
-    for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
-        if (vo.startRow == UINT32_MAX) continue;
-        numVSOutputRegs = std::max(numVSOutputRegs, vo.startRow + vo.rows);
-        if (vo.systemValueType == 3) posOutputReg = static_cast<int32_t>(vo.startRow);
-    }
-
     uint32_t numPSInputRegs = 0;
     uint32_t flatInterpMask = 0;
     if (hasPS) {
@@ -710,9 +1306,10 @@ bool synthesizeGraphicsPSOMLIR(
                 numPSInputRegs = std::max(numPSInputRegs, pi.startRow + pi.rows);
                 for (uint32_t r = 0; r < pi.rows; ++r) {
                     uint32_t reg = pi.startRow + r;
-                    if (reg < 16) {
-                        if (pi.interpMode == 1) flatInterpMask |= (1u << reg);
-                        else if (pi.interpMode == 4) flatInterpMask |= (1u << (16u + reg));
+                    if (pi.interpMode == 1) {
+                        flatInterpMask |= (1u << std::min<uint32_t>(reg, 15u));
+                    } else if (pi.interpMode == 4 && reg < 16) {
+                        flatInterpMask |= (1u << (16u + reg));
                     }
                 }
             }
@@ -757,35 +1354,36 @@ bool synthesizeGraphicsPSOMLIR(
         }
     }
 
+    std::unordered_map<uint32_t, LinkedVSSigSlot> vsToNextMap;
     std::unordered_map<uint32_t, LinkedVSSigSlot> vsToPsMap;
     if (hasTess) {
-        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
-        if (vo.startRow == UINT32_MAX) continue;
+        for (const auto& vo : vsOutputSigsRef) {
+            if (vo.startRow == UINT32_MAX) continue;
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& hi : hsLoaded.inputSigs) {
                 if (toLowerAscii(hi.semanticName) == vn && hi.semanticIndex == vo.semanticIndex) {
-                    vsToPsMap[vo.sigId] = {static_cast<int32_t>(hi.startRow), hi.startCol};
+                    vsToNextMap[vo.sigId] = {static_cast<int32_t>(hi.startRow), hi.startCol};
                     break;
                 }
             }
         }
     } else if (hasGS) {
-        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
-        if (vo.startRow == UINT32_MAX) continue;
-            if (vo.systemValueType == 3) continue; // SV_Position goes to outPosXYZW
+        for (const auto& vo : vsOutputSigsRef) {
+            if (vo.startRow == UINT32_MAX) continue;
+            if (vo.systemValueType == 3) continue;
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& gi : gsLoaded.inputSigs) {
                 if (gi.systemValueType != 0) continue;
                 if (toLowerAscii(gi.semanticName) == vn && gi.semanticIndex == vo.semanticIndex) {
-                    vsToPsMap[vo.sigId] = {static_cast<int32_t>(gi.startRow), gi.startCol};
+                    vsToNextMap[vo.sigId] = {static_cast<int32_t>(gi.startRow), gi.startCol};
                     break;
                 }
             }
         }
-    } else if (hasPS) {
-        for (const auto& vo : (hasMS ? msLoaded.outputSigs : vsLoaded.outputSigs)) {
-        if (vo.startRow == UINT32_MAX) continue;
-            if (vo.systemValueType == 3) continue; // SV_Position
+    } else if (hasMS && hasPS) {
+        for (const auto& vo : msLoaded.outputSigs) {
+            if (vo.startRow == UINT32_MAX) continue;
+            if (vo.systemValueType == 3) continue;
             std::string vn = toLowerAscii(vo.semanticName);
             for (const auto& pi : psLoaded.inputSigs) {
                 if (pi.systemValueType != 0) continue;
@@ -863,8 +1461,6 @@ bool synthesizeGraphicsPSOMLIR(
         }
     }
 
-    // Allocate scalar attribute slots for SV_ClipDistance (systemValueType == 6) and
-    // SV_CullDistance (systemValueType == 7) after the PS input attribute registers.
     std::unordered_map<uint32_t, LinkedVSSigSlot> msPrimToPsMap;
     uint64_t msPrimAttrMask = 0;
     if (hasMS && hasPS) {
@@ -887,319 +1483,175 @@ bool synthesizeGraphicsPSOMLIR(
         }
     }
 
-    const auto& preRastOutputs = hasMS ? msLoaded.outputSigs
-                                       : (hasGS ? gsLoaded.outputSigs : (hasTess ? dsLoaded.outputSigs : vsLoaded.outputSigs));
-    uint32_t nextExtraAttr = numPSInputRegs * 4;
+    CanonicalVSLayoutInfo canonicalVS{};
+    int32_t posOutputReg = 0;
+    uint32_t numVSOutputRegs = 0;
     uint32_t clipDistMask = 0;
     uint32_t cullDistMask = 0;
-    uint32_t clipAttrOffset = nextExtraAttr;
-    uint32_t clipScalarCount = 0;
+    uint32_t clipAttrOffset = 0;
     uint32_t cullAttrOffset = 0;
-    uint32_t cullScalarCount = 0;
-    std::unordered_map<uint32_t, uint32_t> clipSigBaseIdx;
-    std::unordered_map<uint32_t, uint32_t> cullSigBaseIdx;
-    for (const auto& vo : preRastOutputs) {
-        if (vo.systemValueType == 6) {
-            clipSigBaseIdx[vo.sigId] = clipScalarCount;
-            uint32_t count = std::min<uint32_t>(8u - clipScalarCount, vo.rows * vo.cols);
-            for (uint32_t k = 0; k < count; ++k) {
-                clipDistMask |= (1u << (clipScalarCount + k));
-            }
-            clipScalarCount += count;
-        }
-    }
-    nextExtraAttr += clipScalarCount;
-    cullAttrOffset = nextExtraAttr;
-    for (const auto& vo : preRastOutputs) {
-        if (vo.systemValueType == 7) {
-            cullSigBaseIdx[vo.sigId] = cullScalarCount;
-            uint32_t count = std::min<uint32_t>(8u - cullScalarCount, vo.rows * vo.cols);
-            for (uint32_t k = 0; k < count; ++k) {
-                cullDistMask |= (1u << (cullScalarCount + k));
-            }
-            cullScalarCount += count;
-        }
-    }
-    nextExtraAttr += cullScalarCount;
     bool hasViewportArrayIndex = false;
     uint32_t vpIndexAttrOffset = 0;
     bool hasPerPrimShadingRate = false;
     uint32_t shadingRateAttrOffset = 0;
-    for (const auto& vo : preRastOutputs) {
-        if (vo.systemValueType == 5 && !hasViewportArrayIndex) {
-            hasViewportArrayIndex = true;
-            vpIndexAttrOffset = nextExtraAttr++;
-        } else if (vo.systemValueType == 29 && !hasPerPrimShadingRate) {
-            hasPerPrimShadingRate = true;
-            shadingRateAttrOffset = nextExtraAttr++;
-        }
-    }
+    uint32_t totalVSScalarAttrs = 0;
+    std::unordered_map<uint32_t, uint32_t> clipSigBaseIdx;
+    std::unordered_map<uint32_t, uint32_t> cullSigBaseIdx;
+
     if (hasMS) {
-        for (const auto& po : msLoaded.patchConstSigs) {
-            if (po.systemValueType == 5) {
-                if (!hasViewportArrayIndex) {
-                    hasViewportArrayIndex = true;
-                    vpIndexAttrOffset = nextExtraAttr++;
-                }
-                if (vpIndexAttrOffset < 64) msPrimAttrMask |= (1ull << vpIndexAttrOffset);
-            } else if (po.systemValueType == 29) {
-                if (!hasPerPrimShadingRate) {
-                    hasPerPrimShadingRate = true;
-                    shadingRateAttrOffset = nextExtraAttr++;
-                }
-                if (shadingRateAttrOffset < 64) msPrimAttrMask |= (1ull << shadingRateAttrOffset);
-            }
+        for (const auto& vo : msLoaded.outputSigs) {
+            if (vo.startRow == UINT32_MAX) continue;
+            numVSOutputRegs = std::max(numVSOutputRegs, vo.startRow + vo.rows);
+            if (vo.systemValueType == 3) posOutputReg = static_cast<int32_t>(vo.startRow);
+        }
+    } else {
+        canonicalVS = computeCanonicalVSLayout(vsOutputSigsRef);
+        posOutputReg = canonicalVS.posOutputReg;
+        numVSOutputRegs = canonicalVS.numVSOutputRegs;
+        clipDistMask = canonicalVS.clipDistMask;
+        cullDistMask = canonicalVS.cullDistMask;
+        clipAttrOffset = canonicalVS.clipAttrOffset;
+        cullAttrOffset = canonicalVS.cullAttrOffset;
+        hasViewportArrayIndex = canonicalVS.hasViewportArrayIndex;
+        vpIndexAttrOffset = canonicalVS.vpIndexAttrOffset;
+        hasPerPrimShadingRate = canonicalVS.hasPerPrimShadingRate;
+        shadingRateAttrOffset = canonicalVS.shadingRateAttrOffset;
+        totalVSScalarAttrs = canonicalVS.totalVSScalarAttrs;
+        clipSigBaseIdx = canonicalVS.clipSigBaseIdx;
+        cullSigBaseIdx = canonicalVS.cullSigBaseIdx;
+
+        if (!hasTess && !hasGS && skipVS && precompiledVSMeta) {
+            posOutputReg = precompiledVSMeta->posOutputReg;
+            numVSOutputRegs = precompiledVSMeta->numVSOutputRegs;
+            clipDistMask = precompiledVSMeta->clipDistMask;
+            cullDistMask = precompiledVSMeta->cullDistMask;
+            clipAttrOffset = precompiledVSMeta->clipAttrOffset;
+            cullAttrOffset = precompiledVSMeta->cullAttrOffset;
+            hasViewportArrayIndex = precompiledVSMeta->hasViewportArrayIndex != 0;
+            vpIndexAttrOffset = precompiledVSMeta->vpIndexAttrOffset;
+            hasPerPrimShadingRate = precompiledVSMeta->hasPerPrimShadingRate != 0;
+            shadingRateAttrOffset = precompiledVSMeta->shadingRateAttrOffset;
+            totalVSScalarAttrs = precompiledVSMeta->totalVSScalarAttrs;
         }
     }
-    uint32_t totalVSScalarAttrs = hasTess ? numHSInputScalars : (hasGS ? (numGSInputRegs * 4) : nextExtraAttr);
-    uint32_t totalPostDSVertexAttrs = hasGS ? (numGSInputRegs * 4) : nextExtraAttr;
-    uint32_t totalPostGSVertexAttrs = nextExtraAttr;
 
-    // Resolve InputLayout offsets per slot
-    std::vector<uint32_t> elementByteOffsets(desc.InputLayout.NumElements, 0);
-    uint32_t slotRunningOffset[16]{};
-    for (UINT i = 0; i < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++i) {
-        const auto& el = desc.InputLayout.pInputElementDescs[i];
-        UINT slot = std::min<UINT>(el.InputSlot, 15);
-        uint32_t off = (el.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT)
-                           ? slotRunningOffset[slot]
-                           : el.AlignedByteOffset;
-        elementByteOffsets[i] = off;
-        slotRunningOffset[slot] = off + formatByteSizeForVertex(el.Format);
+    uint32_t totalPostDSVertexAttrs = 0;
+    uint32_t totalPostGSVertexAttrs = 0;
+    if (hasMS || hasTess || hasGS) {
+        const auto& preRastOutputs = hasMS ? msLoaded.outputSigs
+                                           : (hasGS ? gsLoaded.outputSigs : dsLoaded.outputSigs);
+        uint32_t nextExtraAttr = numPSInputRegs * 4;
+        clipDistMask = 0;
+        cullDistMask = 0;
+        clipAttrOffset = nextExtraAttr;
+        uint32_t clipScalarCount = 0;
+        cullAttrOffset = 0;
+        uint32_t cullScalarCount = 0;
+        clipSigBaseIdx.clear();
+        cullSigBaseIdx.clear();
+        for (const auto& vo : preRastOutputs) {
+            if (vo.systemValueType == 6) {
+                clipSigBaseIdx[vo.sigId] = clipScalarCount;
+                uint32_t count = std::min<uint32_t>(8u - clipScalarCount, vo.rows * vo.cols);
+                for (uint32_t k = 0; k < count; ++k) {
+                    clipDistMask |= (1u << (clipScalarCount + k));
+                }
+                clipScalarCount += count;
+            }
+        }
+        nextExtraAttr += clipScalarCount;
+        cullAttrOffset = nextExtraAttr;
+        for (const auto& vo : preRastOutputs) {
+            if (vo.systemValueType == 7) {
+                cullSigBaseIdx[vo.sigId] = cullScalarCount;
+                uint32_t count = std::min<uint32_t>(8u - cullScalarCount, vo.rows * vo.cols);
+                for (uint32_t k = 0; k < count; ++k) {
+                    cullDistMask |= (1u << (cullScalarCount + k));
+                }
+                cullScalarCount += count;
+            }
+        }
+        nextExtraAttr += cullScalarCount;
+        hasViewportArrayIndex = false;
+        vpIndexAttrOffset = 0;
+        hasPerPrimShadingRate = false;
+        shadingRateAttrOffset = 0;
+        for (const auto& vo : preRastOutputs) {
+            if (vo.systemValueType == 5 && !hasViewportArrayIndex) {
+                hasViewportArrayIndex = true;
+                vpIndexAttrOffset = nextExtraAttr++;
+            } else if (vo.systemValueType == 29 && !hasPerPrimShadingRate) {
+                hasPerPrimShadingRate = true;
+                shadingRateAttrOffset = nextExtraAttr++;
+            }
+        }
+        if (hasMS) {
+            for (const auto& po : msLoaded.patchConstSigs) {
+                if (po.systemValueType == 5) {
+                    if (!hasViewportArrayIndex) {
+                        hasViewportArrayIndex = true;
+                        vpIndexAttrOffset = nextExtraAttr++;
+                    }
+                    if (vpIndexAttrOffset < 64) msPrimAttrMask |= (1ull << vpIndexAttrOffset);
+                } else if (po.systemValueType == 29) {
+                    if (!hasPerPrimShadingRate) {
+                        hasPerPrimShadingRate = true;
+                        shadingRateAttrOffset = nextExtraAttr++;
+                    }
+                    if (shadingRateAttrOffset < 64) msPrimAttrMask |= (1ull << shadingRateAttrOffset);
+                }
+            }
+        }
+        totalVSScalarAttrs = hasMS ? nextExtraAttr : (hasTess ? numHSInputScalars : (numGSInputRegs * 4));
+        totalPostDSVertexAttrs = hasGS ? (numGSInputRegs * 4) : nextExtraAttr;
+        totalPostGSVertexAttrs = nextExtraAttr;
     }
 
-    // --- 1. Emit @<vsSym>(ptr %rootCtx, ptr %vertexIds, ptr %instanceIds, i32 %activeCount, ptr %outPosXYZW, ptr %outAttrs) ---
-    if (!hasMS)
-    {
-        auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
-        if (!vsSrcFunc || vsSrcFunc.getBody().empty()) {
-            outError = "Vertex shader entry function missing after MLIR SCF lift";
-            return false;
-        }
-
-        mlir::OpBuilder b(combinedMod.getBody(), combinedMod.getBody()->end());
-        IRHelpers h{b, loc, simdWidth};
-        auto ptrTy = h.ptrTy();
-        auto i32Ty = h.i32Ty();
-        auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
-        auto vsFn = mlir::func::FuncOp::create(b, loc, vsSym, fnTy);
-        mlir::Block* entry = vsFn.addEntryBlock();
-        b.setInsertionPointToEnd(entry);
-
-        mlir::Value rootCtx = entry->getArgument(0);
-        mlir::Value vertexIdsPtr = entry->getArgument(1);
-        mlir::Value instanceIdsPtr = entry->getArgument(2);
-        mlir::Value activeCount = entry->getArgument(3);
-        mlir::Value outPosXYZW = entry->getArgument(4);
-        mlir::Value outAttrs = entry->getArgument(5);
-
-        mlir::Value acVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), activeCount);
-        mlir::Value activeMask = mlir::arith::CmpIOp::create(
-            b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
-
-        mlir::Value vidVec = h.splatInt(i32Ty, 0);
-        mlir::Value iidVec = h.splatInt(i32Ty, 0);
-        // Clean helper without i8TyOrByte typo:
-        vidVec = h.splatInt(i32Ty, 0);
-        iidVec = h.splatInt(i32Ty, 0);
-        for (uint32_t l = 0; l < simdWidth; ++l) {
-            mlir::Value mL = mlir::vector::ExtractOp::create(b, loc, activeMask, static_cast<int64_t>(l));
-            auto rVid = mlir::scf::IfOp::create(
-                b, loc, mL,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value ep = mlir::LLVM::GEPOp::create(
-                        nb, nloc, ptrTy, i32Ty, vertexIdsPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(l)});
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(nb, nloc, i32Ty, ep)});
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty, 0)});
-                });
-            auto rIid = mlir::scf::IfOp::create(
-                b, loc, mL,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value ep = mlir::LLVM::GEPOp::create(
-                        nb, nloc, ptrTy, i32Ty, instanceIdsPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(l)});
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(nb, nloc, i32Ty, ep)});
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty, 0)});
-                });
-            vidVec = mlir::vector::InsertOp::create(b, loc, rVid.getResult(0), vidVec, static_cast<int64_t>(l));
-            iidVec = mlir::vector::InsertOp::create(b, loc, rIid.getResult(0), iidVec, static_cast<int64_t>(l));
-        }
-
-        // Preload vertex buffer slots referenced by InputLayout
-        mlir::Value vbBasePtrs[16]{};
-        mlir::Value vbStrideVecs[16]{};
-        mlir::Value vbSizeVecs[16]{};
-        for (UINT i = 0; i < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++i) {
-            UINT slot = std::min<UINT>(desc.InputLayout.pInputElementDescs[i].InputSlot, 15);
-            if (!vbBasePtrs[slot]) {
-                mlir::Value addrInt = h.loadScalar(
-                    h.i64Ty(), h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_buffers) + slot * 8)));
-                vbBasePtrs[slot] = mlir::LLVM::IntToPtrOp::create(b, loc, ptrTy, addrInt);
-                mlir::Value str32 = h.loadScalar(
-                    i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_strides) + slot * 4)));
-                mlir::Value sz32 = h.loadScalar(
-                    i32Ty, h.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, vertex_sizes) + slot * 4)));
-                vbStrideVecs[slot] = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), str32);
-                vbSizeVecs[slot] = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), sz32);
-            }
-        }
-
-        StageHooks vsHooks;
-        vsHooks.isPixelShader = false;
-        vsHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
-                                const SimdVal&, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
-            const DxilSigRecord* sig = vsLoaded.findInputSig(sigId);
-            if (!sig) return false;
-            IRHelpers lh{lb, lloc, simdWidth};
-            bool wantInt = mlir::isa<mlir::IntegerType>(scalarTy);
-
-            if (sig->systemValueType == 1) { // SV_VertexID
-                mlir::Value v = wantInt ? vidVec : mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), vidVec).getResult();
-                out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
-                return true;
-            }
-            if (sig->systemValueType == 2) { // SV_InstanceID
-                mlir::Value v = wantInt ? iidVec : mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), iidVec).getResult();
-                out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
-                return true;
-            }
-
-            std::string sigNameLower = toLowerAscii(sig->semanticName);
-            for (UINT i = 0; i < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++i) {
-                const auto& el = desc.InputLayout.pInputElementDescs[i];
-                if (el.SemanticName && toLowerAscii(el.SemanticName) == sigNameLower &&
-                    el.SemanticIndex == sig->semanticIndex) {
-                    UINT slot = std::min<UINT>(el.InputSlot, 15);
-                    mlir::Value idxVec = vidVec;
-                    if (el.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) {
-                        if (el.InstanceDataStepRate == 0) {
-                            idxVec = lh.splatInt(i32Ty, 0);
-                        } else if (el.InstanceDataStepRate == 1) {
-                            idxVec = iidVec;
-                        } else {
-                            idxVec = mlir::arith::DivUIOp::create(
-                                lb, lloc, iidVec, lh.splatInt(i32Ty, el.InstanceDataStepRate));
+    std::array<int16_t, 128> psInputFromVSSlot;
+    psInputFromVSSlot.fill(-1);
+    if (!hasMS && !hasTess && !hasGS) {
+        if (hasPS) {
+            for (const auto& pi : psLoaded.inputSigs) {
+                if (pi.systemValueType != 0) continue;
+                std::string pn = toLowerAscii(pi.semanticName);
+                for (const auto& vo : vsOutputSigsRef) {
+                    if (vo.systemValueType != 0 || vo.startRow >= 32) continue;
+                    if (toLowerAscii(vo.semanticName) == pn && vo.semanticIndex == pi.semanticIndex) {
+                        uint32_t commonRows = std::min(pi.rows, vo.rows);
+                        uint32_t commonCols = std::min(pi.cols, vo.cols);
+                        for (uint32_t r = 0; r < commonRows; ++r) {
+                            for (uint32_t c = 0; c < commonCols; ++c) {
+                                if ((pi.startCol + c) >= 4 || (vo.startCol + c) >= 4) continue;
+                                uint32_t psSlot = (pi.startRow + r) * 4 + pi.startCol + c;
+                                uint32_t vsSlot = (vo.startRow + r) * 4 + vo.startCol + c;
+                                if (psSlot < 128) {
+                                    psInputFromVSSlot[psSlot] = static_cast<int16_t>(vsSlot);
+                                }
+                            }
                         }
-                    }
-                    mlir::Value decoded = decodeVertexComponent(
-                        lh, el, activeMask, vbBasePtrs[slot], vbStrideVecs[slot], vbSizeVecs[slot],
-                        idxVec, elementByteOffsets[i], col, wantInt);
-                    if (wantInt && scalarTy != i32Ty) {
-                        decoded = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
-                    } else if (!wantInt && scalarTy != lh.f32Ty()) {
-                        decoded = mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), decoded);
-                    }
-                    out = {SimdVal::Kind::Vector, scalarTy, decoded, {}, {}};
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        vsHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
-                                  const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value) -> bool {
-            const DxilSigRecord* sig = vsLoaded.findOutputSig(sigId);
-            if (!sig || val.kind != SimdVal::Kind::Vector) return true;
-            IRHelpers sh{sb, sloc, simdWidth};
-            mlir::Value vVec = val.vec;
-            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
-            if (elemTy != sh.f32Ty()) {
-                if (mlir::isa<mlir::IntegerType>(elemTy)) {
-                    if (elemTy.getIntOrFloatBitWidth() < 32) {
-                        vVec = mlir::arith::ExtUIOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
-                    }
-                    vVec = mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
-                } else {
-                    vVec = mlir::arith::ExtFOp::create(sb, sloc, sh.vecTy(sh.f32Ty()), vVec);
-                }
-            }
-
-            auto storeAttrAtSlot = [&](uint32_t baseSlot) {
-                auto rowConst = tryGetUniformConstUInt(row);
-                if (rowConst.has_value()) {
-                    uint32_t scalarSlot = baseSlot + (*rowConst) * 4 + col;
-                    mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(scalarSlot * simdWidth * 4));
-                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                } else {
-                    for (uint32_t l = 0; l < simdWidth; ++l) {
-                        mlir::Value rL = mlir::vector::ExtractOp::create(sb, sloc, row.vec, static_cast<int64_t>(l));
-                        mlir::Value r32 = (rL.getType() == i32Ty)
-                                              ? rL
-                                              : mlir::arith::ExtUIOp::create(sb, sloc, i32Ty, rL).getResult();
-                        mlir::Value slot32 = mlir::arith::AddIOp::create(
-                            sb, sloc, sh.cInt(i32Ty, static_cast<int64_t>(baseSlot + col)),
-                            mlir::arith::MulIOp::create(sb, sloc, r32, sh.cInt(i32Ty, 4)));
-                        mlir::Value elemIdx = mlir::arith::AddIOp::create(
-                            sb, sloc, mlir::arith::MulIOp::create(sb, sloc, slot32, sh.cInt(i32Ty, simdWidth)),
-                            sh.cInt(i32Ty, static_cast<int64_t>(l)));
-                        mlir::Value byteOff = mlir::arith::MulIOp::create(
-                            sb, sloc, mlir::arith::ExtUIOp::create(sb, sloc, sh.i64Ty(), elemIdx), sh.cInt(sh.i64Ty(), 4));
-                        mlir::Value vL = mlir::vector::ExtractOp::create(sb, sloc, vVec, static_cast<int64_t>(l));
-                        mlir::LLVM::StoreOp::create(sb, sloc, vL, sh.gepBytesDyn(outAttrs, byteOff));
+                        break;
                     }
                 }
-            };
+            }
+        }
+    } else {
+        uint32_t limit = std::min<uint32_t>(128u, numPSInputRegs * 4);
+        for (uint32_t s = 0; s < limit; ++s) {
+            psInputFromVSSlot[s] = static_cast<int16_t>(s);
+        }
+    }
 
-            if (sig->systemValueType == 3) { // SV_Position -> outPosXYZW[col * W + lane]
-                if (col < 4) {
-                    mlir::Value dst = sh.gepBytes(outPosXYZW, static_cast<int64_t>(col * simdWidth * 4));
-                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                }
-                if (!hasTess) return true;
-            }
-
-            if (!hasGS && !hasTess && sig->systemValueType == 6) { // SV_ClipDistance
-                auto cit = clipSigBaseIdx.find(sigId);
-                if (cit != clipSigBaseIdx.end()) {
-                    uint32_t r = tryGetUniformConstUInt(row).value_or(0);
-                    uint32_t idx = cit->second + r * sig->cols + col;
-                    if (idx < 8 && (clipDistMask & (1u << idx))) {
-                        mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>((clipAttrOffset + idx) * simdWidth * 4));
-                        mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                    }
-                }
-                return true;
-            }
-            if (!hasGS && !hasTess && sig->systemValueType == 7) { // SV_CullDistance
-                auto cit = cullSigBaseIdx.find(sigId);
-                if (cit != cullSigBaseIdx.end()) {
-                    uint32_t r = tryGetUniformConstUInt(row).value_or(0);
-                    uint32_t idx = cit->second + r * sig->cols + col;
-                    if (idx < 8 && (cullDistMask & (1u << idx))) {
-                        mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>((cullAttrOffset + idx) * simdWidth * 4));
-                        mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                    }
-                }
-                return true;
-            }
-            if (!hasGS && !hasTess && sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) { // SV_ViewportArrayIndex
-                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(vpIndexAttrOffset * simdWidth * 4));
-                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                return true;
-            }
-            if (!hasGS && !hasTess && sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) { // SV_ShadingRate
-                mlir::Value dst = sh.gepBytes(outAttrs, static_cast<int64_t>(shadingRateAttrOffset * simdWidth * 4));
-                mlir::LLVM::StoreOp::create(sb, sloc, vVec, dst, /*alignment=*/4);
-                return true;
-            }
-
-            auto it = vsToPsMap.find(sigId);
-            if (it != vsToPsMap.end() && it->second.psTargetRow >= 0) {
-                uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol;
-                storeAttrAtSlot(baseSlot);
-            }
-            return true;
-        };
-
-        mlir::Value vsRealMask = activeMask;
-        if (!packetizeRegionWithHooks(b, loc, combinedMod, vsSrcFunc.getBody(), vsLoaded, vsEffectiveLayout,
-                                      simdWidth, rootCtx, activeMask, vsRealMask, vsHooks, outError)) {
+    // --- 1. Emit @<vsSym> unless skipped by VS stage cache hit or Mesh Shader PSO ---
+    if (!hasMS && !skipVS) {
+        auto vsSrcFunc = vsMlirMod->lookupSymbol<mlir::func::FuncOp>(vsLoaded.entryName);
+        if (!emitVertexStageFunction(
+                combinedMod, vsSrcFunc, vsLoaded, vsEffectiveLayout, desc.InputLayout,
+                simdWidth, vsSym, hasTess, hasGS,
+                (!hasTess && !hasGS) ? &canonicalVS : nullptr,
+                (hasTess || hasGS) ? &vsToNextMap : nullptr,
+                outError)) {
             return false;
         }
-        mlir::func::ReturnOp::create(b, loc);
     }
 
     // --- 1-mesh. Emit @<vsSym>_as (optional) and @<vsSym>_ms ---
@@ -1679,6 +2131,131 @@ bool synthesizeGraphicsPSOMLIR(
             return lh.splatScalar(outVal);
         };
 
+        auto convertF32VecToSimd = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
+                                      mlir::Value fVec, mlir::Type scalarTy) -> SimdVal {
+            IRHelpers lh{lb, lloc, simdW};
+            auto i32Ty = lh.i32Ty();
+            auto f32Ty = lh.f32Ty();
+            mlir::Value outVec = fVec;
+            if (scalarTy != f32Ty) {
+                if (mlir::isa<mlir::IntegerType>(scalarTy)) {
+                    outVec = mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(i32Ty), outVec);
+                    if (scalarTy != i32Ty) {
+                        outVec = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), outVec);
+                    }
+                } else if (mlir::isa<mlir::FloatType>(scalarTy)) {
+                    outVec = mlir::arith::TruncFOp::create(lb, lloc, lh.vecTy(scalarTy), outVec);
+                }
+            }
+            return {SimdVal::Kind::Vector, scalarTy, outVec, {}, {}};
+        };
+
+        auto toI32Vec = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW, const SimdVal& sv) -> mlir::Value {
+            IRHelpers lh{lb, lloc, simdW};
+            auto i32Ty = lh.i32Ty();
+            mlir::Type et = llvm::cast<mlir::VectorType>(sv.vec.getType()).getElementType();
+            if (et == i32Ty) return sv.vec;
+            if (et.getIntOrFloatBitWidth() < 32) {
+                return mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+            }
+            return mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+        };
+
+        auto loadPatchInputSIMD = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
+                                      mlir::Value basePtr, uint32_t cpStride,
+                                      const SimdVal* vAxis, const SimdVal& row, uint32_t rowStride,
+                                      uint32_t baseSlot, mlir::Type scalarTy, mlir::Value gatherMask) -> SimdVal {
+            IRHelpers lh{lb, lloc, simdW};
+            auto i32Ty = lh.i32Ty();
+            auto i64Ty = lh.i64Ty();
+            auto f32Ty = lh.f32Ty();
+
+            std::optional<uint32_t> vc = vAxis ? tryGetUniformConstUInt(*vAxis) : std::optional<uint32_t>(0u);
+            std::optional<uint32_t> rc = tryGetUniformConstUInt(row);
+            if (vc.has_value() && rc.has_value()) {
+                int64_t offBytes = static_cast<int64_t>((*vc) * cpStride + baseSlot + (*rc) * rowStride) * 4;
+                mlir::Value fVal = lh.loadScalar(f32Ty, lh.gepBytes(basePtr, offBytes));
+                return convertLoadedF32ToSimd(lb, lloc, simdW, fVal, scalarTy);
+            }
+
+            mlir::Value idxVec = lh.splatInt(i32Ty, static_cast<int64_t>(baseSlot));
+            if (vAxis && cpStride > 0) {
+                idxVec = mlir::arith::AddIOp::create(
+                    lb, lloc, idxVec,
+                    mlir::arith::MulIOp::create(lb, lloc, toI32Vec(lb, lloc, simdW, *vAxis), lh.splatInt(i32Ty, cpStride)));
+            }
+            if (rowStride > 0) {
+                idxVec = mlir::arith::AddIOp::create(
+                    lb, lloc, idxVec,
+                    mlir::arith::MulIOp::create(lb, lloc, toI32Vec(lb, lloc, simdW, row), lh.splatInt(i32Ty, rowStride)));
+            }
+            mlir::Value byteOffVec = mlir::arith::MulIOp::create(
+                lb, lloc, mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(i64Ty), idxVec), lh.splatInt(i64Ty, 4));
+            mlir::Value basePtrVec = mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(lh.ptrTy()), basePtr);
+            mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
+                lb, lloc, lh.vecTy(lh.ptrTy()), lh.i8Ty(), basePtrVec, mlir::ValueRange{byteOffVec});
+            mlir::Value fVec = mlir::LLVM::masked_gather::create(
+                lb, lloc, lh.vecTy(f32Ty), ptrVec, gatherMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
+            return convertF32VecToSimd(lb, lloc, simdW, fVec, scalarTy);
+        };
+
+        auto storeVecToSOA = [](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t simdW,
+                                const SimdVal& val, mlir::Value writeMask, mlir::Value activeMask,
+                                mlir::Value outBasePtr, uint32_t baseSlotWithCol, const SimdVal* dynRow) {
+            if (val.kind != SimdVal::Kind::Vector) return;
+            IRHelpers sh{sb, sloc, simdW};
+            auto i32Ty = sh.i32Ty();
+            auto f32Ty = sh.f32Ty();
+            mlir::Value vVec = val.vec;
+            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vVec.getType()).getElementType();
+            if (elemTy != f32Ty) {
+                if (mlir::isa<mlir::IntegerType>(elemTy)) {
+                    if (elemTy.getIntOrFloatBitWidth() < 32) {
+                        vVec = mlir::arith::ExtUIOp::create(sb, sloc, sh.vecTy(i32Ty), vVec);
+                    }
+                    vVec = mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vVec);
+                } else {
+                    vVec = mlir::arith::ExtFOp::create(sb, sloc, sh.vecTy(f32Ty), vVec);
+                }
+            }
+
+            std::optional<uint32_t> rc = dynRow ? tryGetUniformConstUInt(*dynRow) : std::optional<uint32_t>(0u);
+            if (rc.has_value()) {
+                uint32_t scalarSlot = baseSlotWithCol + (*rc) * 4;
+                mlir::Value dstPtr = sh.gepBytes(outBasePtr, static_cast<int64_t>(scalarSlot * simdW * 4));
+                if (!writeMask || writeMask == activeMask) {
+                    mlir::LLVM::StoreOp::create(sb, sloc, vVec, dstPtr, /*alignment=*/4);
+                } else {
+                    mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), dstPtr);
+                    mlir::Value merged = mlir::arith::SelectOp::create(sb, sloc, writeMask, vVec, prev);
+                    mlir::LLVM::StoreOp::create(sb, sloc, merged, dstPtr, /*alignment=*/4);
+                }
+            } else {
+                mlir::Value effMask = writeMask ? writeMask : activeMask;
+                for (uint32_t l = 0; l < simdW; ++l) {
+                    mlir::Value mL = mlir::vector::ExtractOp::create(sb, sloc, effMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(sb, sloc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        IRHelpers nh{nb, nloc, simdW};
+                        mlir::Value rL = mlir::vector::ExtractOp::create(nb, nloc, dynRow->vec, static_cast<int64_t>(l));
+                        mlir::Value r32 = (rL.getType() == i32Ty)
+                                              ? rL
+                                              : mlir::arith::ExtUIOp::create(nb, nloc, i32Ty, rL).getResult();
+                        mlir::Value slot32 = mlir::arith::AddIOp::create(
+                            nb, nloc, nh.cInt(i32Ty, static_cast<int64_t>(baseSlotWithCol)),
+                            mlir::arith::MulIOp::create(nb, nloc, r32, nh.cInt(i32Ty, 4)));
+                        mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                            nb, nloc, mlir::arith::MulIOp::create(nb, nloc, slot32, nh.cInt(i32Ty, simdW)),
+                            nh.cInt(i32Ty, static_cast<int64_t>(l)));
+                        mlir::Value byteOff = mlir::arith::MulIOp::create(
+                            nb, nloc, mlir::arith::ExtUIOp::create(nb, nloc, nh.i64Ty(), elemIdx), nh.cInt(nh.i64Ty(), 4));
+                        mlir::Value vL = mlir::vector::ExtractOp::create(nb, nloc, vVec, static_cast<int64_t>(l));
+                        mlir::LLVM::StoreOp::create(nb, nloc, vL, nh.gepBytesDyn(outBasePtr, byteOff));
+                        mlir::scf::YieldOp::create(nb, nloc);
+                    });
+                }
+            }
+        };
+
         auto storeLane0ToF32Ptr = [](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t simdW,
                                      const SimdVal& val, mlir::Value realMask, mlir::Value dstPtr) {
             IRHelpers lh{lb, lloc, simdW};
@@ -1700,7 +2277,7 @@ bool synthesizeGraphicsPSOMLIR(
             });
         };
 
-        // 1) @<vsSym>_hs(rootCtx, inCPAttrs, patchId, outCpId, outCPAttrs)
+        // 1) @<vsSym>_hs(rootCtx, inCPAttrs, patchId, baseOutCpId, activeCount, outCPAttrsSOA)
         {
             auto hsSrcFunc = hsMlirMod->lookupSymbol<mlir::func::FuncOp>(hsLoaded.entryName);
             if (!hsSrcFunc || hsSrcFunc.getBody().empty()) {
@@ -1711,8 +2288,7 @@ bool synthesizeGraphicsPSOMLIR(
             IRHelpers h{b, loc, simdWidth};
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
-            auto f32Ty = h.f32Ty();
-            auto fnTy = b.getFunctionType({ptrTy, ptrTy, i32Ty, i32Ty, ptrTy}, {});
+            auto fnTy = b.getFunctionType({ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, ptrTy}, {});
             auto hsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_hs", fnTy);
             mlir::Block* entry = hsFn.addEntryBlock();
             b.setInsertionPointToEnd(entry);
@@ -1720,22 +2296,29 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::Value rootCtx = entry->getArgument(0);
             mlir::Value inCPAttrs = entry->getArgument(1);
             mlir::Value patchIdArg = entry->getArgument(2);
-            mlir::Value outCpIdArg = entry->getArgument(3);
-            mlir::Value outCPAttrs = entry->getArgument(4);
+            mlir::Value baseOutCpIdArg = entry->getArgument(3);
+            mlir::Value activeCountArg = entry->getArgument(4);
+            mlir::Value outCPAttrsSOA = entry->getArgument(5);
 
+            mlir::Value acVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), activeCountArg);
             mlir::Value activeMask = mlir::arith::CmpIOp::create(
-                b, loc, mlir::arith::CmpIPredicate::eq, h.laneIota(), h.splatInt(i32Ty, 0));
+                b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
+            mlir::Value outCpIdVec = mlir::arith::SelectOp::create(
+                b, loc, activeMask,
+                mlir::arith::AddIOp::create(
+                    b, loc, mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), baseOutCpIdArg), h.laneIota()),
+                h.splatInt(i32Ty, 0));
 
             StageHooks hsHooks;
+            mlir::Value hsRealMask = activeMask;
             hsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                               const SimdVal& row, uint32_t col, const SimdVal& vAxis,
                                               mlir::Type scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = hsLoaded.findInputSig(sigId);
                 if (!sig) return false;
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, baseSlot);
-                mlir::Value fVal = IRHelpers{lb, lloc, simdWidth}.loadScalar(f32Ty, ptr);
-                out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                out = loadPatchInputSIMD(
+                    lb, lloc, simdWidth, inCPAttrs, numHSInputScalars, &vAxis, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
             hsHooks.storeOutput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -1744,20 +2327,25 @@ bool synthesizeGraphicsPSOMLIR(
                 auto it = hsToDsMap.find(sigId);
                 if (it == hsToDsMap.end() || it->second.psTargetRow < 0) return true;
                 uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, outCPAttrs, 0, nullptr, row, baseSlot);
-                storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, ptr);
+                storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outCPAttrsSOA, baseSlot, &row);
                 return true;
             };
             hsHooks.loadOutputControlPointId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                out = IRHelpers{lb, lloc, simdWidth}.splatScalar(outCpIdArg);
+                IRHelpers lh{lb, lloc, simdWidth};
+                mlir::Value v = (scalarTy == i32Ty)
+                                    ? outCpIdVec
+                                    : mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), outCpIdVec).getResult();
+                out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                 return true;
             };
             hsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                out = IRHelpers{lb, lloc, simdWidth}.splatScalar(patchIdArg);
+                IRHelpers lh{lb, lloc, simdWidth};
+                mlir::Value v = patchIdArg;
+                if (scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, scalarTy, v);
+                out = lh.splatScalar(v);
                 return true;
             };
 
-            mlir::Value hsRealMask = activeMask;
             if (!packetizeRegionWithHooks(b, loc, combinedMod, hsSrcFunc.getBody(), hsLoaded, hsEffectiveLayout,
                                           simdWidth, rootCtx, activeMask, hsRealMask, hsHooks, outError)) {
                 return false;
@@ -1851,7 +2439,10 @@ bool synthesizeGraphicsPSOMLIR(
                 return true;
             };
             hspcHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                out = IRHelpers{lb, lloc, simdWidth}.splatScalar(patchIdArg);
+                IRHelpers lh{lb, lloc, simdWidth};
+                mlir::Value v = patchIdArg;
+                if (scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, scalarTy, v);
+                out = lh.splatScalar(v);
                 return true;
             };
 
@@ -1863,7 +2454,7 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::func::ReturnOp::create(b, loc);
         }
 
-        // 3) @<vsSym>_ds(rootCtx, inCPAttrs, inPatchConsts, inTessFactors, patchId, domU, domV, domW, outPosXYZW, outAttrs)
+        // 3) @<vsSym>_ds(rootCtx, inCPAttrs, inPatchConsts, inTessFactors, patchId, domUPtr, domVPtr, domWPtr, activeCount, outPosXYZW, outAttrs)
         {
             auto dsSrcFunc = dsMlirMod->lookupSymbol<mlir::func::FuncOp>(dsLoaded.entryName);
             if (!dsSrcFunc || dsSrcFunc.getBody().empty()) {
@@ -1875,7 +2466,7 @@ bool synthesizeGraphicsPSOMLIR(
             auto ptrTy = h.ptrTy();
             auto i32Ty = h.i32Ty();
             auto f32Ty = h.f32Ty();
-            auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, f32Ty, f32Ty, f32Ty, ptrTy, ptrTy}, {});
+            auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy, ptrTy, i32Ty, ptrTy, ptrTy}, {});
             auto dsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_ds", fnTy);
             mlir::Block* entry = dsFn.addEntryBlock();
             b.setInsertionPointToEnd(entry);
@@ -1885,14 +2476,20 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::Value inPatchConsts = entry->getArgument(2);
             mlir::Value inTessFactors = entry->getArgument(3);
             mlir::Value patchIdArg = entry->getArgument(4);
-            mlir::Value domUArg = entry->getArgument(5);
-            mlir::Value domVArg = entry->getArgument(6);
-            mlir::Value domWArg = entry->getArgument(7);
-            mlir::Value outPosXYZW = entry->getArgument(8);
-            mlir::Value outAttrs = entry->getArgument(9);
+            mlir::Value domUPtr = entry->getArgument(5);
+            mlir::Value domVPtr = entry->getArgument(6);
+            mlir::Value domWPtr = entry->getArgument(7);
+            mlir::Value activeCountArg = entry->getArgument(8);
+            mlir::Value outPosXYZW = entry->getArgument(9);
+            mlir::Value outAttrs = entry->getArgument(10);
 
+            mlir::Value acVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), activeCountArg);
             mlir::Value activeMask = mlir::arith::CmpIOp::create(
-                b, loc, mlir::arith::CmpIPredicate::eq, h.laneIota(), h.splatInt(i32Ty, 0));
+                b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
+            mlir::Value zeroFltVec = h.splatFlt(0.0);
+            mlir::Value domUVec = mlir::arith::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domUPtr), zeroFltVec);
+            mlir::Value domVVec = mlir::arith::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domVPtr), zeroFltVec);
+            mlir::Value domWVec = mlir::arith::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domWPtr), zeroFltVec);
 
             StageHooks dsHooks;
             dsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -1901,9 +2498,8 @@ bool synthesizeGraphicsPSOMLIR(
                 const DxilSigRecord* sig = dsLoaded.findInputSig(sigId);
                 if (!sig) return false;
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, inCPAttrs, numHSOutputScalars, &cpIdx, row, baseSlot);
-                mlir::Value fVal = IRHelpers{lb, lloc, simdWidth}.loadScalar(f32Ty, ptr);
-                out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                out = loadPatchInputSIMD(
+                    lb, lloc, simdWidth, inCPAttrs, numHSOutputScalars, &cpIdx, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
             dsHooks.loadPatchConstant = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -1911,38 +2507,32 @@ bool synthesizeGraphicsPSOMLIR(
                                             mlir::Type scalarTy, SimdVal& out) -> bool {
                 const DxilSigRecord* sig = dsLoaded.findPatchConstSig(sigId);
                 if (!sig) return false;
-                IRHelpers lh{lb, lloc, simdWidth};
                 if (sig->systemValueType == 25 || sig->systemValueType == 26) {
                     uint32_t baseIdx = (sig->systemValueType == 25) ? 0u : 4u;
-                    mlir::Value idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseIdx));
-                    if (auto rc = tryGetUniformConstUInt(row)) {
-                        idx32 = lh.cInt(i32Ty, static_cast<int64_t>(baseIdx + *rc));
-                    } else {
-                        mlir::Value r0 = mlir::vector::ExtractOp::create(lb, lloc, row.vec, 0);
-                        if (r0.getType() != i32Ty) r0 = mlir::arith::ExtUIOp::create(lb, lloc, i32Ty, r0);
-                        idx32 = mlir::arith::AddIOp::create(lb, lloc, idx32, r0);
-                    }
-                    mlir::Value byteOff = mlir::arith::MulIOp::create(
-                        lb, lloc, mlir::arith::ExtUIOp::create(lb, lloc, lh.i64Ty(), idx32), lh.cInt(lh.i64Ty(), 4));
-                    mlir::Value fVal = lh.loadScalar(f32Ty, lh.gepBytesDyn(inTessFactors, byteOff));
-                    out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                    out = loadPatchInputSIMD(
+                        lb, lloc, simdWidth, inTessFactors, 0u, nullptr, row, 1u, baseIdx, scalarTy, activeMask);
                     return true;
                 }
                 uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
-                mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, inPatchConsts, 0, nullptr, row, baseSlot);
-                mlir::Value fVal = lh.loadScalar(f32Ty, ptr);
-                out = convertLoadedF32ToSimd(lb, lloc, simdWidth, fVal, scalarTy);
+                out = loadPatchInputSIMD(
+                    lb, lloc, simdWidth, inPatchConsts, 0u, nullptr, row, 4u, baseSlot, scalarTy, activeMask);
                 return true;
             };
             dsHooks.loadDomainLocation = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t comp,
                                              mlir::Type scalarTy, SimdVal& out) -> bool {
                 IRHelpers lh{lb, lloc, simdWidth};
-                mlir::Value v = (comp == 0) ? domUArg : ((comp == 1) ? domVArg : ((comp == 2) ? domWArg : lh.cFlt(0.0)));
-                out = lh.splatScalar(v);
+                mlir::Value v = (comp == 0) ? domUVec : ((comp == 1) ? domVVec : ((comp == 2) ? domWVec : lh.splatFlt(0.0)));
+                if (scalarTy != f32Ty) {
+                    v = mlir::arith::TruncFOp::create(lb, lloc, lh.vecTy(scalarTy), v);
+                }
+                out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                 return true;
             };
             dsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
-                out = IRHelpers{lb, lloc, simdWidth}.splatScalar(patchIdArg);
+                IRHelpers lh{lb, lloc, simdWidth};
+                mlir::Value v = patchIdArg;
+                if (scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, scalarTy, v);
+                out = lh.splatScalar(v);
                 return true;
             };
             dsHooks.storeOutput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -1952,8 +2542,7 @@ bool synthesizeGraphicsPSOMLIR(
                 if (!sig) return false;
                 if (sig->systemValueType == 3) {
                     if (col < 4) {
-                        mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(outPosXYZW, static_cast<int64_t>(col * 4));
-                        storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                        storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outPosXYZW, col, nullptr);
                     }
                     return true;
                 }
@@ -1963,9 +2552,7 @@ bool synthesizeGraphicsPSOMLIR(
                         uint32_t r = tryGetUniformConstUInt(row).value_or(0);
                         uint32_t idx = cit->second + r * sig->cols + col;
                         if (idx < 8 && (clipDistMask & (1u << idx))) {
-                            mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
-                                outAttrs, static_cast<int64_t>((clipAttrOffset + idx) * 4));
-                            storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                            storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, clipAttrOffset + idx, nullptr);
                         }
                     }
                     return true;
@@ -1976,30 +2563,23 @@ bool synthesizeGraphicsPSOMLIR(
                         uint32_t r = tryGetUniformConstUInt(row).value_or(0);
                         uint32_t idx = cit->second + r * sig->cols + col;
                         if (idx < 8 && (cullDistMask & (1u << idx))) {
-                            mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
-                                outAttrs, static_cast<int64_t>((cullAttrOffset + idx) * 4));
-                            storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                            storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, cullAttrOffset + idx, nullptr);
                         }
                     }
                     return true;
                 }
                 if (!hasGS && sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
-                    mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
-                        outAttrs, static_cast<int64_t>(vpIndexAttrOffset * 4));
-                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, vpIndexAttrOffset, nullptr);
                     return true;
                 }
                 if (!hasGS && sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
-                    mlir::Value dst = IRHelpers{lb, lloc, simdWidth}.gepBytes(
-                        outAttrs, static_cast<int64_t>(shadingRateAttrOffset * 4));
-                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, dst);
+                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, shadingRateAttrOffset, nullptr);
                     return true;
                 }
                 auto it = dsToNextMap.find(sigId);
                 if (it != dsToNextMap.end() && it->second.psTargetRow >= 0) {
                     uint32_t baseSlot = static_cast<uint32_t>(it->second.psTargetRow) * 4 + it->second.psStartCol + col;
-                    mlir::Value ptr = computeScalarPtr(lb, lloc, simdWidth, outAttrs, 0, nullptr, row, baseSlot);
-                    storeLane0ToF32Ptr(lb, lloc, simdWidth, val, realMask, ptr);
+                    storeVecToSOA(lb, lloc, simdWidth, val, realMask, activeMask, outAttrs, baseSlot, &row);
                 }
                 return true;
             };
@@ -2013,7 +2593,7 @@ bool synthesizeGraphicsPSOMLIR(
         }
     }
 
-    // --- 1b. Emit @<vsSym>_gs(rootCtx, inPosXYZW, inAttrs, primId, gsInstId, outPosXYZW, outAttrs, outStripCounts, outTotalVerts, outNumStrips) ---
+    // --- 1b. Emit @<vsSym>_gs(rootCtx, inPosXYZW, inAttrs, primIdsPtr, gsInstId, activeCount, outPosXYZW, outAttrs, outStripCounts, outTotalVerts, outNumStrips) ---
     uint32_t numGSInputScalars = numGSInputRegs * 4;
     if (hasGS) {
         auto gsSrcFunc = gsMlirMod->lookupSymbol<mlir::func::FuncOp>(gsLoaded.entryName);
@@ -2027,7 +2607,7 @@ bool synthesizeGraphicsPSOMLIR(
         auto ptrTy = h.ptrTy();
         auto i32Ty = h.i32Ty();
         auto f32Ty = h.f32Ty();
-        auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy}, {});
+        auto fnTy = b.getFunctionType({ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, ptrTy, ptrTy, ptrTy, ptrTy, ptrTy}, {});
         auto gsFn = mlir::func::FuncOp::create(b, loc, vsSym + "_gs", fnTy);
         mlir::Block* entry = gsFn.addEntryBlock();
         b.setInsertionPointToEnd(entry);
@@ -2035,37 +2615,41 @@ bool synthesizeGraphicsPSOMLIR(
         mlir::Value rootCtx = entry->getArgument(0);
         mlir::Value inPosXYZW = entry->getArgument(1);
         mlir::Value inAttrs = entry->getArgument(2);
-        mlir::Value primIdArg = entry->getArgument(3);
+        mlir::Value primIdsPtr = entry->getArgument(3);
         mlir::Value gsInstIdArg = entry->getArgument(4);
-        mlir::Value outPosXYZW = entry->getArgument(5);
-        mlir::Value outAttrs = entry->getArgument(6);
-        mlir::Value outStripCounts = entry->getArgument(7);
-        mlir::Value outTotalVerts = entry->getArgument(8);
-        mlir::Value outNumStrips = entry->getArgument(9);
+        mlir::Value activeCountArg = entry->getArgument(5);
+        mlir::Value outPosXYZW = entry->getArgument(6);
+        mlir::Value outAttrs = entry->getArgument(7);
+        mlir::Value outStripCounts = entry->getArgument(8);
+        mlir::Value outTotalVerts = entry->getArgument(9);
+        mlir::Value outNumStrips = entry->getArgument(10);
 
-        // Run lane 0 only for deterministic per-primitive stream emission
+        mlir::Value acVec = mlir::vector::BroadcastOp::create(b, loc, h.vecTy(i32Ty), activeCountArg);
         mlir::Value activeMask = mlir::arith::CmpIOp::create(
-            b, loc, mlir::arith::CmpIPredicate::eq, h.laneIota(), h.splatInt(i32Ty, 0));
+            b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
+        mlir::Value primIdVec = mlir::arith::SelectOp::create(
+            b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), primIdsPtr), h.splatInt(i32Ty, 0));
 
         uint32_t maxVerts = std::max<uint32_t>(1, gsLoaded.gsMaxVertexCount);
         uint32_t outAttrScalars = totalPostGSVertexAttrs;
+        uint32_t vecAlign = std::max<uint32_t>(64, simdWidth * 4);
 
-        mlir::Value stagingPos = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, f32Ty, h.cInt(i32Ty, 4), 16);
+        mlir::Value stagingPos = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(f32Ty), h.cInt(i32Ty, 4), vecAlign);
         mlir::Value stagingAttrs = mlir::LLVM::AllocaOp::create(
-            b, loc, ptrTy, f32Ty, h.cInt(i32Ty, std::max<uint32_t>(1, outAttrScalars)), 16);
+            b, loc, ptrTy, h.vecTy(f32Ty), h.cInt(i32Ty, std::max<uint32_t>(1, outAttrScalars)), vecAlign);
         for (uint32_t c = 0; c < 4; ++c) {
-            h.storeScalar(h.cFlt(0.0), h.gepBytes(stagingPos, static_cast<int64_t>(c * 4)));
+            h.storeScalar(h.splatFlt(0.0), h.gepBytes(stagingPos, static_cast<int64_t>(c * simdWidth * 4)));
         }
         for (uint32_t s = 0; s < outAttrScalars; ++s) {
-            h.storeScalar(h.cFlt(0.0), h.gepBytes(stagingAttrs, static_cast<int64_t>(s * 4)));
+            h.storeScalar(h.splatFlt(0.0), h.gepBytes(stagingAttrs, static_cast<int64_t>(s * simdWidth * 4)));
         }
 
-        mlir::Value emitCountPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, i32Ty, h.cInt(i32Ty, 1), 4);
-        mlir::Value curStripPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, i32Ty, h.cInt(i32Ty, 1), 4);
-        mlir::Value numStripsPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, i32Ty, h.cInt(i32Ty, 1), 4);
-        h.storeScalar(h.cInt(i32Ty, 0), emitCountPtr);
-        h.storeScalar(h.cInt(i32Ty, 0), curStripPtr);
-        h.storeScalar(h.cInt(i32Ty, 0), numStripsPtr);
+        mlir::Value emitCountPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        mlir::Value curStripPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        mlir::Value numStripsPtr = mlir::LLVM::AllocaOp::create(b, loc, ptrTy, h.vecTy(i32Ty), h.cInt(i32Ty, 1), vecAlign);
+        h.storeScalar(h.splatInt(i32Ty, 0), emitCountPtr);
+        h.storeScalar(h.splatInt(i32Ty, 0), curStripPtr);
+        h.storeScalar(h.splatInt(i32Ty, 0), numStripsPtr);
 
         StageHooks gsHooks;
         gsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
@@ -2074,40 +2658,101 @@ bool synthesizeGraphicsPSOMLIR(
             const DxilSigRecord* sig = gsLoaded.findInputSig(sigId);
             if (!sig) return false;
             IRHelpers lh{lb, lloc, simdWidth};
-            uint32_t vIdx = tryGetUniformConstUInt(vAxis).value_or(0);
-            uint32_t r = tryGetUniformConstUInt(row).value_or(0);
-            mlir::Value scalarVal;
-            if (sig->systemValueType == 3) { // SV_Position
-                scalarVal = lh.loadScalar(f32Ty, lh.gepBytes(inPosXYZW, static_cast<int64_t>((vIdx * 4 + col) * 4)));
-            } else {
-                uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
-                if (slot < numGSInputScalars) {
-                    scalarVal = lh.loadScalar(
-                        f32Ty, lh.gepBytes(inAttrs, static_cast<int64_t>((vIdx * numGSInputScalars + slot) * 4)));
+            auto toI32V = [&](const SimdVal& sv) -> mlir::Value {
+                mlir::Type et = llvm::cast<mlir::VectorType>(sv.vec.getType()).getElementType();
+                if (et == i32Ty) return sv.vec;
+                if (et.getIntOrFloatBitWidth() < 32) {
+                    return mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+                }
+                return mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(i32Ty), sv.vec);
+            };
+
+            auto vcOpt = tryGetUniformConstUInt(vAxis);
+            auto rcOpt = tryGetUniformConstUInt(row);
+            mlir::Value vecVal;
+            if (vcOpt.has_value() && rcOpt.has_value()) {
+                uint32_t vIdx = *vcOpt;
+                uint32_t r = *rcOpt;
+                if (sig->systemValueType == 3) {
+                    vecVal = lh.loadScalar(
+                        lh.vecTy(f32Ty),
+                        lh.gepBytes(inPosXYZW, static_cast<int64_t>((vIdx * 4 + col) * simdWidth * 4)));
                 } else {
-                    scalarVal = lh.cFlt(0.0);
+                    uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
+                    if (slot < numGSInputScalars) {
+                        vecVal = lh.loadScalar(
+                            lh.vecTy(f32Ty),
+                            lh.gepBytes(inAttrs, static_cast<int64_t>((vIdx * numGSInputScalars + slot) * simdWidth * 4)));
+                    } else {
+                        vecVal = lh.splatFlt(0.0);
+                    }
+                }
+            } else {
+                mlir::Value vVec32 = toI32V(vAxis);
+                if (sig->systemValueType == 3) {
+                    mlir::Value planeIdx = mlir::arith::AddIOp::create(
+                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, vVec32, lh.splatInt(i32Ty, 4)),
+                        lh.splatInt(i32Ty, col));
+                    mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, planeIdx, lh.splatInt(i32Ty, simdWidth)),
+                        lh.laneIota());
+                    mlir::Value byteOff = mlir::arith::MulIOp::create(
+                        lb, lloc, mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(lh.i64Ty()), elemIdx),
+                        lh.splatInt(lh.i64Ty(), 4));
+                    mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
+                        lb, lloc, lh.vecTy(ptrTy), lh.i8Ty(),
+                        mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(ptrTy), inPosXYZW),
+                        mlir::ValueRange{byteOff});
+                    vecVal = mlir::LLVM::masked_gather::create(
+                        lb, lloc, lh.vecTy(f32Ty), ptrVec, activeMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
+                } else {
+                    mlir::Value rVec32 = toI32V(row);
+                    mlir::Value slotVec = mlir::arith::AddIOp::create(
+                        lb, lloc,
+                        mlir::arith::MulIOp::create(
+                            lb, lloc, mlir::arith::AddIOp::create(lb, lloc, lh.splatInt(i32Ty, sig->startRow), rVec32),
+                            lh.splatInt(i32Ty, 4)),
+                        lh.splatInt(i32Ty, sig->startCol + col));
+                    mlir::Value inBounds = mlir::arith::CmpIOp::create(
+                        lb, lloc, mlir::arith::CmpIPredicate::ult, slotVec, lh.splatInt(i32Ty, numGSInputScalars));
+                    mlir::Value gatherMask = mlir::arith::AndIOp::create(lb, lloc, activeMask, inBounds);
+                    mlir::Value planeIdx = mlir::arith::AddIOp::create(
+                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, vVec32, lh.splatInt(i32Ty, numGSInputScalars)),
+                        slotVec);
+                    mlir::Value elemIdx = mlir::arith::AddIOp::create(
+                        lb, lloc, mlir::arith::MulIOp::create(lb, lloc, planeIdx, lh.splatInt(i32Ty, simdWidth)),
+                        lh.laneIota());
+                    mlir::Value byteOff = mlir::arith::MulIOp::create(
+                        lb, lloc, mlir::arith::ExtUIOp::create(lb, lloc, lh.vecTy(lh.i64Ty()), elemIdx),
+                        lh.splatInt(lh.i64Ty(), 4));
+                    mlir::Value ptrVec = mlir::LLVM::GEPOp::create(
+                        lb, lloc, lh.vecTy(ptrTy), lh.i8Ty(),
+                        mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(ptrTy), inAttrs),
+                        mlir::ValueRange{byteOff});
+                    vecVal = mlir::LLVM::masked_gather::create(
+                        lb, lloc, lh.vecTy(f32Ty), ptrVec, gatherMask, mlir::ValueRange{lh.splatFlt(0.0)}, /*alignment=*/4);
                 }
             }
             if (scalarTy != f32Ty) {
                 if (mlir::isa<mlir::IntegerType>(scalarTy)) {
-                    scalarVal = mlir::arith::BitcastOp::create(lb, lloc, i32Ty, scalarVal);
+                    vecVal = mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(i32Ty), vecVal);
                     if (scalarTy != i32Ty) {
-                        scalarVal = mlir::arith::TruncIOp::create(lb, lloc, scalarTy, scalarVal);
+                        vecVal = mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), vecVal);
                     }
                 } else {
-                    scalarVal = mlir::arith::BitcastOp::create(lb, lloc, scalarTy, scalarVal);
+                    vecVal = mlir::arith::BitcastOp::create(lb, lloc, lh.vecTy(scalarTy), vecVal);
                 }
             }
-            mlir::Value vecVal = mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(scalarTy), scalarVal);
             out = {SimdVal::Kind::Vector, scalarTy, vecVal, {}, {}};
             return true;
         };
 
         gsHooks.loadPrimitiveId = [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Type scalarTy, SimdVal& out) -> bool {
             IRHelpers lh{lb, lloc, simdWidth};
-            mlir::Value v = primIdArg;
-            if (scalarTy != i32Ty) v = mlir::arith::TruncIOp::create(lb, lloc, scalarTy, v);
-            out = {SimdVal::Kind::Vector, scalarTy, mlir::vector::BroadcastOp::create(lb, lloc, lh.vecTy(scalarTy), v), {}, {}};
+            mlir::Value v = (scalarTy == i32Ty)
+                                ? primIdVec
+                                : mlir::arith::TruncIOp::create(lb, lloc, lh.vecTy(scalarTy), primIdVec).getResult();
+            out = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
             return true;
         };
 
@@ -2120,24 +2765,30 @@ bool synthesizeGraphicsPSOMLIR(
         };
 
         gsHooks.storeOutput = [&](mlir::OpBuilder& sb, mlir::Location sloc, uint32_t sigId,
-                                  const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value) -> bool {
+                                  const SimdVal& row, uint32_t col, const SimdVal& val, mlir::Value writeMask) -> bool {
             const DxilSigRecord* sig = gsLoaded.findOutputSig(sigId);
             if (!sig || val.kind != SimdVal::Kind::Vector) return true;
             IRHelpers sh{sb, sloc, simdWidth};
-            mlir::Value lane0 = mlir::vector::ExtractOp::create(sb, sloc, val.vec, 0);
-            mlir::Type elemTy = lane0.getType();
+            mlir::Value vF32 = val.vec;
+            mlir::Type elemTy = llvm::cast<mlir::VectorType>(vF32.getType()).getElementType();
             if (elemTy != f32Ty) {
                 if (mlir::isa<mlir::IntegerType>(elemTy)) {
                     if (elemTy.getIntOrFloatBitWidth() < 32) {
-                        lane0 = mlir::arith::ExtUIOp::create(sb, sloc, i32Ty, lane0);
+                        vF32 = mlir::arith::ExtUIOp::create(sb, sloc, sh.vecTy(i32Ty), vF32);
                     }
-                    lane0 = mlir::arith::BitcastOp::create(sb, sloc, f32Ty, lane0);
+                    vF32 = mlir::arith::BitcastOp::create(sb, sloc, sh.vecTy(f32Ty), vF32);
                 } else {
-                    lane0 = mlir::arith::ExtFOp::create(sb, sloc, f32Ty, lane0);
+                    vF32 = mlir::arith::ExtFOp::create(sb, sloc, sh.vecTy(f32Ty), vF32);
                 }
             }
+            auto storeStaged = [&](mlir::Value basePtr, uint32_t slotIdx) {
+                mlir::Value slotPtr = sh.gepBytes(basePtr, static_cast<int64_t>(slotIdx * simdWidth * 4));
+                mlir::Value prev = sh.loadScalar(sh.vecTy(f32Ty), slotPtr);
+                mlir::Value effMask = writeMask ? writeMask : activeMask;
+                sh.storeScalar(mlir::arith::SelectOp::create(sb, sloc, effMask, vF32, prev), slotPtr);
+            };
             if (sig->systemValueType == 3) {
-                if (col < 4) sh.storeScalar(lane0, sh.gepBytes(stagingPos, static_cast<int64_t>(col * 4)));
+                if (col < 4) storeStaged(stagingPos, col);
                 return true;
             }
             uint32_t r = tryGetUniformConstUInt(row).value_or(0);
@@ -2146,7 +2797,7 @@ bool synthesizeGraphicsPSOMLIR(
                 if (cit != clipSigBaseIdx.end()) {
                     uint32_t idx = cit->second + r * sig->cols + col;
                     if (idx < 8 && (clipDistMask & (1u << idx))) {
-                        sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>((clipAttrOffset + idx) * 4)));
+                        storeStaged(stagingAttrs, clipAttrOffset + idx);
                     }
                 }
                 return true;
@@ -2156,24 +2807,24 @@ bool synthesizeGraphicsPSOMLIR(
                 if (cit != cullSigBaseIdx.end()) {
                     uint32_t idx = cit->second + r * sig->cols + col;
                     if (idx < 8 && (cullDistMask & (1u << idx))) {
-                        sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>((cullAttrOffset + idx) * 4)));
+                        storeStaged(stagingAttrs, cullAttrOffset + idx);
                     }
                 }
                 return true;
             }
             if (sig->systemValueType == 5 && hasViewportArrayIndex && col == 0) {
-                sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>(vpIndexAttrOffset * 4)));
+                storeStaged(stagingAttrs, vpIndexAttrOffset);
                 return true;
             }
             if (sig->systemValueType == 29 && hasPerPrimShadingRate && col == 0) {
-                sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>(shadingRateAttrOffset * 4)));
+                storeStaged(stagingAttrs, shadingRateAttrOffset);
                 return true;
             }
             auto it = gsToPsMap.find(sigId);
             if (it != gsToPsMap.end() && it->second.psTargetRow >= 0) {
                 uint32_t slot = (static_cast<uint32_t>(it->second.psTargetRow) + r) * 4 + it->second.psStartCol + col;
                 if (slot < outAttrScalars) {
-                    sh.storeScalar(lane0, sh.gepBytes(stagingAttrs, static_cast<int64_t>(slot * 4)));
+                    storeStaged(stagingAttrs, slot);
                 }
             }
             return true;
@@ -2182,55 +2833,102 @@ bool synthesizeGraphicsPSOMLIR(
         gsHooks.emitStream = [&](mlir::OpBuilder& eb, mlir::Location eloc, uint32_t streamId, mlir::Value realMask) -> bool {
             if (streamId != 0) return true;
             IRHelpers eh{eb, eloc, simdWidth};
-            mlir::Value lane0Active = mlir::vector::ExtractOp::create(eb, eloc, realMask, 0);
-            mlir::Value curCount = eh.loadScalar(i32Ty, emitCountPtr);
-            mlir::Value hasRoom = mlir::arith::CmpIOp::create(
-                eb, eloc, mlir::arith::CmpIPredicate::ult, curCount, eh.cInt(i32Ty, maxVerts));
-            mlir::Value doEmit = mlir::arith::AndIOp::create(eb, eloc, lane0Active, hasRoom);
-            mlir::scf::IfOp::create(eb, eloc, doEmit, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+            mlir::Value curCountVec = eh.loadScalar(eh.vecTy(i32Ty), emitCountPtr);
+            mlir::Value hasRoomVec = mlir::arith::CmpIOp::create(
+                eb, eloc, mlir::arith::CmpIPredicate::ult, curCountVec, eh.splatInt(i32Ty, maxVerts));
+            mlir::Value doEmitMask = mlir::arith::AndIOp::create(eb, eloc, realMask, hasRoomVec);
+            mlir::Value anyEmit = eh.orReduce(doEmitMask);
+            mlir::scf::IfOp::create(eb, eloc, anyEmit, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                 IRHelpers nh{nb, nloc, simdWidth};
-                mlir::Value idx64 = mlir::arith::ExtUIOp::create(nb, nloc, nh.i64Ty(), curCount);
-                mlir::Value posBase = mlir::arith::MulIOp::create(nb, nloc, idx64, nh.cInt(nh.i64Ty(), 16));
+                mlir::Value posVecs[4];
                 for (uint32_t c = 0; c < 4; ++c) {
-                    mlir::Value pv = nh.loadScalar(f32Ty, nh.gepBytes(stagingPos, static_cast<int64_t>(c * 4)));
-                    mlir::Value off = mlir::arith::AddIOp::create(nb, nloc, posBase, nh.cInt(nh.i64Ty(), static_cast<int64_t>(c * 4)));
-                    nh.storeScalar(pv, nh.gepBytesDyn(outPosXYZW, off));
+                    posVecs[c] = nh.loadScalar(nh.vecTy(f32Ty), nh.gepBytes(stagingPos, static_cast<int64_t>(c * simdWidth * 4)));
                 }
-                if (outAttrScalars > 0) {
-                    mlir::Value attrBase = mlir::arith::MulIOp::create(
-                        nb, nloc, idx64, nh.cInt(nh.i64Ty(), static_cast<int64_t>(outAttrScalars * 4)));
-                    for (uint32_t s = 0; s < outAttrScalars; ++s) {
-                        mlir::Value av = nh.loadScalar(f32Ty, nh.gepBytes(stagingAttrs, static_cast<int64_t>(s * 4)));
-                        mlir::Value off = mlir::arith::AddIOp::create(nb, nloc, attrBase, nh.cInt(nh.i64Ty(), static_cast<int64_t>(s * 4)));
-                        nh.storeScalar(av, nh.gepBytesDyn(outAttrs, off));
-                    }
+                llvm::SmallVector<mlir::Value, 16> attrVecs(outAttrScalars);
+                for (uint32_t s = 0; s < outAttrScalars; ++s) {
+                    attrVecs[s] = nh.loadScalar(nh.vecTy(f32Ty), nh.gepBytes(stagingAttrs, static_cast<int64_t>(s * simdWidth * 4)));
                 }
-                nh.storeScalar(mlir::arith::AddIOp::create(nb, nloc, curCount, nh.cInt(i32Ty, 1)), emitCountPtr);
-                mlir::Value cs = nh.loadScalar(i32Ty, curStripPtr);
-                nh.storeScalar(mlir::arith::AddIOp::create(nb, nloc, cs, nh.cInt(i32Ty, 1)), curStripPtr);
+
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value laneDo = mlir::vector::ExtractOp::create(nb, nloc, doEmitMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(nb, nloc, laneDo, [&](mlir::OpBuilder& lb2, mlir::Location lloc2) {
+                        IRHelpers lh2{lb2, lloc2, simdWidth};
+                        mlir::Value cL = mlir::vector::ExtractOp::create(lb2, lloc2, curCountVec, static_cast<int64_t>(l));
+                        mlir::Value vIdx = mlir::arith::AddIOp::create(
+                            lb2, lloc2, lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), cL);
+                        mlir::Value vIdx64 = mlir::arith::ExtUIOp::create(lb2, lloc2, lh2.i64Ty(), vIdx);
+                        mlir::Value posBase = mlir::arith::MulIOp::create(lb2, lloc2, vIdx64, lh2.cInt(lh2.i64Ty(), 16));
+                        for (uint32_t c = 0; c < 4; ++c) {
+                            mlir::Value pv = mlir::vector::ExtractOp::create(lb2, lloc2, posVecs[c], static_cast<int64_t>(l));
+                            mlir::Value off = mlir::arith::AddIOp::create(
+                                lb2, lloc2, posBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(c * 4)));
+                            lh2.storeScalar(pv, lh2.gepBytesDyn(outPosXYZW, off));
+                        }
+                        if (outAttrScalars > 0) {
+                            mlir::Value attrBase = mlir::arith::MulIOp::create(
+                                lb2, lloc2, vIdx64, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(outAttrScalars * 4)));
+                            for (uint32_t s = 0; s < outAttrScalars; ++s) {
+                                mlir::Value av = mlir::vector::ExtractOp::create(lb2, lloc2, attrVecs[s], static_cast<int64_t>(l));
+                                mlir::Value off = mlir::arith::AddIOp::create(
+                                    lb2, lloc2, attrBase, lh2.cInt(lh2.i64Ty(), static_cast<int64_t>(s * 4)));
+                                lh2.storeScalar(av, lh2.gepBytesDyn(outAttrs, off));
+                            }
+                        }
+                        mlir::scf::YieldOp::create(lb2, lloc2);
+                    });
+                }
+
+                mlir::Value nextCount = mlir::arith::SelectOp::create(
+                    nb, nloc, doEmitMask, mlir::arith::AddIOp::create(nb, nloc, curCountVec, nh.splatInt(i32Ty, 1)), curCountVec);
+                nh.storeScalar(nextCount, emitCountPtr);
+                mlir::Value csVec = nh.loadScalar(nh.vecTy(i32Ty), curStripPtr);
+                mlir::Value nextCS = mlir::arith::SelectOp::create(
+                    nb, nloc, doEmitMask, mlir::arith::AddIOp::create(nb, nloc, csVec, nh.splatInt(i32Ty, 1)), csVec);
+                nh.storeScalar(nextCS, curStripPtr);
                 mlir::scf::YieldOp::create(nb, nloc);
             });
             return true;
         };
 
-        gsHooks.cutStream = [&](mlir::OpBuilder& cb, mlir::Location cloc, uint32_t streamId, mlir::Value realMask) -> bool {
-            if (streamId != 0) return true;
+        auto emitCutForMask = [&](mlir::OpBuilder& cb, mlir::Location cloc, mlir::Value maskVec) {
             IRHelpers ch{cb, cloc, simdWidth};
-            mlir::Value lane0Active = mlir::vector::ExtractOp::create(cb, cloc, realMask, 0);
-            mlir::Value cs = ch.loadScalar(i32Ty, curStripPtr);
-            mlir::Value hasVerts = mlir::arith::CmpIOp::create(
-                cb, cloc, mlir::arith::CmpIPredicate::ugt, cs, ch.cInt(i32Ty, 0));
-            mlir::Value doCut = mlir::arith::AndIOp::create(cb, cloc, lane0Active, hasVerts);
-            mlir::scf::IfOp::create(cb, cloc, doCut, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+            mlir::Value csVec = ch.loadScalar(ch.vecTy(i32Ty), curStripPtr);
+            mlir::Value hasVertsVec = mlir::arith::CmpIOp::create(
+                cb, cloc, mlir::arith::CmpIPredicate::ugt, csVec, ch.splatInt(i32Ty, 0));
+            mlir::Value doCutMask = mlir::arith::AndIOp::create(cb, cloc, maskVec, hasVertsVec);
+            mlir::Value anyCut = ch.orReduce(doCutMask);
+            mlir::scf::IfOp::create(cb, cloc, anyCut, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                 IRHelpers nh{nb, nloc, simdWidth};
-                mlir::Value ns = nh.loadScalar(i32Ty, numStripsPtr);
-                mlir::Value off = mlir::arith::MulIOp::create(
-                    nb, nloc, mlir::arith::ExtUIOp::create(nb, nloc, nh.i64Ty(), ns), nh.cInt(nh.i64Ty(), 4));
-                nh.storeScalar(cs, nh.gepBytesDyn(outStripCounts, off));
-                nh.storeScalar(mlir::arith::AddIOp::create(nb, nloc, ns, nh.cInt(i32Ty, 1)), numStripsPtr);
-                nh.storeScalar(nh.cInt(i32Ty, 0), curStripPtr);
+                mlir::Value nsVec = nh.loadScalar(nh.vecTy(i32Ty), numStripsPtr);
+                for (uint32_t l = 0; l < simdWidth; ++l) {
+                    mlir::Value laneCut = mlir::vector::ExtractOp::create(nb, nloc, doCutMask, static_cast<int64_t>(l));
+                    mlir::scf::IfOp::create(nb, nloc, laneCut, [&](mlir::OpBuilder& lb2, mlir::Location lloc2) {
+                        IRHelpers lh2{lb2, lloc2, simdWidth};
+                        mlir::Value nsL = mlir::vector::ExtractOp::create(lb2, lloc2, nsVec, static_cast<int64_t>(l));
+                        mlir::Value csL = mlir::vector::ExtractOp::create(lb2, lloc2, csVec, static_cast<int64_t>(l));
+                        mlir::Value stripIdx = mlir::arith::AddIOp::create(
+                            lb2, lloc2, lh2.cInt(i32Ty, static_cast<int64_t>(l * maxVerts)), nsL);
+                        mlir::Value off = mlir::arith::MulIOp::create(
+                            lb2, lloc2, mlir::arith::ExtUIOp::create(lb2, lloc2, lh2.i64Ty(), stripIdx),
+                            lh2.cInt(lh2.i64Ty(), 4));
+                        lh2.storeScalar(csL, lh2.gepBytesDyn(outStripCounts, off));
+                        mlir::scf::YieldOp::create(lb2, lloc2);
+                    });
+                }
+                nh.storeScalar(
+                    mlir::arith::SelectOp::create(
+                        nb, nloc, doCutMask, mlir::arith::AddIOp::create(nb, nloc, nsVec, nh.splatInt(i32Ty, 1)), nsVec),
+                    numStripsPtr);
+                nh.storeScalar(
+                    mlir::arith::SelectOp::create(nb, nloc, doCutMask, nh.splatInt(i32Ty, 0), csVec),
+                    curStripPtr);
                 mlir::scf::YieldOp::create(nb, nloc);
             });
+        };
+
+        gsHooks.cutStream = [&](mlir::OpBuilder& cb, mlir::Location cloc, uint32_t streamId, mlir::Value realMask) -> bool {
+            if (streamId != 0) return true;
+            emitCutForMask(cb, cloc, realMask);
             return true;
         };
 
@@ -2240,22 +2938,11 @@ bool synthesizeGraphicsPSOMLIR(
             return false;
         }
 
-        // Flush any remaining vertices in current strip
-        mlir::Value finalCS = h.loadScalar(i32Ty, curStripPtr);
-        mlir::Value hasFinal = mlir::arith::CmpIOp::create(
-            b, loc, mlir::arith::CmpIPredicate::ugt, finalCS, h.cInt(i32Ty, 0));
-        mlir::scf::IfOp::create(b, loc, hasFinal, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-            IRHelpers nh{nb, nloc, simdWidth};
-            mlir::Value ns = nh.loadScalar(i32Ty, numStripsPtr);
-            mlir::Value off = mlir::arith::MulIOp::create(
-                nb, nloc, mlir::arith::ExtUIOp::create(nb, nloc, nh.i64Ty(), ns), nh.cInt(nh.i64Ty(), 4));
-            nh.storeScalar(finalCS, nh.gepBytesDyn(outStripCounts, off));
-            nh.storeScalar(mlir::arith::AddIOp::create(nb, nloc, ns, nh.cInt(i32Ty, 1)), numStripsPtr);
-            mlir::scf::YieldOp::create(nb, nloc);
-        });
+        // Flush any remaining vertices in current strip across all active lanes
+        emitCutForMask(b, loc, activeMask);
 
-        h.storeScalar(h.loadScalar(i32Ty, emitCountPtr), outTotalVerts);
-        h.storeScalar(h.loadScalar(i32Ty, numStripsPtr), outNumStrips);
+        mlir::LLVM::StoreOp::create(b, loc, h.loadScalar(h.vecTy(i32Ty), emitCountPtr), outTotalVerts, /*alignment=*/4);
+        mlir::LLVM::StoreOp::create(b, loc, h.loadScalar(h.vecTy(i32Ty), numStripsPtr), outNumStrips, /*alignment=*/4);
         mlir::func::ReturnOp::create(b, loc);
     }
 
@@ -2537,15 +3224,16 @@ bool synthesizeGraphicsPSOMLIR(
                 mlir::Value triAttrBasePtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrBase)));
                 mlir::Value triAttrFlatPtr = ph.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrFlat)));
 
-                // Cache interpolated scalar registers (max 16 * 4 = 64 scalars)
-                std::array<mlir::Value, 64> interpScalars{};
+                // Cache interpolated scalar registers (max 32 * 4 = 128 scalars)
+                std::array<mlir::Value, 128> interpScalars{};
                 for (const auto& pi : psLoaded.inputSigs) {
                     if (pi.systemValueType != 0) continue;
                     for (uint32_t r = 0; r < pi.rows; ++r) {
                         for (uint32_t c = 0; c < pi.cols && (pi.startCol + c) < 4; ++c) {
                             uint32_t slot = (pi.startRow + r) * 4 + (pi.startCol + c);
-                            if (slot >= 64) continue;
-                            if (pi.interpMode == 1 || (msPrimAttrMask & (1ull << slot)) != 0) { // nointerpolation or MS per-primitive
+                            if (slot >= 128) continue;
+                            bool isMsPrimAttr = (slot < 64) && ((msPrimAttrMask & (1ull << slot)) != 0);
+                            if (pi.interpMode == 1 || isMsPrimAttr) { // nointerpolation or MS per-primitive
                                 mlir::Value fv = ph.loadScalar(f32Ty, ph.gepBytes(triAttrFlatPtr, static_cast<int64_t>(slot * 4)));
                                 interpScalars[slot] = mlir::vector::BroadcastOp::create(pb, ploc, ph.vecTy(f32Ty), fv);
                             } else {
@@ -2682,14 +3370,14 @@ bool synthesizeGraphicsPSOMLIR(
                     if (rowConst.has_value() || sig->rows <= 1) {
                         uint32_t r = rowConst.value_or(0);
                         uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
-                        v = (slot < 64 && interpScalars[slot]) ? interpScalars[slot] : lh.splatFlt(0.0);
+                        v = (slot < 128 && interpScalars[slot]) ? interpScalars[slot] : lh.splatFlt(0.0);
                     } else {
                         uint32_t baseSlot = sig->startRow * 4 + sig->startCol + col;
-                        v = (baseSlot < 64 && interpScalars[baseSlot]) ? interpScalars[baseSlot] : lh.splatFlt(0.0);
+                        v = (baseSlot < 128 && interpScalars[baseSlot]) ? interpScalars[baseSlot] : lh.splatFlt(0.0);
                         mlir::Type rElemTy = llvm::cast<mlir::VectorType>(row.vec.getType()).getElementType();
                         for (uint32_t r = 1; r < sig->rows; ++r) {
                             uint32_t slot = (sig->startRow + r) * 4 + sig->startCol + col;
-                            if (slot >= 64 || !interpScalars[slot]) continue;
+                            if (slot >= 128 || !interpScalars[slot]) continue;
                             mlir::Value cmp = mlir::arith::CmpIOp::create(
                                 lb, lloc, mlir::arith::CmpIPredicate::eq, row.vec, lh.splatInt(rElemTy, r));
                             v = mlir::arith::SelectOp::create(lb, lloc, cmp, interpScalars[slot], v);
@@ -2943,6 +3631,8 @@ bool synthesizeGraphicsPSOMLIR(
         outMeta.asGroupSharedBytes = asLoaded.groupSharedBytes;
         outMeta.asPayloadBytes = asLoaded.asPayloadBytes;
     }
+    outMeta.psInputFromVSSlot = psInputFromVSSlot;
+    outMeta.psUsesPerspBarycentrics = psUsesPerspBarycentrics ? 1 : 0;
     outMeta.psWritesDepth = psWritesDepth ? 1 : 0;
     outMeta.psUsesDiscard = psUsesDiscard ? 1 : 0;
     outMeta.psHasSideEffects = psHasSideEffects ? 1 : 0;
@@ -2961,10 +3651,126 @@ bool compileGraphicsPSO(
     outPSO.cacheHashLo = lo;
     outPSO.cacheHashHi = hi;
 
+    const bool hasMS = (meshStages.MS.pShaderBytecode && meshStages.MS.BytecodeLength > 0);
+    bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
+                              desc.DS.pShaderBytecode && desc.DS.BytecodeLength > 0);
+    bool hasGS = !hasMS && (desc.GS.pShaderBytecode && desc.GS.BytecodeLength > 0);
+
     std::string hex = hashToHex128(lo, hi);
-    std::string vsSym = "nacelle_vs_" + hex;
     std::string psSym = "nacelle_ps_" + hex;
 
+    auto populatePSOFromMeta = [&](const CachedPSOMeta& meta) {
+        outPSO.simdWidth = meta.simdWidth;
+        outPSO.numVSOutputRegs = meta.numVSOutputRegs;
+        outPSO.posOutputReg = meta.posOutputReg;
+        outPSO.numPSInputRegs = meta.numPSInputRegs;
+        outPSO.flatInterpMask = meta.flatInterpMask;
+        outPSO.clipDistMask = meta.clipDistMask;
+        outPSO.cullDistMask = meta.cullDistMask;
+        outPSO.clipAttrOffset = meta.clipAttrOffset;
+        outPSO.cullAttrOffset = meta.cullAttrOffset;
+        outPSO.hasViewportArrayIndex = meta.hasViewportArrayIndex != 0;
+        outPSO.vpIndexAttrOffset = meta.vpIndexAttrOffset;
+        outPSO.hasPerPrimShadingRate = meta.hasPerPrimShadingRate != 0;
+        outPSO.shadingRateAttrOffset = meta.shadingRateAttrOffset;
+        outPSO.totalVSScalarAttrs = meta.totalVSScalarAttrs;
+        outPSO.hasGS = meta.hasGS != 0;
+        outPSO.gsMaxVertexCount = meta.gsMaxVertexCount;
+        outPSO.gsOutputTopology = meta.gsOutputTopology;
+        outPSO.gsInstanceCount = meta.gsInstanceCount;
+        outPSO.numGSInputScalars = meta.numGSInputScalars;
+        outPSO.hasTess = meta.hasTess != 0;
+        outPSO.hsInputCPCount = meta.hsInputCPCount;
+        outPSO.hsOutputCPCount = meta.hsOutputCPCount;
+        outPSO.tessDomain = meta.tessDomain;
+        outPSO.tessPartitioning = meta.tessPartitioning;
+        outPSO.tessOutputPrimitive = meta.tessOutputPrimitive;
+        outPSO.hsMaxTessFactor = meta.hsMaxTessFactor;
+        outPSO.numHSInputScalars = meta.numHSInputScalars;
+        outPSO.numHSOutputScalars = meta.numHSOutputScalars;
+        outPSO.numPatchConstScalars = meta.numPatchConstScalars;
+        outPSO.hasMS = meta.hasMS != 0;
+        outPSO.hasAS = meta.hasAS != 0;
+        outPSO.msThreadGroupSize[0] = meta.msThreadGroupSize[0];
+        outPSO.msThreadGroupSize[1] = meta.msThreadGroupSize[1];
+        outPSO.msThreadGroupSize[2] = meta.msThreadGroupSize[2];
+        outPSO.msGroupSharedBytes = meta.msGroupSharedBytes;
+        outPSO.msMaxVertexCount = meta.msMaxVertexCount;
+        outPSO.msMaxPrimitiveCount = meta.msMaxPrimitiveCount;
+        outPSO.msOutputTopology = meta.msOutputTopology;
+        outPSO.msPayloadBytes = meta.msPayloadBytes;
+        outPSO.msPrimAttrMask = meta.msPrimAttrMask;
+        outPSO.asThreadGroupSize[0] = meta.asThreadGroupSize[0];
+        outPSO.asThreadGroupSize[1] = meta.asThreadGroupSize[1];
+        outPSO.asThreadGroupSize[2] = meta.asThreadGroupSize[2];
+        outPSO.asGroupSharedBytes = meta.asGroupSharedBytes;
+        outPSO.asPayloadBytes = meta.asPayloadBytes;
+        outPSO.psInputFromVSSlot = meta.psInputFromVSSlot;
+        outPSO.psUsesPerspBarycentrics = meta.psUsesPerspBarycentrics != 0;
+        outPSO.psWritesDepth = meta.psWritesDepth != 0;
+        outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
+        outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
+    };
+
+    if (!hasMS && !hasTess && !hasGS) {
+        uint64_t vsHashLo = 0, vsHashHi = 0;
+        computeVertexStageHash(desc, rootLayout, simdWidth, vsHashLo, vsHashHi);
+        outPSO.vsCacheHashLo = vsHashLo;
+        outPSO.vsCacheHashHi = vsHashHi;
+        std::string vsSym = "nacelle_vs_" + hashToHex128(vsHashLo, vsHashHi);
+
+        if (tryLoadGraphicsPSOFromCache(lo, hi, vsSym, psSym, outPSO)) {
+            return true;
+        }
+
+        thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+        CachedVSMeta vsMeta{};
+        CompiledVertexFn cachedVSFn = nullptr;
+        std::vector<DxilSigRecord> vsOutputRecs;
+        if (tryLoadVertexStageFromCache(
+                vsHashLo, vsHashHi, vsSym, vsMeta, cachedVSFn,
+                &outPSO.vsInputs, &outPSO.vsOutputs, &vsOutputRecs)) {
+            outPSO.vsSymbolName = vsSym;
+            outPSO.vsFn.store(cachedVSFn, std::memory_order_release);
+        } else {
+            mlir::OwningOpRef<mlir::ModuleOp> vsMod;
+            if (!synthesizeVertexStageMLIR(
+                    desc, rootLayout, simdWidth, vsSym, mlirCtx, vsMod, vsMeta,
+                    outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outError)) {
+                return false;
+            }
+            auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            auto vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError);
+            if (!vsLinkedMod) return false;
+            if (!jitCompileVertexStageTier1AndScheduleTier2(
+                    std::move(vsLinkedMod), std::move(vsLlvmCtx), vsHashLo, vsHashHi, vsSym,
+                    vsMeta, outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outPSO, outError)) {
+                return false;
+            }
+        }
+
+        mlir::OwningOpRef<mlir::ModuleOp> psMod;
+        CachedPSOMeta meta{};
+        if (!synthesizeGraphicsPSOMLIR(
+                desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, psMod, meta,
+                outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError,
+                meshStages, /*skipVS=*/true, &vsMeta, &vsOutputRecs)) {
+            return false;
+        }
+        meta.separateVSObject = 1;
+        meta.vsHashLo = vsHashLo;
+        meta.vsHashHi = vsHashHi;
+
+        auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
+        auto psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError);
+        if (!psLinkedMod) return false;
+
+        populatePSOFromMeta(meta);
+        return jitCompilePixelStageTier1AndScheduleTier2(
+            std::move(psLinkedMod), std::move(psLlvmCtx), vsHashLo, vsHashHi, psSym, meta, outPSO, outError);
+    }
+
+    std::string vsSym = "nacelle_vs_" + hex;
     if (tryLoadGraphicsPSOFromCache(lo, hi, vsSym, psSym, outPSO)) {
         return true;
     }
@@ -2982,55 +3788,7 @@ bool compileGraphicsPSO(
     auto linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError);
     if (!linkedMod) return false;
 
-    outPSO.simdWidth = meta.simdWidth;
-    outPSO.numVSOutputRegs = meta.numVSOutputRegs;
-    outPSO.posOutputReg = meta.posOutputReg;
-    outPSO.numPSInputRegs = meta.numPSInputRegs;
-    outPSO.flatInterpMask = meta.flatInterpMask;
-    outPSO.clipDistMask = meta.clipDistMask;
-    outPSO.cullDistMask = meta.cullDistMask;
-    outPSO.clipAttrOffset = meta.clipAttrOffset;
-    outPSO.cullAttrOffset = meta.cullAttrOffset;
-    outPSO.hasViewportArrayIndex = meta.hasViewportArrayIndex != 0;
-    outPSO.vpIndexAttrOffset = meta.vpIndexAttrOffset;
-    outPSO.hasPerPrimShadingRate = meta.hasPerPrimShadingRate != 0;
-    outPSO.shadingRateAttrOffset = meta.shadingRateAttrOffset;
-    outPSO.totalVSScalarAttrs = meta.totalVSScalarAttrs;
-    outPSO.hasGS = meta.hasGS != 0;
-    outPSO.gsMaxVertexCount = meta.gsMaxVertexCount;
-    outPSO.gsOutputTopology = meta.gsOutputTopology;
-    outPSO.gsInstanceCount = meta.gsInstanceCount;
-    outPSO.numGSInputScalars = meta.numGSInputScalars;
-    outPSO.hasTess = meta.hasTess != 0;
-    outPSO.hsInputCPCount = meta.hsInputCPCount;
-    outPSO.hsOutputCPCount = meta.hsOutputCPCount;
-    outPSO.tessDomain = meta.tessDomain;
-    outPSO.tessPartitioning = meta.tessPartitioning;
-    outPSO.tessOutputPrimitive = meta.tessOutputPrimitive;
-    outPSO.hsMaxTessFactor = meta.hsMaxTessFactor;
-    outPSO.numHSInputScalars = meta.numHSInputScalars;
-    outPSO.numHSOutputScalars = meta.numHSOutputScalars;
-    outPSO.numPatchConstScalars = meta.numPatchConstScalars;
-    outPSO.hasMS = meta.hasMS != 0;
-    outPSO.hasAS = meta.hasAS != 0;
-    outPSO.msThreadGroupSize[0] = meta.msThreadGroupSize[0];
-    outPSO.msThreadGroupSize[1] = meta.msThreadGroupSize[1];
-    outPSO.msThreadGroupSize[2] = meta.msThreadGroupSize[2];
-    outPSO.msGroupSharedBytes = meta.msGroupSharedBytes;
-    outPSO.msMaxVertexCount = meta.msMaxVertexCount;
-    outPSO.msMaxPrimitiveCount = meta.msMaxPrimitiveCount;
-    outPSO.msOutputTopology = meta.msOutputTopology;
-    outPSO.msPayloadBytes = meta.msPayloadBytes;
-    outPSO.msPrimAttrMask = meta.msPrimAttrMask;
-    outPSO.asThreadGroupSize[0] = meta.asThreadGroupSize[0];
-    outPSO.asThreadGroupSize[1] = meta.asThreadGroupSize[1];
-    outPSO.asThreadGroupSize[2] = meta.asThreadGroupSize[2];
-    outPSO.asGroupSharedBytes = meta.asGroupSharedBytes;
-    outPSO.asPayloadBytes = meta.asPayloadBytes;
-    outPSO.psWritesDepth = meta.psWritesDepth != 0;
-    outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
-    outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
-
+    populatePSOFromMeta(meta);
     return jitCompileGraphicsTier1AndScheduleTier2(
         std::move(linkedMod), std::move(outLlvmCtx), vsSym, psSym, meta, outPSO, outError);
 }

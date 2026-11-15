@@ -1,4 +1,5 @@
 #include "metal_bench.h"
+#include "bench_types.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -57,22 +58,12 @@ struct GeomStressCB {
     float pad;
 };
 
-double computeMedian(std::vector<double> vals) {
-    if (vals.empty()) return 0.0;
-    std::sort(vals.begin(), vals.end());
-    size_t mid = vals.size() / 2;
-    if (vals.size() % 2 == 0) {
-        return 0.5 * (vals[mid - 1] + vals[mid]);
-    }
-    return vals[mid];
-}
-
 void finalizeSamples(MetalBenchResult& res, const std::vector<double>& samples) {
     if (samples.empty()) return;
     double sum = 0.0;
     for (double s : samples) sum += s;
     res.meanMs = sum / static_cast<double>(samples.size());
-    res.medianMs = computeMedian(samples);
+    res.medianMs = nacelle_bench::computeMedian(samples);
     res.minMs = *std::min_element(samples.begin(), samples.end());
 }
 
@@ -500,6 +491,7 @@ MetalBenchResult runMetalGraphicsBench(
             return res;
         }
 
+        bool isVertexMesh = (benchId == "bench_vertex_mesh");
         bool isPixel = (category == "Pixel");
         bool isGeometry = (category == "Geometry");
         bool isTess = (category == "Tessellation");
@@ -518,6 +510,7 @@ MetalBenchResult runMetalGraphicsBench(
 
         NSError* mtlErr = nil;
         id<MTLRenderPipelineState> pso = nil;
+        id<MTLDepthStencilState> dsState = nil;
         IRRuntimeGeometryPipelineConfig geomCfg{};
         IRRuntimeTessellationPipelineConfig tessCfg{};
 
@@ -526,7 +519,33 @@ MetalBenchResult runMetalGraphicsBench(
             psoDesc.vertexFunction = vsStage.fn;
             psoDesc.fragmentFunction = psStage.fn;
             psoDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-            if (isPixel) {
+            if (isVertexMesh) {
+                psoDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+                MTLVertexDescriptor* vDesc = [MTLVertexDescriptor vertexDescriptor];
+                vDesc.attributes[kIRStageInAttributeStartIndex + 0].format = MTLVertexFormatFloat3;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 0].offset = 0;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 0].bufferIndex = kIRVertexBufferBindPoint + 0;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 1].format = MTLVertexFormatShort4Normalized;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 1].offset = 12;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 1].bufferIndex = kIRVertexBufferBindPoint + 0;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 2].format = MTLVertexFormatUShort2Normalized;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 2].offset = 20;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 2].bufferIndex = kIRVertexBufferBindPoint + 0;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 3].format = MTLVertexFormatUChar4Normalized;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 3].offset = 24;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 3].bufferIndex = kIRVertexBufferBindPoint + 0;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 4].format = MTLVertexFormatUChar4;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 4].offset = 28;
+                vDesc.attributes[kIRStageInAttributeStartIndex + 4].bufferIndex = kIRVertexBufferBindPoint + 0;
+                vDesc.layouts[kIRVertexBufferBindPoint + 0].stride = sizeof(MeshBenchVertex);
+                vDesc.layouts[kIRVertexBufferBindPoint + 0].stepFunction = MTLVertexStepFunctionPerVertex;
+                psoDesc.vertexDescriptor = vDesc;
+
+                MTLDepthStencilDescriptor* dsd = [[MTLDepthStencilDescriptor alloc] init];
+                dsd.depthCompareFunction = MTLCompareFunctionLess;
+                dsd.depthWriteEnabled = YES;
+                dsState = [device newDepthStencilStateWithDescriptor:dsd];
+            } else if (isPixel) {
                 MTLVertexDescriptor* vDesc = [MTLVertexDescriptor vertexDescriptor];
                 vDesc.attributes[kIRStageInAttributeStartIndex + 0].format = MTLVertexFormatFloat3;
                 vDesc.attributes[kIRStageInAttributeStartIndex + 0].offset = 0;
@@ -612,8 +631,8 @@ MetalBenchResult runMetalGraphicsBench(
             return res;
         }
 
-        uint32_t maxW = isPixel ? std::max(128u, width * 2) : 128;
-        uint32_t maxH = isPixel ? std::max(128u, height * 2) : 128;
+        uint32_t maxW = (isPixel || isVertexMesh) ? std::max(128u, width * 2) : 128;
+        uint32_t maxH = (isPixel || isVertexMesh) ? std::max(128u, height * 2) : 128;
         MTLTextureDescriptor* texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                            width:maxW
                                                                                           height:maxH
@@ -622,7 +641,33 @@ MetalBenchResult runMetalGraphicsBench(
         texDesc.storageMode = MTLStorageModeShared;
         id<MTLTexture> rtTex = [device newTextureWithDescriptor:texDesc];
 
-        id<MTLBuffer> cbBuf = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        id<MTLTexture> depthTex = nil;
+        MeshBenchSceneData meshScenes[3];
+        id<MTLBuffer> meshVBs[3] = {nil, nil, nil};
+        id<MTLBuffer> meshIBs[3] = {nil, nil, nil};
+        if (isVertexMesh) {
+            MTLTextureDescriptor* dDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                             width:maxW
+                                                                                            height:maxH
+                                                                                         mipmapped:NO];
+            dDesc.usage = MTLTextureUsageRenderTarget;
+            dDesc.storageMode = MTLStorageModePrivate;
+            depthTex = [device newTextureWithDescriptor:dDesc];
+            for (int m = 0; m < 3; ++m) {
+                uint32_t g = 0, mrw = 0, mrh = 0;
+                getMeshBenchGridAndDims(m, width, height, g, mrw, mrh);
+                meshScenes[m] = buildMeshBenchScene(g, g);
+                meshVBs[m] = [device newBufferWithBytes:meshScenes[m].vertices.data()
+                                                 length:meshScenes[m].vertices.size() * sizeof(MeshBenchVertex)
+                                                options:MTLResourceStorageModeShared];
+                meshIBs[m] = [device newBufferWithBytes:meshScenes[m].indices.data()
+                                                 length:meshScenes[m].indices.size() * sizeof(uint32_t)
+                                                options:MTLResourceStorageModeShared];
+            }
+        }
+
+        size_t cbBytes = isVertexMesh ? sizeof(MeshBenchConstants) : 256;
+        id<MTLBuffer> cbBuf = [device newBufferWithLength:cbBytes options:MTLResourceStorageModeShared];
         const float quadVerts[18] = {
             -1.0f, -1.0f, 0.0f,  1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f,
             -1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f, -1.0f,  1.0f, 0.0f,
@@ -644,7 +689,7 @@ MetalBenchResult runMetalGraphicsBench(
             for (const auto& loc : locs) {
                 if (loc.resourceType == IRResourceTypeCBV && loc.slot == 0) {
                     auto* entry = reinterpret_cast<IRDescriptorTableEntry*>(bytes + loc.topLevelOffset);
-                    IRBufferView view{cbBuf, 0, 256, nil, 0, false};
+                    IRBufferView view{cbBuf, 0, cbBytes, nil, 0, false};
                     IRDescriptorTableSetBufferView(entry, &view);
                 }
             }
@@ -659,7 +704,11 @@ MetalBenchResult runMetalGraphicsBench(
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         auto getGfxParams = [&](int mode, uint32_t& rw, uint32_t& rh, uint32_t& vc) {
-            if (isPixel) {
+            if (isVertexMesh) {
+                uint32_t g = 0;
+                getMeshBenchGridAndDims(mode, width, height, g, rw, rh);
+                vc = static_cast<uint32_t>(meshScenes[mode].indices.size());
+            } else if (isPixel) {
                 rw = (mode == 0) ? 64 : (mode == 1 ? width : width * 2);
                 rh = (mode == 0) ? 64 : (mode == 1 ? height : height * 2);
                 vc = 6;
@@ -675,8 +724,10 @@ MetalBenchResult runMetalGraphicsBench(
             }
         };
 
-        auto drawOnce = [&](uint32_t rw, uint32_t rh, uint32_t vc) -> double {
-            if (isPixel) {
+        auto drawOnce = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vc) -> double {
+            if (isVertexMesh) {
+                std::memcpy([cbBuf contents], &meshScenes[mode].constants, sizeof(MeshBenchConstants));
+            } else if (isPixel) {
                 ShadertoyCB cb{static_cast<float>(rw), static_cast<float>(rh), 1.0f, 1.25f, 0.0f, 0.0f, 0.0f, 0.0f};
                 std::memcpy([cbBuf contents], &cb, sizeof(cb));
             } else if (isGeometry) {
@@ -695,6 +746,12 @@ MetalBenchResult runMetalGraphicsBench(
             rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
             rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
             rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            if (isVertexMesh) {
+                rpd.depthAttachment.texture = depthTex;
+                rpd.depthAttachment.loadAction = MTLLoadActionClear;
+                rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+                rpd.depthAttachment.clearDepth = 1.0;
+            }
 
             auto s0 = std::chrono::steady_clock::now();
             id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
@@ -706,10 +763,22 @@ MetalBenchResult runMetalGraphicsBench(
                 [enc useResource:cbBuf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
                 [enc setVertexBuffer:vsAB offset:0 atIndex:kIRArgumentBufferBindPoint];
                 [enc setFragmentBuffer:psAB offset:0 atIndex:kIRArgumentBufferBindPoint];
-                if (isPixel) {
-                    [enc setVertexBuffer:vbBuf offset:0 atIndex:kIRVertexBufferBindPoint + 0];
+                if (isVertexMesh) {
+                    [enc setDepthStencilState:dsState];
+                    [enc setFrontFacingWinding:MTLWindingClockwise];
+                    [enc setCullMode:MTLCullModeBack];
+                    [enc setVertexBuffer:meshVBs[mode] offset:0 atIndex:kIRVertexBufferBindPoint + 0];
+                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexCount:vc
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:meshIBs[mode]
+                             indexBufferOffset:0];
+                } else {
+                    if (isPixel) {
+                        [enc setVertexBuffer:vbBuf offset:0 atIndex:kIRVertexBufferBindPoint + 0];
+                    }
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vc];
                 }
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vc];
             } else {
                 [enc useResource:cbBuf usage:MTLResourceUsageRead stages:MTLRenderStageObject | MTLRenderStageMesh | MTLRenderStageFragment];
                 [enc setObjectBuffer:emptyVBs offset:0 atIndex:0];
@@ -738,12 +807,12 @@ MetalBenchResult runMetalGraphicsBench(
         uint32_t rw = 128, rh = 128, vc = 6;
         getGfxParams(1, rw, rh, vc);
 
-        res.firstDispatchMs = drawOnce(rw, rh, vc);
+        res.firstDispatchMs = drawOnce(1, rw, rh, vc);
 
         std::vector<double> samples;
         samples.reserve(iters);
         for (uint32_t i = 0; i < iters; ++i) {
-            samples.push_back(drawOnce(rw, rh, vc));
+            samples.push_back(drawOnce(1, rw, rh, vc));
         }
 
         std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4, 0);
@@ -753,9 +822,9 @@ MetalBenchResult runMetalGraphicsBench(
         res.checksum = sum;
 
         getGfxParams(0, rw, rh, vc);
-        res.shortJobMs = drawOnce(rw, rh, vc);
+        res.shortJobMs = drawOnce(0, rw, rh, vc);
         getGfxParams(2, rw, rh, vc);
-        res.longJobMs = drawOnce(rw, rh, vc);
+        res.longJobMs = drawOnce(2, rw, rh, vc);
 
         finalizeSamples(res, samples);
         res.ran = true;

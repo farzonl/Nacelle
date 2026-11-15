@@ -2,6 +2,7 @@
 // RUN: %dxc -T vs_6_0 -E VSMain -Fo %t/vs.dxil %t/shader.hlsl
 // RUN: %dxc -T ps_6_0 -E PSMain -Fo %t/ps.dxil %t/shader.hlsl
 // RUN: %nacelle_compile --vs %t/vs.dxil --ps %t/ps.dxil --simd-width=8 --blend=alpha --depth=less --emit-simd-mlir | %FileCheck %s --check-prefix=GFX
+// RUN: %nacelle_compile --vs %t/vs.dxil --ps %t/ps.dxil --simd-width=8 --auto-input-layout --emit-simd-mlir | %FileCheck %s --check-prefix=VSVEC
 // RUN: %nacelle_compile --vs %t/vs.dxil --simd-width=8 --depth=less --emit-simd-mlir | %FileCheck %s --check-prefix=DEPTHONLY
 
 //--- shader.hlsl
@@ -32,3 +33,9 @@ float4 PSMain(PSIn input) : SV_Target {
 
 // DEPTHONLY: func.func @nacelle_vs_test
 // DEPTHONLY: func.func @nacelle_ps_test
+
+// VSVEC-LABEL: func.func @nacelle_vs_test
+// VSVEC-NOT: scf.if
+// VSVEC: llvm.intr.masked.gather
+// VSVEC-NOT: scf.if
+// VSVEC-LABEL: func.func @nacelle_ps_test

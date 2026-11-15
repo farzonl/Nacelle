@@ -103,6 +103,19 @@ std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         cat.push_back(std::move(s));
     }
 
+    {
+        BenchmarkSpec s;
+        s.id = "bench_vertex_mesh";
+        s.name = "Skinned Mesh (VB+IB+Cull)";
+        s.category = BenchCategory::Vertex;
+        s.kind = PipelineKind::GraphicsVSPS;
+        s.vsDxil = "bench_vertex_mesh_vs.dxil";
+        s.psDxil = "bench_vertex_mesh_ps.dxil";
+        s.vsSpv = "bench_vertex_mesh_vs.spv";
+        s.psSpv = "bench_vertex_mesh_ps.spv";
+        cat.push_back(std::move(s));
+    }
+
     auto addPixel = [&](const std::string& id, const std::string& name,
                         const std::string& psDxil, const std::string& psSpv) {
         BenchmarkSpec s;

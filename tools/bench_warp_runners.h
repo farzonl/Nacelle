@@ -171,6 +171,14 @@ inline BenchRunResult runWarpGraphicsBench(
 
     auto t0 = std::chrono::steady_clock::now();
     D3D12_INPUT_ELEMENT_DESC posLayout = {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    D3D12_INPUT_ELEMENT_DESC meshElems[5] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R16G16B16A16_SNORM, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R16G16_UNORM, 0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    bool isVertexMesh = (spec.id == "bench_vertex_mesh");
     bool usesQuadVB = (spec.category == BenchCategory::Pixel);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
@@ -180,11 +188,19 @@ inline BenchRunResult runWarpGraphicsBench(
     if (!ds.empty()) psoDesc.DS = {ds.data(), ds.size()};
     if (!gs.empty()) psoDesc.GS = {gs.data(), gs.size()};
     psoDesc.PS = {ps.data(), ps.size()};
-    if (usesQuadVB) psoDesc.InputLayout = {&posLayout, 1};
+    if (isVertexMesh) psoDesc.InputLayout = {meshElems, 5};
+    else if (usesQuadVB) psoDesc.InputLayout = {&posLayout, 1};
     psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.CullMode = isVertexMesh ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
+    if (isVertexMesh) {
+        psoDesc.DepthStencilState.DepthEnable = TRUE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    }
     psoDesc.PrimitiveTopologyType = (spec.kind == PipelineKind::GraphicsTessGS)
         ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH
         : (spec.kind == PipelineKind::GraphicsVSGSPS ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
@@ -205,8 +221,8 @@ inline BenchRunResult runWarpGraphicsBench(
         return res;
     }
 
-    uint32_t maxW = (spec.category == BenchCategory::Pixel) ? width * 2 : 128;
-    uint32_t maxH = (spec.category == BenchCategory::Pixel) ? height * 2 : 128;
+    uint32_t maxW = (spec.category == BenchCategory::Pixel || isVertexMesh) ? std::max(128u, width * 2) : 128;
+    uint32_t maxH = (spec.category == BenchCategory::Pixel || isVertexMesh) ? std::max(128u, height * 2) : 128;
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -235,11 +251,58 @@ inline BenchRunResult runWarpGraphicsBench(
                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&rtvTex));
     ctx.dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
 
+    ID3D12Resource* dsvTex = nullptr;
+    ID3D12DescriptorHeap* dsvHeap = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle{};
+    MeshBenchSceneData meshScenes[3];
+    ID3D12Resource* meshVBs[3] = {nullptr, nullptr, nullptr};
+    ID3D12Resource* meshIBs[3] = {nullptr, nullptr, nullptr};
+    if (isVertexMesh) {
+        D3D12_RESOURCE_DESC dsDesc{};
+        dsDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dsDesc.Width = maxW;
+        dsDesc.Height = maxH;
+        dsDesc.DepthOrArraySize = 1;
+        dsDesc.MipLevels = 1;
+        dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsDesc.SampleDesc.Count = 1;
+        dsDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE dsClear{};
+        dsClear.Format = DXGI_FORMAT_D32_FLOAT;
+        dsClear.DepthStencil.Depth = 1.0f;
+        ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &dsDesc,
+                                         D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsClear,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&dsvTex));
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc{};
+        dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        dsvHeapDesc.NumDescriptors = 1;
+        ctx.dev->CreateDescriptorHeap(&dsvHeapDesc, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&dsvHeap));
+        dsvHandle = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        ctx.dev->CreateDepthStencilView(dsvTex, nullptr, dsvHandle);
+
+        for (int m = 0; m < 3; ++m) {
+            uint32_t g = 0, mrw = 0, mrh = 0;
+            getMeshBenchGridAndDims(m, width, height, g, mrw, mrh);
+            meshScenes[m] = buildMeshBenchScene(g, g);
+            size_t vbBytes = meshScenes[m].vertices.size() * sizeof(MeshBenchVertex);
+            size_t ibBytes = meshScenes[m].indices.size() * sizeof(uint32_t);
+            meshVBs[m] = createWarpBuffer(ctx.dev, vbBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            meshIBs[m] = createWarpBuffer(ctx.dev, ibBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* p = nullptr;
+            meshVBs[m]->Map(0, nullptr, &p);
+            std::memcpy(p, meshScenes[m].vertices.data(), vbBytes);
+            meshVBs[m]->Unmap(0, nullptr);
+            meshIBs[m]->Map(0, nullptr, &p);
+            std::memcpy(p, meshScenes[m].indices.data(), ibBytes);
+            meshIBs[m]->Unmap(0, nullptr);
+        }
+    }
+
     UINT64 readbackPitch = (static_cast<UINT64>(maxW) * 4 + 255) & ~255ull;
     ID3D12Resource* rbBuf = createWarpBuffer(ctx.dev, readbackPitch * maxH,
                                              D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
                                              D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12Resource* cbBuf = createWarpBuffer(ctx.dev, 256,
+    ID3D12Resource* cbBuf = createWarpBuffer(ctx.dev, isVertexMesh ? sizeof(MeshBenchConstants) : 256,
                                              D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
                                              D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* vbBuf = nullptr;
@@ -257,10 +320,12 @@ inline BenchRunResult runWarpGraphicsBench(
         vbBuf->Unmap(0, nullptr);
     }
 
-    auto runDraw = [&](uint32_t rw, uint32_t rh, uint32_t vertCount) -> double {
+    auto runDraw = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vertCount) -> double {
         void* p = nullptr;
         cbBuf->Map(0, nullptr, &p);
-        if (spec.category == BenchCategory::Pixel) {
+        if (isVertexMesh) {
+            std::memcpy(p, &meshScenes[mode].constants, sizeof(MeshBenchConstants));
+        } else if (spec.category == BenchCategory::Pixel) {
             ShadertoyCB cb{static_cast<float>(rw), static_cast<float>(rh), 1.0f, 1.25f, 0.0f, 0.0f, 0.0f, 0.0f};
             std::memcpy(p, &cb, sizeof(cb));
         } else if (spec.category == BenchCategory::Vertex) {
@@ -283,23 +348,38 @@ inline BenchRunResult runWarpGraphicsBench(
         D3D12_RECT sc{0, 0, static_cast<LONG>(rw), static_cast<LONG>(rh)};
         ctx.cmd->RSSetViewports(1, &vp);
         ctx.cmd->RSSetScissorRects(1, &sc);
-        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, isVertexMesh ? &dsvHandle : nullptr);
         const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         ctx.cmd->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-        if (usesQuadVB) {
-            D3D12_VERTEX_BUFFER_VIEW vbv{vbBuf->GetGPUVirtualAddress(), 18 * sizeof(float), 3 * sizeof(float)};
+        if (isVertexMesh) {
+            ctx.cmd->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            D3D12_VERTEX_BUFFER_VIEW vbv{
+                meshVBs[mode]->GetGPUVirtualAddress(),
+                static_cast<UINT>(meshScenes[mode].vertices.size() * sizeof(MeshBenchVertex)),
+                sizeof(MeshBenchVertex)};
+            D3D12_INDEX_BUFFER_VIEW ibv{
+                meshIBs[mode]->GetGPUVirtualAddress(),
+                static_cast<UINT>(meshScenes[mode].indices.size() * sizeof(uint32_t)),
+                DXGI_FORMAT_R32_UINT};
             ctx.cmd->IASetVertexBuffers(0, 1, &vbv);
+            ctx.cmd->IASetIndexBuffer(&ibv);
             ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        } else if (spec.kind == PipelineKind::GraphicsTessGS) {
-            ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
-        } else if (spec.kind == PipelineKind::GraphicsVSGSPS) {
-            ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+            ctx.cmd->DrawIndexedInstanced(static_cast<UINT>(meshScenes[mode].indices.size()), 1, 0, 0, 0);
         } else {
-            ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            if (usesQuadVB) {
+                D3D12_VERTEX_BUFFER_VIEW vbv{vbBuf->GetGPUVirtualAddress(), 18 * sizeof(float), 3 * sizeof(float)};
+                ctx.cmd->IASetVertexBuffers(0, 1, &vbv);
+                ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            } else if (spec.kind == PipelineKind::GraphicsTessGS) {
+                ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+            } else if (spec.kind == PipelineKind::GraphicsVSGSPS) {
+                ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+            } else {
+                ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            }
+            ctx.cmd->DrawInstanced(vertCount, 1, 0, 0);
         }
-
-        ctx.cmd->DrawInstanced(vertCount, 1, 0, 0);
         ctx.cmd->Close();
         ID3D12CommandList* lists[] = {ctx.cmd};
         ctx.queue->ExecuteCommandLists(1, lists);
@@ -311,7 +391,11 @@ inline BenchRunResult runWarpGraphicsBench(
     };
 
     auto getGfxParams = [&](int mode, uint32_t& rw, uint32_t& rh, uint32_t& vc) {
-        if (spec.category == BenchCategory::Pixel) {
+        if (isVertexMesh) {
+            uint32_t g = 0;
+            getMeshBenchGridAndDims(mode, width, height, g, rw, rh);
+            vc = static_cast<uint32_t>(meshScenes[mode].indices.size());
+        } else if (spec.category == BenchCategory::Pixel) {
             rw = (mode == 0) ? 64 : (mode == 1 ? width : width * 2);
             rh = (mode == 0) ? 64 : (mode == 1 ? height : height * 2);
             vc = 6;
@@ -330,11 +414,11 @@ inline BenchRunResult runWarpGraphicsBench(
     uint32_t rw = 128, rh = 128, vc = 6;
     getGfxParams(1, rw, rh, vc);
 
-    res.firstDispatchMs = runDraw(rw, rh, vc);
+    res.firstDispatchMs = runDraw(1, rw, rh, vc);
     std::vector<double> samples;
     samples.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i) {
-        samples.push_back(runDraw(rw, rh, vc));
+        samples.push_back(runDraw(1, rw, rh, vc));
     }
 
     // Copy RTV to readback buffer for checksum
@@ -376,12 +460,18 @@ inline BenchRunResult runWarpGraphicsBench(
     }
 
     getGfxParams(0, rw, rh, vc);
-    res.shortJobMs = runDraw(rw, rh, vc);
+    res.shortJobMs = runDraw(0, rw, rh, vc);
     getGfxParams(2, rw, rh, vc);
-    res.longJobMs = runDraw(rw, rh, vc);
+    res.longJobMs = runDraw(2, rw, rh, vc);
 
     finalizeTimingAndMemory(res, memBefore, memAfterCompile, samples);
 
+    for (int m = 0; m < 3; ++m) {
+        if (meshIBs[m]) meshIBs[m]->Release();
+        if (meshVBs[m]) meshVBs[m]->Release();
+    }
+    if (dsvHeap) dsvHeap->Release();
+    if (dsvTex) dsvTex->Release();
     if (vbBuf) vbBuf->Release();
     cbBuf->Release();
     rbBuf->Release();

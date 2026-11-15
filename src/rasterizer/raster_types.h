@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -42,10 +43,6 @@ struct SetupTriangle {
     uint32_t shadingRate = 0;
     float invW[3]{};   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
     float depth[3]{};  // (z0, z1 - z0, z2 - z0)
-    float origBary[9]{}; // [3 * 3]: for each original vertex k, (b0/w0, b1/w1 - b0/w0, b2/w2 - b0/w0)
-
-    uint32_t attrBaseOffset = 0; // offset into RasterScene::attrBaseArena (numScalars * 3)
-    uint32_t attrFlatOffset = 0; // offset into RasterScene::attrFlatArena (numScalars)
 
     bool isLine = false;
     float lineX0 = 0.0f;
@@ -54,12 +51,17 @@ struct SetupTriangle {
     float lineY1 = 0.0f;
 };
 
+struct TileBin {
+    std::vector<uint32_t> triIndices;
+};
+
 struct RasterScene {
     uint32_t fbWidth = 0;
     uint32_t fbHeight = 0;
     uint32_t numTilesX = 0;
     uint32_t numTilesY = 0;
     uint32_t numPSInputScalars = 0;
+    uint32_t preRastScalarAttrs = 0;
     uint32_t clipDistMask = 0;
     uint32_t cullDistMask = 0;
     uint32_t clipAttrOffset = 0;
@@ -68,27 +70,29 @@ struct RasterScene {
     uint32_t vpIndexAttrOffset = 0;
     bool hasPerPrimShadingRate = false;
     uint32_t shadingRateAttrOffset = 0;
+    bool needsFlatAttrs = false;
+    bool needsOrigBary = false;
+    bool binsAlreadyPopulated = false;
     D3D12_SHADING_RATE drawShadingRate = D3D12_SHADING_RATE_1X1;
     D3D12_SHADING_RATE_COMBINER shadingRateCombiner = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
     D3D12_VIEWPORT viewports[16]{};
     uint32_t numViewports = 1;
     D3D12_RECT scissors[16]{};
     uint32_t numScissors = 1;
+    std::array<int16_t, kMaxPSInputScalars> psInputFromPreRastSlot{};
 
     std::vector<SetupTriangle> triangles;
     std::vector<float> attrBaseArena;
     std::vector<float> attrFlatArena;
-};
-
-struct TileBin {
-    std::vector<uint32_t> triIndices;
+    std::vector<float> origBaryArena;
 };
 
 bool buildRasterScene(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const DrawCallParams& draw,
-    RasterScene& outScene);
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins = nullptr);
 
 bool buildMeshRasterScene(
     BS::thread_pool<>& pool,
