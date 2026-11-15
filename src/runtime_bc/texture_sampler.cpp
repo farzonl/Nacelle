@@ -399,7 +399,7 @@ static inline __attribute__((always_inline)) uint8_t* lookup_tiled_block_ptr(
            uint64_t(inX) * elemStride;
 }
 
-static inline __attribute__((always_inline)) void fetch_texel_mip(
+static __attribute__((noinline)) void fetch_texel_mip(
     const BC_Descriptor* tex, uint32_t mip, int32_t x, int32_t y, int32_t z,
     uint32_t addrU, uint32_t addrV, uint32_t addrW, uint32_t borderKind,
     float out[4], uint32_t& inoutMapped) {
@@ -748,6 +748,7 @@ static inline __attribute__((always_inline)) float eval_cmp(uint32_t func, float
     }
 }
 
+__attribute__((noinline))
 float nacelle_tex_sample_cmp(
     const BC_Descriptor* tex,
     const BC_Descriptor* samp,
