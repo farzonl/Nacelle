@@ -114,7 +114,7 @@ add_custom_command(
     OUTPUT "${MATH_SIMD_BC}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
     COMMAND "${NACELLE_CLANGXX}" -std=c++20 -O3 -emit-llvm -c
-            -fno-exceptions -fno-rtti -ffreestanding -fno-math-errno -ffp-contract=off
+            -fno-exceptions -fno-rtti -ffreestanding -fno-math-errno -ffp-contract=fast
             "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/math_simd.cpp"
             -o "${MATH_SIMD_BC}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/math_simd.cpp"
