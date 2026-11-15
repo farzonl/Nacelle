@@ -357,6 +357,26 @@ public:
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
+        if (baseName != "log2") {
+            if (auto shuf = vecArg.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
+                llvm::ArrayRef<int32_t> mask = shuf.getMask();
+                if (!mask.empty() && llvm::all_of(mask, [](int32_t idx) { return idx == 0; })) {
+                    mlir::Value scalarArg;
+                    if (auto ins = shuf.getV1().getDefiningOp<mlir::LLVM::InsertElementOp>()) {
+                        if (auto c = getConstIntValue(ins.getPosition()); c && *c == 0) {
+                            scalarArg = ins.getValue();
+                        }
+                    }
+                    if (!scalarArg) {
+                        scalarArg = llvmExtract(loc, shuf.getV1(), 0);
+                    }
+                    std::string libmName = (elemTy.isF32() ? (baseName + "f") : baseName).str();
+                    mlir::LLVM::LLVMFuncOp libmFn = getOrDeclareLibmFn(loc, libmName, elemTy);
+                    mlir::Value r = mlir::LLVM::CallOp::create(b_, loc, libmFn, mlir::ValueRange{scalarArg}).getResult();
+                    return llvmSplat(loc, elemTy, r);
+                }
+            }
+        }
         if (!strictFp_ && elemTy.isF32() && (W_ == 4 || W_ == 8 || W_ == 16)) {
             std::string fnName = ("nacelle_math_v" + std::to_string(W_) + "_" + baseName + "f").str();
             mlir::func::FuncOp callee = mod_.lookupSymbol<mlir::func::FuncOp>(fnName);
