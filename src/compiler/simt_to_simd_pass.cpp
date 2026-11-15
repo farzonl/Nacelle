@@ -194,6 +194,16 @@ public:
     mlir::Value allTrueMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 1); }
     mlir::Value allFalseMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 0); }
 
+    bool isMaskConstAllTrue(mlir::Value maskVec) const {
+        if (!maskVec) return false;
+        if (auto cst = maskVec.getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto dense = llvm::dyn_cast<mlir::DenseElementsAttr>(cst.getValue())) {
+                return dense.getElementType().isInteger(1) && dense.isSplat() && dense.getSplatValue<bool>();
+            }
+        }
+        return false;
+    }
+
     bool isLaneMaskConstFalse(mlir::Value maskVec, uint32_t lane, uint32_t depth = 0) const {
         if (!maskVec || depth > 8) return false;
         if (auto cst = maskVec.getDefiningOp<mlir::arith::ConstantOp>()) {
@@ -273,10 +283,14 @@ public:
 
     SimdVal makeZeroSimd(mlir::Location loc, mlir::Type origTy) {
         if (mlir::isa<mlir::IntegerType>(origTy)) {
-            return {SimdVal::Kind::Vector, origTy, splatInt(loc, origTy, 0), {}, {}};
+            SimdVal sv{SimdVal::Kind::Vector, origTy, splatInt(loc, origTy, 0), {}, {}};
+            sv.pattern = SimdVal::LanePattern::Uniform;
+            return sv;
         }
         if (mlir::isa<mlir::FloatType>(origTy)) {
-            return {SimdVal::Kind::Vector, origTy, splatFlt(loc, origTy, 0.0), {}, {}};
+            SimdVal sv{SimdVal::Kind::Vector, origTy, splatFlt(loc, origTy, 0.0), {}, {}};
+            sv.pattern = SimdVal::LanePattern::Uniform;
+            return sv;
         }
         if (mlir::isa<mlir::LLVM::LLVMPointerType>(origTy)) {
             auto zeroPtr = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
@@ -334,10 +348,14 @@ public:
         if (auto c = orig.getDefiningOp<mlir::LLVM::ConstantOp>()) {
             mlir::Type ty = orig.getType();
             if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
-                return {SimdVal::Kind::Vector, ty, splatInt(loc, ty, ia.getValue().getZExtValue()), {}, {}};
+                SimdVal sv{SimdVal::Kind::Vector, ty, splatInt(loc, ty, ia.getValue().getZExtValue()), {}, {}};
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                return sv;
             }
             if (auto fa = llvm::dyn_cast<mlir::FloatAttr>(c.getValue())) {
-                return {SimdVal::Kind::Vector, ty, splatFlt(loc, ty, fa.getValueAsDouble()), {}, {}};
+                SimdVal sv{SimdVal::Kind::Vector, ty, splatFlt(loc, ty, fa.getValueAsDouble()), {}, {}};
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                return sv;
             }
             if (auto da = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
                 if (auto vt = llvm::dyn_cast<mlir::VectorType>(ty)) {
@@ -374,10 +392,14 @@ public:
                     sv.lanes.push_back(mlir::arith::ConstantIndexOp::create(b_, loc, ia.getValue().getSExtValue()));
                     return sv;
                 }
-                return {SimdVal::Kind::Vector, ty, splatInt(loc, ty, ia.getValue().getZExtValue()), {}, {}};
+                SimdVal sv{SimdVal::Kind::Vector, ty, splatInt(loc, ty, ia.getValue().getZExtValue()), {}, {}};
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                return sv;
             }
             if (auto fa = llvm::dyn_cast<mlir::FloatAttr>(c.getValue())) {
-                return {SimdVal::Kind::Vector, ty, splatFlt(loc, ty, fa.getValueAsDouble()), {}, {}};
+                SimdVal sv{SimdVal::Kind::Vector, ty, splatFlt(loc, ty, fa.getValueAsDouble()), {}, {}};
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                return sv;
             }
             if (auto da = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue())) {
                 if (auto vt = llvm::dyn_cast<mlir::VectorType>(ty)) {
@@ -862,8 +884,7 @@ private:
             bool uniform = base.isUniform();
             if (uniform) {
                 for (const auto& iv : idxVals) {
-                    if (iv.kind == SimdVal::Kind::Vector && !iv.vec.getDefiningOp<mlir::arith::ConstantOp>()) {
-                        // Safe conservatively to expand if any dynamic index might vary
+                    if (!iv.isUniform()) {
                         uniform = false;
                         break;
                     }
@@ -874,6 +895,13 @@ private:
             out.kind = SimdVal::Kind::Lanes;
             out.origType = gep.getType();
             out.isAllocaPtr = base.isAllocaPtr;
+            if (uniform) {
+                out.pattern = SimdVal::LanePattern::Uniform;
+            } else if (base.isUniform() && idxVals.size() == 1 && idxVals[0].isUnitStride() &&
+                       gep.getRawConstantIndices().size() == 1 &&
+                       gep.getRawConstantIndices()[0] == mlir::LLVM::GEPOp::kDynamicIndex) {
+                out.pattern = SimdVal::LanePattern::UnitStride;
+            }
             auto rawConsts = gep.getRawConstantIndices();
             uint32_t lanesOut = uniform ? 1u : W_;
             for (uint32_t l = 0; l < lanesOut; ++l) {
@@ -899,12 +927,20 @@ private:
             mlir::Type elemTy = loadOp.getResult().getType();
             uint64_t align = loadOp.getAlignment().value_or(1);
             if (addr.isUniform() && mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
-                mlir::Value s = loadScalar(loc, elemTy, addr.lanes[0]);
+                mlir::Value s = loadScalar(loc, elemTy, laneValue(loc, addr, 0));
                 mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), s);
-                setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, bvec, {}, {}});
+                SimdVal sv{SimdVal::Kind::Vector, elemTy, bvec, {}, {}};
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                setMapped(loadOp.getResult(), std::move(sv));
                 return true;
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
+                if (addr.isUnitStride() && !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
+                    mlir::Value v = mlir::LLVM::LoadOp::create(
+                        b_, loc, vecTy(elemTy), laneValue(loc, addr, 0), static_cast<unsigned>(align));
+                    setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, v, {}, {}});
+                    return true;
+                }
                 if (addr.isAllocaPtr) {
                     mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(elemTy));
                     mlir::Value scratch = getOrCreateScratchAlloca(loc);
@@ -1072,6 +1108,13 @@ private:
                 }
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::LLVM::LLVMPointerType>(valTy)) {
+                if (addr.isUnitStride() && !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
+                    if (mlir::Value valVec = asVec(loc, val)) {
+                        mlir::LLVM::StoreOp::create(
+                            b_, loc, valVec, laneValue(loc, addr, 0), static_cast<unsigned>(align));
+                        return true;
+                    }
+                }
                 if (addr.isAllocaPtr) {
                     mlir::Value scratch = getOrCreateScratchAlloca(loc);
                     for (uint32_t l = 0; l < W_; ++l) {
@@ -1234,35 +1277,52 @@ private:
         auto vecUnary = [&](auto tagFn) -> bool {
             mlir::Type resTy = op.getResult(0).getType();
             SimdVal aSv = getMapped(loc, op.getOperand(0));
+            auto outPat = aSv.isUniform() ? SimdVal::LanePattern::Uniform : SimdVal::LanePattern::Divergent;
             if (auto vt = llvm::dyn_cast<mlir::VectorType>(resTy)) {
                 mlir::Type resElem = vt.getElementType();
                 SimdVal out;
                 out.kind = SimdVal::Kind::Struct;
                 out.origType = resTy;
+                out.pattern = outPat;
                 for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                     mlir::Value ai = (aSv.kind == SimdVal::Kind::Struct && static_cast<size_t>(i) < aSv.fields.size())
                                          ? asVec(loc, aSv.fields[static_cast<size_t>(i)])
                                          : asVec(loc, aSv);
                     mlir::Value r = tagFn(vecTy(resElem), ai);
-                    out.fields.push_back({SimdVal::Kind::Vector, resElem, r, {}, {}});
+                    SimdVal fsv{SimdVal::Kind::Vector, resElem, r, {}, {}};
+                    fsv.pattern = outPat;
+                    out.fields.push_back(std::move(fsv));
                 }
                 setMapped(op.getResult(0), out);
                 return true;
             }
             mlir::Value a = asVec(loc, aSv);
             mlir::Value r = tagFn(vecTy(resTy), a);
-            setMapped(op.getResult(0), {SimdVal::Kind::Vector, resTy, r, {}, {}});
+            SimdVal sv{SimdVal::Kind::Vector, resTy, r, {}, {}};
+            sv.pattern = outPat;
+            setMapped(op.getResult(0), std::move(sv));
             return true;
         };
         auto vecBinary = [&](auto tagFn) -> bool {
             mlir::Type resTy = op.getResult(0).getType();
             SimdVal aSv = getMapped(loc, op.getOperand(0));
             SimdVal cSv = getMapped(loc, op.getOperand(1));
+            SimdVal::LanePattern outPat = SimdVal::LanePattern::Divergent;
+            if (aSv.isUniform() && cSv.isUniform()) {
+                outPat = SimdVal::LanePattern::Uniform;
+            } else if (llvm::isa<mlir::LLVM::AddOp, mlir::arith::AddIOp>(&op) &&
+                       ((aSv.isUnitStride() && cSv.isUniform()) || (aSv.isUniform() && cSv.isUnitStride()))) {
+                outPat = SimdVal::LanePattern::UnitStride;
+            } else if (llvm::isa<mlir::LLVM::SubOp, mlir::arith::SubIOp>(&op) &&
+                       aSv.isUnitStride() && cSv.isUniform()) {
+                outPat = SimdVal::LanePattern::UnitStride;
+            }
             if (auto vt = llvm::dyn_cast<mlir::VectorType>(resTy)) {
                 mlir::Type resElem = vt.getElementType();
                 SimdVal out;
                 out.kind = SimdVal::Kind::Struct;
                 out.origType = resTy;
+                out.pattern = outPat;
                 for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                     mlir::Value ai = (aSv.kind == SimdVal::Kind::Struct && static_cast<size_t>(i) < aSv.fields.size())
                                          ? asVec(loc, aSv.fields[static_cast<size_t>(i)])
@@ -1271,7 +1331,9 @@ private:
                                          ? asVec(loc, cSv.fields[static_cast<size_t>(i)])
                                          : asVec(loc, cSv);
                     mlir::Value r = tagFn(vecTy(resElem), ai, ci);
-                    out.fields.push_back({SimdVal::Kind::Vector, resElem, r, {}, {}});
+                    SimdVal fsv{SimdVal::Kind::Vector, resElem, r, {}, {}};
+                    fsv.pattern = outPat;
+                    out.fields.push_back(std::move(fsv));
                 }
                 setMapped(op.getResult(0), out);
                 return true;
@@ -1279,7 +1341,9 @@ private:
             mlir::Value a = asVec(loc, aSv);
             mlir::Value c = asVec(loc, cSv);
             mlir::Value r = tagFn(vecTy(resTy), a, c);
-            setMapped(op.getResult(0), {SimdVal::Kind::Vector, resTy, r, {}, {}});
+            SimdVal sv{SimdVal::Kind::Vector, resTy, r, {}, {}};
+            sv.pattern = outPat;
+            setMapped(op.getResult(0), std::move(sv));
             return true;
         };
 
@@ -2190,12 +2254,20 @@ private:
             mlir::Value v = (op == 93) ? (comp < hooks_.threadId.size() ? hooks_.threadId[comp] : splatInt(loc, i32Ty(), 0))
                             : (op == 94) ? (comp < hooks_.groupId.size() ? hooks_.groupId[comp] : splatInt(loc, i32Ty(), 0))
                                          : (comp < hooks_.threadIdInGroup.size() ? hooks_.threadIdInGroup[comp] : splatInt(loc, i32Ty(), 0));
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), v, {}, {}});
+            SimdVal sv{SimdVal::Kind::Vector, i32Ty(), v, {}, {}};
+            if (op == 94) {
+                sv.pattern = SimdVal::LanePattern::Uniform;
+            } else if ((op == 93 || op == 95) && comp == 0 && !hooks_.isPixelShader) {
+                sv.pattern = SimdVal::LanePattern::UnitStride;
+            }
+            setMapped(call.getResult(), std::move(sv));
             return true;
         }
         if (op == 96) {
             mlir::Value v = hooks_.flatGroupId ? hooks_.flatGroupId : splatInt(loc, i32Ty(), 0);
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), v, {}, {}});
+            SimdVal sv{SimdVal::Kind::Vector, i32Ty(), v, {}, {}};
+            sv.pattern = SimdVal::LanePattern::Uniform;
+            setMapped(call.getResult(), std::move(sv));
             return true;
         }
 
@@ -2992,7 +3064,9 @@ private:
         }
         SimdVal sv = getMapped(loc, origVal);
         if (sv.isUniform()) {
-            outScalar = sv.lanes[0];
+            outScalar = !sv.lanes.empty()
+                            ? sv.lanes[0]
+                            : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, sv.vec, 0));
             return true;
         }
         if (sv.kind == SimdVal::Kind::Vector) {

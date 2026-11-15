@@ -25,6 +25,12 @@ struct SimdVal {
         Handle  // Resolved DXIL resource/sampler handle
     };
 
+    enum class LanePattern : uint8_t {
+        Divergent = 0,
+        Uniform,   // All W lanes hold the same value
+        UnitStride // Lane l holds base + l (e.g. threadId.x + uniform)
+    };
+
     Kind kind = Kind::Invalid;
     mlir::Type origType;
     mlir::Value vec;
@@ -37,7 +43,12 @@ struct SimdVal {
     uint32_t stride = 0;
     bool isRootConstants = false;
     bool isAllocaPtr = false;
-    bool isUniform() const { return (kind == Kind::Lanes || kind == Kind::Handle) && lanes.size() == 1; }
+    LanePattern pattern = LanePattern::Divergent;
+    bool isUniform() const {
+        return pattern == LanePattern::Uniform ||
+               ((kind == Kind::Lanes || kind == Kind::Handle) && lanes.size() == 1);
+    }
+    bool isUnitStride() const { return pattern == LanePattern::UnitStride; }
     bool valid() const { return kind != Kind::Invalid; }
 };
 
