@@ -44,9 +44,12 @@ struct SimdVal {
     bool isRootConstants = false;
     bool isAllocaPtr = false;
     LanePattern pattern = LanePattern::Divergent;
+    mlir::Type unitStrideElemTy; // Element type whose sizeof matches 1-lane byte step when pattern == UnitStride
     bool isUniform() const {
-        return pattern == LanePattern::Uniform ||
-               ((kind == Kind::Lanes || kind == Kind::Handle) && lanes.size() == 1);
+        if (kind == Kind::Lanes || kind == Kind::Handle) {
+            return lanes.size() == 1;
+        }
+        return pattern == LanePattern::Uniform;
     }
     bool isUnitStride() const { return pattern == LanePattern::UnitStride; }
     bool valid() const { return kind != Kind::Invalid; }
@@ -59,7 +62,16 @@ struct StageHooks {
     llvm::SmallVector<mlir::Value, 3> dispatchRaysDim; // vector<W x i32>
     llvm::SmallVector<mlir::Value, 3> groupId;         // vector<W x i32>
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
-    mlir::Value flatGroupId;                           // vector<W x i32>
+    mlir::Value flatGroupId;                           // vector<W x i32> (DXIL op 96: FlattenedThreadIdInGroup / SV_GroupIndex)
+    SimdVal::LanePattern threadIdPattern[3] = {
+        SimdVal::LanePattern::Divergent,
+        SimdVal::LanePattern::Divergent,
+        SimdVal::LanePattern::Divergent};
+    SimdVal::LanePattern threadIdInGroupPattern[3] = {
+        SimdVal::LanePattern::Divergent,
+        SimdVal::LanePattern::Divergent,
+        SimdVal::LanePattern::Divergent};
+    SimdVal::LanePattern flatGroupIdPattern = SimdVal::LanePattern::Divergent;
     mlir::Value groupSharedBase;                       // !llvm.ptr
     mlir::Value meshPayloadBase;                       // !llvm.ptr (for Mesh Shader GetMeshPayload)
     mlir::Block* entryBlock = nullptr;                 // function entry block for hoisted allocas

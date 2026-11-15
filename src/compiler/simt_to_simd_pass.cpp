@@ -627,10 +627,14 @@ public:
         }
         if (t.kind == SimdVal::Kind::Lanes || f.kind == SimdVal::Kind::Lanes ||
             t.kind == SimdVal::Kind::Handle || f.kind == SimdVal::Kind::Handle) {
-            SimdVal out = t;
+            SimdVal out = (t.kind == SimdVal::Kind::Lanes || t.kind == SimdVal::Kind::Handle) ? t : f;
             out.lanes.clear();
-            if (t.isUniform() && f.isUniform() && t.lanes[0] == f.lanes[0]) {
+            out.pattern = SimdVal::LanePattern::Divergent;
+            out.unitStrideElemTy = nullptr;
+            out.isAllocaPtr = t.isAllocaPtr || f.isAllocaPtr;
+            if (t.lanes.size() == 1 && f.lanes.size() == 1 && t.lanes[0] == f.lanes[0]) {
                 out.lanes.push_back(t.lanes[0]);
+                out.pattern = SimdVal::LanePattern::Uniform;
                 return out;
             }
             for (uint32_t l = 0; l < W_; ++l) {
@@ -645,6 +649,8 @@ public:
             t.fields.size() == f.fields.size()) {
             SimdVal out = t;
             out.fields.clear();
+            out.pattern = SimdVal::LanePattern::Divergent;
+            out.unitStrideElemTy = nullptr;
             for (size_t i = 0; i < t.fields.size(); ++i) {
                 out.fields.push_back(selectVal(loc, condVec, t.fields[i], f.fields[i]));
             }
@@ -703,14 +709,11 @@ public:
         if (proto && proto->kind == SimdVal::Kind::Handle) {
             SimdVal h = *proto;
             h.lanes.clear();
+            h.pattern = SimdVal::LanePattern::Divergent;
+            h.unitStrideElemTy = nullptr;
             mlir::Value ptrVec = vals[cursor++];
-            if (h.isUniform()) {
-                mlir::Value p0 = llvmExtract(loc, ptrVec, 0);
-                h.lanes.assign(W_, p0);
-            } else {
-                for (uint32_t l = 0; l < W_; ++l) {
-                    h.lanes.push_back(llvmExtract(loc, ptrVec, l));
-                }
+            for (uint32_t l = 0; l < W_; ++l) {
+                h.lanes.push_back(llvmExtract(loc, ptrVec, l));
             }
             return h;
         }
@@ -732,6 +735,7 @@ public:
             SimdVal sv;
             sv.kind = SimdVal::Kind::Lanes;
             sv.origType = origTy;
+            if (proto) sv.isAllocaPtr = proto->isAllocaPtr;
             mlir::Value ptrVec = vals[cursor++];
             for (uint32_t l = 0; l < W_; ++l) {
                 sv.lanes.push_back(llvmExtract(loc, ptrVec, l));
@@ -926,9 +930,15 @@ private:
             if (auto idxC = getConstIntValue(ie.getPosition())) {
                 size_t idx = static_cast<size_t>(*idxC);
                 if (idx < vec.fields.size()) vec.fields[idx] = val;
+                if (!val.isUniform()) {
+                    vec.pattern = SimdVal::LanePattern::Divergent;
+                    vec.unitStrideElemTy = nullptr;
+                }
                 setMapped(ie.getRes(), vec);
                 return true;
             }
+            vec.pattern = SimdVal::LanePattern::Divergent;
+            vec.unitStrideElemTy = nullptr;
             mlir::Value idxVec = asVec(loc, getMapped(loc, ie.getPosition()));
             mlir::Type idxTy = llvm::cast<mlir::VectorType>(idxVec.getType()).getElementType();
             mlir::Value valVec = asVec(loc, val);
@@ -937,6 +947,8 @@ private:
                     b_, loc, mlir::LLVM::ICmpPredicate::eq, idxVec, splatInt(loc, idxTy, i));
                 mlir::Value cur = asVec(loc, vec.fields[i]);
                 vec.fields[i].vec = mlir::LLVM::SelectOp::create(b_, loc, eq, valVec, cur);
+                vec.fields[i].pattern = SimdVal::LanePattern::Divergent;
+                vec.fields[i].unitStrideElemTy = nullptr;
             }
             setMapped(ie.getRes(), vec);
             return true;
@@ -986,6 +998,10 @@ private:
             auto pos = iv.getPosition();
             std::function<void(SimdVal&, size_t)> setRec = [&](SimdVal& cur, size_t d) {
                 if (cur.kind != SimdVal::Kind::Struct) return;
+                if (!elem.isUniform()) {
+                    cur.pattern = SimdVal::LanePattern::Divergent;
+                    cur.unitStrideElemTy = nullptr;
+                }
                 size_t idx = static_cast<size_t>(pos[d]);
                 if (idx >= cur.fields.size()) return;
                 if (d + 1 == pos.size()) cur.fields[idx] = elem;
@@ -1044,12 +1060,17 @@ private:
             out.kind = SimdVal::Kind::Lanes;
             out.origType = gep.getType();
             out.isAllocaPtr = base.isAllocaPtr;
+            mlir::Type gepElemTy = gep.getElemType();
             if (uniform) {
                 out.pattern = SimdVal::LanePattern::Uniform;
             } else if (base.isUniform() && idxVals.size() == 1 && idxVals[0].isUnitStride() &&
                        gep.getRawConstantIndices().size() == 1 &&
-                       gep.getRawConstantIndices()[0] == mlir::LLVM::GEPOp::kDynamicIndex) {
+                       gep.getRawConstantIndices()[0] == mlir::LLVM::GEPOp::kDynamicIndex &&
+                       mlir::isa<mlir::IntegerType, mlir::FloatType>(gepElemTy) &&
+                       gepElemTy.getIntOrFloatBitWidth() >= 8 &&
+                       (gepElemTy.getIntOrFloatBitWidth() % 8 == 0)) {
                 out.pattern = SimdVal::LanePattern::UnitStride;
+                out.unitStrideElemTy = gepElemTy;
             }
             auto rawConsts = gep.getRawConstantIndices();
             uint32_t lanesOut = uniform ? 1u : W_;
@@ -1084,7 +1105,8 @@ private:
                 return true;
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
-                if (addr.isUnitStride() && !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
+                if (addr.isUnitStride() && addr.unitStrideElemTy == elemTy &&
+                    !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
                     mlir::Value v = mlir::LLVM::LoadOp::create(
                         b_, loc, vecTy(elemTy), laneValue(loc, addr, 0), static_cast<unsigned>(align));
                     setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, v, {}, {}});
@@ -1120,9 +1142,10 @@ private:
                 res.origType = vt;
                 res.fields.resize(static_cast<size_t>(n));
                 if (addr.isUniform()) {
+                    mlir::Value baseAddr = laneValue(loc, addr, 0);
                     for (int64_t i = 0; i < n; ++i) {
                         mlir::Value ep = mlir::LLVM::GEPOp::create(
-                            b_, loc, ptrTy, scalarTy, addr.lanes[0],
+                            b_, loc, ptrTy, scalarTy, baseAddr,
                             mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)});
                         mlir::Value s = loadScalar(loc, scalarTy, ep);
                         mlir::Value bvec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(scalarTy)).getElementType(), s);
@@ -1257,7 +1280,8 @@ private:
                 }
             }
             if (mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::LLVM::LLVMPointerType>(valTy)) {
-                if (addr.isUnitStride() && !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
+                if (addr.isUnitStride() && addr.unitStrideElemTy == valTy &&
+                    !addr.isAllocaPtr && isMaskConstAllTrue(execMask)) {
                     if (mlir::Value valVec = asVec(loc, val)) {
                         mlir::LLVM::StoreOp::create(
                             b_, loc, valVec, laneValue(loc, addr, 0), static_cast<unsigned>(align));
@@ -2406,8 +2430,14 @@ private:
             SimdVal sv{SimdVal::Kind::Vector, i32Ty(), v, {}, {}};
             if (op == 94) {
                 sv.pattern = SimdVal::LanePattern::Uniform;
-            } else if ((op == 93 || op == 95) && comp == 0 && !hooks_.isPixelShader) {
-                sv.pattern = SimdVal::LanePattern::UnitStride;
+            } else if (op == 93) {
+                sv.pattern = (comp < hooks_.threadId.size() && comp < 3)
+                                 ? hooks_.threadIdPattern[comp]
+                                 : SimdVal::LanePattern::Uniform;
+            } else {
+                sv.pattern = (comp < hooks_.threadIdInGroup.size() && comp < 3)
+                                 ? hooks_.threadIdInGroupPattern[comp]
+                                 : SimdVal::LanePattern::Uniform;
             }
             setMapped(call.getResult(), std::move(sv));
             return true;
@@ -2415,7 +2445,7 @@ private:
         if (op == 96) {
             mlir::Value v = hooks_.flatGroupId ? hooks_.flatGroupId : splatInt(loc, i32Ty(), 0);
             SimdVal sv{SimdVal::Kind::Vector, i32Ty(), v, {}, {}};
-            sv.pattern = SimdVal::LanePattern::Uniform;
+            sv.pattern = hooks_.flatGroupId ? hooks_.flatGroupIdPattern : SimdVal::LanePattern::Uniform;
             setMapped(call.getResult(), std::move(sv));
             return true;
         }
@@ -3223,10 +3253,10 @@ private:
         }
         SimdVal sv = getMapped(loc, origVal);
         if (sv.isUniform()) {
-            outScalar = !sv.lanes.empty()
-                            ? sv.lanes[0]
-                            : mlir::Value(llvmExtract(b_, loc, sv.vec, static_cast<uint32_t>(0)));
-            return true;
+            if (mlir::Value s = laneValue(loc, sv, 0)) {
+                outScalar = s;
+                return true;
+            }
         }
         if (sv.kind == SimdVal::Kind::Vector) {
             if (auto shuf = sv.vec.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
@@ -6337,6 +6367,18 @@ static void setupComputeThreadIds(
                       : mlir::Value(mlir::LLVM::AddOp::create(b, loc, mlir::LLVM::MulOp::create(b, loc, gyVec, tgsY), ly)),
         (tgs[2] == 1) ? gzVec
                       : mlir::Value(mlir::LLVM::AddOp::create(b, loc, mlir::LLVM::MulOp::create(b, loc, gzVec, tgsZ), lz))};
+
+    const bool xDivisibleByW = (W > 1) && (tgs[0] >= W) && (tgs[0] % W == 0);
+    hooks.threadIdInGroupPattern[0] = (tgs[0] == 1) ? SimdVal::LanePattern::Uniform
+                                      : (xDivisibleByW ? SimdVal::LanePattern::UnitStride : SimdVal::LanePattern::Divergent);
+    hooks.threadIdInGroupPattern[1] = (tgs[1] == 1 || (xDivisibleByW && tgs[1] > 0)) ? SimdVal::LanePattern::Uniform : SimdVal::LanePattern::Divergent;
+    hooks.threadIdInGroupPattern[2] = (tgs[2] == 1 || (xDivisibleByW && tgs[1] > 0)) ? SimdVal::LanePattern::Uniform : SimdVal::LanePattern::Divergent;
+    for (int c = 0; c < 3; ++c) {
+        hooks.threadIdPattern[c] = hooks.threadIdInGroupPattern[c];
+    }
+    hooks.flatGroupIdPattern = (tgs[0] == 1 && tgs[1] == 1 && tgs[2] == 1)
+                                   ? SimdVal::LanePattern::Uniform
+                                   : SimdVal::LanePattern::UnitStride;
 }
 
 // Collects all SSA values used inside `[segBegin, segEnd)` that are already tracked in `spills`,

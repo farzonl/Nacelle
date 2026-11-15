@@ -404,12 +404,11 @@ bool emitObjectBytesO3(
         return false;
     }
 
-    if (!isStrictFloatingPointEnabled()) {
 #if LLVM_VERSION_MAJOR < 24
+    if (!isStrictFloatingPointEnabled()) {
         jtmbOrErr->getOptions().AllowFPOpFusion = llvm::FPOpFusion::Fast;
-#endif
-        applyShaderFastMathFlags(mod);
     }
+#endif
 
     auto tmOrErr = jtmbOrErr->createTargetMachine();
     if (!tmOrErr) {
@@ -468,7 +467,6 @@ bool emitObjectBytesO3(
 }
 
 void runTier1Optimize(llvm::Module& mod) {
-    applyShaderFastMathFlags(mod);
     llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
     llvm::CGSCCAnalysisManager cgam;
@@ -830,6 +828,11 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     llvmMod->setTargetTriple(llvm::Triple(getHostTargetTripleString()));
     llvmMod->setDataLayout(getHostDataLayoutString());
 
+    // Apply fast-math flags to shader IR before linking freestanding runtime bitcode
+    // so range-reduction, cancellation-free polynomials, and NaN/Inf/signed-zero paths
+    // in math_simd.bc and texture_sampler.bc are not rewritten by reassoc/nsz/arcp.
+    applyShaderFastMathFlags(*llvmMod);
+
     // Rewrite vector-by-value `nacelle_math_v<W>_*` declarations/calls to ABI-neutral
     // `void(ptr out, ptr in)` so `AlwaysInlinerPass` matches `math_simd.bc` on all targets.
     {
@@ -904,6 +907,9 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
                 f.removeFnAttr("target-cpu");
                 f.removeFnAttr("target-features");
                 f.removeFnAttr("tune-cpu");
+                if (!isStrictFloatingPointEnabled()) {
+                    f.addFnAttr("reciprocal-estimates", "none");
+                }
                 if (!f.hasFnAttribute(llvm::Attribute::NoInline)) {
                     f.addFnAttr(llvm::Attribute::AlwaysInline);
                 }
