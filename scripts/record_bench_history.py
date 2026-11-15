@@ -18,7 +18,7 @@ def fetch_json_url(url: str):
         return None
 
 
-def load_existing_history(pages_url: str | None, cache_file: Path | None) -> list:
+def load_existing_history(pages_url: str | None, cache_file: Path | None, history_filename: str = "bench-history.json") -> list:
     if cache_file and cache_file.exists():
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
@@ -29,7 +29,7 @@ def load_existing_history(pages_url: str | None, cache_file: Path | None) -> lis
             print(f"Warning: failed to read cached bench history {cache_file}: {exc}")
 
     if pages_url:
-        loaded = fetch_json_url(pages_url.rstrip("/") + "/data/bench-history.json")
+        loaded = fetch_json_url(pages_url.rstrip("/") + f"/data/{history_filename}")
         if isinstance(loaded, list):
             return loaded
 
@@ -82,6 +82,8 @@ def main() -> None:
     parser.add_argument("--run-url", default="")
     parser.add_argument("--pages-url", default="")
     parser.add_argument("--history-cache", type=Path, default=None)
+    parser.add_argument("--os", dest="os_name", default="Windows")
+    parser.add_argument("--history-filename", default="bench-history.json")
     args = parser.parse_args()
 
     with open(args.bench_json, "r", encoding="utf-8") as f:
@@ -104,7 +106,7 @@ def main() -> None:
         "author": args.author,
         "timestamp": ts,
         "runUrl": args.run_url,
-        "os": "Windows",
+        "os": args.os_name,
         "overallWinner": raw.get("overall_winner") or raw.get("overallWinner", ""),
         "overallGeomeanMs": raw.get("overall_geomean_ms") or raw.get("overallGeomeanMs", {}),
         "categoryWinners": raw.get("category_winners") or raw.get("categoryWinners", []),
@@ -113,7 +115,7 @@ def main() -> None:
         "suites": [normalize_result(r) for r in suites],
     }
 
-    history = load_existing_history(args.pages_url, args.history_cache)
+    history = load_existing_history(args.pages_url, args.history_cache, args.history_filename)
     history = [
         h for h in history
         if h.get("sha") != args.sha and (h.get("suites") or h.get("results"))
@@ -136,17 +138,18 @@ def main() -> None:
 
     data_dir = args.out_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    with open(data_dir / "bench-history.json", "w", encoding="utf-8") as f:
+    with open(data_dir / args.history_filename, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # Preserve compliance history.json, latest.json, and badge.json from live Pages if not already in _site/data
+    # Preserve other OS benchmark history, compliance history.json, latest.json, and badge.json from live Pages
     if args.pages_url:
         base_url = args.pages_url.rstrip("/")
-        if not (data_dir / "history.json").exists():
-            compliance = fetch_json_url(base_url + "/data/history.json")
-            if isinstance(compliance, list):
-                with open(data_dir / "history.json", "w", encoding="utf-8") as f:
-                    json.dump(compliance, f, indent=2)
+        for fname in ("bench-history.json", "bench-history-macos.json", "history.json"):
+            if fname != args.history_filename and not (data_dir / fname).exists():
+                arr = fetch_json_url(base_url + f"/data/{fname}")
+                if isinstance(arr, list):
+                    with open(data_dir / fname, "w", encoding="utf-8") as f:
+                        json.dump(arr, f, indent=2)
         for fname in ("latest.json", "badge.json"):
             if not (data_dir / fname).exists():
                 obj = fetch_json_url(base_url + f"/data/{fname}")
