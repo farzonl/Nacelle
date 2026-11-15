@@ -2,15 +2,11 @@
 
 #include <llvm/IR/Module.h>
 #include <mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h>
-#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlowOps.h>
 #include <mlir/Dialect/DLTI/DLTI.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
-#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
-#include <mlir/Dialect/UB/IR/UBOps.h>
-#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Pass/PassManager.h>
@@ -37,10 +33,6 @@ void configureNacelleMLIRContext(mlir::MLIRContext& ctx) {
             mlir::func::FuncDialect,
             mlir::cf::ControlFlowDialect,
             mlir::scf::SCFDialect,
-            mlir::arith::ArithDialect,
-            mlir::math::MathDialect,
-            mlir::vector::VectorDialect,
-            mlir::ub::UBDialect,
             mlir::LLVM::LLVMDialect>();
         return reg;
     }();
@@ -98,11 +90,11 @@ static bool convertLLVMFuncShellToCF(mlir::ModuleOp mod, const std::string& entr
                 mlir::Block* curBB = bb;
                 for (unsigned i = 0; i < caseDests.size(); ++i) {
                     mlir::OpBuilder cb = (i == 0) ? tb : mlir::OpBuilder::atBlockEnd(curBB);
-                    auto cmpCst = mlir::arith::ConstantIntOp::create(
+                    auto cmpCst = mlir::LLVM::ConstantOp::create(
                         cb, loc, condVal.getType(),
-                        caseVals->getValues<llvm::APInt>()[i].getZExtValue());
-                    auto eq = mlir::arith::CmpIOp::create(
-                        cb, loc, mlir::arith::CmpIPredicate::eq, condVal, cmpCst);
+                        cb.getIntegerAttr(condVal.getType(), caseVals->getValues<llvm::APInt>()[i].getZExtValue()));
+                    auto eq = mlir::LLVM::ICmpOp::create(
+                        cb, loc, mlir::LLVM::ICmpPredicate::eq, condVal, cmpCst);
                     if (i + 1 == caseDests.size()) {
                         mlir::cf::CondBranchOp::create(
                             cb, loc, eq,
@@ -126,7 +118,7 @@ static bool convertLLVMFuncShellToCF(mlir::ModuleOp mod, const std::string& entr
         } else if (auto unreach = llvm::dyn_cast<mlir::LLVM::UnreachableOp>(term)) {
             llvm::SmallVector<mlir::Value, 2> dummyRets;
             for (mlir::Type rt : resTys) {
-                dummyRets.push_back(mlir::ub::PoisonOp::create(tb, loc, rt));
+                dummyRets.push_back(mlir::LLVM::PoisonOp::create(tb, loc, rt));
             }
             mlir::func::ReturnOp::create(tb, loc, dummyRets);
             unreach.erase();
