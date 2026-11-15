@@ -1001,7 +1001,7 @@ private:
             uint32_t numWaves = std::max<uint32_t>(1u, hooks_.numWaves);
             mlir::Value baseAlloca = createEntryAlloca(loc, slotTy, static_cast<uint64_t>(numWaves) * W_, 64);
             if (hooks_.waveIdx && numWaves > 1u) {
-                mlir::Value w32 = mlir::arith::IndexCastOp::create(b_, loc, i32Ty(), hooks_.waveIdx);
+                mlir::Value w32 = hooks_.waveIdx;
                 mlir::Value waveBase = mlir::LLVM::MulOp::create(b_, loc, w32, cInt(loc, i32Ty(), W_));
                 for (uint32_t l = 0; l < W_; ++l) {
                     mlir::Value slotIdx = mlir::LLVM::AddOp::create(b_, loc, waveBase, cInt(loc, i32Ty(), l));
@@ -6287,7 +6287,7 @@ static mlir::Value buildFlatTidAndMask(
     llvm::SmallVector<int32_t, 16> iota;
     for (uint32_t i = 0; i < W; ++i) iota.push_back(static_cast<int32_t>(i));
     mlir::Value iotaVec = mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(iota))).getType(), mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(iota)));
-    mlir::Value w32 = mlir::arith::IndexCastOp::create(b, loc, i32Ty, waveIdx);
+    mlir::Value w32 = waveIdx;
     mlir::Value base = mlir::LLVM::MulOp::create(
         b, loc, w32, mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, W)));
     mlir::Value baseVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), base, W);
@@ -6423,14 +6423,14 @@ static bool packetizeComputeBlockWithBarriers(
                     wb, loc, valToStore, packed[i], llvm::ArrayRef<int64_t>{static_cast<int64_t>(i)});
             }
         }
-        mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, loc, i32Ty, waveIdx);
+        mlir::Value w32 = waveIdx;
         mlir::Value wp = mlir::LLVM::GEPOp::create(wb, loc, ptrTy, slot.packedValTy, slot.arrPtr, mlir::ValueRange{w32});
         mlir::LLVM::StoreOp::create(wb, loc, valToStore, wp, 1u);
     };
 
     auto loadSpillAtWave = [&](mlir::OpBuilder& wb, SimdPacketizer& pkt, const SpillSlot& slot,
                                mlir::Value waveIdx) -> SimdVal {
-        mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, loc, i32Ty, waveIdx);
+        mlir::Value w32 = waveIdx;
         mlir::Value wp = mlir::LLVM::GEPOp::create(wb, loc, ptrTy, slot.packedValTy, slot.arrPtr, mlir::ValueRange{w32});
         mlir::Value loaded = mlir::LLVM::LoadOp::create(wb, loc, slot.packedValTy, wp, 1u);
         llvm::SmallVector<mlir::Value, 4> flatVals;
@@ -6448,8 +6448,8 @@ static bool packetizeComputeBlockWithBarriers(
         return pkt.unpackSimdFromValues(loc, slot.origTy, flatVals, cur, slot.isHandle ? &slot.handleProto : nullptr);
     };
 
-    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b, loc, 0);
-    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b, loc, 1);
+    mlir::Value c0 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(0));
+    mlir::Value c1 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(1));
 
     auto emitWaveSegment = [&](mlir::Block::iterator segBegin, mlir::Block::iterator segEnd) -> bool {
         if (segBegin == segEnd) return true;
@@ -6465,7 +6465,7 @@ static bool packetizeComputeBlockWithBarriers(
             [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
                 mlir::Value baseMask;
                 mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, W, waveIdx, totalThreads, baseMask);
-                mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                mlir::Value w32 = waveIdx;
                 mlir::Value mp = mlir::LLVM::GEPOp::create(
                     wb, wloc, ptrTy, mlir::VectorType::get({W}, wb.getI1Type()), waveMaskArr, mlir::ValueRange{w32});
                 mlir::Value activeMask = mlir::LLVM::LoadOp::create(
@@ -6645,7 +6645,7 @@ static bool packetizeComputeBlockWithBarriers(
                 mlir::scf::ForOp::create(
                     b, loc, c0, numWaves, c1, mlir::ValueRange{},
                     [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
-                        mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                        mlir::Value w32 = waveIdx;
                         mlir::Value srcP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                         mlir::Value dstP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, savedWaveMaskArr, mlir::ValueRange{w32});
                         mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP, 1u), dstP, 1u);
@@ -6680,7 +6680,7 @@ static bool packetizeComputeBlockWithBarriers(
                             [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange acc) {
                                 mlir::Value baseMask;
                                 mlir::Value flatTid = buildFlatTidAndMask(wb, wloc, W, waveIdx, totalThreads, baseMask);
-                                mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                                mlir::Value w32 = waveIdx;
                                 mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                                 mlir::Value curMask = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
 
@@ -6733,7 +6733,7 @@ static bool packetizeComputeBlockWithBarriers(
                                 [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
                                     StageHooks dh;
                                     SimdPacketizer pkt(wb, mod, shader, rootLayout, W, rootCtxPtr, dh);
-                                    mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                                    mlir::Value w32 = waveIdx;
                                     mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                                     mlir::Value m = mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, mp, 1u);
                                     for (unsigned i = 0; i < yo.getNumOperands(); ++i) {
@@ -6757,7 +6757,7 @@ static bool packetizeComputeBlockWithBarriers(
                 mlir::scf::ForOp::create(
                     b, loc, c0, numWaves, c1, mlir::ValueRange{},
                     [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
-                        mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                        mlir::Value w32 = waveIdx;
                         mlir::Value srcP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, savedWaveMaskArr, mlir::ValueRange{w32});
                         mlir::Value dstP = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                         mlir::LLVM::StoreOp::create(wb, wloc, mlir::LLVM::LoadOp::create(wb, wloc, maskVecTy, srcP, 1u), dstP, 1u);
@@ -6806,9 +6806,9 @@ bool packetizeThreadGroupRegion(
         std::max(1u, shader.threadGroupSize[0] * shader.threadGroupSize[1] * shader.threadGroupSize[2]);
     const uint32_t numWavesVal = (totalThreadsVal + simdWidth - 1) / simdWidth;
     mlir::Value totalThreads = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, totalThreadsVal));
-    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b, loc, 0);
-    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b, loc, 1);
-    mlir::Value numWaves = mlir::arith::ConstantIndexOp::create(b, loc, numWavesVal);
+    mlir::Value c0 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(0));
+    mlir::Value c1 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(1));
+    mlir::Value numWaves = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(numWavesVal));
 
     if (!regionContainsBarrier(srcRegion)) {
         auto emitWaveBody = [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx) {
@@ -6847,7 +6847,7 @@ bool packetizeThreadGroupRegion(
             [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange) {
                 mlir::Value activeMask;
                 (void)buildFlatTidAndMask(wb, wloc, simdWidth, waveIdx, totalThreads, activeMask);
-                mlir::Value w32 = mlir::arith::IndexCastOp::create(wb, wloc, i32Ty, waveIdx);
+                mlir::Value w32 = waveIdx;
                 mlir::Value mp = mlir::LLVM::GEPOp::create(wb, wloc, ptrTy, maskVecTy, waveMaskArr, mlir::ValueRange{w32});
                 mlir::LLVM::StoreOp::create(wb, wloc, activeMask, mp, 1u);
                 mlir::scf::YieldOp::create(wb, wloc);

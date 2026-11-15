@@ -55,15 +55,9 @@
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
 #include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
 #include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
-#include <mlir/Conversion/MathToLLVM/MathToLLVM.h>
-#include <mlir/Conversion/MathToLibm/MathToLibm.h>
-#include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
-#include <mlir/Conversion/UBToLLVM/UBToLLVM.h>
-#include <mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
-#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/SymbolTable.h>
@@ -816,91 +810,11 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
     std::string& outError) {
-    const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
-    const bool strictFp = strictFpEnv && strictFpEnv[0] == '1';
-
-    // Upstream MLIR's ConvertMathToLLVMPass lowers math.isnan and math.isfinite
-    // to LLVM::IsFPClass, but omits math.isinf and math.isnormal, which would
-    // otherwise be rejected as illegal by ConvertMathToLibmPass.
-    // Also, when !strictFp, rewrite vector<W x f32> transcendental math.* ops to
-    // our freestanding SIMD polynomial approximations in math_simd.bc.
-    mlir::SymbolTable symTable(mlirMod);
-    auto getOrInsertMathFn = [&](llvm::StringRef fnName, mlir::Type vecTy) -> mlir::func::FuncOp {
-        if (auto existing = symTable.lookup<mlir::func::FuncOp>(fnName)) {
-            return existing;
-        }
-        mlir::OpBuilder mb(mlirMod.getContext());
-        mb.setInsertionPointToStart(mlirMod.getBody());
-        auto fnTy = mb.getFunctionType({vecTy}, {vecTy});
-        auto fnOp = mlir::func::FuncOp::create(mb, mlirMod.getLoc(), fnName, fnTy);
-        fnOp.setPrivate();
-        symTable.insert(fnOp);
-        return fnOp;
-    };
-
-    mlirMod.walk([&](mlir::Operation* op) {
-        if (auto isInf = llvm::dyn_cast<mlir::math::IsInfOp>(op)) {
-            mlir::OpBuilder b(isInf);
-            auto repl = mlir::LLVM::IsFPClass::create(
-                b, isInf.getLoc(), isInf.getResult().getType(),
-                isInf.getOperand(), static_cast<uint32_t>(llvm::fcInf));
-            isInf.replaceAllUsesWith(repl.getRes());
-            isInf.erase();
-            return;
-        }
-        if (auto isNorm = llvm::dyn_cast<mlir::math::IsNormalOp>(op)) {
-            mlir::OpBuilder b(isNorm);
-            auto repl = mlir::LLVM::IsFPClass::create(
-                b, isNorm.getLoc(), isNorm.getResult().getType(),
-                isNorm.getOperand(), static_cast<uint32_t>(llvm::fcNormal));
-            isNorm.replaceAllUsesWith(repl.getRes());
-            isNorm.erase();
-            return;
-        }
-        if (strictFp || op->getNumOperands() != 1 || op->getNumResults() != 1) {
-            return;
-        }
-        auto vt = llvm::dyn_cast<mlir::VectorType>(op->getResult(0).getType());
-        if (!vt || vt.getRank() != 1 || !vt.getElementType().isF32()) {
-            return;
-        }
-        int64_t w = vt.getNumElements();
-        if (w != 4 && w != 8 && w != 16) {
-            return;
-        }
-        const char* suffix = nullptr;
-        if (llvm::isa<mlir::math::Exp2Op>(op)) suffix = "exp2f";
-        else if (llvm::isa<mlir::math::Log2Op>(op)) suffix = "log2f";
-        else if (llvm::isa<mlir::math::SinOp>(op)) suffix = "sinf";
-        else if (llvm::isa<mlir::math::CosOp>(op)) suffix = "cosf";
-        else if (llvm::isa<mlir::math::TanOp>(op)) suffix = "tanf";
-        else if (llvm::isa<mlir::math::AsinOp>(op)) suffix = "asinf";
-        else if (llvm::isa<mlir::math::AcosOp>(op)) suffix = "acosf";
-        else if (llvm::isa<mlir::math::AtanOp>(op)) suffix = "atanf";
-        else if (llvm::isa<mlir::math::SinhOp>(op)) suffix = "sinhf";
-        else if (llvm::isa<mlir::math::CoshOp>(op)) suffix = "coshf";
-        else if (llvm::isa<mlir::math::TanhOp>(op)) suffix = "tanhf";
-        if (!suffix) {
-            return;
-        }
-        std::string fnName = "nacelle_math_v" + std::to_string(w) + "_" + suffix;
-        mlir::func::FuncOp callee = getOrInsertMathFn(fnName, vt);
-        mlir::OpBuilder b(op);
-        auto call = mlir::func::CallOp::create(b, op->getLoc(), callee, op->getOperands());
-        op->replaceAllUsesWith(call.getResults());
-        op->erase();
-    });
-
     mlir::PassManager pm(mlirMod.getContext());
     pm.addPass(mlir::createSCFToControlFlowPass());
-    pm.addPass(mlir::createConvertVectorToLLVMPass());
-    pm.addPass(mlir::createConvertMathToLLVMPass());
-    pm.addPass(mlir::createConvertMathToLibmPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
     pm.addPass(mlir::createConvertFuncToLLVMPass());
-    pm.addPass(mlir::createUBToLLVMConversionPass());
-    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
     if (mlir::failed(pm.run(mlirMod))) {
         outError = "MLIR LLVM lowering pipeline failed";

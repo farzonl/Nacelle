@@ -68,9 +68,6 @@ set(NACELLE_MLIR_LIBS
     MLIRControlFlowDialect
     MLIRFuncDialect
     MLIRArithDialect
-    MLIRMathDialect
-    MLIRVectorDialect
-    MLIRUBDialect
     MLIRTargetLLVMIRImport
     MLIRTargetLLVMIRExport
     MLIRBuiltinToLLVMIRTranslation
@@ -78,15 +75,9 @@ set(NACELLE_MLIR_LIBS
     MLIRLLVMIRToLLVMTranslation
     MLIRControlFlowToSCF
     MLIRSCFToControlFlow
-    MLIRVectorToLLVM
-    MLIRVectorToLLVMPass
     MLIRArithToLLVM
-    MLIRMathToLLVM
     MLIRFuncToLLVM
-    MLIRMathToLibm
     MLIRControlFlowToLLVM
-    MLIRUBToLLVM
-    MLIRReconcileUnrealizedCasts
 )
 
 # 3. Compile texture_sampler.cpp & math_simd.cpp to portable LLVM bitcode (.bc) and embed as C arrays
