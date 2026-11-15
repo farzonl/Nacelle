@@ -43,6 +43,8 @@ struct SimdVal {
     uint32_t stride = 0;
     bool isRootConstants = false;
     bool isAllocaPtr = false;
+    bool isSoAAllocaPtr = false;
+    mlir::Type soaScalarTy; // Leaf scalar type when isSoAAllocaPtr is true (<W x soaScalarTy>)
     LanePattern pattern = LanePattern::Divergent;
     mlir::Type unitStrideElemTy; // Element type whose sizeof matches 1-lane byte step when pattern == UnitStride
     bool isUniform() const {

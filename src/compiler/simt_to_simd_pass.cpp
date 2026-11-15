@@ -1084,14 +1084,91 @@ private:
 
         // Stack Alloca / GEP / Load / Store / Atomic
         if (auto allocaOp = llvm::dyn_cast<mlir::LLVM::AllocaOp>(&op)) {
+            auto unwrapAllocaScalarType = [](mlir::Type ty) -> mlir::Type {
+                while (auto arr = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(ty)) {
+                    ty = arr.getElementType();
+                }
+                if (!mlir::isa<mlir::IntegerType, mlir::FloatType>(ty)) return {};
+                uint64_t bw = ty.getIntOrFloatBitWidth();
+                if (bw < 8 || (bw & (bw - 1)) != 0) return {};
+                return ty;
+            };
+            auto isSoAEligibleAlloca = [&](mlir::Type& outScalarTy) -> bool {
+                if (W_ <= 1) return false;
+                mlir::Type scalarTy = unwrapAllocaScalarType(allocaOp.getElemType());
+                if (!scalarTy) return false;
+                llvm::SmallVector<mlir::Value, 8> worklist{allocaOp.getRes()};
+                llvm::SmallPtrSet<mlir::Value, 16> visited;
+                visited.insert(allocaOp.getRes());
+                while (!worklist.empty()) {
+                    mlir::Value cur = worklist.pop_back_val();
+                    for (mlir::OpOperand& use : cur.getUses()) {
+                        mlir::Operation* user = use.getOwner();
+                        if (auto gep = llvm::dyn_cast<mlir::LLVM::GEPOp>(user)) {
+                            if (gep.getBase() != cur || gep.getRawConstantIndices().empty()) return false;
+                            if (unwrapAllocaScalarType(gep.getElemType()) != scalarTy) return false;
+                            if (visited.insert(gep.getRes()).second) {
+                                worklist.push_back(gep.getRes());
+                            }
+                        } else if (auto ld = llvm::dyn_cast<mlir::LLVM::LoadOp>(user)) {
+                            if (ld.getAddr() != cur || ld.getVolatile_() || ld.getResult().getType() != scalarTy) {
+                                return false;
+                            }
+                        } else if (auto st = llvm::dyn_cast<mlir::LLVM::StoreOp>(user)) {
+                            if (st.getAddr() != cur || st.getVolatile_() || st.getValue().getType() != scalarTy) {
+                                return false;
+                            }
+                        } else if (llvm::isa<mlir::LLVM::LifetimeStartOp, mlir::LLVM::LifetimeEndOp>(user)) {
+                            continue;
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+                outScalarTy = scalarTy;
+                return true;
+            };
+
+            auto replaceArrayLeafType = [](auto& self, mlir::Type ty, mlir::Type leafVecTy) -> mlir::Type {
+                if (auto arr = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(ty)) {
+                    return mlir::LLVM::LLVMArrayType::get(
+                        self(self, arr.getElementType(), leafVecTy), arr.getNumElements());
+                }
+                return leafVecTy;
+            };
+
+            mlir::Type elemTy = allocaOp.getElemType();
+            uint64_t count = getConstIntValue(allocaOp.getArraySize()).value_or(1);
+            uint32_t numWaves = std::max<uint32_t>(1u, hooks_.numWaves);
+
+            mlir::Type soaScalarTy;
+            if (isSoAEligibleAlloca(soaScalarTy)) {
+                mlir::Type soaElemTy = replaceArrayLeafType(replaceArrayLeafType, elemTy, vecTy(soaScalarTy));
+                uint32_t align = std::max<uint32_t>(64u, W_ * static_cast<uint32_t>(soaScalarTy.getIntOrFloatBitWidth() / 8));
+                mlir::Value baseAlloca = createEntryAlloca(loc, soaElemTy, static_cast<uint64_t>(numWaves) * count, align);
+                mlir::Value wavePtr = baseAlloca;
+                if (hooks_.waveIdx && numWaves > 1u) {
+                    mlir::Value waveBase = mlir::LLVM::MulOp::create(b_, loc, hooks_.waveIdx, cInt(loc, i32Ty(), count));
+                    wavePtr = mlir::LLVM::GEPOp::create(
+                        b_, loc, ptrTy(), soaElemTy, baseAlloca, mlir::ValueRange{waveBase});
+                }
+                SimdVal sv;
+                sv.kind = SimdVal::Kind::Lanes;
+                sv.origType = ptrTy();
+                sv.isAllocaPtr = true;
+                sv.isSoAAllocaPtr = true;
+                sv.soaScalarTy = soaScalarTy;
+                sv.pattern = SimdVal::LanePattern::Uniform;
+                sv.lanes.push_back(wavePtr);
+                setMapped(allocaOp.getRes(), sv);
+                return true;
+            }
+
             SimdVal sv;
             sv.kind = SimdVal::Kind::Lanes;
             sv.origType = ptrTy();
             sv.isAllocaPtr = true;
-            mlir::Type elemTy = allocaOp.getElemType();
-            uint64_t count = getConstIntValue(allocaOp.getArraySize()).value_or(1);
             mlir::Type slotTy = (count == 1) ? elemTy : mlir::Type(mlir::LLVM::LLVMArrayType::get(elemTy, count));
-            uint32_t numWaves = std::max<uint32_t>(1u, hooks_.numWaves);
             mlir::Value baseAlloca = createEntryAlloca(loc, slotTy, static_cast<uint64_t>(numWaves) * W_, 64);
             if (hooks_.waveIdx && numWaves > 1u) {
                 mlir::Value w32 = hooks_.waveIdx;
@@ -1124,6 +1201,75 @@ private:
                         break;
                     }
                 }
+            }
+
+            if (base.isSoAAllocaPtr) {
+                auto replaceArrayLeafType = [](auto& self, mlir::Type ty, mlir::Type leafVecTy) -> mlir::Type {
+                    if (auto arr = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(ty)) {
+                        return mlir::LLVM::LLVMArrayType::get(
+                            self(self, arr.getElementType(), leafVecTy), arr.getNumElements());
+                    }
+                    return leafVecTy;
+                };
+                auto rawConsts = gep.getRawConstantIndices();
+                auto gepReachesScalar = [&](mlir::Type elemTy, size_t numIndices, mlir::Type scalarTy) -> bool {
+                    mlir::Type cur = elemTy;
+                    for (size_t i = 1; i < numIndices; ++i) {
+                        auto arr = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(cur);
+                        if (!arr) return false;
+                        cur = arr.getElementType();
+                    }
+                    return cur == scalarTy;
+                };
+
+                mlir::Type soaGepElemTy = replaceArrayLeafType(replaceArrayLeafType, gep.getElemType(), vecTy(base.soaScalarTy));
+                bool reachesScalar = gepReachesScalar(gep.getElemType(), rawConsts.size(), base.soaScalarTy);
+
+                SimdVal out;
+                out.kind = SimdVal::Kind::Lanes;
+                out.origType = gep.getType();
+                out.isAllocaPtr = true;
+                if (uniform) {
+                    out.pattern = SimdVal::LanePattern::Uniform;
+                    out.isSoAAllocaPtr = true;
+                    out.soaScalarTy = base.soaScalarTy;
+                    llvm::SmallVector<mlir::LLVM::GEPArg, 4> gepArgs;
+                    size_t dynIdx = 0;
+                    for (int32_t rc : rawConsts) {
+                        if (rc == mlir::LLVM::GEPOp::kDynamicIndex) {
+                            gepArgs.push_back(laneValue(loc, idxVals[dynIdx++], 0));
+                        } else {
+                            gepArgs.push_back(rc);
+                        }
+                    }
+                    mlir::Value lp = mlir::LLVM::GEPOp::create(
+                        b_, loc, ptrTy(), soaGepElemTy, laneValue(loc, base, 0), gepArgs,
+                        gep.getNoWrapFlags());
+                    out.lanes.push_back(lp);
+                } else {
+                    out.isSoAAllocaPtr = !reachesScalar;
+                    out.soaScalarTy = base.soaScalarTy;
+                    for (uint32_t l = 0; l < W_; ++l) {
+                        llvm::SmallVector<mlir::LLVM::GEPArg, 5> gepArgs;
+                        size_t dynIdx = 0;
+                        for (int32_t rc : rawConsts) {
+                            if (rc == mlir::LLVM::GEPOp::kDynamicIndex) {
+                                gepArgs.push_back(laneValue(loc, idxVals[dynIdx++], l));
+                            } else {
+                                gepArgs.push_back(rc);
+                            }
+                        }
+                        if (reachesScalar) {
+                            gepArgs.push_back(static_cast<int32_t>(l));
+                        }
+                        mlir::Value lp = mlir::LLVM::GEPOp::create(
+                            b_, loc, ptrTy(), soaGepElemTy, laneValue(loc, base, l), gepArgs,
+                            gep.getNoWrapFlags());
+                        out.lanes.push_back(lp);
+                    }
+                }
+                setMapped(gep.getRes(), out);
+                return true;
             }
 
             SimdVal out;
@@ -1166,6 +1312,12 @@ private:
             SimdVal addr = getMapped(loc, loadOp.getAddr());
             mlir::Type elemTy = loadOp.getResult().getType();
             uint64_t align = loadOp.getAlignment().value_or(1);
+            if (addr.isSoAAllocaPtr && addr.isUniform() && mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
+                mlir::Value v = mlir::LLVM::LoadOp::create(
+                    b_, loc, vecTy(elemTy), laneValue(loc, addr, 0), static_cast<unsigned>(align));
+                setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, v, {}, {}});
+                return true;
+            }
             if (addr.isUniform() && mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
                 mlir::Value s = loadScalar(loc, elemTy, laneValue(loc, addr, 0));
                 mlir::Value bvec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), s);
@@ -1184,12 +1336,16 @@ private:
                 }
                 if (addr.isAllocaPtr) {
                     mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(elemTy));
-                    mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                    const bool allTrue = isMaskConstAllTrue(execMask);
+                    mlir::Value scratch = allTrue ? mlir::Value{} : getOrCreateScratchAlloca(loc);
                     for (uint32_t l = 0; l < W_; ++l) {
                         if (isLaneMaskConstFalse(execMask, l)) continue;
-                        mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         mlir::Value pL = laneValue(loc, addr, l);
-                        mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value safePtr = pL;
+                        if (!allTrue) {
+                            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                            safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
+                        }
                         mlir::Value s = loadScalar(loc, elemTy, safePtr);
                         v = llvmInsert(b_, loc, v, s, static_cast<uint32_t>(static_cast<int64_t>(l)));
                     }
@@ -1358,13 +1514,31 @@ private:
                         return true;
                     }
                 }
+                if (addr.isSoAAllocaPtr && addr.isUniform()) {
+                    if (mlir::Value valVec = asVec(loc, val)) {
+                        mlir::Value ptr = laneValue(loc, addr, 0);
+                        if (isMaskConstAllTrue(execMask)) {
+                            mlir::LLVM::StoreOp::create(b_, loc, valVec, ptr, static_cast<unsigned>(align));
+                        } else {
+                            mlir::Value oldVec = mlir::LLVM::LoadOp::create(
+                                b_, loc, vecTy(valTy), ptr, static_cast<unsigned>(align));
+                            mlir::Value merged = mlir::LLVM::SelectOp::create(b_, loc, execMask, valVec, oldVec);
+                            mlir::LLVM::StoreOp::create(b_, loc, merged, ptr, static_cast<unsigned>(align));
+                        }
+                        return true;
+                    }
+                }
                 if (addr.isAllocaPtr) {
-                    mlir::Value scratch = getOrCreateScratchAlloca(loc);
+                    const bool allTrue = isMaskConstAllTrue(execMask);
+                    mlir::Value scratch = allTrue ? mlir::Value{} : getOrCreateScratchAlloca(loc);
                     for (uint32_t l = 0; l < W_; ++l) {
                         if (isLaneMaskConstFalse(execMask, l)) continue;
-                        mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         mlir::Value pL = laneValue(loc, addr, l);
-                        mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value safePtr = pL;
+                        if (!allTrue) {
+                            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                            safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
+                        }
                         mlir::Value vL = laneValue(loc, val, l);
                         storeScalar(loc, vL, safePtr);
                     }

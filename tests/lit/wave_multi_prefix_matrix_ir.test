@@ -3,10 +3,10 @@
 // RUN: %nacelle_compile --simd-width=4 --emit-llvm %t.dxil | %FileCheck %s
 
 // Verify that matrix allocas in non-barrier compute shaders are hoisted to the
-// function entry block (before the wave-loop branch) and sized per-wave (i32 4)
+// function entry block (before the wave-loop branch) and sized per-wave (SoA <4 x i64>)
 // rather than per-thread-group (i32 128).
 // CHECK-LABEL: define void @nacelle_cs_test(
-// CHECK: alloca [{{[0-9]+}} x i64], i32 4, align 64
+// CHECK: alloca [{{[0-9]+}} x <4 x i64>], align 64
 // CHECK: br label
 // CHECK-NOT: alloca
 
