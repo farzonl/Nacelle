@@ -79,7 +79,36 @@
 
 namespace nacelle {
 
-#if defined(__APPLE__)
+#if !defined(__APPLE__)
+template <typename T>
+static void fallbackGemm(
+    const T* A,
+    const T* B,
+    const T* C,
+    T* Out,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    uint32_t hasC) {
+    if (hasC && C) {
+        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(T));
+    } else {
+        std::memset(Out, 0, static_cast<size_t>(M) * N * sizeof(T));
+    }
+    for (uint32_t i = 0; i < M; ++i) {
+        T* outRow = Out + static_cast<size_t>(i) * N;
+        const T* aRow = A + static_cast<size_t>(i) * K;
+        for (uint32_t k = 0; k < K; ++k) {
+            const T aVal = aRow[k];
+            const T* bRow = B + static_cast<size_t>(k) * N;
+            for (uint32_t j = 0; j < N; ++j) {
+                outRow[j] += aVal * bRow[j];
+            }
+        }
+    }
+}
+#endif
+
 extern "C" void nacelle_accel_sgemm(
     const float* A,
     const float* B,
@@ -89,6 +118,7 @@ extern "C" void nacelle_accel_sgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
+#if defined(__APPLE__)
     if (hasC && C) {
         std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
     }
@@ -99,6 +129,9 @@ extern "C" void nacelle_accel_sgemm(
         B, static_cast<int>(N),
         (hasC && C) ? 1.0f : 0.0f,
         Out, static_cast<int>(N));
+#else
+    fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
+#endif
 }
 
 extern "C" void nacelle_accel_dgemm(
@@ -110,6 +143,7 @@ extern "C" void nacelle_accel_dgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
+#if defined(__APPLE__)
     if (hasC && C) {
         std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
     }
@@ -120,8 +154,10 @@ extern "C" void nacelle_accel_dgemm(
         B, static_cast<int>(N),
         (hasC && C) ? 1.0 : 0.0,
         Out, static_cast<int>(N));
-}
+#else
+    fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
 #endif
+}
 
 bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError);
 
@@ -402,10 +438,8 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         addSym("nacelle_dxr_accept_hit_and_end_search", &nacelle_dxr_accept_hit_and_end_search);
         addSym("nacelle_dxr_report_hit", &nacelle_dxr_report_hit);
         addSym("nacelle_dxr_call_shader", &nacelle_dxr_call_shader);
-#if defined(__APPLE__)
         addSym("nacelle_accel_sgemm", &nacelle_accel_sgemm);
         addSym("nacelle_accel_dgemm", &nacelle_accel_dgemm);
-#endif
         if (auto err = rt.jit->getMainJITDylib().define(llvm::orc::absoluteSymbols(std::move(syms)))) {
             outError = llvm::toString(std::move(err));
             rt.jit.reset();
