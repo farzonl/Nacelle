@@ -2033,7 +2033,171 @@ private:
         return true;
     }
 
+    bool tryPacketizeCountedWhile(mlir::scf::WhileOp whileOp, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
+        mlir::Block& srcBefore = whileOp.getBefore().front();
+        mlir::Block& srcAfter = whileOp.getAfter().front();
+        auto condOp = llvm::dyn_cast<mlir::scf::ConditionOp>(srcBefore.getTerminator());
+        auto yieldOp = llvm::dyn_cast<mlir::scf::YieldOp>(srcAfter.getTerminator());
+        if (!condOp || !yieldOp) return false;
+        if (whileOp.getInits().size() != srcBefore.getNumArguments()) return false;
+        if (condOp.getArgs().size() != srcAfter.getNumArguments()) return false;
+        if (whileOp.getNumResults() != condOp.getArgs().size()) return false;
+
+        // Match a do-while loop: `after` block only forwards its arguments 1-to-1 via scf.yield.
+        if (std::distance(srcAfter.begin(), srcAfter.end()) != 1) return false;
+        if (yieldOp.getOperands().size() != srcAfter.getNumArguments()) return false;
+        for (unsigned i = 0; i < srcAfter.getNumArguments(); ++i) {
+            if (yieldOp.getOperand(i) != srcAfter.getArgument(i)) return false;
+        }
+
+        // Unwrap `xori %cmp, true` (emitted by CFG-to-SCF lifting for inverted exits).
+        mlir::Value condVal = condOp.getCondition();
+        bool inverted = false;
+        if (auto xorOp = condVal.getDefiningOp<mlir::arith::XOrIOp>()) {
+            if (auto c = getConstIntValue(xorOp.getRhs()); c && *c == 1) {
+                condVal = xorOp.getLhs();
+                inverted = true;
+            } else if (auto c = getConstIntValue(xorOp.getLhs()); c && *c == 1) {
+                condVal = xorOp.getRhs();
+                inverted = true;
+            }
+        }
+
+        bool isNe = false;
+        mlir::Value cmpLhs, cmpRhs;
+        if (auto icmp = condVal.getDefiningOp<mlir::LLVM::ICmpOp>()) {
+            auto p = icmp.getPredicate();
+            if ((!inverted && p == mlir::LLVM::ICmpPredicate::ne) ||
+                (inverted && p == mlir::LLVM::ICmpPredicate::eq)) {
+                isNe = true;
+            } else if ((!inverted && (p == mlir::LLVM::ICmpPredicate::slt || p == mlir::LLVM::ICmpPredicate::ult)) ||
+                       (inverted && (p == mlir::LLVM::ICmpPredicate::sge || p == mlir::LLVM::ICmpPredicate::uge))) {
+                isNe = false;
+            } else {
+                return false;
+            }
+            cmpLhs = icmp.getLhs();
+            cmpRhs = icmp.getRhs();
+        } else if (auto cmpi = condVal.getDefiningOp<mlir::arith::CmpIOp>()) {
+            auto p = cmpi.getPredicate();
+            if ((!inverted && p == mlir::arith::CmpIPredicate::ne) ||
+                (inverted && p == mlir::arith::CmpIPredicate::eq)) {
+                isNe = true;
+            } else if ((!inverted && (p == mlir::arith::CmpIPredicate::slt || p == mlir::arith::CmpIPredicate::ult)) ||
+                       (inverted && (p == mlir::arith::CmpIPredicate::sge || p == mlir::arith::CmpIPredicate::uge))) {
+                isNe = false;
+            } else {
+                return false;
+            }
+            cmpLhs = cmpi.getLhs();
+            cmpRhs = cmpi.getRhs();
+        } else {
+            return false;
+        }
+
+        auto matchAddConst = [](mlir::Value v, mlir::Value& baseOut, uint64_t& stepOut) -> bool {
+            mlir::Value lhs, rhs;
+            if (auto add = v.getDefiningOp<mlir::LLVM::AddOp>()) {
+                lhs = add.getLhs();
+                rhs = add.getRhs();
+            } else if (auto add = v.getDefiningOp<mlir::arith::AddIOp>()) {
+                lhs = add.getLhs();
+                rhs = add.getRhs();
+            } else {
+                return false;
+            }
+            if (auto c = getConstIntValue(rhs)) {
+                baseOut = lhs;
+                stepOut = *c;
+                return true;
+            }
+            if (auto c = getConstIntValue(lhs)) {
+                baseOut = rhs;
+                stepOut = *c;
+                return true;
+            }
+            return false;
+        };
+
+        auto boundOpt = getConstIntValue(cmpRhs);
+        mlir::Value nextIv = cmpLhs;
+        if (!boundOpt) {
+            boundOpt = getConstIntValue(cmpLhs);
+            nextIv = cmpRhs;
+        }
+        if (!boundOpt) return false;
+        uint64_t boundVal = *boundOpt;
+
+        mlir::Value ivBase;
+        uint64_t stepVal = 0;
+        if (!matchAddConst(nextIv, ivBase, stepVal) || stepVal == 0) return false;
+
+        int ivIdx = -1;
+        for (unsigned i = 0; i < srcBefore.getNumArguments(); ++i) {
+            if (srcBefore.getArgument(i) == ivBase && condOp.getArgs()[i] == nextIv) {
+                ivIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (ivIdx < 0) return false;
+
+        mlir::Type ivTy = srcBefore.getArgument(static_cast<unsigned>(ivIdx)).getType();
+        if (!mlir::isa<mlir::IntegerType>(ivTy)) return false;
+        auto startOpt = getConstIntValue(whileOp.getInits()[static_cast<unsigned>(ivIdx)]);
+        if (!startOpt) return false;
+        uint64_t startVal = *startOpt;
+
+        if (startVal >= 0x7fffffffULL || boundVal >= 0x7fffffffULL || stepVal >= 0x7fffffffULL) return false;
+        if (startVal >= boundVal) return false;
+        if (isNe && ((boundVal - startVal) % stepVal) != 0) return false;
+        uint64_t tripCount = (boundVal - startVal + stepVal - 1) / stepVal;
+        if (tripCount > 6) return false;
+
+        // Only unroll small leaf loops (no nested regions and bounded op count) so we
+        // expose cross-call CSE (e.g. repeated fbm calls) without blowing up compile time.
+        uint32_t bodyOps = 0;
+        for (mlir::Operation& innerOp : srcBefore) {
+            if (innerOp.getNumRegions() > 0) return false;
+            if (++bodyOps > 120) return false;
+        }
+
+        mlir::Location loc = whileOp.getLoc();
+        llvm::SmallVector<SimdVal, 8> curState;
+        for (unsigned i = 0; i < whileOp.getInits().size(); ++i) {
+            curState.push_back(getMapped(loc, whileOp.getInits()[i]));
+        }
+        mlir::Value loopReal = realMask;
+        for (uint64_t iter = 0; iter < tripCount; ++iter) {
+            SimdPacketizer sub(b_, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
+            sub.valueMap_ = valueMap_;
+            for (unsigned i = 0; i < srcBefore.getNumArguments(); ++i) {
+                if (static_cast<int>(i) == ivIdx) {
+                    int64_t ivVal = static_cast<int64_t>(startVal + iter * stepVal);
+                    mlir::Value ivConst = mlir::LLVM::ConstantOp::create(b_, loc, ivTy, b_.getIntegerAttr(ivTy, ivVal));
+                    sub.setMapped(srcBefore.getArgument(i), {SimdVal::Kind::Vector, ivTy, llvmSplat(b_, loc, ivTy, ivConst), {}, {}});
+                } else {
+                    sub.setMapped(srcBefore.getArgument(i), curState[i]);
+                }
+            }
+            if (!sub.packetizeBlock(srcBefore, execMask, loopReal, outError)) {
+                return true;
+            }
+            for (unsigned i = 0; i < condOp.getArgs().size(); ++i) {
+                curState[i] = sub.getMapped(loc, condOp.getArgs()[i]);
+            }
+        }
+
+        for (unsigned i = 0; i < whileOp.getNumResults(); ++i) {
+            setMapped(whileOp.getResult(i), curState[i]);
+        }
+        realMask = loopReal;
+        return true;
+    }
+
     bool packetizeScfWhile(mlir::scf::WhileOp whileOp, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
+        if (tryPacketizeCountedWhile(whileOp, execMask, realMask, outError)) {
+            return outError.empty();
+        }
         mlir::Location loc = whileOp.getLoc();
         llvm::SmallVector<mlir::Type, 8> resTypes;
         llvm::SmallVector<mlir::Value, 8> initVals;
