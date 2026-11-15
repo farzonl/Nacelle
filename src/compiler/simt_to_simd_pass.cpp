@@ -11,10 +11,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
-#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
-#include <mlir/Dialect/UB/IR/UBOps.h>
-#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Verifier.h>
@@ -50,8 +47,7 @@ static std::optional<uint64_t> getConstIntValue(mlir::Value v) {
 
 static bool isUndefOrPoison(mlir::Value v) {
     return v && (v.getDefiningOp<mlir::LLVM::UndefOp>() ||
-                 v.getDefiningOp<mlir::LLVM::PoisonOp>() ||
-                 v.getDefiningOp<mlir::ub::PoisonOp>());
+                 v.getDefiningOp<mlir::LLVM::PoisonOp>());
 }
 
 static bool extractConstStructInts(mlir::Value v, llvm::SmallVectorImpl<uint64_t>& out) {
@@ -131,6 +127,44 @@ static bool regionContainsBarrier(mlir::Region& r) {
     return false;
 }
 
+static mlir::Value llvmExtract(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, uint32_t idx) {
+    mlir::Type i32Ty = builder.getI32Type();
+    mlir::Value idxVal = mlir::LLVM::ConstantOp::create(builder, loc, i32Ty, builder.getI32IntegerAttr(idx));
+    return mlir::LLVM::ExtractElementOp::create(builder, loc, vec, idxVal);
+}
+
+static mlir::Value llvmInsert(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, mlir::Value elem, uint32_t idx) {
+    mlir::Type i32Ty = builder.getI32Type();
+    mlir::Value idxVal = mlir::LLVM::ConstantOp::create(builder, loc, i32Ty, builder.getI32IntegerAttr(idx));
+    return mlir::LLVM::InsertElementOp::create(builder, loc, vec, elem, idxVal);
+}
+
+static mlir::Value llvmSplat(mlir::OpBuilder& builder, mlir::Location loc, mlir::Type elemTy, mlir::Value scalar, uint32_t W) {
+    auto vt = mlir::VectorType::get({W}, elemTy);
+    mlir::Value p = mlir::LLVM::PoisonOp::create(builder, loc, vt);
+    mlir::Value ins = llvmInsert(builder, loc, p, scalar, 0);
+    llvm::SmallVector<int32_t, 16> zeros(W, 0);
+    return mlir::LLVM::ShuffleVectorOp::create(builder, loc, ins, p, zeros);
+}
+
+static mlir::LLVM::ICmpPredicate toLLVMIcmpPred(mlir::arith::CmpIPredicate p) {
+    using AP = mlir::arith::CmpIPredicate;
+    using LP = mlir::LLVM::ICmpPredicate;
+    switch (p) {
+    case AP::eq: return LP::eq;
+    case AP::ne: return LP::ne;
+    case AP::slt: return LP::slt;
+    case AP::sle: return LP::sle;
+    case AP::sgt: return LP::sgt;
+    case AP::sge: return LP::sge;
+    case AP::ult: return LP::ult;
+    case AP::ule: return LP::ule;
+    case AP::ugt: return LP::ugt;
+    case AP::uge: return LP::uge;
+    }
+    return LP::eq;
+}
+
 class SimdPacketizer {
 public:
     struct BufferDescInfo {
@@ -173,7 +207,10 @@ public:
           W_(simdWidth),
           rootCtxPtr_(rootCtxPtr),
           hooks_(hooks),
-          descCache_(sharedDescCache ? sharedDescCache : &ownedDescCache_) {}
+          descCache_(sharedDescCache ? sharedDescCache : &ownedDescCache_) {
+        const char* strictFpEnv = std::getenv("NACELLE_STRICT_FP");
+        strictFp_ = strictFpEnv && strictFpEnv[0] == '1';
+    }
 
     mlir::OpBuilder& builder() { return b_; }
     uint32_t width() const { return W_; }
@@ -187,33 +224,107 @@ public:
     mlir::VectorType vecTy(mlir::Type elem) const { return mlir::VectorType::get({W_}, elem); }
 
     mlir::Value cInt(mlir::Location loc, mlir::Type ty, uint64_t val) {
-        return mlir::arith::ConstantIntOp::create(b_, loc, ty, val);
+        return mlir::LLVM::ConstantOp::create(b_, loc, ty, b_.getIntegerAttr(ty, val));
     }
     mlir::Value cFlt(mlir::Location loc, mlir::Type ty, double val) {
         auto ft = llvm::cast<mlir::FloatType>(ty);
-        return mlir::arith::ConstantFloatOp::create(
-            b_, loc, ft, mlir::FloatAttr::get(ft, val).getValue());
+        return mlir::LLVM::ConstantOp::create(b_, loc, ft, b_.getFloatAttr(ft, val));
     }
     mlir::Value splatInt(mlir::Location loc, mlir::Type elemTy, uint64_t val) {
         auto vt = vecTy(elemTy);
-        return mlir::arith::ConstantOp::create(
-            b_, loc, mlir::DenseElementsAttr::get(vt, b_.getIntegerAttr(elemTy, val)));
+        return mlir::LLVM::ConstantOp::create(
+            b_, loc, vt, mlir::DenseElementsAttr::get(vt, b_.getIntegerAttr(elemTy, val)));
     }
     mlir::Value splatFlt(mlir::Location loc, mlir::Type elemTy, double val) {
         auto vt = vecTy(elemTy);
-        return mlir::arith::ConstantOp::create(
-            b_, loc, mlir::DenseElementsAttr::get(vt, b_.getFloatAttr(elemTy, val)));
+        return mlir::LLVM::ConstantOp::create(
+            b_, loc, vt, mlir::DenseElementsAttr::get(vt, b_.getFloatAttr(elemTy, val)));
     }
     mlir::Value laneIota(mlir::Location loc) {
         llvm::SmallVector<int32_t, 16> vals;
         for (uint32_t i = 0; i < W_; ++i) vals.push_back(static_cast<int32_t>(i));
-        return mlir::arith::ConstantOp::create(
-            b_, loc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), llvm::ArrayRef<int32_t>(vals)));
+        auto vt = vecTy(i32Ty());
+        return mlir::LLVM::ConstantOp::create(
+            b_, loc, vt, mlir::DenseElementsAttr::get(vt, llvm::ArrayRef<int32_t>(vals)));
+    }
+    mlir::Value llvmExtract(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, uint32_t idx) {
+        return ::nacelle::llvmExtract(builder, loc, vec, idx);
+    }
+    mlir::Value llvmExtract(mlir::Location loc, mlir::Value vec, uint32_t idx) {
+        return ::nacelle::llvmExtract(b_, loc, vec, idx);
+    }
+    mlir::Value llvmInsert(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value vec, mlir::Value elem, uint32_t idx) {
+        return ::nacelle::llvmInsert(builder, loc, vec, elem, idx);
+    }
+    mlir::Value llvmInsert(mlir::Location loc, mlir::Value vec, mlir::Value elem, uint32_t idx) {
+        return ::nacelle::llvmInsert(b_, loc, vec, elem, idx);
+    }
+    mlir::Value llvmSplat(mlir::OpBuilder& builder, mlir::Location loc, mlir::Type elemTy, mlir::Value scalar) {
+        return ::nacelle::llvmSplat(builder, loc, elemTy, scalar, W_);
+    }
+    mlir::Value llvmSplat(mlir::Location loc, mlir::Type elemTy, mlir::Value scalar) {
+        return ::nacelle::llvmSplat(b_, loc, elemTy, scalar, W_);
+    }
+    mlir::LLVM::FastmathFlags fpFmf() const {
+        if (strictFp_) return mlir::LLVM::FastmathFlags::none;
+        return mlir::LLVM::FastmathFlags::reassoc | mlir::LLVM::FastmathFlags::nsz |
+               mlir::LLVM::FastmathFlags::arcp | mlir::LLVM::FastmathFlags::contract |
+               mlir::LLVM::FastmathFlags::afn;
+    }
+    template <typename OpT, typename... Args>
+    mlir::Value createFp(mlir::OpBuilder& builder, mlir::Location loc, Args&&... args) {
+        auto op = OpT::create(builder, loc, std::forward<Args>(args)...);
+        if (!strictFp_) {
+            op.setFastmathFlagsAttr(mlir::LLVM::FastmathFlagsAttr::get(ctx_, fpFmf()));
+        }
+        return op.getResult();
+    }
+    template <typename OpT, typename... Args>
+    mlir::Value createFp(mlir::Location loc, Args&&... args) {
+        return createFp<OpT>(b_, loc, std::forward<Args>(args)...);
+    }
+
+    mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
+        auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
+        mlir::Type elemTy = vt.getElementType();
+        if (!strictFp_ && elemTy.isF32() && (W_ == 4 || W_ == 8 || W_ == 16)) {
+            std::string fnName = ("nacelle_math_v" + std::to_string(W_) + "_" + baseName + "f").str();
+            mlir::func::FuncOp callee = mod_.lookupSymbol<mlir::func::FuncOp>(fnName);
+            if (!callee) {
+                mlir::OpBuilder mb(ctx_);
+                mb.setInsertionPointToStart(mod_.getBody());
+                auto fnTy = mb.getFunctionType({vt}, {vt});
+                callee = mlir::func::FuncOp::create(mb, mod_.getLoc(), fnName, fnTy);
+                callee.setPrivate();
+            }
+            return mlir::func::CallOp::create(b_, loc, callee, mlir::ValueRange{vecArg}).getResult(0);
+        }
+        if (baseName == "sin") return createFp<mlir::LLVM::SinOp>(loc, vt, vecArg);
+        if (baseName == "cos") return createFp<mlir::LLVM::CosOp>(loc, vt, vecArg);
+        if (baseName == "exp2") return createFp<mlir::LLVM::Exp2Op>(loc, vt, vecArg);
+        if (baseName == "log2") return createFp<mlir::LLVM::Log2Op>(loc, vt, vecArg);
+        // Scalar libm fallback for strict-FP or non-f32 transcendental ops.
+        std::string libmName = (elemTy.isF32() ? (baseName + "f") : baseName).str();
+        mlir::LLVM::LLVMFuncOp libmFn = getOrDeclareLibmFn(loc, libmName, elemTy);
+        mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vt);
+        for (uint32_t l = 0; l < W_; ++l) {
+            mlir::Value x = llvmExtract(loc, vecArg, l);
+            mlir::Value r = mlir::LLVM::CallOp::create(b_, loc, libmFn, mlir::ValueRange{x}).getResult();
+            outVec = llvmInsert(loc, outVec, r, l);
+        }
+        return outVec;
+    }
+
+    mlir::LLVM::LLVMFuncOp getOrDeclareLibmFn(mlir::Location loc, llvm::StringRef name, mlir::Type ty) {
+        if (auto existing = mod_.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) return existing;
+        mlir::OpBuilder mb(ctx_);
+        mb.setInsertionPointToStart(mod_.getBody());
+        auto fnTy = mlir::LLVM::LLVMFunctionType::get(ty, {ty});
+        return mlir::LLVM::LLVMFuncOp::create(mb, loc, name, fnTy);
     }
 
     mlir::Value orReduce(mlir::Location loc, mlir::Value vecI1) {
-        return mlir::vector::ReductionOp::create(
-            b_, loc, mlir::vector::CombiningKind::OR, vecI1);
+        return mlir::LLVM::vector_reduce_or::create(b_, loc, i1Ty(), vecI1);
     }
 
     mlir::Value allTrueMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 1); }
@@ -295,15 +406,15 @@ public:
 
     mlir::Value expandMaskQuads(mlir::Location loc, mlir::Value mask) {
         // For quad q (4 lanes: 4q..4q+3), any active lane makes all 4 lanes execute in execMask.
-        llvm::SmallVector<int64_t, 16> s1, s2;
+        llvm::SmallVector<int32_t, 16> s1, s2;
         for (uint32_t l = 0; l < W_; ++l) {
-            s1.push_back(static_cast<int64_t>(l ^ 1u));
-            s2.push_back(static_cast<int64_t>(l ^ 2u));
+            s1.push_back(static_cast<int32_t>(l ^ 1u));
+            s2.push_back(static_cast<int32_t>(l ^ 2u));
         }
-        mlir::Value pair = mlir::arith::OrIOp::create(
-            b_, loc, mask, mlir::vector::ShuffleOp::create(b_, loc, mask, mask, s1));
-        return mlir::arith::OrIOp::create(
-            b_, loc, pair, mlir::vector::ShuffleOp::create(b_, loc, pair, pair, s2));
+        mlir::Value pair = mlir::LLVM::OrOp::create(
+            b_, loc, mask, mlir::LLVM::ShuffleVectorOp::create(b_, loc, mask, mask, s1));
+        return mlir::LLVM::OrOp::create(
+            b_, loc, pair, mlir::LLVM::ShuffleVectorOp::create(b_, loc, pair, pair, s2));
     }
 
     SimdVal makeZeroSimd(mlir::Location loc, mlir::Type origTy) {
@@ -472,14 +583,14 @@ public:
         if (sv.kind == SimdVal::Kind::Vector) return sv.vec;
         if (sv.kind == SimdVal::Kind::Lanes && !sv.lanes.empty()) {
             if (sv.lanes.size() == 1) {
-                return mlir::vector::BroadcastOp::create(b_, loc, vecTy(sv.lanes[0].getType()), sv.lanes[0]);
+                return llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(sv.lanes[0].getType())).getElementType(), sv.lanes[0]);
             }
             mlir::Type elemTy = sv.lanes[0].getType();
             mlir::Value v = mlir::LLVM::isCompatibleType(elemTy)
                                 ? mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)))
-                                : mlir::Value(mlir::ub::PoisonOp::create(b_, loc, vecTy(elemTy)));
+                                : mlir::Value(mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
             for (uint32_t l = 0; l < W_; ++l) {
-                v = mlir::vector::InsertOp::create(b_, loc, sv.lanes[l], v, static_cast<int64_t>(l));
+                v = llvmInsert(b_, loc, v, sv.lanes[l], static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             return v;
         }
@@ -488,7 +599,7 @@ public:
 
     mlir::Value laneValue(mlir::Location loc, const SimdVal& sv, uint32_t l) {
         if (sv.kind == SimdVal::Kind::Vector) {
-            return mlir::vector::ExtractOp::create(b_, loc, sv.vec, static_cast<int64_t>(l));
+            return llvmExtract(b_, loc, sv.vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
         }
         if (sv.kind == SimdVal::Kind::Lanes && !sv.lanes.empty()) {
             return sv.lanes.size() == 1 ? sv.lanes[0] : sv.lanes[l];
@@ -504,7 +615,7 @@ public:
 
     SimdVal selectVal(mlir::Location loc, mlir::Value condVec, const SimdVal& t, const SimdVal& f) {
         if (t.kind == SimdVal::Kind::Vector && f.kind == SimdVal::Kind::Vector) {
-            mlir::Value s = mlir::arith::SelectOp::create(b_, loc, condVec, t.vec, f.vec);
+            mlir::Value s = mlir::LLVM::SelectOp::create(b_, loc, condVec, t.vec, f.vec);
             return {SimdVal::Kind::Vector, t.origType, s, {}, {}};
         }
         if (t.kind == SimdVal::Kind::Lanes || f.kind == SimdVal::Kind::Lanes ||
@@ -516,10 +627,10 @@ public:
                 return out;
             }
             for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value cL = mlir::vector::ExtractOp::create(b_, loc, condVec, static_cast<int64_t>(l));
+                mlir::Value cL = llvmExtract(b_, loc, condVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value tL = laneValue(loc, t, l);
                 mlir::Value fL = laneValue(loc, f, l);
-                out.lanes.push_back(mlir::arith::SelectOp::create(b_, loc, cL, tL, fL));
+                out.lanes.push_back(mlir::LLVM::SelectOp::create(b_, loc, cL, tL, fL));
             }
             return out;
         }
@@ -542,7 +653,7 @@ public:
         } else if (origTy.isIndex()) {
             outVecTypes.push_back(vecTy(i64Ty()));
         } else if (mlir::isa<mlir::LLVM::LLVMPointerType>(origTy)) {
-            outVecTypes.push_back(mlir::LLVM::LLVMArrayType::get(ptrTy(), W_));
+            outVecTypes.push_back(vecTy(ptrTy()));
         } else if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(origTy)) {
             for (mlir::Type f : st.getBody()) flattenSimdTypes(f, outVecTypes);
         } else if (auto at = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(origTy)) {
@@ -561,17 +672,19 @@ public:
                 mlir::Value idxL = laneValue(loc, sv, l);
                 mlir::Value i64L = idxL ? mlir::Value(mlir::arith::IndexCastOp::create(b_, loc, i64Ty(), idxL))
                                         : cInt(loc, i64Ty(), 0);
-                vec64 = mlir::vector::InsertOp::create(b_, loc, i64L, vec64, static_cast<int64_t>(l));
+                vec64 = llvmInsert(b_, loc, vec64, i64L, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             out.push_back(vec64);
         } else if (sv.kind == SimdVal::Kind::Lanes || sv.kind == SimdVal::Kind::Handle) {
-            mlir::Type arrTy = mlir::LLVM::LLVMArrayType::get(ptrTy(), W_);
-            mlir::Value arr = mlir::LLVM::UndefOp::create(b_, loc, arrTy);
-            for (uint32_t l = 0; l < W_; ++l) {
-                arr = mlir::LLVM::InsertValueOp::create(b_, loc, arr, laneValue(loc, sv, l),
-                                                        llvm::ArrayRef<int64_t>{static_cast<int64_t>(l)});
+            if (sv.isUniform()) {
+                out.push_back(llvmSplat(loc, ptrTy(), laneValue(loc, sv, 0)));
+            } else {
+                mlir::Value vec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(ptrTy()));
+                for (uint32_t l = 0; l < W_; ++l) {
+                    vec = llvmInsert(loc, vec, laneValue(loc, sv, l), l);
+                }
+                out.push_back(vec);
             }
-            out.push_back(arr);
         } else if (sv.kind == SimdVal::Kind::Struct) {
             for (const auto& f : sv.fields) packSimdToValues(loc, f, out);
         } else {
@@ -583,10 +696,14 @@ public:
         if (proto && proto->kind == SimdVal::Kind::Handle) {
             SimdVal h = *proto;
             h.lanes.clear();
-            mlir::Value arr = vals[cursor++];
-            for (uint32_t l = 0; l < W_; ++l) {
-                h.lanes.push_back(mlir::LLVM::ExtractValueOp::create(
-                    b_, loc, arr, llvm::ArrayRef<int64_t>{static_cast<int64_t>(l)}));
+            mlir::Value ptrVec = vals[cursor++];
+            if (h.isUniform()) {
+                mlir::Value p0 = llvmExtract(loc, ptrVec, 0);
+                h.lanes.assign(W_, p0);
+            } else {
+                for (uint32_t l = 0; l < W_; ++l) {
+                    h.lanes.push_back(llvmExtract(loc, ptrVec, l));
+                }
             }
             return h;
         }
@@ -599,7 +716,7 @@ public:
             sv.origType = origTy;
             mlir::Value vec64 = vals[cursor++];
             for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value i64L = mlir::vector::ExtractOp::create(b_, loc, vec64, static_cast<int64_t>(l));
+                mlir::Value i64L = llvmExtract(b_, loc, vec64, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 sv.lanes.push_back(mlir::arith::IndexCastOp::create(b_, loc, origTy, i64L));
             }
             return sv;
@@ -608,10 +725,9 @@ public:
             SimdVal sv;
             sv.kind = SimdVal::Kind::Lanes;
             sv.origType = origTy;
-            mlir::Value arr = vals[cursor++];
+            mlir::Value ptrVec = vals[cursor++];
             for (uint32_t l = 0; l < W_; ++l) {
-                sv.lanes.push_back(mlir::LLVM::ExtractValueOp::create(
-                    b_, loc, arr, llvm::ArrayRef<int64_t>{static_cast<int64_t>(l)}));
+                sv.lanes.push_back(llvmExtract(loc, ptrVec, l));
             }
             return sv;
         }
@@ -696,7 +812,7 @@ private:
         }
         if (entryBlk) {
             mlir::OpBuilder eb(entryBlk, entryBlk->begin());
-            mlir::Value sz = mlir::arith::ConstantIntOp::create(eb, loc, eb.getI32Type(), count);
+            mlir::Value sz = mlir::LLVM::ConstantOp::create(eb, loc, eb.getI32Type(), eb.getIntegerAttr(eb.getI32Type(), count));
             return mlir::LLVM::AllocaOp::create(eb, loc, ptrTy(), elemTy, sz, align);
         }
         return mlir::LLVM::AllocaOp::create(b_, loc, ptrTy(), elemTy, cInt(loc, i32Ty(), count), align);
@@ -728,7 +844,8 @@ private:
         // Constants / Undef / Poison / Casts
         if (llvm::isa<mlir::LLVM::ConstantOp, mlir::arith::ConstantOp,
                       mlir::LLVM::UndefOp, mlir::LLVM::PoisonOp,
-                      mlir::ub::PoisonOp, mlir::LLVM::ZeroOp>(&op)) {
+                      mlir::LLVM::ZeroOp>(&op) ||
+            op.getName().getStringRef() == "ub.poison") {
             setMapped(op.getResult(0), getMapped(loc, op.getResult(0)));
             return true;
         }
@@ -786,9 +903,9 @@ private:
             mlir::Type elemTy = ee.getType();
             mlir::Value res = asVec(loc, vec.fields[0]);
             for (size_t i = 1; i < vec.fields.size(); ++i) {
-                mlir::Value eq = mlir::arith::CmpIOp::create(
-                    b_, loc, mlir::arith::CmpIPredicate::eq, idxVec, splatInt(loc, idxTy, i));
-                res = mlir::arith::SelectOp::create(b_, loc, eq, asVec(loc, vec.fields[i]), res);
+                mlir::Value eq = mlir::LLVM::ICmpOp::create(
+                    b_, loc, mlir::LLVM::ICmpPredicate::eq, idxVec, splatInt(loc, idxTy, i));
+                res = mlir::LLVM::SelectOp::create(b_, loc, eq, asVec(loc, vec.fields[i]), res);
             }
             setMapped(ee.getRes(), {SimdVal::Kind::Vector, elemTy, res, {}, {}});
             return true;
@@ -809,10 +926,10 @@ private:
             mlir::Type idxTy = llvm::cast<mlir::VectorType>(idxVec.getType()).getElementType();
             mlir::Value valVec = asVec(loc, val);
             for (size_t i = 0; i < vec.fields.size(); ++i) {
-                mlir::Value eq = mlir::arith::CmpIOp::create(
-                    b_, loc, mlir::arith::CmpIPredicate::eq, idxVec, splatInt(loc, idxTy, i));
+                mlir::Value eq = mlir::LLVM::ICmpOp::create(
+                    b_, loc, mlir::LLVM::ICmpPredicate::eq, idxVec, splatInt(loc, idxTy, i));
                 mlir::Value cur = asVec(loc, vec.fields[i]);
-                vec.fields[i].vec = mlir::arith::SelectOp::create(b_, loc, eq, valVec, cur);
+                vec.fields[i].vec = mlir::LLVM::SelectOp::create(b_, loc, eq, valVec, cur);
             }
             setMapped(ie.getRes(), vec);
             return true;
@@ -885,9 +1002,9 @@ private:
             mlir::Value baseAlloca = createEntryAlloca(loc, slotTy, static_cast<uint64_t>(numWaves) * W_, 64);
             if (hooks_.waveIdx && numWaves > 1u) {
                 mlir::Value w32 = mlir::arith::IndexCastOp::create(b_, loc, i32Ty(), hooks_.waveIdx);
-                mlir::Value waveBase = mlir::arith::MulIOp::create(b_, loc, w32, cInt(loc, i32Ty(), W_));
+                mlir::Value waveBase = mlir::LLVM::MulOp::create(b_, loc, w32, cInt(loc, i32Ty(), W_));
                 for (uint32_t l = 0; l < W_; ++l) {
-                    mlir::Value slotIdx = mlir::arith::AddIOp::create(b_, loc, waveBase, cInt(loc, i32Ty(), l));
+                    mlir::Value slotIdx = mlir::LLVM::AddOp::create(b_, loc, waveBase, cInt(loc, i32Ty(), l));
                     sv.lanes.push_back(mlir::LLVM::GEPOp::create(
                         b_, loc, ptrTy(), slotTy, baseAlloca, mlir::ValueRange{slotIdx}));
                 }
@@ -953,7 +1070,7 @@ private:
             uint64_t align = loadOp.getAlignment().value_or(1);
             if (addr.isUniform() && mlir::isa<mlir::IntegerType, mlir::FloatType>(elemTy)) {
                 mlir::Value s = loadScalar(loc, elemTy, laneValue(loc, addr, 0));
-                mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), s);
+                mlir::Value bvec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), s);
                 SimdVal sv{SimdVal::Kind::Vector, elemTy, bvec, {}, {}};
                 sv.pattern = SimdVal::LanePattern::Uniform;
                 setMapped(loadOp.getResult(), std::move(sv));
@@ -971,11 +1088,11 @@ private:
                     mlir::Value scratch = getOrCreateScratchAlloca(loc);
                     for (uint32_t l = 0; l < W_; ++l) {
                         if (isLaneMaskConstFalse(execMask, l)) continue;
-                        mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                        mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         mlir::Value pL = laneValue(loc, addr, l);
-                        mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
                         mlir::Value s = loadScalar(loc, elemTy, safePtr);
-                        v = mlir::vector::InsertOp::create(b_, loc, s, v, static_cast<int64_t>(l));
+                        v = llvmInsert(b_, loc, v, s, static_cast<uint32_t>(static_cast<int64_t>(l)));
                     }
                     setMapped(loadOp.getResult(), {SimdVal::Kind::Vector, elemTy, v, {}, {}});
                     return true;
@@ -1001,7 +1118,7 @@ private:
                             b_, loc, ptrTy, scalarTy, addr.lanes[0],
                             mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)});
                         mlir::Value s = loadScalar(loc, scalarTy, ep);
-                        mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(scalarTy), s);
+                        mlir::Value bvec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(scalarTy)).getElementType(), s);
                         res.fields[static_cast<size_t>(i)] = {SimdVal::Kind::Vector, scalarTy, bvec, {}, {}};
                     }
                 } else if (addr.isAllocaPtr && mlir::isa<mlir::IntegerType, mlir::FloatType>(scalarTy)) {
@@ -1010,16 +1127,16 @@ private:
                         mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(scalarTy));
                         for (uint32_t l = 0; l < W_; ++l) {
                             if (isLaneMaskConstFalse(execMask, l)) continue;
-                            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                             mlir::Value pL = laneValue(loc, addr, l);
                             mlir::Value ep = (i == 0)
                                                  ? pL
                                                  : mlir::Value(mlir::LLVM::GEPOp::create(
                                                        b_, loc, ptrTy, scalarTy, pL,
                                                        mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)}));
-                            mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, ep, scratch);
+                            mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, ep, scratch);
                             mlir::Value s = loadScalar(loc, scalarTy, safePtr);
-                            v = mlir::vector::InsertOp::create(b_, loc, s, v, static_cast<int64_t>(l));
+                            v = llvmInsert(b_, loc, v, s, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         }
                         res.fields[static_cast<size_t>(i)] = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                     }
@@ -1041,7 +1158,7 @@ private:
                         mlir::Value v = mlir::LLVM::UndefOp::create(b_, loc, vecTy(scalarTy));
                         for (uint32_t l = 0; l < W_; ++l) {
                             if (isLaneMaskConstFalse(execMask, l)) continue;
-                            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                             mlir::Value pL = laneValue(loc, addr, l);
                             auto ifL = mlir::scf::IfOp::create(
                                 b_, loc, mL,
@@ -1056,7 +1173,7 @@ private:
                                     mlir::scf::YieldOp::create(
                                         nb, nloc, mlir::ValueRange{mlir::LLVM::UndefOp::create(nb, nloc, scalarTy)});
                                 });
-                            v = mlir::vector::InsertOp::create(b_, loc, ifL.getResult(0), v, static_cast<int64_t>(l));
+                            v = llvmInsert(b_, loc, v, ifL.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
                         }
                         res.fields[static_cast<size_t>(i)] = {SimdVal::Kind::Vector, scalarTy, v, {}, {}};
                     }
@@ -1088,14 +1205,14 @@ private:
                             for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                                 for (uint32_t l = 0; l < W_; ++l) {
                                     if (isLaneMaskConstFalse(execMask, l)) continue;
-                                    mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                                    mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                                     mlir::Value pL = laneValue(loc, addr, l);
                                     mlir::Value ep = (i == 0)
                                                          ? pL
                                                          : mlir::Value(mlir::LLVM::GEPOp::create(
                                                                b_, loc, ptrTy, scalarTy, pL,
                                                                mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(i)}));
-                                    mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, ep, scratch);
+                                    mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, ep, scratch);
                                     mlir::Value vL = laneValue(loc, val.fields[static_cast<size_t>(i)], l);
                                     storeScalar(loc, vL, safePtr);
                                 }
@@ -1117,7 +1234,7 @@ private:
                     for (int64_t i = 0; i < vt.getNumElements(); ++i) {
                         for (uint32_t l = 0; l < W_; ++l) {
                             if (isLaneMaskConstFalse(execMask, l)) continue;
-                            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                             mlir::Value pL = laneValue(loc, addr, l);
                             mlir::Value vL = laneValue(loc, val.fields[static_cast<size_t>(i)], l);
                             mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -1144,9 +1261,9 @@ private:
                     mlir::Value scratch = getOrCreateScratchAlloca(loc);
                     for (uint32_t l = 0; l < W_; ++l) {
                         if (isLaneMaskConstFalse(execMask, l)) continue;
-                        mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                        mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         mlir::Value pL = laneValue(loc, addr, l);
-                        mlir::Value safePtr = mlir::arith::SelectOp::create(b_, loc, mL, pL, scratch);
+                        mlir::Value safePtr = mlir::LLVM::SelectOp::create(b_, loc, mL, pL, scratch);
                         mlir::Value vL = laneValue(loc, val, l);
                         storeScalar(loc, vL, safePtr);
                     }
@@ -1161,7 +1278,7 @@ private:
             }
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value vL = laneValue(loc, val, l);
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -1178,7 +1295,7 @@ private:
             mlir::Value outVec = mlir::isa<mlir::FloatType>(ty) ? splatFlt(loc, ty, 0.0) : splatInt(loc, ty, 0);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(realMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value vL = laneValue(loc, val, l);
                 auto ifL = mlir::scf::IfOp::create(
@@ -1187,10 +1304,10 @@ private:
                         mlir::Value r;
                         if (mlir::isa<mlir::FloatType>(ty) && rmw.getBinOp() == mlir::LLVM::AtomicBinOp::xchg) {
                             mlir::Type intTy = nb.getIntegerType(ty.getIntOrFloatBitWidth());
-                            mlir::Value vInt = mlir::arith::BitcastOp::create(nb, nloc, intTy, vL);
+                            mlir::Value vInt = mlir::LLVM::BitcastOp::create(nb, nloc, intTy, vL);
                             mlir::Value rInt = mlir::LLVM::AtomicRMWOp::create(
                                 nb, nloc, mlir::LLVM::AtomicBinOp::xchg, pL, vInt, rmw.getOrdering());
-                            r = mlir::arith::BitcastOp::create(nb, nloc, ty, rInt);
+                            r = mlir::LLVM::BitcastOp::create(nb, nloc, ty, rInt);
                         } else {
                             r = mlir::LLVM::AtomicRMWOp::create(nb, nloc, rmw.getBinOp(), pL, vL, rmw.getOrdering());
                         }
@@ -1200,7 +1317,7 @@ private:
                         mlir::scf::YieldOp::create(
                             nb, nloc, mlir::ValueRange{mlir::LLVM::UndefOp::create(nb, nloc, ty)});
                     });
-                outVec = mlir::vector::InsertOp::create(b_, loc, ifL.getResult(0), outVec, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, ifL.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(rmw.getRes(), {SimdVal::Kind::Vector, ty, outVec, {}, {}});
             return true;
@@ -1214,7 +1331,7 @@ private:
             mlir::Value outOkVec = splatInt(loc, i1Ty(), 0);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(realMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value pL = laneValue(loc, addr, l);
                 mlir::Value cL = laneValue(loc, cmp, l);
                 mlir::Value vL = laneValue(loc, val, l);
@@ -1225,14 +1342,14 @@ private:
                         mlir::Value vOp = vL;
                         if (mlir::isa<mlir::FloatType>(elemTy)) {
                             mlir::Type intTy = nb.getIntegerType(elemTy.getIntOrFloatBitWidth());
-                            cOp = mlir::arith::BitcastOp::create(nb, nloc, intTy, cL);
-                            vOp = mlir::arith::BitcastOp::create(nb, nloc, intTy, vL);
+                            cOp = mlir::LLVM::BitcastOp::create(nb, nloc, intTy, cL);
+                            vOp = mlir::LLVM::BitcastOp::create(nb, nloc, intTy, vL);
                         }
                         auto r = mlir::LLVM::AtomicCmpXchgOp::create(
                             nb, nloc, pL, cOp, vOp, cx.getSuccessOrdering(), cx.getFailureOrdering());
                         mlir::Value oldV = mlir::LLVM::ExtractValueOp::create(nb, nloc, r, llvm::ArrayRef<int64_t>{0});
                         if (mlir::isa<mlir::FloatType>(elemTy)) {
-                            oldV = mlir::arith::BitcastOp::create(nb, nloc, elemTy, oldV);
+                            oldV = mlir::LLVM::BitcastOp::create(nb, nloc, elemTy, oldV);
                         }
                         mlir::Value ok = mlir::LLVM::ExtractValueOp::create(nb, nloc, r, llvm::ArrayRef<int64_t>{1});
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{oldV, ok});
@@ -1241,10 +1358,10 @@ private:
                         mlir::scf::YieldOp::create(
                             nb, nloc,
                             mlir::ValueRange{mlir::LLVM::UndefOp::create(nb, nloc, elemTy),
-                                             mlir::arith::ConstantIntOp::create(nb, nloc, i1Ty(), 0)});
+                                             mlir::LLVM::ConstantOp::create(nb, nloc, i1Ty(), nb.getIntegerAttr(i1Ty(), 0))});
                     });
-                outValVec = mlir::vector::InsertOp::create(b_, loc, ifL.getResult(0), outValVec, static_cast<int64_t>(l));
-                outOkVec = mlir::vector::InsertOp::create(b_, loc, ifL.getResult(1), outOkVec, static_cast<int64_t>(l));
+                outValVec = llvmInsert(b_, loc, outValVec, ifL.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
+                outOkVec = llvmInsert(b_, loc, outOkVec, ifL.getResult(1), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             SimdVal st;
             st.kind = SimdVal::Kind::Struct;
@@ -1269,7 +1386,7 @@ private:
             mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(dstTy));
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value iv = mlir::LLVM::PtrToIntOp::create(b_, loc, dstTy, laneValue(loc, src, l));
-                outVec = mlir::vector::InsertOp::create(b_, loc, iv, outVec, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, iv, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(p2i.getRes(), {SimdVal::Kind::Vector, dstTy, outVec, {}, {}});
             return true;
@@ -1373,11 +1490,11 @@ private:
         };
 
         if (llvm::isa<mlir::LLVM::AddOp, mlir::arith::AddIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::AddIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::AddOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::SubOp, mlir::arith::SubIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::SubIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::SubOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::MulOp, mlir::arith::MulIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MulIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::MulOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::SDivOp, mlir::arith::DivSIOp>(&op))
             return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::SDivOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::UDivOp, mlir::arith::DivUIOp>(&op))
@@ -1387,51 +1504,51 @@ private:
         if (llvm::isa<mlir::LLVM::URemOp, mlir::arith::RemUIOp>(&op))
             return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::URemOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::ShlOp, mlir::arith::ShLIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::ShLIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::ShlOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::LShrOp, mlir::arith::ShRUIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::ShRUIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::LShrOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::AShrOp, mlir::arith::ShRSIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::ShRSIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::AShrOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::AndOp, mlir::arith::AndIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::AndIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::AndOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::OrOp, mlir::arith::OrIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::OrIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::OrOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::XOrOp, mlir::arith::XOrIOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::XOrIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::XOrOp::create(b_, loc, rt, a, c); });
 
         if (llvm::isa<mlir::LLVM::FAddOp, mlir::arith::AddFOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::AddFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::FAddOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::FSubOp, mlir::arith::SubFOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::SubFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::FSubOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::FMulOp, mlir::arith::MulFOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MulFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::FMulOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::FDivOp, mlir::arith::DivFOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::DivFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::FDivOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::FRemOp, mlir::arith::RemFOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::RemFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::FRemOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::FNegOp, mlir::arith::NegFOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::NegFOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::FNegOp>(loc, rt, a); });
 
         if (llvm::isa<mlir::LLVM::ZExtOp, mlir::arith::ExtUIOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::ExtUIOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::ZExtOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::SExtOp, mlir::arith::ExtSIOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::ExtSIOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::SExtOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::TruncOp, mlir::arith::TruncIOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::TruncIOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::TruncOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FPTruncOp, mlir::arith::TruncFOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::TruncFOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::FPTruncOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FPExtOp, mlir::arith::ExtFOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::ExtFOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::FPExtOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FPToSIOp, mlir::arith::FPToSIOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::FPToSIOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::FPToSIOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FPToUIOp, mlir::arith::FPToUIOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::FPToUIOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::FPToUIOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::SIToFPOp, mlir::arith::SIToFPOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::SIToFPOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::SIToFPOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::UIToFPOp, mlir::arith::UIToFPOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::UIToFPOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::UIToFPOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::LLVM::BitcastOp, mlir::arith::BitcastOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::arith::BitcastOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::LLVM::BitcastOp::create(b_, loc, rt, a); });
         if (llvm::isa<mlir::arith::IndexCastOp, mlir::arith::IndexCastUIOp>(&op)) {
             bool isUnsigned = llvm::isa<mlir::arith::IndexCastUIOp>(&op);
             SimdVal v = getMapped(loc, op.getOperand(0));
@@ -1445,7 +1562,7 @@ private:
                 for (uint32_t l = 0; l < nLanes; ++l) {
                     mlir::Value s = (v.kind == SimdVal::Kind::Lanes)
                                         ? v.lanes[l]
-                                        : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, v.vec, static_cast<int64_t>(l)));
+                                        : mlir::Value(llvmExtract(b_, loc, v.vec, static_cast<uint32_t>(static_cast<int64_t>(l))));
                     mlir::Value casted = isUnsigned
                                              ? mlir::Value(mlir::arith::IndexCastUIOp::create(b_, loc, resTy, s))
                                              : mlir::Value(mlir::arith::IndexCastOp::create(b_, loc, resTy, s));
@@ -1462,7 +1579,7 @@ private:
                     mlir::Value casted = isUnsigned
                                              ? mlir::Value(mlir::arith::IndexCastUIOp::create(b_, loc, resTy, s))
                                              : mlir::Value(mlir::arith::IndexCastOp::create(b_, loc, resTy, s));
-                    vec = mlir::vector::InsertOp::create(b_, loc, casted, vec, static_cast<int64_t>(l));
+                    vec = llvmInsert(b_, loc, vec, casted, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
                 SimdVal vecOut;
                 vecOut.kind = SimdVal::Kind::Vector;
@@ -1475,10 +1592,10 @@ private:
             uint32_t dstBits = resTy.getIntOrFloatBitWidth();
             mlir::Value out = v.vec;
             if (dstBits > srcBits) {
-                out = isUnsigned ? mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vecResTy, v.vec))
-                                 : mlir::Value(mlir::arith::ExtSIOp::create(b_, loc, vecResTy, v.vec));
+                out = isUnsigned ? mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, vecResTy, v.vec))
+                                 : mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, vecResTy, v.vec));
             } else if (dstBits < srcBits) {
-                out = mlir::arith::TruncIOp::create(b_, loc, vecResTy, v.vec);
+                out = mlir::LLVM::TruncOp::create(b_, loc, vecResTy, v.vec);
             }
             SimdVal vecOut;
             vecOut.kind = SimdVal::Kind::Vector;
@@ -1511,7 +1628,7 @@ private:
                 for (uint32_t l = 0; l < W_; ++l) {
                     mlir::Value r = mlir::LLVM::ICmpOp::create(
                         b_, loc, icmp.getPredicate(), laneValue(loc, a, l), laneValue(loc, c, l));
-                    outVec = mlir::vector::InsertOp::create(b_, loc, r, outVec, static_cast<int64_t>(l));
+                    outVec = llvmInsert(b_, loc, outVec, r, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
                 setMapped(icmp.getRes(), {SimdVal::Kind::Vector, i1Ty(), outVec, {}, {}});
                 return true;
@@ -1531,12 +1648,12 @@ private:
                 for (uint32_t l = 0; l < W_; ++l) {
                     mlir::Value la = (va.kind == SimdVal::Kind::Lanes)
                                          ? (va.lanes.size() == 1 ? va.lanes[0] : va.lanes[l])
-                                         : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, va.vec, static_cast<int64_t>(l)));
+                                         : mlir::Value(llvmExtract(b_, loc, va.vec, static_cast<uint32_t>(static_cast<int64_t>(l))));
                     mlir::Value lc = (vc.kind == SimdVal::Kind::Lanes)
                                          ? (vc.lanes.size() == 1 ? vc.lanes[0] : vc.lanes[l])
-                                         : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, vc.vec, static_cast<int64_t>(l)));
-                    mlir::Value r = mlir::arith::CmpIOp::create(b_, loc, icmp.getPredicate(), la, lc);
-                    outVec = mlir::vector::InsertOp::create(b_, loc, r, outVec, static_cast<int64_t>(l));
+                                         : mlir::Value(llvmExtract(b_, loc, vc.vec, static_cast<uint32_t>(static_cast<int64_t>(l))));
+                    mlir::Value r = mlir::LLVM::ICmpOp::create(b_, loc, toLLVMIcmpPred(icmp.getPredicate()), la, lc);
+                    outVec = llvmInsert(b_, loc, outVec, r, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
                 setMapped(icmp.getResult(), {SimdVal::Kind::Vector, i1Ty(), outVec, {}, {}});
                 return true;
@@ -1544,7 +1661,7 @@ private:
             mlir::Value a = asVec(loc, getMapped(loc, icmp.getLhs()));
             mlir::Value c = asVec(loc, getMapped(loc, icmp.getRhs()));
             if (!a || !c) return false;
-            mlir::Value r = mlir::arith::CmpIOp::create(b_, loc, icmp.getPredicate(), a, c);
+            mlir::Value r = mlir::LLVM::ICmpOp::create(b_, loc, toLLVMIcmpPred(icmp.getPredicate()), a, c);
             setMapped(icmp.getResult(), {SimdVal::Kind::Vector, i1Ty(), r, {}, {}});
             return true;
         }
@@ -1598,46 +1715,46 @@ private:
 
         // Standard LLVM intrinsics (which DXIL/Clang might emit alongside dx.op.*)
         if (llvm::isa<mlir::LLVM::FAbsOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::AbsFOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::FAbsOp>(loc, rt, a); });
         if (llvm::isa<mlir::LLVM::SqrtOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::SqrtOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::SqrtOp>(loc, rt, a); });
         if (llvm::isa<mlir::LLVM::SinOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::SinOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "sin", a); });
         if (llvm::isa<mlir::LLVM::CosOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::CosOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "cos", a); });
         if (llvm::isa<mlir::LLVM::Exp2Op>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::Exp2Op::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "exp2", a); });
         if (llvm::isa<mlir::LLVM::Log2Op>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::Log2Op::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type, mlir::Value a) { return emitMathUnary(loc, "log2", a); });
         if (llvm::isa<mlir::LLVM::FFloorOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::FloorOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::FFloorOp>(loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FCeilOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::CeilOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::FCeilOp>(loc, rt, a); });
         if (llvm::isa<mlir::LLVM::FTruncOp>(&op))
-            return vecUnary([&](mlir::Type rt, mlir::Value a) { return mlir::math::TruncOp::create(b_, loc, rt, a); });
+            return vecUnary([&](mlir::Type rt, mlir::Value a) { return createFp<mlir::LLVM::FTruncOp>(loc, rt, a); });
         if (llvm::isa<mlir::LLVM::MinNumOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MinimumFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::MinNumOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::MaxNumOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MaximumFOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return createFp<mlir::LLVM::MaxNumOp>(loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::UMinOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MinUIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::UMinOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::UMaxOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MaxUIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::UMaxOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::SMinOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MinSIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::SMinOp::create(b_, loc, rt, a, c); });
         if (llvm::isa<mlir::LLVM::SMaxOp>(&op))
-            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::arith::MaxSIOp::create(b_, loc, rt, a, c); });
+            return vecBinary([&](mlir::Type rt, mlir::Value a, mlir::Value c) { return mlir::LLVM::SMaxOp::create(b_, loc, rt, a, c); });
         auto castIntVec = [&](mlir::Value v, mlir::Type dstElem) -> mlir::Value {
             mlir::Type srcElem = llvm::cast<mlir::VectorType>(v.getType()).getElementType();
             if (srcElem == dstElem) return v;
             return (srcElem.getIntOrFloatBitWidth() > dstElem.getIntOrFloatBitWidth())
-                       ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vecTy(dstElem), v))
-                       : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vecTy(dstElem), v));
+                       ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, vecTy(dstElem), v))
+                       : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, vecTy(dstElem), v));
         };
         if (llvm::isa<mlir::LLVM::CtPopOp>(&op)) {
             mlir::Type resElem = op.getResult(0).getType();
             mlir::Value a = asVec(loc, getMapped(loc, op.getOperand(0)));
-            mlir::Value r = castIntVec(mlir::math::CtPopOp::create(b_, loc, a.getType(), a), resElem);
+            mlir::Value r = castIntVec(mlir::LLVM::CtPopOp::create(b_, loc, a.getType(), a), resElem);
             setMapped(op.getResult(0), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
@@ -1648,21 +1765,21 @@ private:
             mlir::Value a = asVec(loc, getMapped(loc, op.getOperand(0)));
             mlir::Value x = asVec(loc, getMapped(loc, op.getOperand(1)));
             mlir::Value c = asVec(loc, getMapped(loc, op.getOperand(2)));
-            mlir::Value r = mlir::math::FmaOp::create(b_, loc, vecTy(resElem), a, x, c);
+            mlir::Value r = createFp<mlir::LLVM::FMAOp>(loc, vecTy(resElem), a, x, c);
             setMapped(op.getResult(0), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
         if (auto ctlz = llvm::dyn_cast<mlir::LLVM::CountLeadingZerosOp>(&op)) {
             mlir::Type resElem = ctlz.getType();
             mlir::Value a = asVec(loc, getMapped(loc, ctlz.getIn()));
-            mlir::Value r = castIntVec(mlir::math::CountLeadingZerosOp::create(b_, loc, a.getType(), a), resElem);
+            mlir::Value r = castIntVec(mlir::LLVM::CountLeadingZerosOp::create(b_, loc, a.getType(), a, false), resElem);
             setMapped(ctlz.getRes(), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
         if (auto cttz = llvm::dyn_cast<mlir::LLVM::CountTrailingZerosOp>(&op)) {
             mlir::Type resElem = cttz.getType();
             mlir::Value a = asVec(loc, getMapped(loc, cttz.getIn()));
-            mlir::Value r = castIntVec(mlir::math::CountTrailingZerosOp::create(b_, loc, a.getType(), a), resElem);
+            mlir::Value r = castIntVec(mlir::LLVM::CountTrailingZerosOp::create(b_, loc, a.getType(), a, false), resElem);
             setMapped(cttz.getRes(), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
@@ -1687,7 +1804,7 @@ private:
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value idxVal = (argVal.kind == SimdVal::Kind::Lanes)
                                      ? (argVal.lanes.size() == 1 ? argVal.lanes[0] : argVal.lanes[l])
-                                     : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, argVal.vec, static_cast<int64_t>(l)));
+                                     : mlir::Value(llvmExtract(b_, loc, argVal.vec, static_cast<uint32_t>(static_cast<int64_t>(l))));
             if (!idxVal) {
                 outError = "Null idxVal in scf.index_switch";
                 return false;
@@ -1695,7 +1812,7 @@ private:
             mlir::Value i64v = idxVal.getType().isIndex()
                                    ? mlir::Value(mlir::arith::IndexCastOp::create(b_, loc, i64Ty(), idxVal))
                                    : idxVal;
-            argVec = mlir::vector::InsertOp::create(b_, loc, i64v, argVec, static_cast<int64_t>(l)).getResult();
+            argVec = llvmInsert(b_, loc, argVec, i64v, static_cast<uint32_t>(static_cast<int64_t>(l)));
         }
 
         llvm::SmallVector<SimdVal, 8> accVals;
@@ -1704,8 +1821,8 @@ private:
         }
 
         auto runCaseBlock = [&](mlir::Block& srcBB, mlir::Value caseMask) -> bool {
-            mlir::Value curReal = mlir::arith::AndIOp::create(b_, loc, realMask, caseMask);
-            mlir::Value curExec = mlir::arith::AndIOp::create(b_, loc, execMask, caseMask);
+            mlir::Value curReal = mlir::LLVM::AndOp::create(b_, loc, realMask, caseMask);
+            mlir::Value curExec = mlir::LLVM::AndOp::create(b_, loc, execMask, caseMask);
             if (hooks_.isPixelShader && shader_.hasDerivativesOrImplicitSample) {
                 curExec = expandMaskQuads(loc, curReal);
             }
@@ -1767,11 +1884,11 @@ private:
         auto cases = swOp.getCases();
         for (size_t ci = 0; ci < cases.size(); ++ci) {
             mlir::Value cVec = splatInt(loc, i64Ty(), cases[ci]);
-            mlir::Value eqMask = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, argVec, cVec);
-            mlir::Value caseMask = mlir::arith::AndIOp::create(b_, loc, remainingMask, eqMask);
+            mlir::Value eqMask = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, argVec, cVec);
+            mlir::Value caseMask = mlir::LLVM::AndOp::create(b_, loc, remainingMask, eqMask);
             if (!runCaseBlock(swOp.getCaseRegions()[ci].front(), caseMask)) return false;
-            mlir::Value notCase = mlir::arith::XOrIOp::create(b_, loc, caseMask, allTrueMask(loc));
-            remainingMask = mlir::arith::AndIOp::create(b_, loc, remainingMask, notCase);
+            mlir::Value notCase = mlir::LLVM::XOrOp::create(b_, loc, caseMask, allTrueMask(loc));
+            remainingMask = mlir::LLVM::AndOp::create(b_, loc, remainingMask, notCase);
         }
         if (!swOp.getDefaultRegion().empty()) {
             if (!runCaseBlock(swOp.getDefaultRegion().front(), remainingMask)) return false;
@@ -1785,12 +1902,12 @@ private:
     bool packetizeScfIf(mlir::scf::IfOp ifOp, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
         mlir::Location loc = ifOp.getLoc();
         mlir::Value condVec = asVec(loc, getMapped(loc, ifOp.getCondition()));
-        mlir::Value realThen = mlir::arith::AndIOp::create(b_, loc, realMask, condVec);
-        mlir::Value notCond = mlir::arith::XOrIOp::create(b_, loc, condVec, allTrueMask(loc));
-        mlir::Value realElse = mlir::arith::AndIOp::create(b_, loc, realMask, notCond);
+        mlir::Value realThen = mlir::LLVM::AndOp::create(b_, loc, realMask, condVec);
+        mlir::Value notCond = mlir::LLVM::XOrOp::create(b_, loc, condVec, allTrueMask(loc));
+        mlir::Value realElse = mlir::LLVM::AndOp::create(b_, loc, realMask, notCond);
 
-        mlir::Value execThen = mlir::arith::AndIOp::create(b_, loc, execMask, condVec);
-        mlir::Value execElse = mlir::arith::AndIOp::create(b_, loc, execMask, notCond);
+        mlir::Value execThen = mlir::LLVM::AndOp::create(b_, loc, execMask, condVec);
+        mlir::Value execElse = mlir::LLVM::AndOp::create(b_, loc, execMask, notCond);
         if (hooks_.isPixelShader && shader_.hasDerivativesOrImplicitSample) {
             execThen = expandMaskQuads(loc, realThen);
             execElse = expandMaskQuads(loc, realElse);
@@ -1879,7 +1996,7 @@ private:
             }
         }
         if (hasRealMaskOut && !thenPacked.empty() && !elsePacked.empty()) {
-            realMask = mlir::arith::OrIOp::create(b_, loc, thenPacked.back(), elsePacked.back());
+            realMask = mlir::LLVM::OrOp::create(b_, loc, thenPacked.back(), elsePacked.back());
             (void)realMaskAfterThen;
         }
         return true;
@@ -1941,17 +2058,17 @@ private:
                     prevExitU.push_back(sub.unpackSimdFromValues(nloc, rt, bArgs, cur, &exitProtos[j]));
                 }
 
-                mlir::Value curReal = mlir::arith::AndIOp::create(nb, nloc, loopExec, aliveMask);
+                mlir::Value curReal = mlir::LLVM::AndOp::create(nb, nloc, loopExec, aliveMask);
                 (void)sub.packetizeBlock(srcBefore, loopExec, curReal, outError);
 
-                mlir::Value notLoopExec = mlir::arith::XOrIOp::create(nb, nloc, loopExec, sub.allTrueMask(nloc));
-                mlir::Value survived = mlir::arith::OrIOp::create(nb, nloc, notLoopExec, curReal);
-                mlir::Value aliveAfterBefore = mlir::arith::AndIOp::create(nb, nloc, aliveMask, survived);
+                mlir::Value notLoopExec = mlir::LLVM::XOrOp::create(nb, nloc, loopExec, sub.allTrueMask(nloc));
+                mlir::Value survived = mlir::LLVM::OrOp::create(nb, nloc, notLoopExec, curReal);
+                mlir::Value aliveAfterBefore = mlir::LLVM::AndOp::create(nb, nloc, aliveMask, survived);
 
                 auto condOp = llvm::cast<mlir::scf::ConditionOp>(srcBefore.getTerminator());
                 mlir::Value condVec = sub.asVec(nloc, sub.getMapped(nloc, condOp.getCondition()));
-                mlir::Value nextExec = mlir::arith::AndIOp::create(nb, nloc, loopExec, condVec);
-                nextExec = mlir::arith::AndIOp::create(nb, nloc, nextExec, aliveAfterBefore);
+                mlir::Value nextExec = mlir::LLVM::AndOp::create(nb, nloc, loopExec, condVec);
+                nextExec = mlir::LLVM::AndOp::create(nb, nloc, nextExec, aliveAfterBefore);
                 if (hooks_.isPixelShader && shader_.hasDerivativesOrImplicitSample) {
                     nextExec = sub.expandMaskQuads(nloc, nextExec);
                 }
@@ -1996,12 +2113,12 @@ private:
                     passedExitU.push_back(sub.unpackSimdFromValues(nloc, rt, aArgs, cur, &exitProtos[j]));
                 }
 
-                mlir::Value bodyReal = mlir::arith::AndIOp::create(nb, nloc, bodyExec, bodyAlive);
+                mlir::Value bodyReal = mlir::LLVM::AndOp::create(nb, nloc, bodyExec, bodyAlive);
                 (void)sub.packetizeBlock(srcAfter, bodyExec, bodyReal, outError);
 
-                mlir::Value notBodyExec = mlir::arith::XOrIOp::create(nb, nloc, bodyExec, sub.allTrueMask(nloc));
-                mlir::Value survived = mlir::arith::OrIOp::create(nb, nloc, notBodyExec, bodyReal);
-                mlir::Value aliveAfterBody = mlir::arith::AndIOp::create(nb, nloc, bodyAlive, survived);
+                mlir::Value notBodyExec = mlir::LLVM::XOrOp::create(nb, nloc, bodyExec, sub.allTrueMask(nloc));
+                mlir::Value survived = mlir::LLVM::OrOp::create(nb, nloc, notBodyExec, bodyReal);
+                mlir::Value aliveAfterBody = mlir::LLVM::AndOp::create(nb, nloc, bodyAlive, survived);
 
                 auto yieldOp = llvm::cast<mlir::scf::YieldOp>(srcAfter.getTerminator());
                 llvm::SmallVector<mlir::Value, 8> nextArgs;
@@ -2039,9 +2156,9 @@ private:
 
     bool packetizeScfFor(mlir::scf::ForOp forOp, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
         mlir::Location loc = forOp.getLoc();
-        mlir::Value lb = mlir::vector::ExtractOp::create(b_, loc, asVec(loc, getMapped(loc, forOp.getLowerBound())), 0);
-        mlir::Value ub = mlir::vector::ExtractOp::create(b_, loc, asVec(loc, getMapped(loc, forOp.getUpperBound())), 0);
-        mlir::Value step = mlir::vector::ExtractOp::create(b_, loc, asVec(loc, getMapped(loc, forOp.getStep())), 0);
+        mlir::Value lb = llvmExtract(b_, loc, asVec(loc, getMapped(loc, forOp.getLowerBound())), static_cast<uint32_t>(0));
+        mlir::Value ub = llvmExtract(b_, loc, asVec(loc, getMapped(loc, forOp.getUpperBound())), static_cast<uint32_t>(0));
+        mlir::Value step = llvmExtract(b_, loc, asVec(loc, getMapped(loc, forOp.getStep())), static_cast<uint32_t>(0));
         llvm::SmallVector<mlir::Value, 4> inits;
         llvm::SmallVector<SimdVal, 4> protos;
         for (mlir::Value iv : forOp.getInitArgs()) {
@@ -2054,7 +2171,7 @@ private:
             [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value iv, mlir::ValueRange iterArgs) {
                 SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                 sub.valueMap_ = valueMap_;
-                mlir::Value ivVec = mlir::vector::BroadcastOp::create(nb, nloc, sub.vecTy(iv.getType()), iv);
+                mlir::Value ivVec = llvmSplat(nb, nloc, llvm::cast<mlir::VectorType>(sub.vecTy(iv.getType())).getElementType(), iv);
                 sub.setMapped(forOp.getInductionVar(), {SimdVal::Kind::Vector, iv.getType(), ivVec, {}, {}});
                 size_t cur = 0;
                 for (unsigned i = 0; i < forOp.getRegionIterArgs().size(); ++i) {
@@ -2153,17 +2270,17 @@ private:
             mlir::Value heapCnt = loadInvariantScalar(loc, i32Ty(), gepByteOffset(loc, rootCtxPtr_, heapCntOff));
             mlir::Value heapI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), heapBase);
             mlir::Value tblI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), tblBase);
-            mlir::Value heapBytes = mlir::arith::MulIOp::create(
-                b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), heapCnt), cInt(loc, i64Ty(), 64));
-            mlir::Value heapEnd = mlir::arith::AddIOp::create(b_, loc, heapI64, heapBytes);
-            mlir::Value heapNonNull = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::ne, heapI64, cInt(loc, i64Ty(), 0));
-            mlir::Value tblInHeap = mlir::arith::AndIOp::create(
+            mlir::Value heapBytes = mlir::LLVM::MulOp::create(
+                b_, loc, mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), heapCnt), cInt(loc, i64Ty(), 64));
+            mlir::Value heapEnd = mlir::LLVM::AddOp::create(b_, loc, heapI64, heapBytes);
+            mlir::Value heapNonNull = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::ne, heapI64, cInt(loc, i64Ty(), 0));
+            mlir::Value tblInHeap = mlir::LLVM::AndOp::create(
                 b_, loc, heapNonNull,
-                mlir::arith::AndIOp::create(
+                mlir::LLVM::AndOp::create(
                     b_, loc,
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::uge, tblI64, heapI64),
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, tblI64, heapEnd)));
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::uge, tblI64, heapI64),
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, tblI64, heapEnd)));
 
             mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
             SimdVal idxSimd = getMapped(loc, indexVal);
@@ -2174,27 +2291,27 @@ private:
                     h.lanes.push_back(nullPtr);
                     continue;
                 }
-                mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-                mlir::Value idx64 = mlir::arith::ExtSIOp::create(b_, loc, i64Ty(), idxL);
-                mlir::Value slot = mlir::arith::AddIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), bias));
-                mlir::Value byteOff = mlir::arith::MulIOp::create(b_, loc, slot, cInt(loc, i64Ty(), 64));
+                mlir::Value idxL = llvmExtract(b_, loc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value idx64 = mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), idxL);
+                mlir::Value slot = mlir::LLVM::AddOp::create(b_, loc, idx64, cInt(loc, i64Ty(), bias));
+                mlir::Value byteOff = mlir::LLVM::MulOp::create(b_, loc, slot, cInt(loc, i64Ty(), 64));
                 mlir::Value candPtr = gepDynByteOffset(loc, tblBase, byteOff);
 
-                mlir::Value slotNonNeg = mlir::arith::CmpIOp::create(
-                    b_, loc, mlir::arith::CmpIPredicate::sge, slot, cInt(loc, i64Ty(), 0));
+                mlir::Value slotNonNeg = mlir::LLVM::ICmpOp::create(
+                    b_, loc, mlir::LLVM::ICmpPredicate::sge, slot, cInt(loc, i64Ty(), 0));
                 mlir::Value candI64 = mlir::LLVM::PtrToIntOp::create(b_, loc, i64Ty(), candPtr);
-                mlir::Value inHeap = mlir::arith::AndIOp::create(
+                mlir::Value inHeap = mlir::LLVM::AndOp::create(
                     b_, loc,
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::uge, candI64, heapI64),
-                    mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, candI64, heapEnd));
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::uge, candI64, heapI64),
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, candI64, heapEnd));
                 // If tblBase is inside the descriptor heap, enforce [heapBase, heapEnd);
                 // otherwise allow non-negative slot offsets (e.g. standalone test tables).
-                mlir::Value boundsOk = mlir::arith::SelectOp::create(b_, loc, tblInHeap, inHeap, slotNonNeg);
+                mlir::Value boundsOk = mlir::LLVM::SelectOp::create(b_, loc, tblInHeap, inHeap, slotNonNeg);
                 if (execMask) {
-                    mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
-                    boundsOk = mlir::arith::AndIOp::create(b_, loc, mL, boundsOk);
+                    mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    boundsOk = mlir::LLVM::AndOp::create(b_, loc, mL, boundsOk);
                 }
-                h.lanes.push_back(mlir::arith::SelectOp::create(b_, loc, boundsOk, candPtr, nullPtr));
+                h.lanes.push_back(mlir::LLVM::SelectOp::create(b_, loc, boundsOk, candPtr, nullPtr));
             }
             return h;
         }
@@ -2211,8 +2328,8 @@ private:
         }
         mlir::Value descP = laneValue(loc, h, lane);
         if (maskVec && h.lanes.size() > 1) {
-            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, maskVec, static_cast<int64_t>(lane));
-            descP = mlir::arith::SelectOp::create(b_, loc, mL, descP, nullPtr);
+            mlir::Value mL = llvmExtract(b_, loc, maskVec, static_cast<uint32_t>(static_cast<int64_t>(lane)));
+            descP = mlir::LLVM::SelectOp::create(b_, loc, mL, descP, nullPtr);
         }
         return descP;
     }
@@ -2240,7 +2357,7 @@ private:
         return mlir::scf::IfOp::create(
                    b_, loc, isNull,
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), fallback)});
+                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), fallback))});
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                        mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
@@ -2257,7 +2374,7 @@ private:
         return mlir::scf::IfOp::create(
                    b_, loc, isNull,
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i64Ty(), 0)});
+                       mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i64Ty(), nb.getIntegerAttr(i64Ty(), 0))});
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                        mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
@@ -2353,8 +2470,8 @@ private:
             h.origType = resTy();
             h.resClass = isSamp ? 3u : 0u;
             if (auto idxC = getConstIntValue(arg(1))) {
-                mlir::Value ok = mlir::arith::CmpIOp::create(
-                    b_, loc, mlir::arith::CmpIPredicate::ult, cInt(loc, i32Ty(), *idxC), heapCnt);
+                mlir::Value ok = mlir::LLVM::ICmpOp::create(
+                    b_, loc, mlir::LLVM::ICmpPredicate::ult, cInt(loc, i32Ty(), *idxC), heapCnt);
                 mlir::Value p = mlir::scf::IfOp::create(
                                     b_, loc, ok,
                                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
@@ -2372,14 +2489,14 @@ private:
             }
             mlir::Value idxVec = asVec(loc, getMapped(loc, arg(1)));
             for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-                mlir::Value ok = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, idxL, heapCnt);
+                mlir::Value idxL = llvmExtract(b_, loc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value ok = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, idxL, heapCnt);
                 mlir::Value p = mlir::scf::IfOp::create(
                                     b_, loc, ok,
                                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                                        mlir::Value idx64 = mlir::arith::ExtUIOp::create(nb, nloc, i64Ty(), idxL);
-                                        mlir::Value bOff = mlir::arith::MulIOp::create(
-                                            nb, nloc, idx64, mlir::arith::ConstantIntOp::create(nb, nloc, i64Ty(), 64));
+                                        mlir::Value idx64 = mlir::LLVM::ZExtOp::create(nb, nloc, i64Ty(), idxL);
+                                        mlir::Value bOff = mlir::LLVM::MulOp::create(
+                                            nb, nloc, idx64, mlir::LLVM::ConstantOp::create(nb, nloc, i64Ty(), nb.getIntegerAttr(i64Ty(), 64)));
                                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{
                                             mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), heapBase, mlir::ValueRange{bOff})});
                                     },
@@ -2482,12 +2599,12 @@ private:
                 return true;
             }
             size_t n = std::min(aSv.fields.size(), bSv.fields.size());
-            mlir::Value acc = mlir::arith::MulFOp::create(
+            mlir::Value acc = mlir::LLVM::FMulOp::create(
                 b_, loc, vT, asVec(loc, aSv.fields[0]), asVec(loc, bSv.fields[0]));
             for (size_t i = 1; i < n; ++i) {
-                mlir::Value prod = mlir::arith::MulFOp::create(
+                mlir::Value prod = mlir::LLVM::FMulOp::create(
                     b_, loc, vT, asVec(loc, aSv.fields[i]), asVec(loc, bSv.fields[i]));
-                acc = mlir::arith::AddFOp::create(b_, loc, vT, acc, prod);
+                acc = mlir::LLVM::FAddOp::create(b_, loc, vT, acc, prod);
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, resElem, acc, {}, {}});
             return true;
@@ -2501,10 +2618,10 @@ private:
             mlir::Value outVec = splatInt(loc, i32Ty(), 0);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(realMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value descP = laneValue(loc, h, l);
                 mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-                mlir::Value isValid = mlir::arith::AndIOp::create(
+                mlir::Value isValid = mlir::LLVM::AndOp::create(
                     b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, descP, nullP));
                 auto r = mlir::scf::IfOp::create(
                     b_, loc, isValid,
@@ -2518,32 +2635,32 @@ private:
                         auto cr = mlir::scf::IfOp::create(
                             nb, nloc, cValid,
                             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
-                                mlir::Value incVal = mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), inc);
+                                mlir::Value incVal = mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), inc));
                                 mlir::Value old = mlir::LLVM::AtomicRMWOp::create(
                                     ib, iloc, mlir::LLVM::AtomicBinOp::add, cptr, incVal,
                                     mlir::LLVM::AtomicOrdering::acq_rel);
                                 mlir::Value retVal = (inc < 0)
-                                    ? mlir::arith::AddIOp::create(ib, iloc, old, incVal).getResult()
+                                    ? mlir::LLVM::AddOp::create(ib, iloc, old, incVal).getResult()
                                     : old;
                                 mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{retVal});
                             },
                             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
-                                mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)});
+                                mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 0))});
                             });
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{cr.getResult(0)});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 0)});
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 0))});
                     });
-                outVec = mlir::vector::InsertOp::create(b_, loc, r.getResult(0), outVec, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, r.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), outVec, {}, {}});
             return true;
         }
         if (op == 71) { // CheckAccessFullyMapped(status) -> i1
             mlir::Value stVec = asVec(loc, getMapped(loc, arg(1)));
-            mlir::Value mapped = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::ne, stVec, splatInt(loc, i32Ty(), 0));
+            mlir::Value mapped = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::ne, stVec, splatInt(loc, i32Ty(), 0));
             setMapped(call.getResult(), {SimdVal::Kind::Vector, b_.getI1Type(), mapped, {}, {}});
             return true;
         }
@@ -2670,9 +2787,9 @@ private:
             if (hooks_.onDiscard) {
                 hooks_.onDiscard(b_, loc, condVec, execMask, realMask);
             } else {
-                mlir::Value killed = mlir::arith::AndIOp::create(b_, loc, execMask, condVec);
-                mlir::Value keep = mlir::arith::XOrIOp::create(b_, loc, killed, allTrueMask(loc));
-                realMask = mlir::arith::AndIOp::create(b_, loc, realMask, keep);
+                mlir::Value killed = mlir::LLVM::AndOp::create(b_, loc, execMask, condVec);
+                mlir::Value keep = mlir::LLVM::XOrOp::create(b_, loc, killed, allTrueMask(loc));
+                realMask = mlir::LLVM::AndOp::create(b_, loc, realMask, keep);
             }
             return true;
         }
@@ -2786,12 +2903,12 @@ private:
         info.descP = descPtr;
         if (h.isRootConstants) {
             info.basePtr = descPtr;
-            info.byteSize = mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), UINT64_MAX);
-            info.isReserved = mlir::arith::ConstantIntOp::create(nb, loc, i1Ty(), 0);
+            info.byteSize = mlir::LLVM::ConstantOp::create(nb, loc, i64Ty(), nb.getIntegerAttr(i64Ty(), UINT64_MAX));
+            info.isReserved = mlir::LLVM::ConstantOp::create(nb, loc, i1Ty(), nb.getIntegerAttr(i1Ty(), 0));
             mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(nb, loc, ptrTy());
             info.okPtr = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::ne, descPtr, nullPtr);
-            if (needElemStride) info.elemStride = mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), 0);
-            if (needStride64) info.stride64 = mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), h.stride);
+            if (needElemStride) info.elemStride = mlir::LLVM::ConstantOp::create(nb, loc, i32Ty(), nb.getIntegerAttr(i32Ty(), 0));
+            if (needStride64) info.stride64 = mlir::LLVM::ConstantOp::create(nb, loc, i64Ty(), nb.getIntegerAttr(i64Ty(), h.stride));
             return info;
         }
 
@@ -2803,9 +2920,9 @@ private:
             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
                 llvm::SmallVector<mlir::Value, 4> z = {
                     mlir::LLVM::ZeroOp::create(ib, iloc, ptrTy()),
-                    mlir::arith::ConstantIntOp::create(ib, iloc, i64Ty(), 0),
-                    mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0)};
-                if (loadEs) z.push_back(mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0));
+                    mlir::LLVM::ConstantOp::create(ib, iloc, i64Ty(), ib.getIntegerAttr(i64Ty(), 0)),
+                    mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 0))};
+                if (loadEs) z.push_back(mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 0)));
                 mlir::scf::YieldOp::create(ib, iloc, z);
             },
             [&](mlir::OpBuilder& ib, mlir::Location iloc) {
@@ -2835,17 +2952,17 @@ private:
         info.basePtr = ifOp.getResult(0);
         info.byteSize = ifOp.getResult(1);
         mlir::Value vf = ifOp.getResult(2);
-        mlir::Value flag = mlir::arith::AndIOp::create(
-            nb, loc, vf, mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), kDescViewFlagReservedBuffer));
-        info.isReserved = mlir::arith::CmpIOp::create(
-            nb, loc, mlir::arith::CmpIPredicate::ne, flag, mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), 0));
+        mlir::Value flag = mlir::LLVM::AndOp::create(
+            nb, loc, vf, mlir::LLVM::ConstantOp::create(nb, loc, i32Ty(), nb.getIntegerAttr(i32Ty(), kDescViewFlagReservedBuffer)));
+        info.isReserved = mlir::LLVM::ICmpOp::create(
+            nb, loc, mlir::LLVM::ICmpPredicate::ne, flag, mlir::LLVM::ConstantOp::create(nb, loc, i32Ty(), nb.getIntegerAttr(i32Ty(), 0)));
         info.okPtr = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::ne, info.basePtr, nullPtr);
         mlir::Value loadedEs = loadEs ? ifOp.getResult(3) : mlir::Value();
         if (needElemStride) info.elemStride = loadedEs;
         if (needStride64) {
             info.stride64 = (h.stride > 0)
-                                ? mlir::Value(mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), h.stride))
-                                : mlir::Value(mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), loadedEs));
+                                ? mlir::Value(mlir::LLVM::ConstantOp::create(nb, loc, i64Ty(), nb.getIntegerAttr(i64Ty(), h.stride)))
+                                : mlir::Value(mlir::LLVM::ZExtOp::create(nb, loc, i64Ty(), loadedEs));
         }
         if (canCache) {
             descCache_->push_back({key, info});
@@ -2860,36 +2977,36 @@ private:
         mlir::Value tileTablePtr,
         mlir::Value cOff,
         uint32_t elemBytes) {
-        auto ci64 = [&](uint64_t v) { return mlir::arith::ConstantIntOp::create(nb, nloc, i64Ty(), v); };
+        auto ci64 = [&](uint64_t v) { return mlir::LLVM::ConstantOp::create(nb, nloc, i64Ty(), nb.getIntegerAttr(i64Ty(), v)); };
         auto loadU32 = [&](int64_t fOff) -> mlir::Value {
             mlir::Value fp = mlir::LLVM::GEPOp::create(
                 nb, nloc, ptrTy(), i8Ty(), descP,
                 llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(fOff)});
             return mlir::LLVM::LoadOp::create(nb, nloc, i32Ty(), fp);
         };
-        mlir::Value lo = mlir::arith::ExtUIOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, row_pitch)));
-        mlir::Value hi = mlir::arith::ExtUIOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, depth_or_array)));
-        mlir::Value viewOff = mlir::arith::OrIOp::create(
-            nb, nloc, mlir::arith::ShLIOp::create(nb, nloc, hi, ci64(32)), lo);
-        mlir::Value resOff = mlir::arith::AddIOp::create(nb, nloc, viewOff, cOff);
-        mlir::Value tileIdx = mlir::arith::ShRUIOp::create(nb, nloc, resOff, ci64(16));
+        mlir::Value lo = mlir::LLVM::ZExtOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, row_pitch)));
+        mlir::Value hi = mlir::LLVM::ZExtOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, depth_or_array)));
+        mlir::Value viewOff = mlir::LLVM::OrOp::create(
+            nb, nloc, mlir::LLVM::ShlOp::create(nb, nloc, hi, ci64(32)), lo);
+        mlir::Value resOff = mlir::LLVM::AddOp::create(nb, nloc, viewOff, cOff);
+        mlir::Value tileIdx = mlir::LLVM::LShrOp::create(nb, nloc, resOff, ci64(16));
         mlir::Value endTileIdx =
             (elemBytes > 1)
-                ? mlir::Value(mlir::arith::ShRUIOp::create(
-                      nb, nloc, mlir::arith::AddIOp::create(nb, nloc, resOff, ci64(elemBytes - 1)), ci64(16)))
+                ? mlir::Value(mlir::LLVM::LShrOp::create(
+                      nb, nloc, mlir::LLVM::AddOp::create(nb, nloc, resOff, ci64(elemBytes - 1)), ci64(16)))
                 : tileIdx;
         mlir::Value totalTiles64 =
-            mlir::arith::ExtUIOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, height)));
-        mlir::Value validTile = mlir::arith::AndIOp::create(
+            mlir::LLVM::ZExtOp::create(nb, nloc, i64Ty(), loadU32(offsetof(NacelleDescriptor, height)));
+        mlir::Value validTile = mlir::LLVM::AndOp::create(
             nb, nloc,
-            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ult, tileIdx, totalTiles64),
-            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::eq, tileIdx, endTileIdx));
+            mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::ult, tileIdx, totalTiles64),
+            mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::eq, tileIdx, endTileIdx));
 
         return mlir::scf::IfOp::create(
                    nb, nloc, validTile,
                    [&](mlir::OpBuilder& tb, mlir::Location tloc) {
-                       mlir::Value slotByteOff = mlir::arith::ShLIOp::create(
-                           tb, tloc, tileIdx, mlir::arith::ConstantIntOp::create(tb, tloc, i64Ty(), 3));
+                       mlir::Value slotByteOff = mlir::LLVM::ShlOp::create(
+                           tb, tloc, tileIdx, mlir::LLVM::ConstantOp::create(tb, tloc, i64Ty(), tb.getIntegerAttr(i64Ty(), 3)));
                        mlir::Value slotPtr = mlir::LLVM::GEPOp::create(
                            tb, tloc, ptrTy(), i8Ty(), tileTablePtr, mlir::ValueRange{slotByteOff});
                        mlir::Value tileBase = mlir::LLVM::LoadOp::create(tb, tloc, ptrTy(), slotPtr);
@@ -2900,8 +3017,8 @@ private:
                            mlir::scf::IfOp::create(
                                tb, tloc, hasPage,
                                [&](mlir::OpBuilder& pb, mlir::Location ploc) {
-                                   mlir::Value inTile = mlir::arith::AndIOp::create(
-                                       pb, ploc, resOff, mlir::arith::ConstantIntOp::create(pb, ploc, i64Ty(), 0xFFFF));
+                                   mlir::Value inTile = mlir::LLVM::AndOp::create(
+                                       pb, ploc, resOff, mlir::LLVM::ConstantOp::create(pb, ploc, i64Ty(), pb.getIntegerAttr(i64Ty(), 0xFFFF)));
                                    mlir::scf::YieldOp::create(
                                        pb, ploc,
                                        mlir::ValueRange{mlir::LLVM::GEPOp::create(
@@ -2960,7 +3077,7 @@ private:
                         mlir::Value ep = mlir::LLVM::GEPOp::create(
                             rb, rloc, ptrTy(), i8Ty(), basePtr, mlir::ValueRange{cOff});
                         mlir::Value v = mlir::LLVM::LoadOp::create(rb, rloc, elemTy, ep);
-                        mlir::Value t = mlir::arith::ConstantIntOp::create(rb, rloc, rb.getI1Type(), 1);
+                        mlir::Value t = mlir::LLVM::ConstantOp::create(rb, rloc, rb.getI1Type(), rb.getIntegerAttr(rb.getI1Type(), 1));
                         mlir::scf::YieldOp::create(rb, rloc, mlir::ValueRange{v, t});
                     });
                 mlir::scf::YieldOp::create(nb, nloc, resIf.getResults());
@@ -2969,7 +3086,7 @@ private:
                 SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
                 mlir::Value z = mlir::isa<mlir::FloatType>(elemTy) ? tmp.cFlt(nloc, elemTy, 0.0)
                                                                    : tmp.cInt(nloc, elemTy, 0);
-                mlir::Value t = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 1);
+                mlir::Value t = mlir::LLVM::ConstantOp::create(nb, nloc, nb.getI1Type(), nb.getIntegerAttr(nb.getI1Type(), 1));
                 mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{z, t});
             });
         return {loadIf.getResult(0), loadIf.getResult(1)};
@@ -3020,10 +3137,9 @@ private:
         auto makeZero = [&](mlir::OpBuilder& zb, mlir::Location zloc) -> mlir::Value {
             if (mlir::isa<mlir::FloatType>(elemTy)) {
                 auto ft = llvm::cast<mlir::FloatType>(elemTy);
-                return mlir::arith::ConstantFloatOp::create(
-                    zb, zloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
+                return mlir::LLVM::ConstantOp::create(zb, zloc, ft, mlir::FloatAttr::get(ft, mlir::FloatAttr::get(ft, 0.0).getValue()));
             }
-            return mlir::arith::ConstantIntOp::create(zb, zloc, elemTy, 0);
+            return mlir::LLVM::ConstantOp::create(zb, zloc, elemTy, zb.getIntegerAttr(elemTy, 0));
         };
         auto loadIf = mlir::scf::IfOp::create(
             rb, rloc, inBounds,
@@ -3046,7 +3162,7 @@ private:
                 mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{v, mapped});
             },
             [&](mlir::OpBuilder& tb, mlir::Location tloc) {
-                mlir::Value t = mlir::arith::ConstantIntOp::create(tb, tloc, i1Ty(), 1);
+                mlir::Value t = mlir::LLVM::ConstantOp::create(tb, tloc, i1Ty(), tb.getIntegerAttr(i1Ty(), 1));
                 mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{makeZero(tb, tloc), t});
             });
         return {loadIf.getResult(0), loadIf.getResult(1)};
@@ -3077,20 +3193,20 @@ private:
     mlir::Value computeBufferByteOffsetScalar(
         mlir::Location loc, mlir::OpBuilder& nb, const SimdVal& h, mlir::Value stride64,
         mlir::Value idxL, mlir::Value elemOffL, bool isRawOp, bool hasElemOff) {
-        mlir::Value idx64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), idxL);
+        mlir::Value idx64 = mlir::LLVM::ZExtOp::create(nb, loc, i64Ty(), idxL);
         if (isRawOp) {
             if (!hasElemOff) return idx64;
-            mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
-            return mlir::arith::AddIOp::create(
-                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, stride64), e64);
+            mlir::Value e64 = mlir::LLVM::ZExtOp::create(nb, loc, i64Ty(), elemOffL);
+            return mlir::LLVM::AddOp::create(
+                nb, loc, mlir::LLVM::MulOp::create(nb, loc, idx64, stride64), e64);
         }
         if (hasElemOff) {
-            mlir::Value e64 = mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), elemOffL);
-            return mlir::arith::AddIOp::create(
-                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64, stride64), e64);
+            mlir::Value e64 = mlir::LLVM::ZExtOp::create(nb, loc, i64Ty(), elemOffL);
+            return mlir::LLVM::AddOp::create(
+                nb, loc, mlir::LLVM::MulOp::create(nb, loc, idx64, stride64), e64);
         }
         if (h.resourceKind == 11) return idx64;
-        return mlir::arith::MulIOp::create(nb, loc, idx64, stride64);
+        return mlir::LLVM::MulOp::create(nb, loc, idx64, stride64);
     }
 
     bool tryGetUniformScalar(mlir::Location loc, mlir::Value origVal, mlir::Value& outScalar) {
@@ -3102,21 +3218,26 @@ private:
         if (sv.isUniform()) {
             outScalar = !sv.lanes.empty()
                             ? sv.lanes[0]
-                            : mlir::Value(mlir::vector::ExtractOp::create(b_, loc, sv.vec, 0));
+                            : mlir::Value(llvmExtract(b_, loc, sv.vec, static_cast<uint32_t>(0)));
             return true;
         }
         if (sv.kind == SimdVal::Kind::Vector) {
-            if (auto bcast = sv.vec.getDefiningOp<mlir::vector::BroadcastOp>()) {
-                if (!mlir::isa<mlir::VectorType>(bcast.getSource().getType())) {
-                    outScalar = bcast.getSource();
-                    return true;
+            if (auto shuf = sv.vec.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
+                llvm::ArrayRef<int32_t> mask = shuf.getMask();
+                if (!mask.empty() && llvm::all_of(mask, [](int32_t idx) { return idx == 0; })) {
+                    if (auto ins = shuf.getV1().getDefiningOp<mlir::LLVM::InsertElementOp>()) {
+                        if (getConstIntValue(ins.getPosition()) == 0) {
+                            outScalar = ins.getValue();
+                            return true;
+                        }
+                    }
                 }
             }
-            if (auto cst = sv.vec.getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto cst = sv.vec.getDefiningOp<mlir::LLVM::ConstantOp>()) {
                 if (auto dea = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue())) {
                     if (dea.isSplat()) {
-                        outScalar = mlir::arith::ConstantOp::create(
-                            b_, loc, mlir::cast<mlir::TypedAttr>(dea.getSplatValue<mlir::Attribute>()));
+                        auto attr = mlir::cast<mlir::TypedAttr>(dea.getSplatValue<mlir::Attribute>());
+                        outScalar = mlir::LLVM::ConstantOp::create(b_, loc, attr.getType(), attr);
                         return true;
                     }
                 }
@@ -3143,32 +3264,31 @@ private:
         auto makeScalarZero = [&](mlir::OpBuilder& zb, mlir::Location zloc) -> mlir::Value {
             if (mlir::isa<mlir::FloatType>(elemTy)) {
                 auto ft = llvm::cast<mlir::FloatType>(elemTy);
-                return mlir::arith::ConstantFloatOp::create(
-                    zb, zloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
+                return mlir::LLVM::ConstantOp::create(zb, zloc, ft, mlir::FloatAttr::get(ft, mlir::FloatAttr::get(ft, 0.0).getValue()));
             }
-            return mlir::arith::ConstantIntOp::create(zb, zloc, elemTy, 0);
+            return mlir::LLVM::ConstantOp::create(zb, zloc, elemTy, zb.getIntegerAttr(elemTy, 0));
         };
 
         auto compInBounds = [&](mlir::OpBuilder& zb, mlir::Location zloc, unsigned c) -> std::pair<mlir::Value, mlir::Value> {
             mlir::Value cOff = (c == 0)
                                    ? byteOff
-                                   : mlir::Value(mlir::arith::AddIOp::create(
+                                   : mlir::Value(mlir::LLVM::AddOp::create(
                                          zb, zloc, byteOff,
-                                         mlir::arith::ConstantIntOp::create(zb, zloc, i64Ty(), uint64_t(c) * elemBytes)));
+                                         mlir::LLVM::ConstantOp::create(zb, zloc, i64Ty(), zb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes))));
             if (isRootConstants) return {cOff, info.okPtr};
-            mlir::Value cEnd = mlir::arith::AddIOp::create(
-                zb, zloc, cOff, mlir::arith::ConstantIntOp::create(zb, zloc, i64Ty(), elemBytes));
-            mlir::Value ok = mlir::arith::AndIOp::create(
+            mlir::Value cEnd = mlir::LLVM::AddOp::create(
+                zb, zloc, cOff, mlir::LLVM::ConstantOp::create(zb, zloc, i64Ty(), zb.getIntegerAttr(i64Ty(), elemBytes)));
+            mlir::Value ok = mlir::LLVM::AndOp::create(
                 zb, zloc, info.okPtr,
-                mlir::arith::CmpIOp::create(zb, zloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                mlir::LLVM::ICmpOp::create(zb, zloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
             if (info.elemStride) {
-                mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(zb, zloc, i32Ty(), (c + 1) * elemBytes);
-                mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                    zb, zloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
-                    mlir::arith::ConstantIntOp::create(zb, zloc, i32Ty(), 0));
-                mlir::Value inElem = mlir::arith::CmpIOp::create(
-                    zb, zloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
-                ok = mlir::arith::AndIOp::create(zb, zloc, ok, mlir::arith::OrIOp::create(zb, zloc, strideZero, inElem));
+                mlir::Value elemEnd = mlir::LLVM::ConstantOp::create(zb, zloc, i32Ty(), zb.getIntegerAttr(i32Ty(), (c + 1) * elemBytes));
+                mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+                    zb, zloc, mlir::LLVM::ICmpPredicate::eq, info.elemStride,
+                    mlir::LLVM::ConstantOp::create(zb, zloc, i32Ty(), zb.getIntegerAttr(i32Ty(), 0)));
+                mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+                    zb, zloc, mlir::LLVM::ICmpPredicate::ule, elemEnd, info.elemStride);
+                ok = mlir::LLVM::AndOp::create(zb, zloc, ok, mlir::LLVM::OrOp::create(zb, zloc, strideZero, inElem));
             }
             return {cOff, ok};
         };
@@ -3241,23 +3361,23 @@ private:
         if (isRootConstants) {
             auto scalars = emitNormalScalarLoads(b_, loc);
             for (size_t i = 0; i < activeComps.size(); ++i) {
-                outVecs[activeComps[i]] = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), scalars[i]);
+                outVecs[activeComps[i]] = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), scalars[i]);
             }
             return {outVecs, splatInt(loc, i32Ty(), 1)};
         }
 
         auto emitPerCompReserved = [&](mlir::OpBuilder& rb, mlir::Location rloc) -> llvm::SmallVector<mlir::Value, 17> {
-            mlir::Value allMapped = mlir::arith::ConstantIntOp::create(rb, rloc, i1Ty(), 1);
+            mlir::Value allMapped = mlir::LLVM::ConstantOp::create(rb, rloc, i1Ty(), rb.getIntegerAttr(i1Ty(), 1));
             llvm::SmallVector<mlir::Value, 17> yielded;
             yielded.reserve(activeComps.size() + 1);
             for (unsigned c : activeComps) {
                 auto [cOff, ok] = compInBounds(rb, rloc, c);
                 auto [v, mapped] = emitReservedElemLoad(
                     rb, rloc, elemTy, elemBytes, info.descP, info.basePtr, ok, cOff);
-                allMapped = mlir::arith::AndIOp::create(rb, rloc, allMapped, mapped);
+                allMapped = mlir::LLVM::AndOp::create(rb, rloc, allMapped, mapped);
                 yielded.push_back(v);
             }
-            yielded.push_back(mlir::arith::ExtUIOp::create(rb, rloc, i32Ty(), allMapped));
+            yielded.push_back(mlir::LLVM::ZExtOp::create(rb, rloc, i32Ty(), allMapped));
             return yielded;
         };
 
@@ -3292,7 +3412,7 @@ private:
                                                                llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
                                     vals.push_back(mlir::LLVM::LoadOp::create(lb, lloc, elemTy, ep));
                                 }
-                                vals.push_back(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 1));
+                                vals.push_back(mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), 1)));
                                 mlir::scf::YieldOp::create(lb, lloc, vals);
                             },
                             [&](mlir::OpBuilder& lb, mlir::Location lloc) {
@@ -3307,95 +3427,91 @@ private:
             },
             [&](mlir::OpBuilder& rb, mlir::Location rloc) {
                 auto vals = emitNormalScalarLoads(rb, rloc);
-                vals.push_back(mlir::arith::ConstantIntOp::create(rb, rloc, i32Ty(), 1));
+                vals.push_back(mlir::LLVM::ConstantOp::create(rb, rloc, i32Ty(), rb.getIntegerAttr(i32Ty(), 1)));
                 mlir::scf::YieldOp::create(rb, rloc, vals);
             });
 
         for (size_t i = 0; i < activeComps.size(); ++i) {
-            outVecs[activeComps[i]] = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), ifRes.getResult(i));
+            outVecs[activeComps[i]] = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), ifRes.getResult(i));
         }
-        mlir::Value statusVec = mlir::vector::BroadcastOp::create(
-            b_, loc, vecTy(i32Ty()), ifRes.getResult(activeComps.size()));
+        mlir::Value statusVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i32Ty())).getElementType(), ifRes.getResult(activeComps.size()));
         return {outVecs, statusVec};
     }
 
     mlir::Value computeBufferByteOffsetVec(
         mlir::Location loc, mlir::OpBuilder& nb, const SimdVal& h, mlir::Value stride64Vec,
         mlir::Value idxVec, mlir::Value elemOffVec, bool isRawOp, bool hasElemOff) {
-        mlir::Value idx64Vec = mlir::arith::ExtUIOp::create(nb, loc, vecTy(i64Ty()), idxVec);
+        mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(nb, loc, vecTy(i64Ty()), idxVec);
         if (isRawOp) {
             if (!hasElemOff) return idx64Vec;
-            mlir::Value e64Vec = mlir::arith::ExtUIOp::create(nb, loc, vecTy(i64Ty()), elemOffVec);
-            return mlir::arith::AddIOp::create(
-                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64Vec, stride64Vec), e64Vec);
+            mlir::Value e64Vec = mlir::LLVM::ZExtOp::create(nb, loc, vecTy(i64Ty()), elemOffVec);
+            return mlir::LLVM::AddOp::create(
+                nb, loc, mlir::LLVM::MulOp::create(nb, loc, idx64Vec, stride64Vec), e64Vec);
         }
         if (hasElemOff) {
-            mlir::Value e64Vec = mlir::arith::ExtUIOp::create(nb, loc, vecTy(i64Ty()), elemOffVec);
-            return mlir::arith::AddIOp::create(
-                nb, loc, mlir::arith::MulIOp::create(nb, loc, idx64Vec, stride64Vec), e64Vec);
+            mlir::Value e64Vec = mlir::LLVM::ZExtOp::create(nb, loc, vecTy(i64Ty()), elemOffVec);
+            return mlir::LLVM::AddOp::create(
+                nb, loc, mlir::LLVM::MulOp::create(nb, loc, idx64Vec, stride64Vec), e64Vec);
         }
         if (h.resourceKind == 11) return idx64Vec;
-        return mlir::arith::MulIOp::create(nb, loc, idx64Vec, stride64Vec);
+        return mlir::LLVM::MulOp::create(nb, loc, idx64Vec, stride64Vec);
     }
 
     mlir::Value computeBufferBoundsMaskVec(
         mlir::Location loc, mlir::OpBuilder& nb, mlir::Value byteOffVec, mlir::Value byteSizeVec,
         mlir::Value okPtrVec, mlir::Value elemStrideOkVec, uint32_t c, uint32_t elemBytes) {
-        mlir::Value endBytesSplat = mlir::arith::ConstantOp::create(
-            nb, loc, mlir::DenseElementsAttr::get(vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c + 1) * elemBytes)));
-        mlir::Value cEndVec = mlir::arith::AddIOp::create(nb, loc, byteOffVec, endBytesSplat);
-        mlir::Value inBoundsVec = mlir::arith::AndIOp::create(
+        mlir::Value endBytesSplat = mlir::LLVM::ConstantOp::create(nb, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c + 1) * elemBytes))).getType(), mlir::DenseElementsAttr::get(vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c + 1) * elemBytes)));
+        mlir::Value cEndVec = mlir::LLVM::AddOp::create(nb, loc, byteOffVec, endBytesSplat);
+        mlir::Value inBoundsVec = mlir::LLVM::AndOp::create(
             nb, loc, okPtrVec,
-            mlir::arith::CmpIOp::create(nb, loc, mlir::arith::CmpIPredicate::ule, cEndVec, byteSizeVec));
+            mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::ule, cEndVec, byteSizeVec));
         if (elemStrideOkVec) {
-            inBoundsVec = mlir::arith::AndIOp::create(nb, loc, inBoundsVec, elemStrideOkVec);
+            inBoundsVec = mlir::LLVM::AndOp::create(nb, loc, inBoundsVec, elemStrideOkVec);
         }
         return inBoundsVec;
     }
 
     std::pair<mlir::Value, mlir::Value> checkContiguousByteOffsets(
         mlir::Location loc, mlir::OpBuilder& nb, mlir::Value byteOffVec, uint32_t elemBytes) {
-        mlir::Value lane0Off = mlir::vector::ExtractOp::create(nb, loc, byteOffVec, 0);
+        mlir::Value lane0Off = llvmExtract(nb, loc, byteOffVec, static_cast<uint32_t>(0));
         if (W_ <= 1) {
-            return {mlir::arith::ConstantIntOp::create(nb, loc, i1Ty(), 1), lane0Off};
+            return {mlir::LLVM::ConstantOp::create(nb, loc, i1Ty(), nb.getIntegerAttr(i1Ty(), 1)), lane0Off};
         }
         llvm::SmallVector<int64_t, 16> steps;
         for (uint32_t l = 0; l < W_; ++l) {
             steps.push_back(static_cast<int64_t>(l) * elemBytes);
         }
-        mlir::Value stepConst = mlir::arith::ConstantOp::create(
-            nb, loc, mlir::DenseElementsAttr::get(vecTy(i64Ty()), llvm::ArrayRef<int64_t>(steps)));
-        mlir::Value expectedVec = mlir::arith::AddIOp::create(
-            nb, loc, mlir::vector::BroadcastOp::create(nb, loc, vecTy(i64Ty()), lane0Off), stepConst);
-        mlir::Value eqVec = mlir::arith::CmpIOp::create(nb, loc, mlir::arith::CmpIPredicate::eq, byteOffVec, expectedVec);
-        mlir::Value isContig = mlir::vector::ReductionOp::create(nb, loc, mlir::vector::CombiningKind::AND, eqVec);
+        mlir::Value stepConst = mlir::LLVM::ConstantOp::create(nb, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i64Ty()), llvm::ArrayRef<int64_t>(steps))).getType(), mlir::DenseElementsAttr::get(vecTy(i64Ty()), llvm::ArrayRef<int64_t>(steps)));
+        mlir::Value expectedVec = mlir::LLVM::AddOp::create(
+            nb, loc, llvmSplat(nb, loc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), lane0Off), stepConst);
+        mlir::Value eqVec = mlir::LLVM::ICmpOp::create(nb, loc, mlir::LLVM::ICmpPredicate::eq, byteOffVec, expectedVec);
+        mlir::Value isContig = mlir::LLVM::vector_reduce_and::create(nb, loc, i1Ty(), eqVec);
         return {isContig, lane0Off};
     }
 
     mlir::Value computeScalarElemStrideOkVec(
         mlir::Location loc, mlir::OpBuilder& nb, mlir::Value elemStride, uint32_t c, uint32_t elemBytes) {
         if (!elemStride) return {};
-        mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), (c + 1) * elemBytes);
-        mlir::Value strideZero = mlir::arith::CmpIOp::create(
-            nb, loc, mlir::arith::CmpIPredicate::eq, elemStride, mlir::arith::ConstantIntOp::create(nb, loc, i32Ty(), 0));
-        mlir::Value inElem = mlir::arith::CmpIOp::create(
-            nb, loc, mlir::arith::CmpIPredicate::ule, elemEnd, elemStride);
-        mlir::Value ok = mlir::arith::OrIOp::create(nb, loc, strideZero, inElem);
-        return mlir::vector::BroadcastOp::create(nb, loc, vecTy(i1Ty()), ok);
+        mlir::Value elemEnd = mlir::LLVM::ConstantOp::create(nb, loc, i32Ty(), nb.getIntegerAttr(i32Ty(), (c + 1) * elemBytes));
+        mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+            nb, loc, mlir::LLVM::ICmpPredicate::eq, elemStride, mlir::LLVM::ConstantOp::create(nb, loc, i32Ty(), nb.getIntegerAttr(i32Ty(), 0)));
+        mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+            nb, loc, mlir::LLVM::ICmpPredicate::ule, elemEnd, elemStride);
+        mlir::Value ok = mlir::LLVM::OrOp::create(nb, loc, strideZero, inElem);
+        return llvmSplat(nb, loc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), ok);
     }
 
     mlir::Value computeVecElemStrideOkVec(
         mlir::Location loc, mlir::OpBuilder& nb, mlir::Value elemStrideVec, uint32_t c, uint32_t elemBytes) {
         if (!elemStrideVec) return {};
         auto splatI32 = [&](uint32_t v) {
-            return mlir::arith::ConstantOp::create(
-                nb, loc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), v)));
+            return mlir::LLVM::ConstantOp::create(nb, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), v))).getType(), mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), v)));
         };
-        mlir::Value strideZero = mlir::arith::CmpIOp::create(
-            nb, loc, mlir::arith::CmpIPredicate::eq, elemStrideVec, splatI32(0));
-        mlir::Value inElem = mlir::arith::CmpIOp::create(
-            nb, loc, mlir::arith::CmpIPredicate::ule, splatI32((c + 1) * elemBytes), elemStrideVec);
-        return mlir::arith::OrIOp::create(nb, loc, strideZero, inElem);
+        mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+            nb, loc, mlir::LLVM::ICmpPredicate::eq, elemStrideVec, splatI32(0));
+        mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+            nb, loc, mlir::LLVM::ICmpPredicate::ule, splatI32((c + 1) * elemBytes), elemStrideVec);
+        return mlir::LLVM::OrOp::create(nb, loc, strideZero, inElem);
     }
 
     bool packetizeCBufferLoad(mlir::LLVM::CallOp call, bool isLegacy, std::string& outError) {
@@ -3438,8 +3554,8 @@ private:
             if (auto idxConst = getConstIntValue(idxArg)) {
                 byteOff = cInt(loc, i64Ty(), isLegacy ? (*idxConst * 16) : *idxConst);
             } else {
-                mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), uniformIdx);
-                byteOff = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
+                mlir::Value idx64 = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), uniformIdx);
+                byteOff = isLegacy ? mlir::Value(mlir::LLVM::MulOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
             }
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
             auto [compVecs, _] = emitCoalescedUniformBufferLoad(
@@ -3469,14 +3585,14 @@ private:
         mlir::Value idxVec = asVec(loc, getMapped(loc, idxArg));
         if (h.isUniform()) {
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
-            mlir::Value idx64Vec = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i64Ty()), idxVec);
-            mlir::Value off64Vec = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64Vec, splatInt(loc, i64Ty(), 16))) : idx64Vec;
+            mlir::Value idx64Vec = mlir::LLVM::ZExtOp::create(b_, loc, vecTy(i64Ty()), idxVec);
+            mlir::Value off64Vec = isLegacy ? mlir::Value(mlir::LLVM::MulOp::create(b_, loc, idx64Vec, splatInt(loc, i64Ty(), 16))) : idx64Vec;
 
             auto emitGatherCBuffer = [&](mlir::OpBuilder& gb, mlir::Location gloc) -> llvm::SmallVector<mlir::Value, 8> {
-                mlir::Value okPtrVec = mlir::vector::BroadcastOp::create(gb, gloc, vecTy(i1Ty()), info.okPtr);
+                mlir::Value okPtrVec = llvmSplat(gb, gloc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), info.okPtr);
                 mlir::Value byteSizeVec = h.isRootConstants
                                               ? mlir::Value()
-                                              : mlir::Value(mlir::vector::BroadcastOp::create(gb, gloc, vecTy(i64Ty()), info.byteSize));
+                                              : mlir::Value(llvmSplat(gb, gloc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.byteSize));
                 llvm::SmallVector<mlir::Value, 8> gathered;
                 gathered.reserve(activeComps.size());
                 for (unsigned f : activeComps) {
@@ -3504,30 +3620,30 @@ private:
                 auto ifRes = mlir::scf::IfOp::create(
                     b_, loc, info.isReserved,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
-                        mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
-                        mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                        mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
+                        mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
+                        mlir::Value cW = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(W_));
                         llvm::SmallVector<mlir::Value, 8> initArgs(activeComps.size(), zeroElemVec);
                         auto loop = mlir::scf::ForOp::create(
                             nb, nloc, c0, cW, c1, initArgs,
                             [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
-                                mlir::Value offL = mlir::vector::ExtractOp::create(lb, lloc, off64Vec, mlir::OpFoldResult{lIdx});
+                                mlir::Value offL = mlir::LLVM::ExtractElementOp::create(lb, lloc, off64Vec, lIdx);
                                 llvm::SmallVector<mlir::Value, 8> nextArgs(iterArgs.begin(), iterArgs.end());
                                 for (size_t i = 0; i < activeComps.size(); ++i) {
                                     unsigned f = activeComps[i];
                                     mlir::Value cOff = (f == 0)
                                                            ? offL
-                                                           : mlir::Value(mlir::arith::AddIOp::create(
+                                                           : mlir::Value(mlir::LLVM::AddOp::create(
                                                                  lb, lloc, offL,
-                                                                 mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(f) * elemBytes)));
-                                    mlir::Value cEnd = mlir::arith::AddIOp::create(
-                                        lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
-                                    mlir::Value inBounds = mlir::arith::AndIOp::create(
+                                                                 mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), uint64_t(f) * elemBytes))));
+                                    mlir::Value cEnd = mlir::LLVM::AddOp::create(
+                                        lb, lloc, cOff, mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), elemBytes)));
+                                    mlir::Value inBounds = mlir::LLVM::AndOp::create(
                                         lb, lloc, info.okPtr,
-                                        mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                        mlir::LLVM::ICmpOp::create(lb, lloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
                                     auto [val, _] = emitReservedElemLoad(
                                         lb, lloc, elemTy, elemBytes, info.descP, info.basePtr, inBounds, cOff);
-                                    nextArgs[i] = mlir::vector::InsertOp::create(lb, lloc, val, nextArgs[i], mlir::OpFoldResult{lIdx});
+                                    nextArgs[i] = mlir::LLVM::InsertElementOp::create(lb, lloc, nextArgs[i], val, lIdx);
                                 }
                                 mlir::scf::YieldOp::create(lb, lloc, nextArgs);
                             });
@@ -3552,21 +3668,21 @@ private:
         for (uint32_t l = 0; l < W_; ++l) {
             mlir::Value ptr = laneValue(loc, h, l);
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, ptr, /*needElemStride=*/false, /*needStride64=*/false);
-            mlir::Value idxL = mlir::vector::ExtractOp::create(b_, loc, idxVec, static_cast<int64_t>(l));
-            mlir::Value idx64 = mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), idxL);
-            mlir::Value off64 = isLegacy ? mlir::Value(mlir::arith::MulIOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
+            mlir::Value idxL = llvmExtract(b_, loc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            mlir::Value idx64 = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), idxL);
+            mlir::Value off64 = isLegacy ? mlir::Value(mlir::LLVM::MulOp::create(b_, loc, idx64, cInt(loc, i64Ty(), 16))) : idx64;
             for (unsigned f : activeComps) {
-                mlir::Value cOff = (f == 0) ? off64 : mlir::Value(mlir::arith::AddIOp::create(b_, loc, off64, cInt(loc, i64Ty(), uint64_t(f) * elemBytes)));
-                mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
+                mlir::Value cOff = (f == 0) ? off64 : mlir::Value(mlir::LLVM::AddOp::create(b_, loc, off64, cInt(loc, i64Ty(), uint64_t(f) * elemBytes)));
+                mlir::Value cEnd = mlir::LLVM::AddOp::create(b_, loc, cOff, cInt(loc, i64Ty(), elemBytes));
                 mlir::Value inBounds = h.isRootConstants
                                            ? info.okPtr
-                                           : mlir::Value(mlir::arith::AndIOp::create(
+                                           : mlir::Value(mlir::LLVM::AndOp::create(
                                                  b_, loc, info.okPtr,
-                                                 mlir::arith::CmpIOp::create(
-                                                     b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize)));
+                                                 mlir::LLVM::ICmpOp::create(
+                                                     b_, loc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize)));
                 auto [val, _] = emitScalarBufferComponentLoad(
                     loc, elemTy, elemBytes, ptr, info.basePtr, info.isReserved, inBounds, cOff);
-                fieldVecs[f] = mlir::vector::InsertOp::create(b_, loc, val, fieldVecs[f], static_cast<int64_t>(l));
+                fieldVecs[f] = llvmInsert(b_, loc, fieldVecs[f], val, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
         }
         for (unsigned f = 0; f < numFields; ++f) {
@@ -3618,59 +3734,57 @@ private:
         if (h.isUniform()) {
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], hasElemStride, needsStride);
             mlir::Value stride64Vec = needsStride
-                                          ? mlir::Value(mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), info.stride64))
+                                          ? mlir::Value(llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.stride64))
                                           : mlir::Value();
 
             auto ifRes = mlir::scf::IfOp::create(
                 b_, loc, info.isReserved,
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
-                    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
-                    mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                    mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
+                    mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
+                    mlir::Value cW = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(W_));
                     llvm::SmallVector<mlir::Value, 17> initArgs(activeComps.size(), zeroElemVec);
-                    initArgs.push_back(mlir::arith::ConstantOp::create(
-                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                    initArgs.push_back(mlir::LLVM::ConstantOp::create(nb, nloc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))).getType(), mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
                     auto loop = mlir::scf::ForOp::create(
                         nb, nloc, c0, cW, c1, initArgs,
                         [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
-                            mlir::Value idxL = mlir::vector::ExtractOp::create(lb, lloc, idxVec, mlir::OpFoldResult{lIdx});
+                            mlir::Value idxL = mlir::LLVM::ExtractElementOp::create(lb, lloc, idxVec, lIdx);
                             mlir::Value eL = hasElemOff
-                                                 ? mlir::Value(mlir::vector::ExtractOp::create(lb, lloc, elemOffVec, mlir::OpFoldResult{lIdx}))
-                                                 : mlir::Value(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                                                 ? mlir::Value(mlir::LLVM::ExtractElementOp::create(lb, lloc, elemOffVec, lIdx))
+                                                 : mlir::Value(mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), 0)));
                             mlir::Value byteOff = computeBufferByteOffsetScalar(
                                 lloc, lb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
-                            mlir::Value laneMapped = mlir::arith::ConstantIntOp::create(lb, lloc, i1Ty(), 1);
+                            mlir::Value laneMapped = mlir::LLVM::ConstantOp::create(lb, lloc, i1Ty(), lb.getIntegerAttr(i1Ty(), 1));
                             llvm::SmallVector<mlir::Value, 17> nextArgs(iterArgs.begin(), iterArgs.end());
                             for (size_t i = 0; i < activeComps.size(); ++i) {
                                 unsigned c = activeComps[i];
                                 mlir::Value cOff = (c == 0)
                                                        ? byteOff
-                                                       : mlir::Value(mlir::arith::AddIOp::create(
+                                                       : mlir::Value(mlir::LLVM::AddOp::create(
                                                              lb, lloc, byteOff,
-                                                             mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(c) * elemBytes)));
-                                mlir::Value cEnd = mlir::arith::AddIOp::create(
-                                    lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
-                                mlir::Value inBounds = mlir::arith::AndIOp::create(
+                                                             mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes))));
+                                mlir::Value cEnd = mlir::LLVM::AddOp::create(
+                                    lb, lloc, cOff, mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), elemBytes)));
+                                mlir::Value inBounds = mlir::LLVM::AndOp::create(
                                     lb, lloc, info.okPtr,
-                                    mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                    mlir::LLVM::ICmpOp::create(lb, lloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
                                 if (info.elemStride) {
-                                    mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), (c + 1) * elemBytes);
-                                    mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                                        lb, lloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
-                                        mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
-                                    mlir::Value inElem = mlir::arith::CmpIOp::create(
-                                        lb, lloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
-                                    inBounds = mlir::arith::AndIOp::create(
-                                        lb, lloc, inBounds, mlir::arith::OrIOp::create(lb, lloc, strideZero, inElem));
+                                    mlir::Value elemEnd = mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), (c + 1) * elemBytes));
+                                    mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+                                        lb, lloc, mlir::LLVM::ICmpPredicate::eq, info.elemStride,
+                                        mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), 0)));
+                                    mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+                                        lb, lloc, mlir::LLVM::ICmpPredicate::ule, elemEnd, info.elemStride);
+                                    inBounds = mlir::LLVM::AndOp::create(
+                                        lb, lloc, inBounds, mlir::LLVM::OrOp::create(lb, lloc, strideZero, inElem));
                                 }
                                 auto [val, compMapped] = emitReservedElemLoad(
                                     lb, lloc, elemTy, elemBytes, info.descP, info.basePtr, inBounds, cOff);
-                                laneMapped = mlir::arith::AndIOp::create(lb, lloc, laneMapped, compMapped);
-                                nextArgs[i] = mlir::vector::InsertOp::create(lb, lloc, val, nextArgs[i], mlir::OpFoldResult{lIdx});
+                                laneMapped = mlir::LLVM::AndOp::create(lb, lloc, laneMapped, compMapped);
+                                nextArgs[i] = mlir::LLVM::InsertElementOp::create(lb, lloc, nextArgs[i], val, lIdx);
                             }
-                            mlir::Value laneStatus = mlir::arith::ExtUIOp::create(lb, lloc, i32Ty(), laneMapped);
-                            nextArgs[activeComps.size()] = mlir::vector::InsertOp::create(
-                                lb, lloc, laneStatus, nextArgs[activeComps.size()], mlir::OpFoldResult{lIdx});
+                            mlir::Value laneStatus = mlir::LLVM::ZExtOp::create(lb, lloc, i32Ty(), laneMapped);
+                            nextArgs[activeComps.size()] = mlir::LLVM::InsertElementOp::create(lb, lloc, nextArgs[activeComps.size()], laneStatus, lIdx);
                             mlir::scf::YieldOp::create(lb, lloc, nextArgs);
                         });
                     mlir::scf::YieldOp::create(nb, nloc, loop.getResults());
@@ -3678,8 +3792,8 @@ private:
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::Value byteOffVec = computeBufferByteOffsetVec(
                         nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), info.byteSize);
-                    mlir::Value okPtrVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), info.okPtr);
+                    mlir::Value byteSizeVec = llvmSplat(nb, nloc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.byteSize);
+                    mlir::Value okPtrVec = llvmSplat(nb, nloc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), info.okPtr);
 
                     llvm::SmallVector<mlir::Value, 16> inBounds(activeComps.size());
                     if (nonStraddling) {
@@ -3745,8 +3859,7 @@ private:
                     } else {
                         out = emitGatherLoads(nb, nloc);
                     }
-                    out.push_back(mlir::arith::ConstantOp::create(
-                        nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                    out.push_back(mlir::LLVM::ConstantOp::create(nb, nloc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))).getType(), mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
                     mlir::scf::YieldOp::create(nb, nloc, out);
                 });
 
@@ -3769,15 +3882,15 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, descP, hasElemStride, needsStride);
             descInfos[l] = info;
-            basePtrVec = mlir::vector::InsertOp::create(b_, loc, info.basePtr, basePtrVec, static_cast<int64_t>(l));
-            byteSizeVec = mlir::vector::InsertOp::create(b_, loc, info.byteSize, byteSizeVec, static_cast<int64_t>(l));
-            okPtrVec = mlir::vector::InsertOp::create(b_, loc, info.okPtr, okPtrVec, static_cast<int64_t>(l));
-            isReservedVec = mlir::vector::InsertOp::create(b_, loc, info.isReserved, isReservedVec, static_cast<int64_t>(l));
+            basePtrVec = llvmInsert(b_, loc, basePtrVec, info.basePtr, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            byteSizeVec = llvmInsert(b_, loc, byteSizeVec, info.byteSize, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            okPtrVec = llvmInsert(b_, loc, okPtrVec, info.okPtr, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            isReservedVec = llvmInsert(b_, loc, isReservedVec, info.isReserved, static_cast<uint32_t>(static_cast<int64_t>(l)));
             if (hasElemStride) {
-                elemStrideVec = mlir::vector::InsertOp::create(b_, loc, info.elemStride, elemStrideVec, static_cast<int64_t>(l));
+                elemStrideVec = llvmInsert(b_, loc, elemStrideVec, info.elemStride, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             if (needsStride) {
-                stride64Vec = mlir::vector::InsertOp::create(b_, loc, info.stride64, stride64Vec, static_cast<int64_t>(l));
+                stride64Vec = llvmInsert(b_, loc, stride64Vec, info.stride64, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
         }
         mlir::Value anyReserved = orReduce(loc, isReservedVec);
@@ -3790,8 +3903,8 @@ private:
                 mlir::Value statusVec = tmp.splatInt(nloc, i32Ty(), 1);
                 for (uint32_t l = 0; l < W_; ++l) {
                     const BufferDescInfo& info = descInfos[l];
-                    mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
-                    mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
+                    mlir::Value idxL = llvmExtract(nb, nloc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    mlir::Value eL = llvmExtract(nb, nloc, elemOffVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                     mlir::Value byteOff = tmp.computeBufferByteOffsetScalar(
                         nloc, nb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
                     mlir::Value laneMapped = tmp.cInt(nloc, i1Ty(), 1);
@@ -3799,28 +3912,28 @@ private:
                         unsigned c = activeComps[i];
                         mlir::Value cOff = (c == 0)
                                                ? byteOff
-                                               : mlir::Value(mlir::arith::AddIOp::create(
+                                               : mlir::Value(mlir::LLVM::AddOp::create(
                                                      nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), uint64_t(c) * elemBytes)));
-                        mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
-                        mlir::Value inBounds = mlir::arith::AndIOp::create(
+                        mlir::Value cEnd = mlir::LLVM::AddOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
+                        mlir::Value inBounds = mlir::LLVM::AndOp::create(
                             nb, nloc, info.okPtr,
-                            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                            mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
                         if (info.elemStride) {
                             mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
-                            mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                                nb, nloc, mlir::arith::CmpIPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
-                            mlir::Value inElem = mlir::arith::CmpIOp::create(
-                                nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
-                            inBounds = mlir::arith::AndIOp::create(
-                                nb, nloc, inBounds, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
+                            mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+                                nb, nloc, mlir::LLVM::ICmpPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
+                            mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+                                nb, nloc, mlir::LLVM::ICmpPredicate::ule, elemEnd, info.elemStride);
+                            inBounds = mlir::LLVM::AndOp::create(
+                                nb, nloc, inBounds, mlir::LLVM::OrOp::create(nb, nloc, strideZero, inElem));
                         }
                         auto [val, compMapped] = tmp.emitScalarBufferComponentLoad(
                             nloc, elemTy, elemBytes, info.descP, info.basePtr, info.isReserved, inBounds, cOff);
-                        laneMapped = mlir::arith::AndIOp::create(nb, nloc, laneMapped, compMapped);
-                        activeVecs[i] = mlir::vector::InsertOp::create(nb, nloc, val, activeVecs[i], static_cast<int64_t>(l));
+                        laneMapped = mlir::LLVM::AndOp::create(nb, nloc, laneMapped, compMapped);
+                        activeVecs[i] = llvmInsert(nb, nloc, activeVecs[i], val, static_cast<uint32_t>(static_cast<int64_t>(l)));
                     }
-                    mlir::Value laneStatus = mlir::arith::ExtUIOp::create(nb, nloc, i32Ty(), laneMapped);
-                    statusVec = mlir::vector::InsertOp::create(nb, nloc, laneStatus, statusVec, static_cast<int64_t>(l));
+                    mlir::Value laneStatus = mlir::LLVM::ZExtOp::create(nb, nloc, i32Ty(), laneMapped);
+                    statusVec = llvmInsert(nb, nloc, statusVec, laneStatus, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
                 activeVecs.push_back(statusVec);
                 mlir::scf::YieldOp::create(nb, nloc, activeVecs);
@@ -3847,19 +3960,17 @@ private:
                     mlir::Value cOffVec =
                         (c == 0)
                             ? byteOffVec
-                            : mlir::Value(mlir::arith::AddIOp::create(
+                            : mlir::Value(mlir::LLVM::AddOp::create(
                                   nb, nloc, byteOffVec,
-                                  mlir::arith::ConstantOp::create(
-                                      nb, nloc,
-                                      mlir::DenseElementsAttr::get(
+                                  mlir::LLVM::ConstantOp::create(nb, nloc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(
+                                          vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes))).getType(), mlir::DenseElementsAttr::get(
                                           vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes)))));
                     mlir::Value ptrs = mlir::LLVM::GEPOp::create(
                         nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
                     out.push_back(mlir::LLVM::masked_gather::create(
                         nb, nloc, vecTy(elemTy), ptrs, inBoundsVec, mlir::ValueRange{zeroElemVec}, /*alignment=*/1));
                 }
-                out.push_back(mlir::arith::ConstantOp::create(
-                    nb, nloc, mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
+                out.push_back(mlir::LLVM::ConstantOp::create(nb, nloc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))).getType(), mlir::DenseElementsAttr::get(vecTy(i32Ty()), nb.getIntegerAttr(i32Ty(), 1))));
                 mlir::scf::YieldOp::create(nb, nloc, out);
             });
 
@@ -3898,48 +4009,48 @@ private:
         if (h.isUniform()) {
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], hasElemStride, needsStride);
             mlir::Value stride64Vec = needsStride
-                                          ? mlir::Value(mlir::vector::BroadcastOp::create(b_, loc, vecTy(i64Ty()), info.stride64))
+                                          ? mlir::Value(llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.stride64))
                                           : mlir::Value();
 
             mlir::scf::IfOp::create(
                 b_, loc, info.isReserved,
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::Value c0 = mlir::arith::ConstantIndexOp::create(nb, nloc, 0);
-                    mlir::Value c1 = mlir::arith::ConstantIndexOp::create(nb, nloc, 1);
-                    mlir::Value cW = mlir::arith::ConstantIndexOp::create(nb, nloc, W_);
+                    mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
+                    mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
+                    mlir::Value cW = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(W_));
                     mlir::scf::ForOp::create(
                         nb, nloc, c0, cW, c1, mlir::ValueRange{},
                         [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange) {
-                            mlir::Value mL = mlir::vector::ExtractOp::create(lb, lloc, realMask, mlir::OpFoldResult{lIdx});
-                            mlir::Value okPtr = mlir::arith::AndIOp::create(lb, lloc, mL, info.okPtr);
-                            mlir::Value idxL = mlir::vector::ExtractOp::create(lb, lloc, idxVec, mlir::OpFoldResult{lIdx});
+                            mlir::Value mL = mlir::LLVM::ExtractElementOp::create(lb, lloc, realMask, lIdx);
+                            mlir::Value okPtr = mlir::LLVM::AndOp::create(lb, lloc, mL, info.okPtr);
+                            mlir::Value idxL = mlir::LLVM::ExtractElementOp::create(lb, lloc, idxVec, lIdx);
                             mlir::Value eL = hasElemOff
-                                                 ? mlir::Value(mlir::vector::ExtractOp::create(lb, lloc, elemOffVec, mlir::OpFoldResult{lIdx}))
-                                                 : mlir::Value(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
+                                                 ? mlir::Value(mlir::LLVM::ExtractElementOp::create(lb, lloc, elemOffVec, lIdx))
+                                                 : mlir::Value(mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), 0)));
                             mlir::Value byteOff = computeBufferByteOffsetScalar(
                                 lloc, lb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
                             for (size_t i = 0; i < activeComps.size(); ++i) {
                                 unsigned c = activeComps[i];
-                                mlir::Value vL = mlir::vector::ExtractOp::create(lb, lloc, activeValVecs[i], mlir::OpFoldResult{lIdx});
+                                mlir::Value vL = mlir::LLVM::ExtractElementOp::create(lb, lloc, activeValVecs[i], lIdx);
                                 mlir::Value cOff = (c == 0)
                                                        ? byteOff
-                                                       : mlir::Value(mlir::arith::AddIOp::create(
+                                                       : mlir::Value(mlir::LLVM::AddOp::create(
                                                              lb, lloc, byteOff,
-                                                             mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), uint64_t(c) * elemBytes)));
-                                mlir::Value cEnd = mlir::arith::AddIOp::create(
-                                    lb, lloc, cOff, mlir::arith::ConstantIntOp::create(lb, lloc, i64Ty(), elemBytes));
-                                mlir::Value doStore = mlir::arith::AndIOp::create(
+                                                             mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes))));
+                                mlir::Value cEnd = mlir::LLVM::AddOp::create(
+                                    lb, lloc, cOff, mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), elemBytes)));
+                                mlir::Value doStore = mlir::LLVM::AndOp::create(
                                     lb, lloc, okPtr,
-                                    mlir::arith::CmpIOp::create(lb, lloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                                    mlir::LLVM::ICmpOp::create(lb, lloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
                                 if (info.elemStride) {
-                                    mlir::Value elemEnd = mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), (c + 1) * elemBytes);
-                                    mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                                        lb, lloc, mlir::arith::CmpIPredicate::eq, info.elemStride,
-                                        mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 0));
-                                    mlir::Value inElem = mlir::arith::CmpIOp::create(
-                                        lb, lloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
-                                    doStore = mlir::arith::AndIOp::create(
-                                        lb, lloc, doStore, mlir::arith::OrIOp::create(lb, lloc, strideZero, inElem));
+                                    mlir::Value elemEnd = mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), (c + 1) * elemBytes));
+                                    mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+                                        lb, lloc, mlir::LLVM::ICmpPredicate::eq, info.elemStride,
+                                        mlir::LLVM::ConstantOp::create(lb, lloc, i32Ty(), lb.getIntegerAttr(i32Ty(), 0)));
+                                    mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+                                        lb, lloc, mlir::LLVM::ICmpPredicate::ule, elemEnd, info.elemStride);
+                                    doStore = mlir::LLVM::AndOp::create(
+                                        lb, lloc, doStore, mlir::LLVM::OrOp::create(lb, lloc, strideZero, inElem));
                                 }
                                 emitReservedElemStore(lb, lloc, elemBytes, info.descP, info.basePtr, doStore, cOff, vL);
                             }
@@ -3950,9 +4061,9 @@ private:
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::Value byteOffVec = computeBufferByteOffsetVec(
                         nloc, nb, h, stride64Vec, idxVec, elemOffVec, isRawOp, hasElemOff);
-                    mlir::Value byteSizeVec = mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i64Ty()), info.byteSize);
-                    mlir::Value activeOkVec = mlir::arith::AndIOp::create(
-                        nb, nloc, realMask, mlir::vector::BroadcastOp::create(nb, nloc, vecTy(i1Ty()), info.okPtr));
+                    mlir::Value byteSizeVec = llvmSplat(nb, nloc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.byteSize);
+                    mlir::Value activeOkVec = mlir::LLVM::AndOp::create(
+                        nb, nloc, realMask, llvmSplat(nb, nloc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), info.okPtr));
 
                     llvm::SmallVector<mlir::Value, 16> doStores(activeComps.size());
                     if (nonStraddling) {
@@ -4028,19 +4139,19 @@ private:
             mlir::Value descP = laneValue(loc, h, l);
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, descP, hasElemStride, needsStride);
             descInfos[l] = info;
-            basePtrVec = mlir::vector::InsertOp::create(b_, loc, info.basePtr, basePtrVec, static_cast<int64_t>(l));
-            byteSizeVec = mlir::vector::InsertOp::create(b_, loc, info.byteSize, byteSizeVec, static_cast<int64_t>(l));
-            okPtrVec = mlir::vector::InsertOp::create(b_, loc, info.okPtr, okPtrVec, static_cast<int64_t>(l));
-            isReservedVec = mlir::vector::InsertOp::create(b_, loc, info.isReserved, isReservedVec, static_cast<int64_t>(l));
+            basePtrVec = llvmInsert(b_, loc, basePtrVec, info.basePtr, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            byteSizeVec = llvmInsert(b_, loc, byteSizeVec, info.byteSize, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            okPtrVec = llvmInsert(b_, loc, okPtrVec, info.okPtr, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            isReservedVec = llvmInsert(b_, loc, isReservedVec, info.isReserved, static_cast<uint32_t>(static_cast<int64_t>(l)));
             if (hasElemStride) {
-                elemStrideVec = mlir::vector::InsertOp::create(b_, loc, info.elemStride, elemStrideVec, static_cast<int64_t>(l));
+                elemStrideVec = llvmInsert(b_, loc, elemStrideVec, info.elemStride, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             if (needsStride) {
-                stride64Vec = mlir::vector::InsertOp::create(b_, loc, info.stride64, stride64Vec, static_cast<int64_t>(l));
+                stride64Vec = llvmInsert(b_, loc, stride64Vec, info.stride64, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
         }
         mlir::Value anyReserved = orReduce(loc, isReservedVec);
-        mlir::Value activeOkVec = mlir::arith::AndIOp::create(b_, loc, realMask, okPtrVec);
+        mlir::Value activeOkVec = mlir::LLVM::AndOp::create(b_, loc, realMask, okPtrVec);
 
         mlir::scf::IfOp::create(
             b_, loc, anyReserved,
@@ -4048,31 +4159,31 @@ private:
                 SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
                 for (uint32_t l = 0; l < W_; ++l) {
                     const BufferDescInfo& info = descInfos[l];
-                    mlir::Value mL = mlir::vector::ExtractOp::create(nb, nloc, realMask, static_cast<int64_t>(l));
-                    mlir::Value okPtr = mlir::arith::AndIOp::create(nb, nloc, mL, info.okPtr);
-                    mlir::Value idxL = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
-                    mlir::Value eL = mlir::vector::ExtractOp::create(nb, nloc, elemOffVec, static_cast<int64_t>(l));
+                    mlir::Value mL = llvmExtract(nb, nloc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    mlir::Value okPtr = mlir::LLVM::AndOp::create(nb, nloc, mL, info.okPtr);
+                    mlir::Value idxL = llvmExtract(nb, nloc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    mlir::Value eL = llvmExtract(nb, nloc, elemOffVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                     mlir::Value byteOff = tmp.computeBufferByteOffsetScalar(
                         nloc, nb, h, info.stride64, idxL, eL, isRawOp, hasElemOff);
                     for (size_t i = 0; i < activeComps.size(); ++i) {
                         unsigned c = activeComps[i];
-                        mlir::Value vL = mlir::vector::ExtractOp::create(nb, nloc, activeValVecs[i], static_cast<int64_t>(l));
+                        mlir::Value vL = llvmExtract(nb, nloc, activeValVecs[i], static_cast<uint32_t>(static_cast<int64_t>(l)));
                         mlir::Value cOff = (c == 0)
                                                ? byteOff
-                                               : mlir::Value(mlir::arith::AddIOp::create(
+                                               : mlir::Value(mlir::LLVM::AddOp::create(
                                                      nb, nloc, byteOff, tmp.cInt(nloc, i64Ty(), uint64_t(c) * elemBytes)));
-                        mlir::Value cEnd = mlir::arith::AddIOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
-                        mlir::Value doStore = mlir::arith::AndIOp::create(
+                        mlir::Value cEnd = mlir::LLVM::AddOp::create(nb, nloc, cOff, tmp.cInt(nloc, i64Ty(), elemBytes));
+                        mlir::Value doStore = mlir::LLVM::AndOp::create(
                             nb, nloc, okPtr,
-                            mlir::arith::CmpIOp::create(nb, nloc, mlir::arith::CmpIPredicate::ule, cEnd, info.byteSize));
+                            mlir::LLVM::ICmpOp::create(nb, nloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
                         if (info.elemStride) {
                             mlir::Value elemEnd = tmp.cInt(nloc, i32Ty(), (c + 1) * elemBytes);
-                            mlir::Value strideZero = mlir::arith::CmpIOp::create(
-                                nb, nloc, mlir::arith::CmpIPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
-                            mlir::Value inElem = mlir::arith::CmpIOp::create(
-                                nb, nloc, mlir::arith::CmpIPredicate::ule, elemEnd, info.elemStride);
-                            doStore = mlir::arith::AndIOp::create(
-                                nb, nloc, doStore, mlir::arith::OrIOp::create(nb, nloc, strideZero, inElem));
+                            mlir::Value strideZero = mlir::LLVM::ICmpOp::create(
+                                nb, nloc, mlir::LLVM::ICmpPredicate::eq, info.elemStride, tmp.cInt(nloc, i32Ty(), 0));
+                            mlir::Value inElem = mlir::LLVM::ICmpOp::create(
+                                nb, nloc, mlir::LLVM::ICmpPredicate::ule, elemEnd, info.elemStride);
+                            doStore = mlir::LLVM::AndOp::create(
+                                nb, nloc, doStore, mlir::LLVM::OrOp::create(nb, nloc, strideZero, inElem));
                         }
                         tmp.emitScalarBufferComponentStore(
                             nloc, elemBytes, info.descP, info.basePtr, info.isReserved, doStore, cOff, vL);
@@ -4100,11 +4211,10 @@ private:
                     mlir::Value cOffVec =
                         (c == 0)
                             ? byteOffVec
-                            : mlir::Value(mlir::arith::AddIOp::create(
+                            : mlir::Value(mlir::LLVM::AddOp::create(
                                   nb, nloc, byteOffVec,
-                                  mlir::arith::ConstantOp::create(
-                                      nb, nloc,
-                                      mlir::DenseElementsAttr::get(
+                                  mlir::LLVM::ConstantOp::create(nb, nloc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(
+                                          vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes))).getType(), mlir::DenseElementsAttr::get(
                                           vecTy(i64Ty()), nb.getIntegerAttr(i64Ty(), uint64_t(c) * elemBytes)))));
                     mlir::Value ptrs = mlir::LLVM::GEPOp::create(
                         nb, nloc, vecTy(ptrTy()), i8Ty(), basePtrVec, mlir::ValueRange{cOffVec});
@@ -4337,14 +4447,14 @@ private:
         mlir::Value outVec = isFloat ? splatFlt(loc, resTy, 0.0) : splatInt(loc, resTy, 0);
         for (uint32_t l = 0; l < W_; ++l) {
             if (isLaneMaskConstFalse(realMask, l)) continue;
-            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
+            mlir::Value mL = llvmExtract(b_, loc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
             mlir::Value descP;
             mlir::Value basePtr;
             mlir::Value isReserved;
             mlir::Value byteSize;
             mlir::Value okPtr;
-            mlir::Value o0L = mlir::vector::ExtractOp::create(b_, loc, off0, static_cast<int64_t>(l));
-            mlir::Value o1L = mlir::vector::ExtractOp::create(b_, loc, off1, static_cast<int64_t>(l));
+            mlir::Value o0L = llvmExtract(b_, loc, off0, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            mlir::Value o1L = llvmExtract(b_, loc, off1, static_cast<uint32_t>(static_cast<int64_t>(l)));
             mlir::Value byteOff;
             if (isTexAtomic) {
                 descP = maskDescPtrForLane(loc, h, realMask, l);
@@ -4352,16 +4462,16 @@ private:
                 isReserved = cInt(loc, i1Ty(), 0);
                 byteSize = loadDescU64Field(loc, descP, offsetof(NacelleDescriptor, byte_size));
                 mlir::Value nullP = mlir::LLVM::ZeroOp::create(b_, loc, ptrTy());
-                okPtr = mlir::arith::AndIOp::create(
+                okPtr = mlir::LLVM::AndOp::create(
                     b_, loc, mL, mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, basePtr, nullP));
                 // RWTexture2D atomic: off0=x, off1=y
                 mlir::Value rp = loadDescU32Field(loc, descP, offsetof(NacelleDescriptor, row_pitch), 0);
-                mlir::Value y64 = mlir::arith::MulIOp::create(
-                    b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o1L),
-                    mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), rp));
-                mlir::Value x64 = mlir::arith::MulIOp::create(
-                    b_, loc, mlir::arith::ExtUIOp::create(b_, loc, i64Ty(), o0L), cInt(loc, i64Ty(), elemBytes));
-                byteOff = mlir::arith::AddIOp::create(b_, loc, y64, x64);
+                mlir::Value y64 = mlir::LLVM::MulOp::create(
+                    b_, loc, mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), o1L),
+                    mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), rp));
+                mlir::Value x64 = mlir::LLVM::MulOp::create(
+                    b_, loc, mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), o0L), cInt(loc, i64Ty(), elemBytes));
+                byteOff = mlir::LLVM::AddOp::create(b_, loc, y64, x64);
             } else {
                 BufferDescInfo info = uniformBufInfo.has_value()
                                           ? *uniformBufInfo
@@ -4370,22 +4480,22 @@ private:
                 basePtr = info.basePtr;
                 isReserved = info.isReserved;
                 byteSize = info.byteSize;
-                okPtr = mlir::arith::AndIOp::create(b_, loc, mL, info.okPtr);
+                okPtr = mlir::LLVM::AndOp::create(b_, loc, mL, info.okPtr);
                 byteOff = computeBufferByteOffsetScalar(loc, b_, h, info.stride64, o0L, o1L, isRawBufAtomic, hasOff1);
             }
-            mlir::Value cEnd = mlir::arith::AddIOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
-            mlir::Value doOp = mlir::arith::AndIOp::create(
+            mlir::Value cEnd = mlir::LLVM::AddOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
+            mlir::Value doOp = mlir::LLVM::AndOp::create(
                 b_, loc, okPtr,
-                mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ule, cEnd, byteSize));
-            mlir::Value newL = mlir::vector::ExtractOp::create(b_, loc, newValVec, static_cast<int64_t>(l));
-            mlir::Value cmpL = isCmpXchg ? mlir::vector::ExtractOp::create(b_, loc, cmpValVec, static_cast<int64_t>(l)) : mlir::Value();
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ule, cEnd, byteSize));
+            mlir::Value newL = llvmExtract(b_, loc, newValVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+            mlir::Value cmpL = isCmpXchg ? llvmExtract(b_, loc, cmpValVec, static_cast<uint32_t>(static_cast<int64_t>(l))) : mlir::Value();
 
             auto makeZeroRes = [&](mlir::OpBuilder& zb, mlir::Location zloc) -> mlir::Value {
                 if (isFloat) {
                     auto ft = llvm::cast<mlir::FloatType>(resTy);
-                    return mlir::arith::ConstantFloatOp::create(zb, zloc, ft, mlir::FloatAttr::get(ft, 0.0).getValue());
+                    return mlir::LLVM::ConstantOp::create(zb, zloc, ft, mlir::FloatAttr::get(ft, mlir::FloatAttr::get(ft, 0.0).getValue()));
                 }
-                return mlir::arith::ConstantIntOp::create(zb, zloc, resTy, 0);
+                return mlir::LLVM::ConstantOp::create(zb, zloc, resTy, zb.getIntegerAttr(resTy, 0));
             };
 
             mlir::Value resL = mlir::scf::IfOp::create(
@@ -4416,19 +4526,19 @@ private:
                                                [&](mlir::OpBuilder& ab, mlir::Location aloc) {
                                                    mlir::Value ar;
                                                    if (isCmpXchg) {
-                                                       mlir::Value cOp = isFloat ? mlir::Value(mlir::arith::BitcastOp::create(ab, aloc, intTy, cmpL)) : cmpL;
-                                                       mlir::Value nOp = isFloat ? mlir::Value(mlir::arith::BitcastOp::create(ab, aloc, intTy, newL)) : newL;
+                                                       mlir::Value cOp = isFloat ? mlir::Value(mlir::LLVM::BitcastOp::create(ab, aloc, intTy, cmpL)) : cmpL;
+                                                       mlir::Value nOp = isFloat ? mlir::Value(mlir::LLVM::BitcastOp::create(ab, aloc, intTy, newL)) : newL;
                                                        auto cx = mlir::LLVM::AtomicCmpXchgOp::create(
                                                            ab, aloc, ep, cOp, nOp,
                                                            mlir::LLVM::AtomicOrdering::seq_cst,
                                                            mlir::LLVM::AtomicOrdering::acquire);
                                                        ar = mlir::LLVM::ExtractValueOp::create(ab, aloc, cx, llvm::ArrayRef<int64_t>{0});
-                                                       if (isFloat) ar = mlir::arith::BitcastOp::create(ab, aloc, resTy, ar);
+                                                       if (isFloat) ar = mlir::LLVM::BitcastOp::create(ab, aloc, resTy, ar);
                                                    } else if (isFloat && toBinOp(atomicOp) == mlir::LLVM::AtomicBinOp::xchg) {
-                                                       mlir::Value nOp = mlir::arith::BitcastOp::create(ab, aloc, intTy, newL);
+                                                       mlir::Value nOp = mlir::LLVM::BitcastOp::create(ab, aloc, intTy, newL);
                                                        ar = mlir::LLVM::AtomicRMWOp::create(
                                                            ab, aloc, mlir::LLVM::AtomicBinOp::xchg, ep, nOp, mlir::LLVM::AtomicOrdering::seq_cst);
-                                                       ar = mlir::arith::BitcastOp::create(ab, aloc, resTy, ar);
+                                                       ar = mlir::LLVM::BitcastOp::create(ab, aloc, resTy, ar);
                                                    } else {
                                                        ar = mlir::LLVM::AtomicRMWOp::create(
                                                            ab, aloc, toBinOp(atomicOp), ep, newL, mlir::LLVM::AtomicOrdering::seq_cst);
@@ -4445,15 +4555,15 @@ private:
                                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{makeZeroRes(nb, nloc)});
                                    })
                                    .getResult(0);
-            outVec = mlir::vector::InsertOp::create(b_, loc, resL, outVec, static_cast<int64_t>(l));
+            outVec = llvmInsert(b_, loc, outVec, resL, static_cast<uint32_t>(static_cast<int64_t>(l)));
         }
         setMapped(call.getResult(), {SimdVal::Kind::Vector, resTy, outVec, {}, {}});
         return true;
     }
 
     std::pair<mlir::Value, mlir::Value> computeQuadFiniteDiff(mlir::Location loc, mlir::Value vec, bool fine) {
-        llvm::SmallVector<int64_t, 16> loX, hiX, loY, hiY;
-        for (uint32_t q = 0; q < W_; q += 4) {
+        llvm::SmallVector<int32_t, 16> loX, hiX, loY, hiY;
+        for (int32_t q = 0; q < static_cast<int32_t>(W_); q += 4) {
             if (fine) {
                 loX.insert(loX.end(), {q, q, q + 2, q + 2});
                 hiX.insert(hiX.end(), {q + 1, q + 1, q + 3, q + 3});
@@ -4466,11 +4576,11 @@ private:
                 hiY.insert(hiY.end(), {q + 2, q + 2, q + 2, q + 2});
             }
         }
-        mlir::Value ax = mlir::vector::ShuffleOp::create(b_, loc, vec, vec, loX);
-        mlir::Value bx = mlir::vector::ShuffleOp::create(b_, loc, vec, vec, hiX);
-        mlir::Value ay = mlir::vector::ShuffleOp::create(b_, loc, vec, vec, loY);
-        mlir::Value by = mlir::vector::ShuffleOp::create(b_, loc, vec, vec, hiY);
-        return {mlir::arith::SubFOp::create(b_, loc, bx, ax), mlir::arith::SubFOp::create(b_, loc, by, ay)};
+        mlir::Value ax = mlir::LLVM::ShuffleVectorOp::create(b_, loc, vec, vec, loX);
+        mlir::Value bx = mlir::LLVM::ShuffleVectorOp::create(b_, loc, vec, vec, hiX);
+        mlir::Value ay = mlir::LLVM::ShuffleVectorOp::create(b_, loc, vec, vec, loY);
+        mlir::Value by = mlir::LLVM::ShuffleVectorOp::create(b_, loc, vec, vec, hiY);
+        return {mlir::LLVM::FSubOp::create(b_, loc, bx, ax), mlir::LLVM::FSubOp::create(b_, loc, by, ay)};
     }
 
     bool packetizeTextureOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask, mlir::Value realMask, std::string&) {
@@ -4489,11 +4599,11 @@ private:
             llvm::SmallVector<mlir::Value, 4> dims(4, splatInt(loc, i32Ty(), 0));
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value m = mlir::vector::ExtractOp::create(b_, loc, mipVec, static_cast<int64_t>(l));
+                mlir::Value m = llvmExtract(b_, loc, mipVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::LLVM::CallOp::create(b_, loc, fn, mlir::ValueRange{laneValue(loc, h, l), m, tmp4});
                 for (unsigned c = 0; c < 4; ++c) {
                     mlir::Value ep = gepByteOffset(loc, tmp4, c * 4);
-                    dims[c] = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, i32Ty(), ep), dims[c], static_cast<int64_t>(l));
+                    dims[c] = llvmInsert(b_, loc, dims[c], loadScalar(loc, i32Ty(), ep), static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
             }
             SimdVal st;
@@ -4518,18 +4628,18 @@ private:
                                             {ptrTy(), i32Ty(), i32Ty(), i32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty()});
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(realMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, realMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, realMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value dp = laneValue(loc, h, l);
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     auto ext = [&](mlir::Value v) {
-                        mlir::Value ev = mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
+                        mlir::Value ev = llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l)));
                         if (auto it = llvm::dyn_cast<mlir::IntegerType>(ev.getType())) {
                             if (it.getWidth() < 32) {
-                                ev = mlir::arith::ExtUIOp::create(nb, nloc, nb.getI32Type(), ev);
+                                ev = mlir::LLVM::ZExtOp::create(nb, nloc, nb.getI32Type(), ev);
                             } else if (it.getWidth() > 32) {
-                                ev = mlir::arith::TruncIOp::create(nb, nloc, nb.getI32Type(), ev);
+                                ev = mlir::LLVM::TruncOp::create(nb, nloc, nb.getI32Type(), ev);
                             }
-                            ev = mlir::arith::BitcastOp::create(nb, nloc, nb.getF32Type(), ev);
+                            ev = mlir::LLVM::BitcastOp::create(nb, nloc, nb.getF32Type(), ev);
                         }
                         return ev;
                     };
@@ -4537,9 +4647,9 @@ private:
                         nb, nloc, fn,
                         mlir::ValueRange{
                             dp,
-                            mlir::vector::ExtractOp::create(nb, nloc, x, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, y, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, z, static_cast<int64_t>(l)),
+                            llvmExtract(nb, nloc, x, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, y, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, z, static_cast<uint32_t>(static_cast<int64_t>(l))),
                             ext(r), ext(g), ext(b), ext(a)});
                     mlir::scf::YieldOp::create(nb, nloc);
                 });
@@ -4550,16 +4660,16 @@ private:
         if (op == 66) { // textureLoad(op, srv, mip, x, y, z, off0, off1, off2)
             SimdVal h = getMapped(loc, call.getOperand(1));
             mlir::Value mip = vecOrZero(2, i32Ty(), 0.0);
-            mlir::Value x = mlir::arith::AddIOp::create(b_, loc, vecOrZero(3, i32Ty(), 0.0), vecOrZero(6, i32Ty(), 0.0));
-            mlir::Value y = mlir::arith::AddIOp::create(b_, loc, vecOrZero(4, i32Ty(), 0.0), vecOrZero(7, i32Ty(), 0.0));
-            mlir::Value z = mlir::arith::AddIOp::create(b_, loc, vecOrZero(5, i32Ty(), 0.0), vecOrZero(8, i32Ty(), 0.0));
+            mlir::Value x = mlir::LLVM::AddOp::create(b_, loc, vecOrZero(3, i32Ty(), 0.0), vecOrZero(6, i32Ty(), 0.0));
+            mlir::Value y = mlir::LLVM::AddOp::create(b_, loc, vecOrZero(4, i32Ty(), 0.0), vecOrZero(7, i32Ty(), 0.0));
+            mlir::Value z = mlir::LLVM::AddOp::create(b_, loc, vecOrZero(5, i32Ty(), 0.0), vecOrZero(8, i32Ty(), 0.0));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_tex_load", i32Ty(), {ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), ptrTy()});
             mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
             llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value dp = laneValue(loc, h, l);
                 auto stIf = mlir::scf::IfOp::create(
                     b_, loc, mL,
@@ -4568,21 +4678,21 @@ private:
                             nb, nloc, fn,
                             mlir::ValueRange{
                                 dp,
-                                mlir::vector::ExtractOp::create(nb, nloc, x, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, y, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, z, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, mip, static_cast<int64_t>(l)),
+                                llvmExtract(nb, nloc, x, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, y, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, z, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, mip, static_cast<uint32_t>(static_cast<int64_t>(l))),
                                 out4});
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult()});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         mlir::scf::YieldOp::create(
-                            nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 1)});
+                            nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 1))});
                     });
-                statusVec = mlir::vector::InsertOp::create(b_, loc, stIf.getResult(0), statusVec, static_cast<int64_t>(l));
+                statusVec = llvmInsert(b_, loc, statusVec, stIf.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
                 for (unsigned c = 0; c < 4; ++c) {
                     mlir::Value ep = gepByteOffset(loc, out4, c * 4);
-                    rgba[c] = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), ep), rgba[c], static_cast<int64_t>(l));
+                    rgba[c] = llvmInsert(b_, loc, rgba[c], loadScalar(loc, f32Ty(), ep), static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
             }
             SimdVal st;
@@ -4592,11 +4702,11 @@ private:
             for (unsigned c = 0; c < 4; ++c) {
                 mlir::Value v = rgba[c];
                 if (auto it = llvm::dyn_cast<mlir::IntegerType>(resElem)) {
-                    v = mlir::arith::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
+                    v = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
                     if (it.getWidth() < 32) {
-                        v = mlir::arith::TruncIOp::create(b_, loc, vecTy(resElem), v);
+                        v = mlir::LLVM::TruncOp::create(b_, loc, vecTy(resElem), v);
                     } else if (it.getWidth() > 32) {
-                        v = mlir::arith::ExtUIOp::create(b_, loc, vecTy(resElem), v);
+                        v = mlir::LLVM::ZExtOp::create(b_, loc, vecTy(resElem), v);
                     }
                 }
                 st.fields.push_back({SimdVal::Kind::Vector, resElem, v, {}, {}});
@@ -4629,7 +4739,7 @@ private:
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
                 auto stIf = mlir::scf::IfOp::create(
@@ -4637,25 +4747,25 @@ private:
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         llvm::SmallVector<mlir::Value, 10> args{
                             tp, sp,
-                            mlir::vector::ExtractOp::create(nb, nloc, u, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, w, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, offX, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, offY, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, comp, static_cast<int64_t>(l))};
-                        if (isCmp) args.push_back(mlir::vector::ExtractOp::create(nb, nloc, cmpV, static_cast<int64_t>(l)));
+                            llvmExtract(nb, nloc, u, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, w, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, offX, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, offY, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, comp, static_cast<uint32_t>(static_cast<int64_t>(l)))};
+                        if (isCmp) args.push_back(llvmExtract(nb, nloc, cmpV, static_cast<uint32_t>(static_cast<int64_t>(l))));
                         args.push_back(out4);
                         auto c = mlir::LLVM::CallOp::create(nb, nloc, fn, args);
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult()});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         mlir::scf::YieldOp::create(
-                            nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 1)});
+                            nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 1))});
                     });
-                statusVec = mlir::vector::InsertOp::create(b_, loc, stIf.getResult(0), statusVec, static_cast<int64_t>(l));
+                statusVec = llvmInsert(b_, loc, statusVec, stIf.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
                 for (unsigned c = 0; c < 4; ++c) {
                     mlir::Value ep = gepByteOffset(loc, out4, c * 4);
-                    rgba[c] = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), ep), rgba[c], static_cast<int64_t>(l));
+                    rgba[c] = llvmInsert(b_, loc, rgba[c], loadScalar(loc, f32Ty(), ep), static_cast<uint32_t>(static_cast<int64_t>(l)));
                 }
             }
             SimdVal st;
@@ -4684,22 +4794,22 @@ private:
             mlir::Value sw = su;
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::scf::IfOp::create(b_, loc, mL, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::LLVM::CallOp::create(
                         nb, nloc, projFn,
                         mlir::ValueRange{
                             tp,
-                            mlir::vector::ExtractOp::create(nb, nloc, u, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l)),
-                            mlir::vector::ExtractOp::create(nb, nloc, w, static_cast<int64_t>(l)),
+                            llvmExtract(nb, nloc, u, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                            llvmExtract(nb, nloc, w, static_cast<uint32_t>(static_cast<int64_t>(l))),
                             out3});
                     mlir::scf::YieldOp::create(nb, nloc);
                 });
-                su = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), out3), su, static_cast<int64_t>(l));
-                sv = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), gepByteOffset(loc, out3, 4)), sv, static_cast<int64_t>(l));
-                sw = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), gepByteOffset(loc, out3, 8)), sw, static_cast<int64_t>(l));
+                su = llvmInsert(b_, loc, su, loadScalar(loc, f32Ty(), out3), static_cast<uint32_t>(static_cast<int64_t>(l)));
+                sv = llvmInsert(b_, loc, sv, loadScalar(loc, f32Ty(), gepByteOffset(loc, out3, 4)), static_cast<uint32_t>(static_cast<int64_t>(l)));
+                sw = llvmInsert(b_, loc, sw, loadScalar(loc, f32Ty(), gepByteOffset(loc, out3, 8)), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
 
             mlir::Value ddxU = splatFlt(loc, f32Ty(), 0.0), ddxV = ddxU, ddxW = ddxU;
@@ -4717,31 +4827,31 @@ private:
             mlir::Value resVec = splatFlt(loc, f32Ty(), 0.0);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
                 auto r = mlir::scf::IfOp::create(
                     b_, loc, mL,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::Value c1 = mlir::vector::ExtractOp::create(nb, nloc, clampedVec, static_cast<int64_t>(l));
-                        mlir::Value c32 = mlir::arith::ExtUIOp::create(nb, nloc, nb.getI32Type(), c1);
+                        mlir::Value c1 = llvmExtract(nb, nloc, clampedVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                        mlir::Value c32 = mlir::LLVM::ZExtOp::create(nb, nloc, nb.getI32Type(), c1);
                         auto c = mlir::LLVM::CallOp::create(
                             nb, nloc, lodFn,
                             mlir::ValueRange{
                                 tp, sp,
-                                mlir::vector::ExtractOp::create(nb, nloc, ddxU, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, ddxV, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, ddxW, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, ddyU, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, ddyV, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, ddyW, static_cast<int64_t>(l)),
+                                llvmExtract(nb, nloc, ddxU, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, ddxV, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, ddxW, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, ddyU, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, ddyV, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, ddyW, static_cast<uint32_t>(static_cast<int64_t>(l))),
                                 c32});
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult()});
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::arith::ConstantFloatOp::create(nb, nloc, nb.getF32Type(), llvm::APFloat(0.0f))});
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, nb.getF32Type(), mlir::FloatAttr::get(nb.getF32Type(), llvm::APFloat(0.0f)))});
                     });
-                resVec = mlir::vector::InsertOp::create(b_, loc, r.getResult(0), resVec, static_cast<int64_t>(l));
+                resVec = llvmInsert(b_, loc, resVec, r.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, f32Ty(), resVec, {}, {}});
             return true;
@@ -4761,15 +4871,15 @@ private:
             if (op == 64 && hooks_.isPixelShader) {
                 auto [dux, duy] = computeQuadFiniteDiff(loc, u, true);
                 auto [dvx, dvy] = computeQuadFiniteDiff(loc, v, true);
-                mlir::Value d2 = mlir::arith::MaxNumFOp::create(
+                mlir::Value d2 = mlir::LLVM::MaxNumOp::create(
                     b_, loc,
-                    mlir::arith::AddFOp::create(b_, loc, mlir::arith::MulFOp::create(b_, loc, dux, dux), mlir::arith::MulFOp::create(b_, loc, dvx, dvx)),
-                    mlir::arith::AddFOp::create(b_, loc, mlir::arith::MulFOp::create(b_, loc, duy, duy), mlir::arith::MulFOp::create(b_, loc, dvy, dvy)));
+                    mlir::LLVM::FAddOp::create(b_, loc, mlir::LLVM::FMulOp::create(b_, loc, dux, dux), mlir::LLVM::FMulOp::create(b_, loc, dvx, dvx)),
+                    mlir::LLVM::FAddOp::create(b_, loc, mlir::LLVM::FMulOp::create(b_, loc, duy, duy), mlir::LLVM::FMulOp::create(b_, loc, dvy, dvy)));
                 // Multiply by approx tex size or let explicit lod stay ~0 if constant; good approximation
-                expLod = mlir::arith::MulFOp::create(
+                expLod = mlir::LLVM::FMulOp::create(
                     b_, loc, splatFlt(loc, f32Ty(), 0.5),
-                    mlir::math::Log2Op::create(b_, loc, mlir::arith::MaxNumFOp::create(b_, loc, d2, splatFlt(loc, f32Ty(), 1e-12))));
-                expLod = mlir::arith::MaxNumFOp::create(b_, loc, expLod, splatFlt(loc, f32Ty(), 0.0));
+                    emitMathUnary(loc, "log2", createFp<mlir::LLVM::MaxNumOp>(loc, vecTy(f32Ty()), d2, splatFlt(loc, f32Ty(), 1e-12))));
+                expLod = mlir::LLVM::MaxNumOp::create(b_, loc, expLod, splatFlt(loc, f32Ty(), 0.0));
             }
             auto fn = getOrDeclareRuntimeFn(
                 loc, "nacelle_tex_sample_cmp", f32Ty(),
@@ -4779,7 +4889,7 @@ private:
             mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(execMask, l)) continue;
-                mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+                mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value tp = laneValue(loc, texH, l);
                 mlir::Value sp = laneValue(loc, sampH, l);
                 auto r = mlir::scf::IfOp::create(
@@ -4789,14 +4899,14 @@ private:
                             nb, nloc, fn,
                             mlir::ValueRange{
                                 tp, sp,
-                                mlir::vector::ExtractOp::create(nb, nloc, u, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, w, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, cmpV, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, expLod, static_cast<int64_t>(l)),
-                                mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), isL0),
-                                mlir::vector::ExtractOp::create(nb, nloc, offX, static_cast<int64_t>(l)),
-                                mlir::vector::ExtractOp::create(nb, nloc, offY, static_cast<int64_t>(l)),
+                                llvmExtract(nb, nloc, u, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, w, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, cmpV, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, expLod, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), isL0)),
+                                llvmExtract(nb, nloc, offX, static_cast<uint32_t>(static_cast<int64_t>(l))),
+                                llvmExtract(nb, nloc, offY, static_cast<uint32_t>(static_cast<int64_t>(l))),
                                 statusPtr});
                         mlir::Value stVal = mlir::LLVM::LoadOp::create(nb, nloc, i32Ty(), statusPtr);
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult(), stVal});
@@ -4805,11 +4915,11 @@ private:
                         mlir::scf::YieldOp::create(
                             nb, nloc,
                             mlir::ValueRange{
-                                mlir::arith::ConstantFloatOp::create(nb, nloc, nb.getF32Type(), llvm::APFloat(0.0f)),
-                                mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 1)});
+                                mlir::LLVM::ConstantOp::create(nb, nloc, nb.getF32Type(), mlir::FloatAttr::get(nb.getF32Type(), llvm::APFloat(0.0f))),
+                                mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 1))});
                     });
-                resVec = mlir::vector::InsertOp::create(b_, loc, r.getResult(0), resVec, static_cast<int64_t>(l));
-                statusVec = mlir::vector::InsertOp::create(b_, loc, r.getResult(1), statusVec, static_cast<int64_t>(l));
+                resVec = llvmInsert(b_, loc, resVec, r.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
+                statusVec = llvmInsert(b_, loc, statusVec, r.getResult(1), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             SimdVal st;
             st.kind = SimdVal::Kind::Struct;
@@ -4874,31 +4984,31 @@ private:
         mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
         for (uint32_t l = 0; l < W_; ++l) {
             if (isLaneMaskConstFalse(execMask, l)) continue;
-            mlir::Value mL = mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
             mlir::Value tp = laneValue(loc, texH, l);
             mlir::Value sp = laneValue(loc, sampH, l);
             auto stIf = mlir::scf::IfOp::create(
                 b_, loc, mL,
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    auto ex = [&](mlir::Value vv) { return mlir::vector::ExtractOp::create(nb, nloc, vv, static_cast<int64_t>(l)); };
+                    auto ex = [&](mlir::Value vv) { return llvmExtract(nb, nloc, vv, static_cast<uint32_t>(static_cast<int64_t>(l))); };
                     auto c = mlir::LLVM::CallOp::create(
                         nb, nloc, fn,
                         mlir::ValueRange{
                             tp, sp, ex(u), ex(v), ex(w), ex(c3),
                             ex(ddxU), ex(ddxV), ex(ddxW), ex(ddyU), ex(ddyV), ex(ddyW),
                             ex(bias), ex(expLod),
-                            mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), lodMode),
+                            mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), lodMode)),
                             ex(offX), ex(offY), ex(offZ), ex(clampLod), out4});
                     mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult()});
                 },
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::scf::YieldOp::create(
-                        nb, nloc, mlir::ValueRange{mlir::arith::ConstantIntOp::create(nb, nloc, i32Ty(), 1)});
+                        nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 1))});
                 });
-            statusVec = mlir::vector::InsertOp::create(b_, loc, stIf.getResult(0), statusVec, static_cast<int64_t>(l));
+            statusVec = llvmInsert(b_, loc, statusVec, stIf.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             for (unsigned c = 0; c < 4; ++c) {
                 mlir::Value ep = gepByteOffset(loc, out4, c * 4);
-                rgba[c] = mlir::vector::InsertOp::create(b_, loc, loadScalar(loc, f32Ty(), ep), rgba[c], static_cast<int64_t>(l));
+                rgba[c] = llvmInsert(b_, loc, rgba[c], loadScalar(loc, f32Ty(), ep), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
         }
         SimdVal st;
@@ -4927,25 +5037,26 @@ private:
         auto buildBallotWords = [&](mlir::Value m) -> std::array<mlir::Value, 4> {
             mlir::Value zero = cInt(loc, i32Ty(), 0);
             if (W_ <= 32) {
-                mlir::Value bits = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i32Ty()), m);
-                mlir::Value shl = mlir::arith::ShLIOp::create(b_, loc, bits, laneIota(loc));
-                mlir::Value w0 = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, shl);
+                mlir::Value bits = mlir::LLVM::ZExtOp::create(b_, loc, vecTy(i32Ty()), m);
+                mlir::Value shl = mlir::LLVM::ShlOp::create(b_, loc, bits, laneIota(loc));
+                mlir::Value w0 = mlir::LLVM::vector_reduce_or::create(b_, loc, i32Ty(), shl);
                 return {w0, zero, zero, zero};
             }
             mlir::VectorType v32i32 = mlir::VectorType::get({32}, i32Ty());
             llvm::SmallVector<int32_t, 32> iotaVals(32);
             for (int32_t i = 0; i < 32; ++i) iotaVals[i] = i;
-            mlir::Value iota32 = mlir::arith::ConstantOp::create(
-                b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(iotaVals)));
+            mlir::Value iota32 = mlir::LLVM::ConstantOp::create(
+                b_, loc, v32i32,
+                mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(iotaVals)));
             std::array<mlir::Value, 4> words{zero, zero, zero, zero};
             uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
             for (uint32_t w = 0; w < numWords; ++w) {
-                mlir::Value slice = mlir::vector::ExtractStridedSliceOp::create(
-                    b_, loc, m, llvm::ArrayRef<int64_t>{static_cast<int64_t>(w * 32u)},
-                    llvm::ArrayRef<int64_t>{32}, llvm::ArrayRef<int64_t>{1});
-                mlir::Value bits = mlir::arith::ExtUIOp::create(b_, loc, v32i32, slice);
-                mlir::Value shl = mlir::arith::ShLIOp::create(b_, loc, bits, iota32);
-                words[w] = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, shl);
+                llvm::SmallVector<int32_t, 32> sliceIdx(32);
+                for (int32_t i = 0; i < 32; ++i) sliceIdx[i] = static_cast<int32_t>(w * 32u) + i;
+                mlir::Value slice = mlir::LLVM::ShuffleVectorOp::create(b_, loc, m, m, sliceIdx);
+                mlir::Value bits = mlir::LLVM::ZExtOp::create(b_, loc, v32i32, slice);
+                mlir::Value shl = mlir::LLVM::ShlOp::create(b_, loc, bits, iota32);
+                words[w] = mlir::LLVM::vector_reduce_or::create(b_, loc, i32Ty(), shl);
             }
             return words;
         };
@@ -4953,28 +5064,28 @@ private:
         auto buildFirstActiveLane = [&](mlir::Value m) -> mlir::Value {
             auto words = buildBallotWords(m);
             if (W_ <= 32) {
-                return mlir::arith::MinUIOp::create(
-                    b_, loc, mlir::math::CountTrailingZerosOp::create(b_, loc, words[0]), cInt(loc, i32Ty(), W_ - 1));
+                return mlir::LLVM::UMinOp::create(
+                    b_, loc, mlir::LLVM::CountTrailingZerosOp::create(b_, loc, words[0], false), cInt(loc, i32Ty(), W_ - 1));
             }
             mlir::Value firstIdx = cInt(loc, i32Ty(), W_ - 1);
             uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
             for (int w = static_cast<int>(numWords) - 1; w >= 0; --w) {
-                mlir::Value nz = mlir::arith::CmpIOp::create(
-                    b_, loc, mlir::arith::CmpIPredicate::ne, words[w], cInt(loc, i32Ty(), 0));
-                mlir::Value idx = mlir::arith::AddIOp::create(
+                mlir::Value nz = mlir::LLVM::ICmpOp::create(
+                    b_, loc, mlir::LLVM::ICmpPredicate::ne, words[w], cInt(loc, i32Ty(), 0));
+                mlir::Value idx = mlir::LLVM::AddOp::create(
                     b_, loc, cInt(loc, i32Ty(), static_cast<uint64_t>(w) * 32u),
-                    mlir::math::CountTrailingZerosOp::create(b_, loc, words[w]));
-                firstIdx = mlir::arith::SelectOp::create(b_, loc, nz, idx, firstIdx);
+                    mlir::LLVM::CountTrailingZerosOp::create(b_, loc, words[w], false));
+                firstIdx = mlir::LLVM::SelectOp::create(b_, loc, nz, idx, firstIdx);
             }
             return firstIdx;
         };
 
         if (op == 110) { // waveIsFirstLane
             mlir::Value firstIdx = buildFirstActiveLane(activeMask);
-            mlir::Value firstVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), firstIdx);
-            mlir::Value isFirst = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::eq, laneIota(loc), firstVec);
-            isFirst = mlir::arith::AndIOp::create(b_, loc, isFirst, activeMask);
+            mlir::Value firstVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i32Ty())).getElementType(), firstIdx);
+            mlir::Value isFirst = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::eq, laneIota(loc), firstVec);
+            isFirst = mlir::LLVM::AndOp::create(b_, loc, isFirst, activeMask);
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i1Ty(), isFirst, {}, {}});
             return true;
         }
@@ -4982,27 +5093,27 @@ private:
             mlir::Value condVec = asVec(loc, getMapped(loc, arg(1)));
             mlir::Value scalarRes;
             if (op == 113) {
-                mlir::Value actCond = mlir::arith::AndIOp::create(b_, loc, condVec, activeMask);
-                scalarRes = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::OR, actCond);
+                mlir::Value actCond = mlir::LLVM::AndOp::create(b_, loc, condVec, activeMask);
+                scalarRes = mlir::LLVM::vector_reduce_or::create(b_, loc, i1Ty(), actCond);
             } else {
                 // !active || cond across all lanes
-                mlir::Value inact = mlir::arith::XOrIOp::create(b_, loc, activeMask, allTrueMask(loc));
-                mlir::Value impl = mlir::arith::OrIOp::create(b_, loc, condVec, inact);
-                scalarRes = mlir::vector::ReductionOp::create(b_, loc, mlir::vector::CombiningKind::AND, impl);
+                mlir::Value inact = mlir::LLVM::XOrOp::create(b_, loc, activeMask, allTrueMask(loc));
+                mlir::Value impl = mlir::LLVM::OrOp::create(b_, loc, condVec, inact);
+                scalarRes = mlir::LLVM::vector_reduce_and::create(b_, loc, i1Ty(), impl);
             }
-            mlir::Value bvec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i1Ty()), scalarRes);
+            mlir::Value bvec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), scalarRes);
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i1Ty(), bvec, {}, {}});
             return true;
         }
         if (op == 116) { // waveActiveBallot(cond) -> %dx.types.fouri32
-            mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
+            mlir::Value condVec = mlir::LLVM::AndOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
             auto words = buildBallotWords(condVec);
             SimdVal st;
             st.kind = SimdVal::Kind::Struct;
             st.origType = call.getResult().getType();
             for (int i = 0; i < 4; ++i) {
                 st.fields.push_back({SimdVal::Kind::Vector, i32Ty(),
-                                     mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), words[i]), {}, {}});
+                                     llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i32Ty())).getElementType(), words[i]), {}, {}});
             }
             setMapped(call.getResult(), st);
             return true;
@@ -5010,10 +5121,9 @@ private:
         if (op == 118) { // waveReadLaneFirst(val)
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(1)));
             mlir::Value firstIdx = buildFirstActiveLane(activeMask);
-            mlir::Value scalar = mlir::vector::ExtractOp::create(
-                b_, loc, valVec, mlir::OpFoldResult{mlir::arith::IndexCastOp::create(b_, loc, b_.getIndexType(), firstIdx)});
+            mlir::Value scalar = mlir::LLVM::ExtractElementOp::create(b_, loc, valVec, firstIdx);
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, mlir::vector::BroadcastOp::create(b_, loc, vecTy(et), scalar), {}, {}});
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(et)).getElementType(), scalar), {}, {}});
             return true;
         }
         if (op == 117) { // waveReadLaneAt(val, lane)
@@ -5022,11 +5132,10 @@ private:
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
             mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(et));
             for (uint32_t l = 0; l < W_; ++l) {
-                mlir::Value li = mlir::vector::ExtractOp::create(b_, loc, laneVec, static_cast<int64_t>(l));
-                mlir::Value clamped = mlir::arith::MinUIOp::create(b_, loc, li, cInt(loc, i32Ty(), W_ - 1));
-                mlir::Value idx = mlir::arith::IndexCastOp::create(b_, loc, b_.getIndexType(), clamped);
-                mlir::Value s = mlir::vector::ExtractOp::create(b_, loc, valVec, mlir::OpFoldResult{idx});
-                outVec = mlir::vector::InsertOp::create(b_, loc, s, outVec, static_cast<int64_t>(l));
+                mlir::Value li = llvmExtract(b_, loc, laneVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value clamped = mlir::LLVM::UMinOp::create(b_, loc, li, cInt(loc, i32Ty(), W_ - 1));
+                mlir::Value s = mlir::LLVM::ExtractElementOp::create(b_, loc, valVec, clamped);
+                outVec = llvmInsert(b_, loc, outVec, s, static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, et, outVec, {}, {}});
             return true;
@@ -5034,17 +5143,16 @@ private:
         if (op == 115) { // waveActiveAllEqual(val)
             mlir::Value valVec = asVec(loc, getMapped(loc, arg(1)));
             mlir::Value firstIdx = buildFirstActiveLane(activeMask);
-            mlir::Value firstScalar = mlir::vector::ExtractOp::create(
-                b_, loc, valVec, mlir::OpFoldResult{mlir::arith::IndexCastOp::create(b_, loc, b_.getIndexType(), firstIdx)});
+            mlir::Value firstScalar = mlir::LLVM::ExtractElementOp::create(b_, loc, valVec, firstIdx);
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
-            mlir::Value firstVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(et), firstScalar);
+            mlir::Value firstVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(et)).getElementType(), firstScalar);
             mlir::Value eq = mlir::isa<mlir::FloatType>(et)
-                                 ? mlir::arith::CmpFOp::create(b_, loc, mlir::arith::CmpFPredicate::OEQ, valVec, firstVec).getResult()
-                                 : mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, valVec, firstVec).getResult();
-            mlir::Value inact = mlir::arith::XOrIOp::create(b_, loc, activeMask, allTrueMask(loc));
-            mlir::Value allEq = mlir::vector::ReductionOp::create(
-                b_, loc, mlir::vector::CombiningKind::AND, mlir::arith::OrIOp::create(b_, loc, eq, inact));
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i1Ty(), mlir::vector::BroadcastOp::create(b_, loc, vecTy(i1Ty()), allEq), {}, {}});
+                                 ? mlir::LLVM::FCmpOp::create(b_, loc, mlir::LLVM::FCmpPredicate::oeq, valVec, firstVec).getResult()
+                                 : mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, valVec, firstVec).getResult();
+            mlir::Value inact = mlir::LLVM::XOrOp::create(b_, loc, activeMask, allTrueMask(loc));
+            mlir::Value allEq = mlir::LLVM::vector_reduce_and::create(
+                b_, loc, i1Ty(), mlir::LLVM::OrOp::create(b_, loc, eq, inact));
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i1Ty(), llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), allEq), {}, {}});
             return true;
         }
         if (op == 119 || op == 120) { // waveActiveOp / waveActiveBit
@@ -5055,54 +5163,76 @@ private:
             bool isFloat = mlir::isa<mlir::FloatType>(et);
 
             mlir::Value identity;
-            mlir::vector::CombiningKind ck = mlir::vector::CombiningKind::ADD;
+            enum class WaveRedKind { And, Or, Xor, Add, Mul, MinF, MaxF, MinUI, MaxUI, MinSI, MaxSI };
+            WaveRedKind rk = WaveRedKind::Add;
             if (op == 120) {
                 if (kind == 0) { // AND
-                    ck = mlir::vector::CombiningKind::AND;
+                    rk = WaveRedKind::And;
                     identity = splatInt(loc, et, ~uint64_t(0));
                 } else if (kind == 1) { // OR
-                    ck = mlir::vector::CombiningKind::OR;
+                    rk = WaveRedKind::Or;
                     identity = splatInt(loc, et, 0);
                 } else { // XOR
-                    ck = mlir::vector::CombiningKind::XOR;
+                    rk = WaveRedKind::Xor;
                     identity = splatInt(loc, et, 0);
                 }
             } else if (kind == 0) { // SUM
-                ck = mlir::vector::CombiningKind::ADD;
+                rk = WaveRedKind::Add;
                 identity = isFloat ? splatFlt(loc, et, 0.0) : splatInt(loc, et, 0);
             } else if (kind == 1) { // PROD
-                ck = mlir::vector::CombiningKind::MUL;
+                rk = WaveRedKind::Mul;
                 identity = isFloat ? splatFlt(loc, et, 1.0) : splatInt(loc, et, 1);
             } else if (kind == 2) { // MIN
                 if (isFloat) {
-                    ck = mlir::vector::CombiningKind::MINNUMF;
+                    rk = WaveRedKind::MinF;
                     identity = splatFlt(loc, et, std::numeric_limits<double>::infinity());
                 } else if (sop != 0) {
-                    ck = mlir::vector::CombiningKind::MINUI;
+                    rk = WaveRedKind::MinUI;
                     identity = splatInt(loc, et, ~uint64_t(0));
                 } else {
-                    ck = mlir::vector::CombiningKind::MINSI;
+                    rk = WaveRedKind::MinSI;
                     unsigned bw = et.getIntOrFloatBitWidth();
                     uint64_t sMax = (bw >= 64) ? uint64_t(INT64_MAX) : ((uint64_t(1) << (bw - 1)) - 1);
                     identity = splatInt(loc, et, sMax);
                 }
             } else { // MAX
                 if (isFloat) {
-                    ck = mlir::vector::CombiningKind::MAXNUMF;
+                    rk = WaveRedKind::MaxF;
                     identity = splatFlt(loc, et, -std::numeric_limits<double>::infinity());
                 } else if (sop != 0) {
-                    ck = mlir::vector::CombiningKind::MAXUI;
+                    rk = WaveRedKind::MaxUI;
                     identity = splatInt(loc, et, 0);
                 } else {
-                    ck = mlir::vector::CombiningKind::MAXSI;
+                    rk = WaveRedKind::MaxSI;
                     unsigned bw = et.getIntOrFloatBitWidth();
                     uint64_t sMin = (bw >= 64) ? uint64_t(INT64_MIN) : (uint64_t(1) << (bw - 1));
                     identity = splatInt(loc, et, sMin);
                 }
             }
-            mlir::Value masked = mlir::arith::SelectOp::create(b_, loc, activeMask, valVec, identity);
-            mlir::Value reduced = mlir::vector::ReductionOp::create(b_, loc, ck, masked);
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, mlir::vector::BroadcastOp::create(b_, loc, vecTy(et), reduced), {}, {}});
+            mlir::Value masked = mlir::LLVM::SelectOp::create(b_, loc, activeMask, valVec, identity);
+            mlir::Value reduced;
+            switch (rk) {
+            case WaveRedKind::And: reduced = mlir::LLVM::vector_reduce_and::create(b_, loc, et, masked); break;
+            case WaveRedKind::Or: reduced = mlir::LLVM::vector_reduce_or::create(b_, loc, et, masked); break;
+            case WaveRedKind::Xor: reduced = mlir::LLVM::vector_reduce_xor::create(b_, loc, et, masked); break;
+            case WaveRedKind::Add:
+                reduced = isFloat
+                              ? mlir::Value(createFp<mlir::LLVM::vector_reduce_fadd>(b_, loc, et, cFlt(loc, et, 0.0), masked))
+                              : mlir::Value(mlir::LLVM::vector_reduce_add::create(b_, loc, et, masked));
+                break;
+            case WaveRedKind::Mul:
+                reduced = isFloat
+                              ? mlir::Value(createFp<mlir::LLVM::vector_reduce_fmul>(b_, loc, et, cFlt(loc, et, 1.0), masked))
+                              : mlir::Value(mlir::LLVM::vector_reduce_mul::create(b_, loc, et, masked));
+                break;
+            case WaveRedKind::MinF: reduced = mlir::LLVM::vector_reduce_fmin::create(b_, loc, et, masked); break;
+            case WaveRedKind::MaxF: reduced = mlir::LLVM::vector_reduce_fmax::create(b_, loc, et, masked); break;
+            case WaveRedKind::MinUI: reduced = mlir::LLVM::vector_reduce_umin::create(b_, loc, et, masked); break;
+            case WaveRedKind::MaxUI: reduced = mlir::LLVM::vector_reduce_umax::create(b_, loc, et, masked); break;
+            case WaveRedKind::MinSI: reduced = mlir::LLVM::vector_reduce_smin::create(b_, loc, et, masked); break;
+            case WaveRedKind::MaxSI: reduced = mlir::LLVM::vector_reduce_smax::create(b_, loc, et, masked); break;
+            }
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, et, llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(et)).getElementType(), reduced), {}, {}});
             return true;
         }
         if (op == 121) { // wavePrefixOp (exclusive prefix sum or prod)
@@ -5113,18 +5243,18 @@ private:
             bool isFloat = mlir::isa<mlir::FloatType>(et);
             mlir::Value idScalar = isFloat ? cFlt(loc, et, isMul ? 1.0 : 0.0) : cInt(loc, et, isMul ? 1 : 0);
             mlir::Value idVec = isFloat ? splatFlt(loc, et, isMul ? 1.0 : 0.0) : splatInt(loc, et, isMul ? 1 : 0);
-            mlir::Value contrib = mlir::arith::SelectOp::create(b_, loc, activeMask, valVec, idVec);
+            mlir::Value contrib = mlir::LLVM::SelectOp::create(b_, loc, activeMask, valVec, idVec);
             mlir::Value acc = idScalar;
             mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(et));
             for (uint32_t l = 0; l < W_; ++l) {
-                outVec = mlir::vector::InsertOp::create(b_, loc, acc, outVec, static_cast<int64_t>(l));
-                mlir::Value vL = mlir::vector::ExtractOp::create(b_, loc, contrib, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, acc, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value vL = llvmExtract(b_, loc, contrib, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 if (isFloat) {
-                    acc = isMul ? mlir::arith::MulFOp::create(b_, loc, acc, vL).getResult()
-                                : mlir::arith::AddFOp::create(b_, loc, acc, vL).getResult();
+                    acc = isMul ? mlir::LLVM::FMulOp::create(b_, loc, acc, vL).getResult()
+                                : mlir::LLVM::FAddOp::create(b_, loc, acc, vL).getResult();
                 } else {
-                    acc = isMul ? mlir::arith::MulIOp::create(b_, loc, acc, vL).getResult()
-                                : mlir::arith::AddIOp::create(b_, loc, acc, vL).getResult();
+                    acc = isMul ? mlir::LLVM::MulOp::create(b_, loc, acc, vL).getResult()
+                                : mlir::LLVM::AddOp::create(b_, loc, acc, vL).getResult();
                 }
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, et, outVec, {}, {}});
@@ -5135,42 +5265,43 @@ private:
             mlir::Type et = llvm::cast<mlir::VectorType>(valVec.getType()).getElementType();
             uint32_t kind = static_cast<uint32_t>(getConstIntValue(arg(2)).value_or(0));
             uint32_t xorMask = (kind == 0) ? 1u : (kind == 1 ? 2u : 3u);
-            llvm::SmallVector<int64_t, 16> indices;
+            llvm::SmallVector<int32_t, 16> indices;
             indices.reserve(W_);
             for (uint32_t l = 0; l < W_; ++l) {
                 uint32_t peer = l ^ xorMask;
-                indices.push_back(peer < W_ ? static_cast<int64_t>(peer) : static_cast<int64_t>(l));
+                indices.push_back(peer < W_ ? static_cast<int32_t>(peer) : static_cast<int32_t>(l));
             }
-            mlir::Value res = mlir::vector::ShuffleOp::create(b_, loc, valVec, valVec, indices);
+            mlir::Value res = mlir::LLVM::ShuffleVectorOp::create(b_, loc, valVec, valVec, indices);
             setMapped(call.getResult(), {SimdVal::Kind::Vector, et, res, {}, {}});
             return true;
         }
         if (op == 135) { // waveAllBitCount(cond) -> i32
-            mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
+            mlir::Value condVec = mlir::LLVM::AndOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
             auto words = buildBallotWords(condVec);
             uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
-            mlir::Value cnt = mlir::math::CtPopOp::create(b_, loc, words[0]);
+            mlir::Value cnt = mlir::LLVM::CtPopOp::create(b_, loc, words[0]);
             for (uint32_t w = 1; w < numWords; ++w) {
-                mlir::Value wc = mlir::math::CtPopOp::create(b_, loc, words[w]);
-                cnt = mlir::arith::AddIOp::create(b_, loc, cnt, wc);
+                mlir::Value wc = mlir::LLVM::CtPopOp::create(b_, loc, words[w]);
+                cnt = mlir::LLVM::AddOp::create(b_, loc, cnt, wc);
             }
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), cnt), {}, {}});
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), llvmSplat(loc, i32Ty(), cnt), {}, {}});
             return true;
         }
         if (op == 136) { // wavePrefixBitCount(cond) -> i32
-            mlir::Value condVec = mlir::arith::AndIOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
+            mlir::Value condVec = mlir::LLVM::AndOp::create(b_, loc, asVec(loc, getMapped(loc, arg(1))), activeMask);
             auto words = buildBallotWords(condVec);
             if (W_ <= 32) {
-                mlir::Value ballotVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), words[0]);
+                mlir::Value ballotVec = llvmSplat(loc, i32Ty(), words[0]);
                 llvm::SmallVector<int32_t, 32> laneMasks;
                 laneMasks.reserve(W_);
                 for (uint32_t l = 0; l < W_; ++l) {
                     laneMasks.push_back(static_cast<int32_t>((uint32_t(1) << l) - 1u));
                 }
-                mlir::Value maskVec = mlir::arith::ConstantOp::create(
-                    b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(vecTy(i32Ty())), llvm::ArrayRef<int32_t>(laneMasks)));
-                mlir::Value masked = mlir::arith::AndIOp::create(b_, loc, ballotVec, maskVec);
-                mlir::Value cntVec = mlir::math::CtPopOp::create(b_, loc, masked);
+                mlir::Value maskVec = mlir::LLVM::ConstantOp::create(
+                    b_, loc, vecTy(i32Ty()),
+                    mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(vecTy(i32Ty())), llvm::ArrayRef<int32_t>(laneMasks)));
+                mlir::Value masked = mlir::LLVM::AndOp::create(b_, loc, ballotVec, maskVec);
+                mlir::Value cntVec = mlir::LLVM::CtPopOp::create(b_, loc, masked);
                 setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), cntVec, {}, {}});
                 return true;
             }
@@ -5179,21 +5310,27 @@ private:
             for (int32_t l = 0; l < 32; ++l) {
                 laneMasks32[l] = static_cast<int32_t>((uint32_t(1) << l) - 1u);
             }
-            mlir::Value maskVec32 = mlir::arith::ConstantOp::create(
-                b_, loc, mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(laneMasks32)));
+            mlir::Value maskVec32 = mlir::LLVM::ConstantOp::create(
+                b_, loc, v32i32,
+                mlir::DenseElementsAttr::get(llvm::cast<mlir::ShapedType>(v32i32), llvm::ArrayRef<int32_t>(laneMasks32)));
+            mlir::Value p32 = mlir::LLVM::PoisonOp::create(b_, loc, v32i32);
+            llvm::SmallVector<int32_t, 32> zeros32(32, 0);
+            auto splat32 = [&](mlir::Value s) {
+                mlir::Value ins = llvmInsert(b_, loc, p32, s, 0);
+                return mlir::LLVM::ShuffleVectorOp::create(b_, loc, ins, p32, zeros32);
+            };
             mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()));
             mlir::Value prefixSum = cInt(loc, i32Ty(), 0);
             uint32_t numWords = std::min<uint32_t>(4u, (W_ + 31u) / 32u);
             for (uint32_t w = 0; w < numWords; ++w) {
-                mlir::Value bVec = mlir::vector::BroadcastOp::create(b_, loc, v32i32, words[w]);
-                mlir::Value inWord = mlir::math::CtPopOp::create(b_, loc, mlir::arith::AndIOp::create(b_, loc, bVec, maskVec32));
-                mlir::Value chunk = mlir::arith::AddIOp::create(
-                    b_, loc, inWord, mlir::vector::BroadcastOp::create(b_, loc, v32i32, prefixSum));
-                outVec = mlir::vector::InsertStridedSliceOp::create(
-                    b_, loc, chunk, outVec, llvm::ArrayRef<int64_t>{static_cast<int64_t>(w * 32u)},
-                    llvm::ArrayRef<int64_t>{1});
+                mlir::Value bVec = splat32(words[w]);
+                mlir::Value inWord = mlir::LLVM::CtPopOp::create(b_, loc, mlir::LLVM::AndOp::create(b_, loc, bVec, maskVec32));
+                mlir::Value chunk = mlir::LLVM::AddOp::create(b_, loc, inWord, splat32(prefixSum));
+                for (uint32_t i = 0; i < 32u && (w * 32u + i) < W_; ++i) {
+                    outVec = llvmInsert(loc, outVec, llvmExtract(loc, chunk, i), w * 32u + i);
+                }
                 if (w + 1 < numWords) {
-                    prefixSum = mlir::arith::AddIOp::create(b_, loc, prefixSum, mlir::math::CtPopOp::create(b_, loc, words[w]));
+                    prefixSum = mlir::LLVM::AddOp::create(b_, loc, prefixSum, mlir::LLVM::CtPopOp::create(b_, loc, words[w]));
                 }
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), outVec, {}, {}});
@@ -5248,9 +5385,9 @@ private:
                     idScalar = isFloat ? cFlt(loc, et, 0.0) : cInt(loc, et, 0);
                 }
 
-                mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b_, loc, 0);
-                mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b_, loc, 1);
-                mlir::Value cW = mlir::arith::ConstantIndexOp::create(b_, loc, W_);
+                mlir::Value c0 = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(0));
+                mlir::Value c1 = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(1));
+                mlir::Value cW = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(W_));
                 mlir::Value initOut = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(et));
 
                 auto outer = mlir::scf::ForOp::create(
@@ -5259,55 +5396,54 @@ private:
                         mlir::Value curOut = outerArgs[0];
                         llvm::SmallVector<mlir::Value, 4> maskL(numWords);
                         for (uint32_t w = 0; w < numWords; ++w) {
-                            maskL[w] = mlir::vector::ExtractOp::create(ob, oloc, fnMaskVecs[w], mlir::OpFoldResult{lIdx});
+                            maskL[w] = mlir::LLVM::ExtractElementOp::create(ob, oloc, fnMaskVecs[w], lIdx);
                         }
                         auto inner = mlir::scf::ForOp::create(
                             ob, oloc, c0, lIdx, c1, mlir::ValueRange{idScalar},
                             [&](mlir::OpBuilder& ib, mlir::Location iloc, mlir::Value jIdx, mlir::ValueRange innerArgs) {
                                 mlir::Value acc = innerArgs[0];
-                                mlir::Value j32 = mlir::arith::IndexCastOp::create(ib, iloc, i32Ty(), jIdx);
+                                mlir::Value j32 = jIdx;
                                 mlir::Value maskWordL = maskL[0];
                                 if (numWords > 1) {
-                                    mlir::Value wIdx = mlir::arith::ShRUIOp::create(
-                                        ib, iloc, j32, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 5));
+                                    mlir::Value wIdx = mlir::LLVM::LShrOp::create(
+                                        ib, iloc, j32, mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 5)));
                                     for (uint32_t w = 1; w < numWords; ++w) {
-                                        mlir::Value isW = mlir::arith::CmpIOp::create(
-                                            ib, iloc, mlir::arith::CmpIPredicate::eq, wIdx,
-                                            mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), w));
-                                        maskWordL = mlir::arith::SelectOp::create(ib, iloc, isW, maskL[w], maskWordL);
+                                        mlir::Value isW = mlir::LLVM::ICmpOp::create(
+                                            ib, iloc, mlir::LLVM::ICmpPredicate::eq, wIdx,
+                                            mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), w)));
+                                        maskWordL = mlir::LLVM::SelectOp::create(ib, iloc, isW, maskL[w], maskWordL);
                                     }
                                 }
-                                mlir::Value bitIdx = mlir::arith::AndIOp::create(
-                                    ib, iloc, j32, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 31));
-                                mlir::Value shifted = mlir::arith::ShRUIOp::create(ib, iloc, maskWordL, bitIdx);
-                                mlir::Value bitJ = mlir::arith::AndIOp::create(
-                                    ib, iloc, shifted, mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 1));
-                                mlir::Value inGroup = mlir::arith::CmpIOp::create(
-                                    ib, iloc, mlir::arith::CmpIPredicate::ne, bitJ,
-                                    mlir::arith::ConstantIntOp::create(ib, iloc, i32Ty(), 0));
-                                mlir::Value actJ = mlir::vector::ExtractOp::create(ib, iloc, fnActiveMask, mlir::OpFoldResult{jIdx});
-                                mlir::Value take = mlir::arith::AndIOp::create(ib, iloc, inGroup, actJ);
-                                mlir::Value valJ = mlir::vector::ExtractOp::create(ib, iloc, fnValVec, mlir::OpFoldResult{jIdx});
+                                mlir::Value bitIdx = mlir::LLVM::AndOp::create(
+                                    ib, iloc, j32, mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 31)));
+                                mlir::Value shifted = mlir::LLVM::LShrOp::create(ib, iloc, maskWordL, bitIdx);
+                                mlir::Value bitJ = mlir::LLVM::AndOp::create(
+                                    ib, iloc, shifted, mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 1)));
+                                mlir::Value inGroup = mlir::LLVM::ICmpOp::create(
+                                    ib, iloc, mlir::LLVM::ICmpPredicate::ne, bitJ,
+                                    mlir::LLVM::ConstantOp::create(ib, iloc, i32Ty(), ib.getIntegerAttr(i32Ty(), 0)));
+                                mlir::Value actJ = mlir::LLVM::ExtractElementOp::create(ib, iloc, fnActiveMask, jIdx);
+                                mlir::Value take = mlir::LLVM::AndOp::create(ib, iloc, inGroup, actJ);
+                                mlir::Value valJ = mlir::LLVM::ExtractElementOp::create(ib, iloc, fnValVec, jIdx);
 
                                 mlir::Value cand;
                                 if (kind == 0) {
-                                    cand = isFloat ? mlir::arith::AddFOp::create(ib, iloc, acc, valJ).getResult()
-                                                   : mlir::arith::AddIOp::create(ib, iloc, acc, valJ).getResult();
+                                    cand = isFloat ? mlir::LLVM::FAddOp::create(ib, iloc, acc, valJ).getResult()
+                                                   : mlir::LLVM::AddOp::create(ib, iloc, acc, valJ).getResult();
                                 } else if (kind == 1) {
-                                    cand = mlir::arith::AndIOp::create(ib, iloc, acc, valJ);
+                                    cand = mlir::LLVM::AndOp::create(ib, iloc, acc, valJ);
                                 } else if (kind == 2) {
-                                    cand = mlir::arith::OrIOp::create(ib, iloc, acc, valJ);
+                                    cand = mlir::LLVM::OrOp::create(ib, iloc, acc, valJ);
                                 } else if (kind == 3) {
-                                    cand = mlir::arith::XOrIOp::create(ib, iloc, acc, valJ);
+                                    cand = mlir::LLVM::XOrOp::create(ib, iloc, acc, valJ);
                                 } else {
-                                    cand = isFloat ? mlir::arith::MulFOp::create(ib, iloc, acc, valJ).getResult()
-                                                   : mlir::arith::MulIOp::create(ib, iloc, acc, valJ).getResult();
+                                    cand = isFloat ? mlir::LLVM::FMulOp::create(ib, iloc, acc, valJ).getResult()
+                                                   : mlir::LLVM::MulOp::create(ib, iloc, acc, valJ).getResult();
                                 }
-                                mlir::Value nextAcc = mlir::arith::SelectOp::create(ib, iloc, take, cand, acc);
+                                mlir::Value nextAcc = mlir::LLVM::SelectOp::create(ib, iloc, take, cand, acc);
                                 mlir::scf::YieldOp::create(ib, iloc, mlir::ValueRange{nextAcc});
                             });
-                        mlir::Value nextOut = mlir::vector::InsertOp::create(
-                            ob, oloc, inner.getResult(0), curOut, mlir::OpFoldResult{lIdx});
+                        mlir::Value nextOut = mlir::LLVM::InsertElementOp::create(ob, oloc, curOut, inner.getResult(0), lIdx);
                         mlir::scf::YieldOp::create(ob, oloc, mlir::ValueRange{nextOut});
                     });
                 mlir::func::ReturnOp::create(b_, loc, mlir::ValueRange{outer.getResult(0)});
@@ -5335,7 +5471,7 @@ private:
             return asVec(loc, getMapped(loc, v));
         };
         auto activeAt = [&](uint32_t l) -> mlir::Value {
-            return mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+            return llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
         };
 
         auto runPerActiveLaneVoid = [&](auto&& emitCall) {
@@ -5349,7 +5485,7 @@ private:
         };
 
         auto runPerActiveLaneScalar = [&](mlir::Type elemTy, mlir::Value fallbackVal, auto&& emitCall) {
-            mlir::Value outVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), fallbackVal);
+            mlir::Value outVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), fallbackVal);
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value act = activeAt(l);
                 auto ifOp = mlir::scf::IfOp::create(
@@ -5361,8 +5497,7 @@ private:
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{fallbackVal});
                     });
-                outVec = mlir::vector::InsertOp::create(
-                    b_, loc, ifOp.getResult(0), outVec, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, ifOp.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, elemTy, outVec, {}, {}});
         };
@@ -5371,7 +5506,7 @@ private:
         if (op == 145 || op == 146) {
             const auto& arr = (op == 145) ? hooks_.threadId : hooks_.dispatchRaysDim;
             auto bcastI32 = [&](mlir::Value scalar) -> mlir::Value {
-                return mlir::vector::BroadcastOp::create(b_, loc, vecTy(i32Ty()), scalar);
+                return llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i32Ty())).getElementType(), scalar);
             };
             if (auto comp = getConstIntValue(arg(1))) {
                 const uint32_t c = static_cast<uint32_t>(*comp);
@@ -5379,16 +5514,16 @@ private:
                 setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), v, {}, {}});
                 return true;
             }
-            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
+            mlir::Value compVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
             mlir::Value v0 = arr[0] ? arr[0] : bcastI32(cInt(loc, i32Ty(), 0));
             mlir::Value v1 = arr[1] ? arr[1] : bcastI32(cInt(loc, i32Ty(), 0));
             mlir::Value v2 = arr[2] ? arr[2] : bcastI32(cInt(loc, i32Ty(), 0));
-            mlir::Value is1 = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 1)));
-            mlir::Value is2 = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 2)));
-            mlir::Value sel01 = mlir::arith::SelectOp::create(b_, loc, is1, v1, v0);
-            mlir::Value res = mlir::arith::SelectOp::create(b_, loc, is2, v2, sel01);
+            mlir::Value is1 = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 1)));
+            mlir::Value is2 = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::eq, compVec, bcastI32(cInt(loc, i32Ty(), 2)));
+            mlir::Value sel01 = mlir::LLVM::SelectOp::create(b_, loc, is1, v1, v0);
+            mlir::Value res = mlir::LLVM::SelectOp::create(b_, loc, is2, v2, sel01);
             setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), res, {}, {}});
             return true;
         }
@@ -5435,7 +5570,7 @@ private:
                                               ? payloadVal.lanes[0]
                                               : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult());
                 auto ext = [&](mlir::Value v) -> mlir::Value {
-                    return mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
+                    return llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 };
                 mlir::LLVM::CallOp::create(
                     nb, nloc, fn,
@@ -5461,8 +5596,8 @@ private:
             auto fn = getOrDeclareRuntimeFn(
                 loc, "nacelle_dxr_report_hit", i32Ty(), {f32Ty(), i32Ty(), ptrTy(), i32Ty()});
             runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value t = mlir::vector::ExtractOp::create(nb, nloc, tHitVec, static_cast<int64_t>(l));
-                mlir::Value k = mlir::vector::ExtractOp::create(nb, nloc, hitKindVec, static_cast<int64_t>(l));
+                mlir::Value t = llvmExtract(nb, nloc, tHitVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value k = llvmExtract(nb, nloc, hitKindVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value aPtr = l < attrVal.lanes.size()
                                        ? attrVal.lanes[l]
                                        : (!attrVal.lanes.empty()
@@ -5470,7 +5605,7 @@ private:
                                               : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult());
                 mlir::Value r = mlir::LLVM::CallOp::create(
                     nb, nloc, fn, mlir::ValueRange{t, k, aPtr, attrBytesConst}).getResult();
-                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+                return mlir::LLVM::TruncOp::create(nb, nloc, i1Ty(), r).getResult();
             });
             return true;
         }
@@ -5481,7 +5616,7 @@ private:
             SimdVal paramVal = getMapped(loc, arg(2));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_call_shader", nullptr, {i32Ty(), ptrTy()});
             runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value idx = mlir::vector::ExtractOp::create(nb, nloc, idxVec, static_cast<int64_t>(l));
+                mlir::Value idx = llvmExtract(nb, nloc, idxVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value pPtr = l < paramVal.lanes.size()
                                        ? paramVal.lanes[l]
                                        : (!paramVal.lanes.empty()
@@ -5515,11 +5650,11 @@ private:
         // Vector float state queries: WorldRayOrigin (147), WorldRayDirection (148),
         // ObjectRayOrigin (149), ObjectRayDirection (150)
         if (op >= 147 && op <= 150) {
-            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
+            mlir::Value compVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_vec", f32Ty(), {i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, compVec, static_cast<int64_t>(l));
+                mlir::Value c = llvmExtract(nb, nloc, compVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, c}).getResult();
             });
             return true;
@@ -5528,12 +5663,12 @@ private:
         // Matrix float state queries: ObjectToWorld (151), WorldToObject (152)
         if (op == 151 || op == 152) {
             mlir::Value rowVec = laneVec(arg(1));
-            mlir::Value colVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
+            mlir::Value colVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value r = mlir::vector::ExtractOp::create(nb, nloc, rowVec, static_cast<int64_t>(l));
-                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, colVec, static_cast<int64_t>(l));
+                mlir::Value r = llvmExtract(nb, nloc, rowVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value c = llvmExtract(nb, nloc, colVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, r, c}).getResult();
             });
             return true;
@@ -5563,10 +5698,10 @@ private:
             return asVec(loc, getMapped(loc, v));
         };
         auto laneAt = [&](mlir::Value vec, uint32_t l) -> mlir::Value {
-            return mlir::vector::ExtractOp::create(b_, loc, vec, static_cast<int64_t>(l));
+            return llvmExtract(b_, loc, vec, static_cast<uint32_t>(static_cast<int64_t>(l)));
         };
         auto activeAt = [&](uint32_t l) -> mlir::Value {
-            return mlir::vector::ExtractOp::create(b_, loc, execMask, static_cast<int64_t>(l));
+            return llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
         };
 
         auto runPerActiveLaneVoid = [&](auto&& emitCall) {
@@ -5580,7 +5715,7 @@ private:
         };
 
         auto runPerActiveLaneScalar = [&](mlir::Type elemTy, mlir::Value fallbackVal, auto&& emitCall) {
-            mlir::Value outVec = mlir::vector::BroadcastOp::create(b_, loc, vecTy(elemTy), fallbackVal);
+            mlir::Value outVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), fallbackVal);
             for (uint32_t l = 0; l < W_; ++l) {
                 mlir::Value act = activeAt(l);
                 auto ifOp = mlir::scf::IfOp::create(
@@ -5592,8 +5727,7 @@ private:
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{fallbackVal});
                     });
-                outVec = mlir::vector::InsertOp::create(
-                    b_, loc, ifOp.getResult(0), outVec, static_cast<int64_t>(l));
+                outVec = llvmInsert(b_, loc, outVec, ifOp.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
             }
             setMapped(call.getResult(), {SimdVal::Kind::Vector, elemTy, outVec, {}, {}});
         };
@@ -5603,7 +5737,7 @@ private:
             mlir::Value flagsVec = laneVec(arg(1));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_alloc", i32Ty(), {i32Ty()});
             runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value fl = mlir::vector::ExtractOp::create(nb, nloc, flagsVec, static_cast<int64_t>(l));
+                mlir::Value fl = llvmExtract(nb, nloc, flagsVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{fl}).getResult();
             });
             return true;
@@ -5643,7 +5777,7 @@ private:
                     tlasPtr = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr).getResult();
                 }
                 auto ext = [&](mlir::Value v) -> mlir::Value {
-                    return mlir::vector::ExtractOp::create(nb, nloc, v, static_cast<int64_t>(l));
+                    return llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 };
                 mlir::LLVM::CallOp::create(
                     nb, nloc, fn,
@@ -5659,9 +5793,9 @@ private:
             mlir::Value qVec = laneVec(arg(1));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_proceed", i32Ty(), {i32Ty()});
             runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q}).getResult();
-                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+                return mlir::LLVM::TruncOp::create(nb, nloc, i1Ty(), r).getResult();
             });
             return true;
         }
@@ -5672,7 +5806,7 @@ private:
             const char* fnName = (op == 181) ? "nacelle_rayquery_abort" : "nacelle_rayquery_commit_triangle";
             auto fn = getOrDeclareRuntimeFn(loc, fnName, nullptr, {i32Ty()});
             runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q});
             });
             return true;
@@ -5684,8 +5818,8 @@ private:
             mlir::Value tVec = laneVec(arg(2));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_commit_procedural", nullptr, {i32Ty(), f32Ty()});
             runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
-                mlir::Value t = mlir::vector::ExtractOp::create(nb, nloc, tVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value t = llvmExtract(nb, nloc, tVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{q, t});
             });
             return true;
@@ -5697,7 +5831,7 @@ private:
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_f32", f32Ty(), {i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
             });
             return true;
@@ -5707,12 +5841,12 @@ private:
         if (op == 193 || op == 194 || op == 196 || op == 197 ||
             op == 205 || op == 206 || op == 211 || op == 212) {
             mlir::Value qVec = laneVec(arg(1));
-            mlir::Value compVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
+            mlir::Value compVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_vec", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
-                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, compVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value c = llvmExtract(nb, nloc, compVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q, c}).getResult();
             });
             return true;
@@ -5722,13 +5856,13 @@ private:
         if (op >= 186 && op <= 189) {
             mlir::Value qVec = laneVec(arg(1));
             mlir::Value rowVec = laneVec(arg(2));
-            mlir::Value colVec = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(3)));
+            mlir::Value colVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(3)));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
-                mlir::Value r = mlir::vector::ExtractOp::create(nb, nloc, rowVec, static_cast<int64_t>(l));
-                mlir::Value c = mlir::vector::ExtractOp::create(nb, nloc, colVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value r = llvmExtract(nb, nloc, rowVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                mlir::Value c = llvmExtract(nb, nloc, colVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q, r, c}).getResult();
             });
             return true;
@@ -5741,13 +5875,13 @@ private:
         const bool isBool = call.getResult().getType().isInteger(1);
         if (isBool) {
             runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
-                return mlir::arith::TruncIOp::create(nb, nloc, i1Ty(), r).getResult();
+                return mlir::LLVM::TruncOp::create(nb, nloc, i1Ty(), r).getResult();
             });
         } else {
             runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
-                mlir::Value q = mlir::vector::ExtractOp::create(nb, nloc, qVec, static_cast<int64_t>(l));
+                mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
             });
         }
@@ -5785,13 +5919,13 @@ private:
                 };
                 auto flushDenormF = [&](mlir::Value v) -> mlir::Value {
                     if (!resTy.isF32()) return v;
-                    mlir::Value bits = mlir::arith::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
-                    mlir::Value absBits = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
-                    mlir::Value isDenorm = mlir::arith::CmpIOp::create(
-                        b_, loc, mlir::arith::CmpIPredicate::ult, absBits, splatInt(loc, i32Ty(), 0x00800000u));
-                    mlir::Value signZero = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x80000000u));
-                    mlir::Value flushed = mlir::arith::SelectOp::create(b_, loc, isDenorm, signZero, bits);
-                    return mlir::arith::BitcastOp::create(b_, loc, vT, flushed);
+                    mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
+                    mlir::Value absBits = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
+                    mlir::Value isDenorm = mlir::LLVM::ICmpOp::create(
+                        b_, loc, mlir::LLVM::ICmpPredicate::ult, absBits, splatInt(loc, i32Ty(), 0x00800000u));
+                    mlir::Value signZero = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x80000000u));
+                    mlir::Value flushed = mlir::LLVM::SelectOp::create(b_, loc, isDenorm, signZero, bits);
+                    return mlir::LLVM::BitcastOp::create(b_, loc, vT, flushed);
                 };
                 if (!packetizeScalarMathSwitch(call, op, loc, resTy, vT, argV, store, flushDenormF, outError)) {
                     return false;
@@ -5810,13 +5944,13 @@ private:
 
         auto flushDenormF = [&](mlir::Value v) -> mlir::Value {
             if (!resTy.isF32()) return v;
-            mlir::Value bits = mlir::arith::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
-            mlir::Value absBits = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
-            mlir::Value isDenorm = mlir::arith::CmpIOp::create(
-                b_, loc, mlir::arith::CmpIPredicate::ult, absBits, splatInt(loc, i32Ty(), 0x00800000u));
-            mlir::Value signZero = mlir::arith::AndIOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x80000000u));
-            mlir::Value flushed = mlir::arith::SelectOp::create(b_, loc, isDenorm, signZero, bits);
-            return mlir::arith::BitcastOp::create(b_, loc, vT, flushed);
+            mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i32Ty()), v);
+            mlir::Value absBits = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x7FFFFFFFu));
+            mlir::Value isDenorm = mlir::LLVM::ICmpOp::create(
+                b_, loc, mlir::LLVM::ICmpPredicate::ult, absBits, splatInt(loc, i32Ty(), 0x00800000u));
+            mlir::Value signZero = mlir::LLVM::AndOp::create(b_, loc, bits, splatInt(loc, i32Ty(), 0x80000000u));
+            mlir::Value flushed = mlir::LLVM::SelectOp::create(b_, loc, isDenorm, signZero, bits);
+            return mlir::LLVM::BitcastOp::create(b_, loc, vT, flushed);
         };
 
         return packetizeScalarMathSwitch(call, op, loc, resTy, vT, argV, store, flushDenormF, outError);
@@ -5827,87 +5961,88 @@ private:
         mlir::LLVM::CallOp call, uint32_t op, mlir::Location loc, mlir::Type resTy, mlir::Type vT,
         ArgVFn&& argV, StoreFn&& store, FlushFn&& flushDenormF, std::string& outError) {
         switch (op) {
-        case 6: return store(mlir::math::AbsFOp::create(b_, loc, vT, argV(1)));
+        case 6: return store(createFp<mlir::LLVM::FAbsOp>(loc, vT, argV(1)));
         case 7: { // Saturate
-            mlir::Value lo = mlir::arith::MaxNumFOp::create(b_, loc, vT, argV(1), splatFlt(loc, resTy, 0.0));
-            return store(mlir::arith::MinNumFOp::create(b_, loc, vT, lo, splatFlt(loc, resTy, 1.0)));
+            mlir::Value lo = createFp<mlir::LLVM::MaxNumOp>(loc, vT, argV(1), splatFlt(loc, resTy, 0.0));
+            return store(createFp<mlir::LLVM::MinNumOp>(loc, vT, lo, splatFlt(loc, resTy, 1.0)));
         }
-        case 8: return store(mlir::math::IsNaNOp::create(b_, loc, vT, argV(1)));
-        case 9: return store(mlir::math::IsInfOp::create(b_, loc, vT, argV(1)));
-        case 10: return store(mlir::math::IsFiniteOp::create(b_, loc, vT, argV(1)));
-        case 11: return store(mlir::math::IsNormalOp::create(b_, loc, vT, argV(1)));
-        case 12: return store(mlir::math::CosOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 13: return store(mlir::math::SinOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 14: return store(mlir::math::TanOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 15: return store(mlir::math::AcosOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 16: return store(mlir::math::AsinOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 17: return store(mlir::math::AtanOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 18: return store(mlir::math::CoshOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 19: return store(mlir::math::SinhOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 20: return store(mlir::math::TanhOp::create(b_, loc, vT, flushDenormF(argV(1))));
-        case 21: return store(mlir::math::Exp2Op::create(b_, loc, vT, flushDenormF(argV(1)))); // DXIL Exp is base-2!
+        case 8: return store(mlir::LLVM::IsFPClass::create(b_, loc, vT, argV(1), static_cast<uint32_t>(llvm::fcNan)));
+        case 9: return store(mlir::LLVM::IsFPClass::create(b_, loc, vT, argV(1), static_cast<uint32_t>(llvm::fcInf)));
+        case 10: return store(mlir::LLVM::IsFPClass::create(
+            b_, loc, vT, argV(1), static_cast<uint32_t>(llvm::fcNormal | llvm::fcSubnormal | llvm::fcZero)));
+        case 11: return store(mlir::LLVM::IsFPClass::create(b_, loc, vT, argV(1), static_cast<uint32_t>(llvm::fcNormal)));
+        case 12: return store(emitMathUnary(loc, "cos", flushDenormF(argV(1))));
+        case 13: return store(emitMathUnary(loc, "sin", flushDenormF(argV(1))));
+        case 14: return store(emitMathUnary(loc, "tan", flushDenormF(argV(1))));
+        case 15: return store(emitMathUnary(loc, "acos", flushDenormF(argV(1))));
+        case 16: return store(emitMathUnary(loc, "asin", flushDenormF(argV(1))));
+        case 17: return store(emitMathUnary(loc, "atan", flushDenormF(argV(1))));
+        case 18: return store(emitMathUnary(loc, "cosh", flushDenormF(argV(1))));
+        case 19: return store(emitMathUnary(loc, "sinh", flushDenormF(argV(1))));
+        case 20: return store(emitMathUnary(loc, "tanh", flushDenormF(argV(1))));
+        case 21: return store(emitMathUnary(loc, "exp2", flushDenormF(argV(1)))); // DXIL Exp is base-2!
         case 22: { // Frc = x - floor(x)
             mlir::Value x = argV(1);
-            return store(mlir::arith::SubFOp::create(b_, loc, vT, x, mlir::math::FloorOp::create(b_, loc, vT, x)));
+            return store(createFp<mlir::LLVM::FSubOp>(loc, vT, x, createFp<mlir::LLVM::FFloorOp>(loc, vT, x)));
         }
-        case 23: return store(mlir::math::Log2Op::create(b_, loc, vT, flushDenormF(argV(1)))); // DXIL Log is base-2!
-        case 24: return store(mlir::math::SqrtOp::create(b_, loc, vT, argV(1)));
+        case 23: return store(emitMathUnary(loc, "log2", flushDenormF(argV(1)))); // DXIL Log is base-2!
+        case 24: return store(createFp<mlir::LLVM::SqrtOp>(loc, vT, argV(1)));
         case 25: { // Rsqrt = 1.0 / sqrt(x)
-            mlir::Value sq = mlir::math::SqrtOp::create(b_, loc, vT, argV(1));
-            return store(mlir::arith::DivFOp::create(b_, loc, vT, splatFlt(loc, resTy, 1.0), sq));
+            mlir::Value sq = createFp<mlir::LLVM::SqrtOp>(loc, vT, argV(1));
+            return store(createFp<mlir::LLVM::FDivOp>(loc, vT, splatFlt(loc, resTy, 1.0), sq));
         }
-        case 26: return store(mlir::math::RoundEvenOp::create(b_, loc, vT, argV(1)));
-        case 27: return store(mlir::math::FloorOp::create(b_, loc, vT, argV(1)));
-        case 28: return store(mlir::math::CeilOp::create(b_, loc, vT, argV(1)));
-        case 29: return store(mlir::math::TruncOp::create(b_, loc, vT, argV(1)));
+        case 26: return store(createFp<mlir::LLVM::RoundEvenOp>(loc, vT, argV(1)));
+        case 27: return store(createFp<mlir::LLVM::FFloorOp>(loc, vT, argV(1)));
+        case 28: return store(createFp<mlir::LLVM::FCeilOp>(loc, vT, argV(1)));
+        case 29: return store(createFp<mlir::LLVM::FTruncOp>(loc, vT, argV(1)));
         case 30: return store(mlir::LLVM::BitReverseOp::create(b_, loc, vT, argV(1)));
         case 31: { // Countbits: population count, result is always i32 in DXIL
             mlir::Value x = argV(1);
             mlir::Type argTy = llvm::cast<mlir::VectorType>(x.getType()).getElementType();
-            mlir::Value pop = mlir::math::CtPopOp::create(b_, loc, vecTy(argTy), x);
+            mlir::Value pop = mlir::LLVM::CtPopOp::create(b_, loc, vecTy(argTy), x);
             if (argTy != resTy) {
                 pop = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
-                          ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, pop))
-                          : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, pop));
+                          ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, vT, pop))
+                          : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, vT, pop));
             }
             return store(pop);
         }
         case 32: { // FirstbitLo: index of lowest set bit, or -1 if 0
             mlir::Value x = argV(1);
             mlir::Type argTy = llvm::cast<mlir::VectorType>(x.getType()).getElementType();
-            mlir::Value tz = mlir::math::CountTrailingZerosOp::create(b_, loc, vecTy(argTy), x);
+            mlir::Value tz = mlir::LLVM::CountTrailingZerosOp::create(b_, loc, vecTy(argTy), x, false);
             if (argTy != resTy) {
                 tz = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
-                         ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, tz))
-                         : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, tz));
+                         ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, vT, tz))
+                         : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, vT, tz));
             }
-            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, argTy, 0));
-            return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), tz));
+            mlir::Value isZero = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, x, splatInt(loc, argTy, 0));
+            return store(mlir::LLVM::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), tz));
         }
         case 33: // FirstbitHi: clz(x), or -1 if 0 (DXIL returns leading-zero count from MSB; DXC emits bitWidth-1 - res)
         case 34: { // FirstbitSHi: clz(x < 0 ? ~x : x), or -1 if 0 or -1
             mlir::Value x = argV(1);
             mlir::Type argTy = llvm::cast<mlir::VectorType>(x.getType()).getElementType();
             if (op == 34) {
-                mlir::Value isNeg = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::slt, x, splatInt(loc, argTy, 0));
-                mlir::Value inv = mlir::arith::XOrIOp::create(b_, loc, x, splatInt(loc, argTy, ~uint64_t(0)));
-                x = mlir::arith::SelectOp::create(b_, loc, isNeg, inv, x);
+                mlir::Value isNeg = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::slt, x, splatInt(loc, argTy, 0));
+                mlir::Value inv = mlir::LLVM::XOrOp::create(b_, loc, x, splatInt(loc, argTy, ~uint64_t(0)));
+                x = mlir::LLVM::SelectOp::create(b_, loc, isNeg, inv, x);
             }
-            mlir::Value lz = mlir::math::CountLeadingZerosOp::create(b_, loc, vecTy(argTy), x);
+            mlir::Value lz = mlir::LLVM::CountLeadingZerosOp::create(b_, loc, vecTy(argTy), x, false);
             if (argTy != resTy) {
                 lz = (argTy.getIntOrFloatBitWidth() > resTy.getIntOrFloatBitWidth())
-                         ? mlir::Value(mlir::arith::TruncIOp::create(b_, loc, vT, lz))
-                         : mlir::Value(mlir::arith::ExtUIOp::create(b_, loc, vT, lz));
+                         ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, vT, lz))
+                         : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, vT, lz));
             }
-            mlir::Value isZero = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::eq, x, splatInt(loc, argTy, 0));
-            return store(mlir::arith::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), lz));
+            mlir::Value isZero = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, x, splatInt(loc, argTy, 0));
+            return store(mlir::LLVM::SelectOp::create(b_, loc, isZero, splatInt(loc, resTy, ~uint64_t(0)), lz));
         }
-        case 35: return store(mlir::arith::MaxNumFOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 36: return store(mlir::arith::MinNumFOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 37: return store(mlir::arith::MaxSIOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 38: return store(mlir::arith::MinSIOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 39: return store(mlir::arith::MaxUIOp::create(b_, loc, vT, argV(1), argV(2)));
-        case 40: return store(mlir::arith::MinUIOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 35: return store(createFp<mlir::LLVM::MaxNumOp>(loc, vT, argV(1), argV(2)));
+        case 36: return store(createFp<mlir::LLVM::MinNumOp>(loc, vT, argV(1), argV(2)));
+        case 37: return store(mlir::LLVM::SMaxOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 38: return store(mlir::LLVM::SMinOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 39: return store(mlir::LLVM::UMaxOp::create(b_, loc, vT, argV(1), argV(2)));
+        case 40: return store(mlir::LLVM::UMinOp::create(b_, loc, vT, argV(1), argV(2)));
         case 44: { // UAddc(a, b) -> { sum, carry }
             auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(resTy);
             if (!st || st.getBody().size() < 2) {
@@ -5917,8 +6052,8 @@ private:
             mlir::Type elemTy = st.getBody()[0];
             mlir::Value a = argV(1);
             mlir::Value b = argV(2);
-            mlir::Value sum = mlir::arith::AddIOp::create(b_, loc, a, b);
-            mlir::Value carry = mlir::arith::CmpIOp::create(b_, loc, mlir::arith::CmpIPredicate::ult, sum, a);
+            mlir::Value sum = mlir::LLVM::AddOp::create(b_, loc, a, b);
+            mlir::Value carry = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, sum, a);
             SimdVal outSt;
             outSt.kind = SimdVal::Kind::Struct;
             outSt.origType = resTy;
@@ -5928,20 +6063,20 @@ private:
             return true;
         }
         case 46:
-        case 47: return store(mlir::math::FmaOp::create(b_, loc, vT, argV(1), argV(2), argV(3)));
+        case 47: return store(createFp<mlir::LLVM::FMAOp>(loc, vT, argV(1), argV(2), argV(3)));
         case 48:
         case 49: {
-            mlir::Value prod = mlir::arith::MulIOp::create(b_, loc, vT, argV(1), argV(2));
-            return store(mlir::arith::AddIOp::create(b_, loc, vT, prod, argV(3)));
+            mlir::Value prod = mlir::LLVM::MulOp::create(b_, loc, vT, argV(1), argV(2));
+            return store(mlir::LLVM::AddOp::create(b_, loc, vT, prod, argV(3)));
         }
         case 54: // Dot2
         case 55: // Dot3
         case 56: { // Dot4
             unsigned n = (op == 54) ? 2u : (op == 55 ? 3u : 4u);
-            mlir::Value sum = mlir::arith::MulFOp::create(b_, loc, vT, argV(1), argV(1 + n));
+            mlir::Value sum = mlir::LLVM::FMulOp::create(b_, loc, vT, argV(1), argV(1 + n));
             for (unsigned c = 1; c < n; ++c) {
-                mlir::Value p = mlir::arith::MulFOp::create(b_, loc, vT, argV(1 + c), argV(1 + n + c));
-                sum = mlir::arith::AddFOp::create(b_, loc, vT, sum, p);
+                mlir::Value p = mlir::LLVM::FMulOp::create(b_, loc, vT, argV(1 + c), argV(1 + n + c));
+                sum = mlir::LLVM::FAddOp::create(b_, loc, vT, sum, p);
             }
             return store(sum);
         }
@@ -5955,11 +6090,11 @@ private:
             return store((op == 83 || op == 85) ? dx : dy);
         }
         case 101: { // MakeDouble(lo, hi) -> f64
-            mlir::Value lo64 = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i64Ty()), argV(1));
-            mlir::Value hi64 = mlir::arith::ExtUIOp::create(b_, loc, vecTy(i64Ty()), argV(2));
-            mlir::Value hiShift = mlir::arith::ShLIOp::create(b_, loc, hi64, splatInt(loc, i64Ty(), 32));
-            mlir::Value bits = mlir::arith::OrIOp::create(b_, loc, lo64, hiShift);
-            return store(mlir::arith::BitcastOp::create(b_, loc, vecTy(b_.getF64Type()), bits));
+            mlir::Value lo64 = mlir::LLVM::ZExtOp::create(b_, loc, vecTy(i64Ty()), argV(1));
+            mlir::Value hi64 = mlir::LLVM::ZExtOp::create(b_, loc, vecTy(i64Ty()), argV(2));
+            mlir::Value hiShift = mlir::LLVM::ShlOp::create(b_, loc, hi64, splatInt(loc, i64Ty(), 32));
+            mlir::Value bits = mlir::LLVM::OrOp::create(b_, loc, lo64, hiShift);
+            return store(mlir::LLVM::BitcastOp::create(b_, loc, vecTy(b_.getF64Type()), bits));
         }
         case 102: { // SplitDouble(val) -> { i32 lo, i32 hi }
             auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(resTy);
@@ -5967,11 +6102,11 @@ private:
                 outError = "SplitDouble expected { i32, i32 } struct return type";
                 return false;
             }
-            mlir::Value bits = mlir::arith::BitcastOp::create(b_, loc, vecTy(i64Ty()), argV(1));
-            mlir::Value lo = mlir::arith::TruncIOp::create(b_, loc, vecTy(i32Ty()), bits);
-            mlir::Value hi = mlir::arith::TruncIOp::create(
+            mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(i64Ty()), argV(1));
+            mlir::Value lo = mlir::LLVM::TruncOp::create(b_, loc, vecTy(i32Ty()), bits);
+            mlir::Value hi = mlir::LLVM::TruncOp::create(
                 b_, loc, vecTy(i32Ty()),
-                mlir::arith::ShRUIOp::create(b_, loc, bits, splatInt(loc, i64Ty(), 32)));
+                mlir::LLVM::LShrOp::create(b_, loc, bits, splatInt(loc, i64Ty(), 32)));
             SimdVal outSt;
             outSt.kind = SimdVal::Kind::Struct;
             outSt.origType = resTy;
@@ -5981,24 +6116,24 @@ private:
             return true;
         }
         case 130: { // LegacyF32ToF16(val) -> i32
-            mlir::Value f16v = mlir::arith::TruncFOp::create(b_, loc, vecTy(b_.getF16Type()), argV(1));
-            mlir::Value i16v = mlir::arith::BitcastOp::create(b_, loc, vecTy(b_.getI16Type()), f16v);
-            return store(mlir::arith::ExtUIOp::create(b_, loc, vecTy(i32Ty()), i16v));
+            mlir::Value f16v = mlir::LLVM::FPTruncOp::create(b_, loc, vecTy(b_.getF16Type()), argV(1));
+            mlir::Value i16v = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(b_.getI16Type()), f16v);
+            return store(mlir::LLVM::ZExtOp::create(b_, loc, vecTy(i32Ty()), i16v));
         }
         case 131: { // LegacyF16ToF32(val) -> f32
-            mlir::Value i16v = mlir::arith::TruncIOp::create(b_, loc, vecTy(b_.getI16Type()), argV(1));
-            mlir::Value f16v = mlir::arith::BitcastOp::create(b_, loc, vecTy(b_.getF16Type()), i16v);
-            return store(mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), f16v));
+            mlir::Value i16v = mlir::LLVM::TruncOp::create(b_, loc, vecTy(b_.getI16Type()), argV(1));
+            mlir::Value f16v = mlir::LLVM::BitcastOp::create(b_, loc, vecTy(b_.getF16Type()), i16v);
+            return store(mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), f16v));
         }
         case 162: { // Dot2AddHalf(acc, ax, ay, bx, by) -> f32
             mlir::Value acc = argV(1);
-            mlir::Value ax = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(2));
-            mlir::Value ay = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(3));
-            mlir::Value bx = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(4));
-            mlir::Value by = mlir::arith::ExtFOp::create(b_, loc, vecTy(f32Ty()), argV(5));
-            mlir::Value px = mlir::arith::MulFOp::create(b_, loc, ax, bx);
-            mlir::Value py = mlir::arith::MulFOp::create(b_, loc, ay, by);
-            mlir::Value sum = mlir::arith::AddFOp::create(b_, loc, acc, mlir::arith::AddFOp::create(b_, loc, px, py));
+            mlir::Value ax = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), argV(2));
+            mlir::Value ay = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), argV(3));
+            mlir::Value bx = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), argV(4));
+            mlir::Value by = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), argV(5));
+            mlir::Value px = mlir::LLVM::FMulOp::create(b_, loc, ax, bx);
+            mlir::Value py = mlir::LLVM::FMulOp::create(b_, loc, ay, by);
+            mlir::Value sum = mlir::LLVM::FAddOp::create(b_, loc, acc, mlir::LLVM::FAddOp::create(b_, loc, px, py));
             return store(sum);
         }
         case 163: // Dot4AddI8Packed(acc, a, b)
@@ -6013,14 +6148,14 @@ private:
                 mlir::Value ai, bi;
                 if (isSigned) {
                     mlir::Value shlAmt = splatInt(loc, i32Ty(), 24 - i * 8);
-                    ai = mlir::arith::ShRSIOp::create(b_, loc, mlir::arith::ShLIOp::create(b_, loc, a, shlAmt), c24);
-                    bi = mlir::arith::ShRSIOp::create(b_, loc, mlir::arith::ShLIOp::create(b_, loc, b, shlAmt), c24);
+                    ai = mlir::LLVM::AShrOp::create(b_, loc, mlir::LLVM::ShlOp::create(b_, loc, a, shlAmt), c24);
+                    bi = mlir::LLVM::AShrOp::create(b_, loc, mlir::LLVM::ShlOp::create(b_, loc, b, shlAmt), c24);
                 } else {
                     mlir::Value shrAmt = splatInt(loc, i32Ty(), i * 8);
-                    ai = mlir::arith::AndIOp::create(b_, loc, mlir::arith::ShRUIOp::create(b_, loc, a, shrAmt), maskFF);
-                    bi = mlir::arith::AndIOp::create(b_, loc, mlir::arith::ShRUIOp::create(b_, loc, b, shrAmt), maskFF);
+                    ai = mlir::LLVM::AndOp::create(b_, loc, mlir::LLVM::LShrOp::create(b_, loc, a, shrAmt), maskFF);
+                    bi = mlir::LLVM::AndOp::create(b_, loc, mlir::LLVM::LShrOp::create(b_, loc, b, shrAmt), maskFF);
                 }
-                acc = mlir::arith::AddIOp::create(b_, loc, acc, mlir::arith::MulIOp::create(b_, loc, ai, bi));
+                acc = mlir::LLVM::AddOp::create(b_, loc, acc, mlir::LLVM::MulOp::create(b_, loc, ai, bi));
             }
             return store(acc);
         }
@@ -6043,13 +6178,13 @@ private:
                 mlir::Value comp;
                 if (mode == 1) { // Signed
                     mlir::Value shlAmt = splatInt(loc, i32Ty(), 24 - i * 8);
-                    comp = mlir::arith::ShRSIOp::create(b_, loc, mlir::arith::ShLIOp::create(b_, loc, pk, shlAmt), c24);
+                    comp = mlir::LLVM::AShrOp::create(b_, loc, mlir::LLVM::ShlOp::create(b_, loc, pk, shlAmt), c24);
                 } else { // Unsigned
                     mlir::Value shrAmt = splatInt(loc, i32Ty(), i * 8);
-                    comp = mlir::arith::AndIOp::create(b_, loc, mlir::arith::ShRUIOp::create(b_, loc, pk, shrAmt), maskFF);
+                    comp = mlir::LLVM::AndOp::create(b_, loc, mlir::LLVM::LShrOp::create(b_, loc, pk, shrAmt), maskFF);
                 }
                 if (needTrunc) {
-                    comp = mlir::arith::TruncIOp::create(b_, loc, vecTy(elemTy), comp);
+                    comp = mlir::LLVM::TruncOp::create(b_, loc, vecTy(elemTy), comp);
                 }
                 outSt.fields.push_back({SimdVal::Kind::Vector, elemTy, comp, {}, {}});
             }
@@ -6064,20 +6199,20 @@ private:
                 mlir::Value c = argV(2 + i);
                 mlir::Type cet = llvm::cast<mlir::VectorType>(c.getType()).getElementType();
                 if (cet.getIntOrFloatBitWidth() < 32) {
-                    c = mlir::arith::ExtSIOp::create(b_, loc, vecTy(i32Ty()), c);
+                    c = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), c);
                 }
                 if (mode == 1) { // U8Clamp [0, 255]
-                    c = mlir::arith::MaxSIOp::create(b_, loc, splatInt(loc, i32Ty(), 0),
-                                                     mlir::arith::MinSIOp::create(b_, loc, splatInt(loc, i32Ty(), 255), c));
+                    c = mlir::LLVM::SMaxOp::create(b_, loc, splatInt(loc, i32Ty(), 0),
+                                                     mlir::LLVM::SMinOp::create(b_, loc, splatInt(loc, i32Ty(), 255), c));
                 } else if (mode == 2) { // S8Clamp [-128, 127]
-                    c = mlir::arith::MaxSIOp::create(b_, loc, splatInt(loc, i32Ty(), -128),
-                                                     mlir::arith::MinSIOp::create(b_, loc, splatInt(loc, i32Ty(), 127), c));
+                    c = mlir::LLVM::SMaxOp::create(b_, loc, splatInt(loc, i32Ty(), -128),
+                                                     mlir::LLVM::SMinOp::create(b_, loc, splatInt(loc, i32Ty(), 127), c));
                 }
-                c = mlir::arith::AndIOp::create(b_, loc, c, maskFF);
+                c = mlir::LLVM::AndOp::create(b_, loc, c, maskFF);
                 if (i > 0) {
-                    c = mlir::arith::ShLIOp::create(b_, loc, c, splatInt(loc, i32Ty(), i * 8));
+                    c = mlir::LLVM::ShlOp::create(b_, loc, c, splatInt(loc, i32Ty(), i * 8));
                 }
-                acc = mlir::arith::OrIOp::create(b_, loc, acc, c);
+                acc = mlir::LLVM::OrOp::create(b_, loc, acc, c);
             }
             return store(acc);
         }
@@ -6096,6 +6231,7 @@ private:
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
     mlir::Value scratchAlloca_;
+    bool strictFp_ = false;
     DescInfoCache ownedDescCache_;
     DescInfoCache* descCache_ = nullptr;
 
@@ -6144,24 +6280,21 @@ static mlir::Value buildFlatTidAndMask(
                 maskBits.push_back(tid < *totConst);
             }
             mlir::VectorType vI1 = mlir::VectorType::get({W}, b.getI1Type());
-            outActiveMask = mlir::arith::ConstantOp::create(
-                b, loc, mlir::DenseElementsAttr::get(vI1, llvm::ArrayRef<bool>(maskBits)));
-            return mlir::arith::ConstantOp::create(
-                b, loc, mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(tids)));
+            outActiveMask = mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vI1, llvm::ArrayRef<bool>(maskBits))).getType(), mlir::DenseElementsAttr::get(vI1, llvm::ArrayRef<bool>(maskBits)));
+            return mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(tids))).getType(), mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(tids)));
         }
     }
     llvm::SmallVector<int32_t, 16> iota;
     for (uint32_t i = 0; i < W; ++i) iota.push_back(static_cast<int32_t>(i));
-    mlir::Value iotaVec = mlir::arith::ConstantOp::create(
-        b, loc, mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(iota)));
+    mlir::Value iotaVec = mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(iota))).getType(), mlir::DenseElementsAttr::get(vI32, llvm::ArrayRef<int32_t>(iota)));
     mlir::Value w32 = mlir::arith::IndexCastOp::create(b, loc, i32Ty, waveIdx);
-    mlir::Value base = mlir::arith::MulIOp::create(
-        b, loc, w32, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, W));
-    mlir::Value baseVec = mlir::vector::BroadcastOp::create(b, loc, vI32, base);
-    mlir::Value flatTid = mlir::arith::AddIOp::create(b, loc, baseVec, iotaVec);
-    mlir::Value totVec = mlir::vector::BroadcastOp::create(b, loc, vI32, totalThreads);
-    outActiveMask = mlir::arith::CmpIOp::create(
-        b, loc, mlir::arith::CmpIPredicate::ult, flatTid, totVec);
+    mlir::Value base = mlir::LLVM::MulOp::create(
+        b, loc, w32, mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, W)));
+    mlir::Value baseVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), base, W);
+    mlir::Value flatTid = mlir::LLVM::AddOp::create(b, loc, baseVec, iotaVec);
+    mlir::Value totVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), totalThreads, W);
+    outActiveMask = mlir::LLVM::ICmpOp::create(
+        b, loc, mlir::LLVM::ICmpPredicate::ult, flatTid, totVec);
     return flatTid;
 }
 
@@ -6172,32 +6305,31 @@ static void setupComputeThreadIds(
     mlir::Type i32Ty = b.getI32Type();
     mlir::VectorType vI32 = mlir::VectorType::get({W}, i32Ty);
     auto splat = [&](uint32_t val) {
-        return mlir::arith::ConstantOp::create(
-            b, loc, mlir::DenseElementsAttr::get(vI32, b.getIntegerAttr(i32Ty, val)));
+        return mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vI32, b.getIntegerAttr(i32Ty, val))).getType(), mlir::DenseElementsAttr::get(vI32, b.getIntegerAttr(i32Ty, val)));
     };
     mlir::Value zeroVec = splat(0);
     mlir::Value tgsX = splat(tgs[0]), tgsY = splat(tgs[1]), tgsZ = splat(tgs[2]);
     mlir::Value xy = splat(tgs[0] * tgs[1]);
 
-    mlir::Value lx = (tgs[0] == 1) ? zeroVec : mlir::Value(mlir::arith::RemUIOp::create(b, loc, flatTid, tgsX));
-    mlir::Value qx = (tgs[0] == 1) ? flatTid : mlir::Value(mlir::arith::DivUIOp::create(b, loc, flatTid, tgsX));
-    mlir::Value ly = (tgs[1] == 1) ? zeroVec : mlir::Value(mlir::arith::RemUIOp::create(b, loc, qx, tgsY));
-    mlir::Value lz = (tgs[2] == 1) ? zeroVec : mlir::Value(mlir::arith::DivUIOp::create(b, loc, flatTid, xy));
+    mlir::Value lx = (tgs[0] == 1) ? zeroVec : mlir::Value(mlir::LLVM::URemOp::create(b, loc, flatTid, tgsX));
+    mlir::Value qx = (tgs[0] == 1) ? flatTid : mlir::Value(mlir::LLVM::UDivOp::create(b, loc, flatTid, tgsX));
+    mlir::Value ly = (tgs[1] == 1) ? zeroVec : mlir::Value(mlir::LLVM::URemOp::create(b, loc, qx, tgsY));
+    mlir::Value lz = (tgs[2] == 1) ? zeroVec : mlir::Value(mlir::LLVM::UDivOp::create(b, loc, flatTid, xy));
 
-    mlir::Value gxVec = mlir::vector::BroadcastOp::create(b, loc, vI32, gx);
-    mlir::Value gyVec = mlir::vector::BroadcastOp::create(b, loc, vI32, gy);
-    mlir::Value gzVec = mlir::vector::BroadcastOp::create(b, loc, vI32, gz);
+    mlir::Value gxVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), gx, W);
+    mlir::Value gyVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), gy, W);
+    mlir::Value gzVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vI32).getElementType(), gz, W);
 
     hooks.groupId = {gxVec, gyVec, gzVec};
     hooks.threadIdInGroup = {lx, ly, lz};
     hooks.flatGroupId = (tgs[0] == 1 && tgs[1] == 1 && tgs[2] == 1) ? zeroVec : flatTid;
     hooks.threadId = {
         (tgs[0] == 1) ? gxVec
-                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gxVec, tgsX), lx)),
+                      : mlir::Value(mlir::LLVM::AddOp::create(b, loc, mlir::LLVM::MulOp::create(b, loc, gxVec, tgsX), lx)),
         (tgs[1] == 1) ? gyVec
-                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gyVec, tgsY), ly)),
+                      : mlir::Value(mlir::LLVM::AddOp::create(b, loc, mlir::LLVM::MulOp::create(b, loc, gyVec, tgsY), ly)),
         (tgs[2] == 1) ? gzVec
-                      : mlir::Value(mlir::arith::AddIOp::create(b, loc, mlir::arith::MulIOp::create(b, loc, gzVec, tgsZ), lz))};
+                      : mlir::Value(mlir::LLVM::AddOp::create(b, loc, mlir::LLVM::MulOp::create(b, loc, gzVec, tgsZ), lz))};
 }
 
 // Collects all SSA values used inside `[segBegin, segEnd)` that are already tracked in `spills`,
@@ -6271,7 +6403,7 @@ static bool packetizeComputeBlockWithBarriers(
         llvm::SmallVector<mlir::Type, 4> flatTys;
         helper.flattenSimdTypes(origTy, flatTys);
         slot.packedValTy = (flatTys.size() == 1) ? flatTys[0] : mlir::LLVM::LLVMStructType::getLiteral(b.getContext(), flatTys);
-        mlir::Value n32 = mlir::arith::ConstantIntOp::create(eb, loc, i32Ty, numWavesVal);
+        mlir::Value n32 = mlir::LLVM::ConstantOp::create(eb, loc, i32Ty, eb.getIntegerAttr(i32Ty, numWavesVal));
         uint32_t vecAlign = std::max<uint32_t>(64, W * 8);
         slot.arrPtr = mlir::LLVM::AllocaOp::create(eb, loc, ptrTy, slot.packedValTy, n32, vecAlign);
         return slot;
@@ -6389,7 +6521,7 @@ static bool packetizeComputeBlockWithBarriers(
                 SimdVal cVal = spills.count(ifOp.getCondition())
                                    ? loadSpillAtWave(b, condPkt, spills[ifOp.getCondition()], c0)
                                    : condPkt.getMapped(loc, ifOp.getCondition());
-                mlir::Value condScalar = mlir::vector::ExtractOp::create(b, loc, condPkt.asVec(loc, cVal), 0);
+                mlir::Value condScalar = llvmExtract(b, loc, condPkt.asVec(loc, cVal), static_cast<uint32_t>(0));
                 for (mlir::Value r : ifOp.getResults()) spills[r] = allocSpillSlot(r.getType());
 
                 mlir::scf::IfOp::create(
@@ -6507,7 +6639,7 @@ static bool packetizeComputeBlockWithBarriers(
                     mlir::OpBuilder eb(entryAllocaAnchor);
                     savedWaveMaskArr = mlir::LLVM::AllocaOp::create(
                         eb, loc, ptrTy, maskVecTy,
-                        mlir::arith::ConstantIntOp::create(eb, loc, i32Ty, numWavesVal),
+                        mlir::LLVM::ConstantOp::create(eb, loc, i32Ty, eb.getIntegerAttr(i32Ty, numWavesVal)),
                         std::max<uint32_t>(64, W * 8));
                 }
                 mlir::scf::ForOp::create(
@@ -6526,7 +6658,7 @@ static bool packetizeComputeBlockWithBarriers(
                         if (!packetizeComputeBlockWithBarriers(
                                 nb, nloc, mod, srcBefore, shader, rootLayout, W, numWavesVal, rootCtxPtr, gsBase,
                                 gx, gy, gz, totalThreads, numWaves, waveMaskArr, spills, entryAllocaAnchor, baseHooks, outError)) {
-                            mlir::Value cFalse = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 0);
+                            mlir::Value cFalse = mlir::LLVM::ConstantOp::create(nb, nloc, nb.getI1Type(), nb.getIntegerAttr(nb.getI1Type(), 0));
                             mlir::scf::ConditionOp::create(nb, nloc, cFalse, mlir::ValueRange{});
                             return;
                         }
@@ -6542,7 +6674,7 @@ static bool packetizeComputeBlockWithBarriers(
                             }
                         }
 
-                        mlir::Value cFalse = mlir::arith::ConstantIntOp::create(nb, nloc, nb.getI1Type(), 0);
+                        mlir::Value cFalse = mlir::LLVM::ConstantOp::create(nb, nloc, nb.getI1Type(), nb.getIntegerAttr(nb.getI1Type(), 0));
                         auto anyLoop = mlir::scf::ForOp::create(
                             nb, nloc, c0, numWaves, c1, mlir::ValueRange{cFalse},
                             [&](mlir::OpBuilder& wb, mlir::Location wloc, mlir::Value waveIdx, mlir::ValueRange acc) {
@@ -6565,7 +6697,7 @@ static bool packetizeComputeBlockWithBarriers(
                                                        ? loadSpillAtWave(wb, pkt, spills[condOpnd], waveIdx)
                                                        : pkt.getMapped(wloc, condOpnd);
                                 mlir::Value condVec = pkt.asVec(wloc, condSimd);
-                                mlir::Value nextMask = mlir::arith::AndIOp::create(wb, wloc, curMask, condVec);
+                                mlir::Value nextMask = mlir::LLVM::AndOp::create(wb, wloc, curMask, condVec);
                                 mlir::LLVM::StoreOp::create(wb, wloc, nextMask, mp, 1u);
 
                                 for (unsigned i = 0; i < condOp.getArgs().size(); ++i) {
@@ -6583,7 +6715,7 @@ static bool packetizeComputeBlockWithBarriers(
                                     storeSpillAtWave(wb, pkt, afterSlots[i], waveIdx, pkt.selectVal(wloc, curMask, cv, prevAfter));
                                 }
                                 mlir::Value waveAny = pkt.orReduce(wloc, nextMask);
-                                mlir::Value nextAny = mlir::arith::OrIOp::create(wb, wloc, acc[0], waveAny);
+                                mlir::Value nextAny = mlir::LLVM::OrOp::create(wb, wloc, acc[0], waveAny);
                                 mlir::scf::YieldOp::create(wb, wloc, mlir::ValueRange{nextAny});
                             });
                         mlir::scf::ConditionOp::create(nb, nloc, anyLoop.getResult(0), mlir::ValueRange{});
@@ -6673,7 +6805,7 @@ bool packetizeThreadGroupRegion(
     const uint32_t totalThreadsVal =
         std::max(1u, shader.threadGroupSize[0] * shader.threadGroupSize[1] * shader.threadGroupSize[2]);
     const uint32_t numWavesVal = (totalThreadsVal + simdWidth - 1) / simdWidth;
-    mlir::Value totalThreads = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, totalThreadsVal);
+    mlir::Value totalThreads = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, totalThreadsVal));
     mlir::Value c0 = mlir::arith::ConstantIndexOp::create(b, loc, 0);
     mlir::Value c1 = mlir::arith::ConstantIndexOp::create(b, loc, 1);
     mlir::Value numWaves = mlir::arith::ConstantIndexOp::create(b, loc, numWavesVal);
@@ -6706,7 +6838,7 @@ bool packetizeThreadGroupRegion(
     } else {
         mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
         mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
-            b, loc, ptrTy, maskVecTy, mlir::arith::ConstantIntOp::create(b, loc, i32Ty, numWavesVal),
+            b, loc, ptrTy, maskVecTy, mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, numWavesVal)),
             std::max<uint32_t>(64, simdWidth * 8));
         mlir::Operation* entryAllocaAnchor = waveMaskArr.getDefiningOp();
         // Initialize per-wave active masks
@@ -6849,17 +6981,16 @@ bool packetizeDxrEntry(
     mlir::Value payloadPtr = entry->getArgument(8);
     mlir::Value attrPtr = entry->getArgument(9);
 
-    mlir::Value c0 = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, 0);
-    mlir::Value c1 = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, 1);
-    mlir::Value initExecMask = mlir::arith::ConstantOp::create(
-        b, loc, mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false)));
+    mlir::Value c0 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, 0));
+    mlir::Value c1 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, 1));
+    mlir::Value initExecMask = mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false))).getType(), mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false)));
     for (uint32_t l = 0; l < simdWidth; ++l) {
-        mlir::Value shift = mlir::arith::ConstantIntOp::create(b, loc, i32Ty, l);
-        mlir::Value shifted = mlir::arith::ShRUIOp::create(b, loc, activeMaskArg, shift);
-        mlir::Value bit = mlir::arith::AndIOp::create(b, loc, shifted, c1);
-        mlir::Value cond = mlir::arith::CmpIOp::create(
-            b, loc, mlir::arith::CmpIPredicate::ne, bit, c0);
-        initExecMask = mlir::vector::InsertOp::create(b, loc, cond, initExecMask, static_cast<int64_t>(l));
+        mlir::Value shift = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, l));
+        mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, activeMaskArg, shift);
+        mlir::Value bit = mlir::LLVM::AndOp::create(b, loc, shifted, c1);
+        mlir::Value cond = mlir::LLVM::ICmpOp::create(
+            b, loc, mlir::LLVM::ICmpPredicate::ne, bit, c0);
+        initExecMask = llvmInsert(b, loc, initExecMask, cond, static_cast<uint32_t>(static_cast<int64_t>(l)));
     }
 
     StageHooks hooks;
@@ -6867,9 +6998,9 @@ bool packetizeDxrEntry(
     hooks.threadId[0] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rxPtr, 4u);
     hooks.threadId[1] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, ryPtr, 4u);
     hooks.threadId[2] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rzPtr, 4u);
-    hooks.dispatchRaysDim[0] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimX);
-    hooks.dispatchRaysDim[1] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimY);
-    hooks.dispatchRaysDim[2] = mlir::vector::BroadcastOp::create(b, loc, vecI32Ty, dimZ);
+    hooks.dispatchRaysDim[0] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimX, simdWidth);
+    hooks.dispatchRaysDim[1] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimY, simdWidth);
+    hooks.dispatchRaysDim[2] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimZ, simdWidth);
 
     SimdPacketizer pkt(b, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
     for (unsigned a = 0; a < srcFunc.getNumArguments() && a < 2; ++a) {

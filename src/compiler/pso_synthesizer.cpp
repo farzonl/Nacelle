@@ -35,18 +35,30 @@ std::string toLowerAscii(const std::string& s) {
 
 std::optional<uint32_t> tryGetUniformConstUInt(const SimdVal& sv) {
     if (sv.kind != SimdVal::Kind::Vector || !sv.vec) return std::nullopt;
-    if (auto c = sv.vec.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto splat = llvm::dyn_cast<mlir::SplatElementsAttr>(c.getValue())) {
+    auto extractAttr = [](mlir::Attribute attr) -> std::optional<uint32_t> {
+        if (auto splat = llvm::dyn_cast<mlir::SplatElementsAttr>(attr)) {
             if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(splat.getSplatValue<mlir::Attribute>())) {
                 return static_cast<uint32_t>(ia.getValue().getZExtValue());
             }
         }
-        if (auto dense = llvm::dyn_cast<mlir::DenseElementsAttr>(c.getValue()); dense && dense.isSplat()) {
+        if (auto dense = llvm::dyn_cast<mlir::DenseElementsAttr>(attr); dense && dense.isSplat()) {
             return static_cast<uint32_t>(dense.getSplatValue<llvm::APInt>().getZExtValue());
         }
+        return std::nullopt;
+    };
+    if (auto c = sv.vec.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto v = extractAttr(c.getValue())) return v;
+    }
+    if (auto c = sv.vec.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+        if (auto v = extractAttr(c.getValue())) return v;
     }
     if (auto bc = sv.vec.getDefiningOp<mlir::vector::BroadcastOp>()) {
         if (auto c = bc.getSource().getDefiningOp<mlir::arith::ConstantOp>()) {
+            if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
+                return static_cast<uint32_t>(ia.getValue().getZExtValue());
+            }
+        }
+        if (auto c = bc.getSource().getDefiningOp<mlir::LLVM::ConstantOp>()) {
             if (auto ia = llvm::dyn_cast<mlir::IntegerAttr>(c.getValue())) {
                 return static_cast<uint32_t>(ia.getValue().getZExtValue());
             }

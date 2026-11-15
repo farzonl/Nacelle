@@ -31,13 +31,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 }
 
 // SIMD8: func.func @nacelle_cs_test
-// SIMD8-DAG: math.ctpop {{.*}} : vector<8xi64>
-// SIMD8-DAG: arith.trunci {{.*}} : vector<8xi64> to vector<8xi32>
-// SIMD8-DAG: math.ctpop {{.*}} : vector<8xi16>
-// SIMD8-DAG: arith.extui {{.*}} : vector<8xi16> to vector<8xi32>
-// SIMD8-DAG: math.cttz {{.*}} : vector<8xi64>
-// SIMD8-DAG: math.ctlz {{.*}} : vector<8xi64>
-// SIMD8-DAG: math.isinf {{.*}} : vector<8xf32>
+// SIMD8-DAG: llvm.intr.ctpop{{.*}}vector<8xi64>
+// SIMD8-DAG: llvm.trunc {{.*}} : vector<8xi64> to vector<8xi32>
+// SIMD8-DAG: llvm.intr.ctpop{{.*}}vector<8xi16>
+// SIMD8-DAG: llvm.zext {{.*}} : vector<8xi16> to vector<8xi32>
+// SIMD8-DAG: llvm.intr.cttz{{.*}}vector<8xi64>
+// SIMD8-DAG: llvm.intr.ctlz{{.*}}vector<8xi64>
+// SIMD8-DAG: llvm.intr.is.fpclass{{.*}}vector<8xf32>
 // SIMD8-NOT: dx.op.unaryBits
 // SIMD8-NOT: dx.op.isSpecialFloat
 

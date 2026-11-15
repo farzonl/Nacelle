@@ -8,7 +8,7 @@
 // W4: vector<4x
 // W4: llvm.intr.masked.load{{.*}}vector<4xf32>
 // W4: llvm.intr.masked.gather{{.*}}vector<4xf32>
-// W4: arith.addf{{.*}}vector<4xf32>
+// W4: llvm.fadd{{.*}}vector<4xf32>
 // W4: llvm.intr.masked.store{{.*}}vector<4xf32>
 // W4: llvm.intr.masked.scatter{{.*}}vector<4xf32>
 
@@ -16,7 +16,7 @@
 // W8: vector<8x
 // W8: llvm.intr.masked.load{{.*}}vector<8xf32>
 // W8: llvm.intr.masked.gather{{.*}}vector<8xf32>
-// W8: arith.addf{{.*}}vector<8xf32>
+// W8: llvm.fadd{{.*}}vector<8xf32>
 // W8: llvm.intr.masked.store{{.*}}vector<8xf32>
 // W8: llvm.intr.masked.scatter{{.*}}vector<8xf32>
 
@@ -24,7 +24,7 @@
 // W16: vector<16x
 // W16: llvm.intr.masked.load{{.*}}vector<16xf32>
 // W16: llvm.intr.masked.gather{{.*}}vector<16xf32>
-// W16: arith.addf{{.*}}vector<16xf32>
+// W16: llvm.fadd{{.*}}vector<16xf32>
 // W16: llvm.intr.masked.store{{.*}}vector<16xf32>
 // W16: llvm.intr.masked.scatter{{.*}}vector<16xf32>
 
