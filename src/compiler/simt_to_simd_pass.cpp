@@ -287,11 +287,6 @@ public:
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
-        if (elemTy.isF16()) {
-            mlir::Value f32Arg = mlir::LLVM::FPExtOp::create(b_, loc, vecTy(f32Ty()), vecArg);
-            mlir::Value f32Res = emitMathUnary(loc, baseName, f32Arg);
-            return mlir::LLVM::FPTruncOp::create(b_, loc, vt, f32Res);
-        }
         if (!strictFp_ && elemTy.isF32() && (W_ == 4 || W_ == 8 || W_ == 16)) {
             std::string fnName = ("nacelle_math_v" + std::to_string(W_) + "_" + baseName + "f").str();
             mlir::func::FuncOp callee = mod_.lookupSymbol<mlir::func::FuncOp>(fnName);
@@ -306,6 +301,13 @@ public:
         }
         if (baseName == "sin") return createFp<mlir::LLVM::SinOp>(loc, vt, vecArg);
         if (baseName == "cos") return createFp<mlir::LLVM::CosOp>(loc, vt, vecArg);
+        if (baseName == "tan") return createFp<mlir::LLVM::TanOp>(loc, vt, vecArg);
+        if (baseName == "acos") return createFp<mlir::LLVM::ACosOp>(loc, vt, vecArg);
+        if (baseName == "asin") return createFp<mlir::LLVM::ASinOp>(loc, vt, vecArg);
+        if (baseName == "atan") return createFp<mlir::LLVM::ATanOp>(loc, vt, vecArg);
+        if (baseName == "cosh") return createFp<mlir::LLVM::CoshOp>(loc, vt, vecArg);
+        if (baseName == "sinh") return createFp<mlir::LLVM::SinhOp>(loc, vt, vecArg);
+        if (baseName == "tanh") return createFp<mlir::LLVM::TanhOp>(loc, vt, vecArg);
         if (baseName == "exp2") return createFp<mlir::LLVM::Exp2Op>(loc, vt, vecArg);
         if (baseName == "log2") return createFp<mlir::LLVM::Log2Op>(loc, vt, vecArg);
         // Scalar libm fallback for strict-FP or non-f32 transcendental ops.
