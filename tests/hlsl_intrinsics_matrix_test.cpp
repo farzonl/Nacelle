@@ -513,6 +513,234 @@ bool testBitAndFPClassIntrinsics(testutil::TestRuntime& rt) {
     return ok;
 }
 
+uint32_t floatBits(float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, sizeof(b));
+    return b;
+}
+
+float flushDenormInput(float v) {
+    if (std::isnan(v) || std::isinf(v) || v == 0.0f) return v;
+    if (std::fabs(v) < std::numeric_limits<float>::min()) {
+        return std::signbit(v) ? -0.0f : 0.0f;
+    }
+    return v;
+}
+
+uint64_t ulpDiffFloat(float got, double refD) {
+    const double fltMax = static_cast<double>(std::numeric_limits<float>::max());
+    const double fltMin = static_cast<double>(std::numeric_limits<float>::min());
+    if (std::isnan(refD)) return std::isnan(got) ? 0 : UINT64_MAX;
+    if (std::isnan(got)) return UINT64_MAX;
+    if (std::isinf(refD) || std::fabs(refD) > fltMax) {
+        bool wantNeg = std::signbit(refD);
+        return (std::isinf(got) && (std::signbit(got) == wantNeg)) ? 0 : UINT64_MAX;
+    }
+    if (std::isinf(got)) return UINT64_MAX;
+    if (std::fabs(refD) < fltMin) {
+        return (std::fabs(got) <= std::numeric_limits<float>::min()) ? 0 : UINT64_MAX;
+    }
+    float refF = static_cast<float>(refD);
+    auto toOrdered = [](float f) -> int64_t {
+        uint32_t u = floatBits(f);
+        return (u & 0x80000000u) ? -static_cast<int64_t>(u & 0x7FFFFFFFu) : static_cast<int64_t>(u);
+    };
+    int64_t d = toOrdered(got) - toOrdered(refF);
+    return static_cast<uint64_t>(d < 0 ? -d : d);
+}
+
+bool testTranscendentalMath(testutil::TestRuntime& rt) {
+    std::cout << "=== Test: transcendental_math ===\n";
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = 2;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = 0;
+    ranges[1].OffsetInDescriptorsFromTableStart = 2;
+
+    D3D12_ROOT_PARAMETER rp{};
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp.DescriptorTable.NumDescriptorRanges = 2;
+    rp.DescriptorTable.pDescriptorRanges = ranges;
+
+    auto rs = createRS(rt.device.Get(), 1, &rp);
+    auto pso = createCS(rt.device.Get(), rs.Get(), "transcendental_math.dxil");
+
+    constexpr UINT kLanes = 64;
+    constexpr UINT kFuncs = 16;
+    const float posInf = std::numeric_limits<float>::infinity();
+    const float negInf = -std::numeric_limits<float>::infinity();
+    const float qNan = std::numeric_limits<float>::quiet_NaN();
+
+    float inX[kLanes]{};
+    float inY[kLanes]{};
+
+    const float fixedX[25] = {
+        0.0f, -0.0f, 0x1.5p-130f, -0x1.5p-130f, posInf, negInf, qNan,
+        1.5f, -1.5f, 1.0f, -1.0f, 1e-6f, -1e-6f, 0.9999f, -0.9999f,
+        89.0f, -89.0f, 90.0f, -90.0f, 127.5f, 128.0f, -126.0f, -150.0f,
+        1.25f, 1.25f
+    };
+    const float fixedY[25] = {
+        2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f,
+        -3.0f, 2.5f, 0.0f, 3.0f, 1.0f, 1.0f, 4.0f, 4.0f,
+        0.25f, 0.25f, 0.1f, 0.1f, 0.1f, 0.1f, 0.0f, 0.0f,
+        -150.0f, 130.0f
+    };
+    for (UINT i = 0; i < 25; ++i) {
+        inX[i] = fixedX[i];
+        inY[i] = fixedY[i];
+    }
+    for (UINT i = 25; i < 45; ++i) {
+        float t = static_cast<float>(i - 25) / 19.0f; // [0, 1]
+        inX[i] = -0.95f + 1.90f * t;
+        if (std::fabs(inX[i]) < 0.02f) inX[i] = 0.035f;
+        inY[i] = -2.25f + 4.5f * t;
+    }
+    for (UINT i = 45; i < kLanes; ++i) {
+        float k = static_cast<float>(i - 44);
+        float mag = 0.17f + 0.61f * k; // avoids odd multiples of pi/2
+        inX[i] = ((i & 1u) == 0u) ? mag : -mag;
+        inY[i] = ((i % 3u) == 0u) ? -1.5f : 1.75f;
+    }
+
+    auto bufX = rt.createBuffer(sizeof(inX), D3D12_HEAP_TYPE_DEFAULT);
+    auto bufY = rt.createBuffer(sizeof(inY), D3D12_HEAP_TYPE_DEFAULT);
+    auto bufOut = rt.createBuffer(kFuncs * kLanes * sizeof(float), D3D12_HEAP_TYPE_DEFAULT,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    rt.uploadBuffer(bufX.Get(), inX, sizeof(inX));
+    rt.uploadBuffer(bufY.Get(), inY, sizeof(inY));
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    testutil::checkHR(rt.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "Heap");
+    const UINT inc = rt.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+
+    auto makeSrv = [&](ID3D12Resource* r, UINT num, UINT idx) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = DXGI_FORMAT_UNKNOWN;
+        d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.NumElements = num;
+        d.Buffer.StructureByteStride = sizeof(float);
+        rt.device->CreateShaderResourceView(r, &d, {cpu.ptr + idx * inc});
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_UNKNOWN;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = kFuncs * kLanes;
+    uav.Buffer.StructureByteStride = sizeof(float);
+
+    makeSrv(bufX.Get(), kLanes, 0);
+    makeSrv(bufY.Get(), kLanes, 1);
+    rt.device->CreateUnorderedAccessView(bufOut.Get(), nullptr, &uav, {cpu.ptr + 2 * inc});
+
+    rt.resetCmd();
+    ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+    rt.cmdList->SetDescriptorHeaps(1, heaps);
+    rt.cmdList->SetComputeRootSignature(rs.Get());
+    rt.cmdList->SetPipelineState(pso.Get());
+    rt.cmdList->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+    rt.cmdList->Dispatch(1, 1, 1);
+    rt.executeAndWait();
+
+    auto outRaw = rt.readbackBuffer(bufOut.Get(), kFuncs * kLanes * sizeof(float));
+    float out[kFuncs][kLanes];
+    std::memcpy(out, outRaw.data(), sizeof(out));
+
+    const char* fnNames[kFuncs] = {
+        "exp2", "exp", "ldexp", "log2", "log", "log10", "pow",
+        "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh"
+    };
+
+    bool ok = true;
+    for (UINT i = 0; i < kLanes; ++i) {
+        float xf = flushDenormInput(inX[i]);
+        float yf = flushDenormInput(inY[i]);
+        double xd = static_cast<double>(xf);
+        double yd = static_cast<double>(yf);
+
+        auto check = [&](UINT fn, double ref, uint64_t maxUlp) {
+            float got = out[fn][i];
+            uint64_t ulp = ulpDiffFloat(got, ref);
+            if (ulp > maxUlp) {
+                ok = false;
+                std::cout << fnNames[fn] << "[lane " << i << "] (x=" << inX[i] << ", y=" << inY[i]
+                          << ") got=" << got << " (0x" << std::hex << floatBits(got) << std::dec
+                          << ") expected=" << static_cast<float>(ref) << " ulp=" << ulp << "\n";
+            }
+        };
+
+        check(0, std::exp2(xd), 3);
+        // DXC lowers HLSL exp(x) to exp2(float(x * log2(e))) in DXIL
+        double expDxilArg = static_cast<double>(xf * 1.4426950408889634f);
+        check(1, std::exp2(expDxilArg), 3);
+
+        // HLSL ldexp(x, y) := x * exp2(y)
+        double ldexpRef = xd * std::exp2(yd);
+        check(2, ldexpRef, 4);
+
+        // log2, log, log10: 0 -> -inf, < 0 -> NaN, +inf -> +inf
+        double log2Ref = (xf == 0.0f) ? -std::numeric_limits<double>::infinity()
+                       : (xf < 0.0f)  ? std::numeric_limits<double>::quiet_NaN()
+                                      : std::log2(xd);
+        double logRef  = (xf == 0.0f) ? -std::numeric_limits<double>::infinity()
+                       : (xf < 0.0f)  ? std::numeric_limits<double>::quiet_NaN()
+                                      : std::log(xd);
+        double log10Ref = (xf == 0.0f) ? -std::numeric_limits<double>::infinity()
+                        : (xf < 0.0f)  ? std::numeric_limits<double>::quiet_NaN()
+                                       : std::log10(xd);
+        check(3, log2Ref, 3);
+        check(4, logRef, 3);
+        check(5, log10Ref, 3);
+
+        // DXC lowers HLSL pow(|x|, y) to exp2(float(y * float(log2(|x|))))
+        float absXf = std::fabs(xf);
+        double powRef;
+        if (std::isnan(xd) || std::isnan(yd)) {
+            powRef = std::numeric_limits<double>::quiet_NaN();
+        } else if (absXf == 0.0f) {
+            powRef = std::exp2(yd * (-std::numeric_limits<double>::infinity()));
+        } else {
+            float lg2 = static_cast<float>(std::log2(static_cast<double>(absXf)));
+            float prod = yf * lg2;
+            powRef = std::exp2(static_cast<double>(prod));
+        }
+        uint64_t powTol = 4 + static_cast<uint64_t>(std::ceil(std::fabs(yd) * 1.5));
+        check(6, powRef, powTol);
+
+        // sin, cos, tan: ±inf / NaN -> NaN
+        bool trigDomInvalid = std::isnan(xd) || std::isinf(xd);
+        check(7, trigDomInvalid ? std::numeric_limits<double>::quiet_NaN() : std::sin(xd), 3);
+        check(8, trigDomInvalid ? std::numeric_limits<double>::quiet_NaN() : std::cos(xd), 3);
+        check(9, trigDomInvalid ? std::numeric_limits<double>::quiet_NaN() : std::tan(xd), 4);
+
+        // asin, acos: |x| > 1 -> NaN
+        bool invTrigInvalid = std::isnan(xd) || std::fabs(xd) > 1.0;
+        check(10, invTrigInvalid ? std::numeric_limits<double>::quiet_NaN() : std::asin(xd), 3);
+        check(11, invTrigInvalid ? std::numeric_limits<double>::quiet_NaN() : std::acos(xd), 3);
+        check(12, std::isnan(xd) ? std::numeric_limits<double>::quiet_NaN() : std::atan(xd), 3);
+
+        // sinh, cosh, tanh: full domain including tiny |x|, near-overflow |x|=89, overflow |x|=90, ±Inf, NaN
+        check(13, std::sinh(xd), 3);
+        check(14, std::cosh(xd), 3);
+        check(15, std::tanh(xd), 3);
+    }
+
+    // Explicitly verify small-input non-zero preservation (no catastrophic cancellation to 0)
+    if (out[13][11] == 0.0f || out[15][11] == 0.0f) {
+        ok = false;
+        std::cout << "Catastrophic cancellation for tiny input x=1e-6: sinh="
+                  << out[13][11] << " tanh=" << out[15][11] << "\n";
+    }
+
+    if (ok) std::cout << "PASS\n";
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -524,5 +752,6 @@ int main() {
     bool ok2d = testQuadDerivatives(rt, true);
     bool ok3 = testMathDenormsBits(rt);
     bool ok4 = testBitAndFPClassIntrinsics(rt);
-    return (ok1 && ok2 && ok2d && ok3 && ok4) ? 0 : 1;
+    bool ok5 = testTranscendentalMath(rt);
+    return (ok1 && ok2 && ok2d && ok3 && ok4 && ok5) ? 0 : 1;
 }

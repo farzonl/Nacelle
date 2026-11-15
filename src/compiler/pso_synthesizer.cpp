@@ -1684,7 +1684,7 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::Type i32 = lb.getI32Type();
             mlir::Value v = (sv.kind == SimdVal::Kind::Vector)
                                 ? llvmExtract(lb, lloc, sv.vec, static_cast<uint32_t>(static_cast<int64_t>(lane)))
-                                : (sv.isUniform() ? sv.lanes[0] : sv.lanes[lane]);
+                                : (sv.lanes.size() == 1 ? sv.lanes[0] : sv.lanes[lane]);
             if (v.getType() != i32) {
                 if (mlir::isa<mlir::FloatType>(v.getType())) {
                     if (v.getType().getIntOrFloatBitWidth() != 32) {
@@ -1760,7 +1760,7 @@ bool synthesizeGraphicsPSOMLIR(
                             ch.storeScalar(extractLaneI32(cb, cloc, countY, l), ch.gepBytes(outDispatchDims, 4));
                             ch.storeScalar(extractLaneI32(cb, cloc, countZ, l), ch.gepBytes(outDispatchDims, 8));
                             if (asLoaded.asPayloadBytes > 0 && payloadArg.kind == SimdVal::Kind::Lanes && !payloadArg.lanes.empty()) {
-                                mlir::Value srcPtr = payloadArg.isUniform() ? payloadArg.lanes[0] : payloadArg.lanes[l];
+                                mlir::Value srcPtr = payloadArg.lanes.size() == 1 ? payloadArg.lanes[0] : payloadArg.lanes[l];
                                 mlir::Value nullP = mlir::LLVM::ZeroOp::create(cb, cloc, ptrTy);
                                 mlir::Value srcOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, srcPtr, nullP);
                                 mlir::Value dstOk = mlir::LLVM::ICmpOp::create(cb, cloc, mlir::LLVM::ICmpPredicate::ne, outPayload, nullP);

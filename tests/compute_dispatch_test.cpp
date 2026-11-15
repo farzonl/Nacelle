@@ -343,6 +343,117 @@ int main() {
         assert(cntVal == 0xFFFFFFFCu);
     }
 
-    std::printf("compute_dispatch_test PASSED (vec_add, matmul, divergent_cf_atomics, prefix_sum_groupshared, byte_address_get_dims, uav_counter_dec)\n");
+    // 7. group_index_patterns.dxil: SV_GroupIndex (op 96) dynamic CBuffer + StructuredBuffer + groupshared float4
+    {
+        D3D12_ROOT_PARAMETER rp[3]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        rp[0].Descriptor.ShaderRegister = 0;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rp[1].Descriptor.ShaderRegister = 0;
+        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[2].Descriptor.ShaderRegister = 0;
+
+        auto rs = createComputeRS(rt.device.Get(), 3, rp);
+        auto pso = createComputePSO(rt.device.Get(), rs.Get(), "group_index_patterns.dxil");
+
+        struct PackedRecord {
+            uint32_t tag;
+            float weight;
+            uint32_t payload;
+        };
+        static_assert(sizeof(PackedRecord) == 12, "12-byte non-power-of-two stride");
+
+        constexpr UINT kGroups = 2;
+        constexpr UINT kGroupSize = 32;
+        constexpr UINT kTotal = kGroups * kGroupSize;
+
+        uint32_t cbData[8 * 4]{};
+        for (UINT i = 0; i < 8; ++i) {
+            cbData[i * 4] = (i + 1u) * 11u;
+        }
+        std::vector<PackedRecord> records(kTotal);
+        for (UINT idx = 0; idx < kTotal; ++idx) {
+            records[idx].tag = idx * 3u + 5u;
+            records[idx].weight = static_cast<float>(idx * 2u + 7u);
+            records[idx].payload = idx * 5u + 13u;
+        }
+
+        auto cb = rt.createBuffer(256, D3D12_HEAP_TYPE_DEFAULT);
+        auto bIn = rt.createBuffer(records.size() * sizeof(PackedRecord), D3D12_HEAP_TYPE_DEFAULT);
+        auto bOut = rt.createBuffer(kTotal * sizeof(uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        rt.uploadBuffer(cb.Get(), cbData, sizeof(cbData));
+        rt.uploadBuffer(bIn.Get(), records.data(), records.size() * sizeof(PackedRecord));
+
+        rt.resetCmd();
+        rt.cmdList->SetComputeRootSignature(rs.Get());
+        rt.cmdList->SetPipelineState(pso.Get());
+        rt.cmdList->SetComputeRootConstantBufferView(0, cb->GetGPUVirtualAddress());
+        rt.cmdList->SetComputeRootShaderResourceView(1, bIn->GetGPUVirtualAddress());
+        rt.cmdList->SetComputeRootUnorderedAccessView(2, bOut->GetGPUVirtualAddress());
+        rt.cmdList->Dispatch(kGroups, 1, 1);
+        rt.executeAndWait();
+
+        auto outRaw = rt.readbackBuffer(bOut.Get(), kTotal * sizeof(uint32_t));
+        std::vector<uint32_t> out(kTotal);
+        std::memcpy(out.data(), outRaw.data(), kTotal * sizeof(uint32_t));
+
+        for (UINT g = 0; g < kGroups; ++g) {
+            for (UINT gi = 0; gi < kGroupSize; ++gi) {
+                UINT idx = g * kGroupSize + gi;
+                UINT mateA = (gi + 1u) & 31u;
+                UINT mateB = (gi + 17u) & 31u;
+                UINT idxB = g * kGroupSize + mateB;
+                uint32_t exp = (mateA + 1u)
+                             + static_cast<uint32_t>(records[idx].weight)
+                             + (records[idxB].tag + cbData[(mateB & 7u) * 4])
+                             + records[idx].payload;
+                assert(out[idx] == exp);
+            }
+        }
+    }
+
+    // 8. subwave_group_thread.dxil: [numthreads(4, 4, 1)] where tgs[0] < SIMD width
+    {
+        D3D12_ROOT_PARAMETER rp[2]{};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rp[0].Descriptor.ShaderRegister = 0;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        rp[1].Descriptor.ShaderRegister = 0;
+
+        auto rs = createComputeRS(rt.device.Get(), 2, rp);
+        auto pso = createComputePSO(rt.device.Get(), rs.Get(), "subwave_group_thread.dxil");
+
+        uint32_t colWeights[16]{};
+        for (UINT x = 0; x < 16; ++x) {
+            colWeights[x] = (x + 1u) * 7u;
+        }
+        auto bCols = rt.createBuffer(sizeof(colWeights), D3D12_HEAP_TYPE_DEFAULT);
+        auto bOut = rt.createBuffer(64 * sizeof(uint32_t), D3D12_HEAP_TYPE_DEFAULT,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        rt.uploadBuffer(bCols.Get(), colWeights, sizeof(colWeights));
+
+        rt.resetCmd();
+        rt.cmdList->SetComputeRootSignature(rs.Get());
+        rt.cmdList->SetPipelineState(pso.Get());
+        rt.cmdList->SetComputeRootShaderResourceView(0, bCols->GetGPUVirtualAddress());
+        rt.cmdList->SetComputeRootUnorderedAccessView(1, bOut->GetGPUVirtualAddress());
+        rt.cmdList->Dispatch(2, 2, 1);
+        rt.executeAndWait();
+
+        auto outRaw = rt.readbackBuffer(bOut.Get(), 64 * sizeof(uint32_t));
+        uint32_t out[64]{};
+        std::memcpy(out, outRaw.data(), sizeof(out));
+
+        for (UINT y = 0; y < 8; ++y) {
+            for (UINT x = 0; x < 8; ++x) {
+                UINT gtidX = x % 4u;
+                uint32_t exp = colWeights[x] * 100u + (gtidX * 10u + 3u) + y;
+                assert(out[y * 8u + x] == exp);
+            }
+        }
+    }
+
+    std::printf("compute_dispatch_test PASSED (vec_add, matmul, divergent_cf_atomics, prefix_sum_groupshared, byte_address_get_dims, uav_counter_dec, group_index_patterns, subwave_group_thread)\n");
     return 0;
 }
