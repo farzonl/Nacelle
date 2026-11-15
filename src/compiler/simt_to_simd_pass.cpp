@@ -133,6 +133,29 @@ static bool regionContainsBarrier(mlir::Region& r) {
 
 class SimdPacketizer {
 public:
+    struct BufferDescInfo {
+        mlir::Value descP;
+        mlir::Value basePtr;
+        mlir::Value byteSize;
+        mlir::Value isReserved;
+        mlir::Value okPtr;
+        mlir::Value elemStride;
+        mlir::Value stride64;
+    };
+
+    struct DescInfoCacheKey {
+        mlir::Value descPtr;
+        bool isRootConstants = false;
+        uint32_t stride = 0;
+        bool needElemStride = false;
+        bool needStride64 = false;
+        bool operator==(const DescInfoCacheKey& o) const {
+            return descPtr == o.descPtr && isRootConstants == o.isRootConstants && stride == o.stride &&
+                   needElemStride == o.needElemStride && needStride64 == o.needStride64;
+        }
+    };
+    using DescInfoCache = llvm::SmallVector<std::pair<DescInfoCacheKey, BufferDescInfo>, 8>;
+
     SimdPacketizer(
         mlir::OpBuilder& builder,
         mlir::ModuleOp mod,
@@ -140,7 +163,8 @@ public:
         const RootSignatureLayout& rootLayout,
         uint32_t simdWidth,
         mlir::Value rootCtxPtr,
-        StageHooks& hooks)
+        StageHooks& hooks,
+        DescInfoCache* sharedDescCache = nullptr)
         : b_(builder),
           ctx_(builder.getContext()),
           mod_(mod),
@@ -148,7 +172,8 @@ public:
           rootLayout_(rootLayout),
           W_(simdWidth),
           rootCtxPtr_(rootCtxPtr),
-          hooks_(hooks) {}
+          hooks_(hooks),
+          descCache_(sharedDescCache ? sharedDescCache : &ownedDescCache_) {}
 
     mlir::OpBuilder& builder() { return b_; }
     uint32_t width() const { return W_; }
@@ -1694,7 +1719,7 @@ private:
                 auto guard = mlir::scf::IfOp::create(
                     b_, loc, anyExec,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         sub.valueMap_ = valueMap_;
                         bool ok = sub.packetizeBlock(srcBB, curExec, curReal, outError);
                         llvm::SmallVector<mlir::Value, 8> yielded;
@@ -1713,7 +1738,7 @@ private:
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         llvm::SmallVector<mlir::Value, 8> zeros;
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         for (mlir::Value r : swOp.getResults()) {
                             sub.packSimdToValues(nloc, sub.makeZeroSimd(nloc, r.getType()), zeros);
                         }
@@ -1728,7 +1753,7 @@ private:
                 mlir::scf::IfOp::create(
                     b_, loc, anyExec,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         sub.valueMap_ = valueMap_;
                         (void)sub.packetizeBlock(srcBB, curExec, curReal, outError);
                         mlir::scf::YieldOp::create(nb, nloc);
@@ -1792,7 +1817,7 @@ private:
                 auto guard = mlir::scf::IfOp::create(
                     b_, loc, anyExec,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         sub.valueMap_ = valueMap_;
                         if (!sub.packetizeBlock(srcBB, bExec, curReal, outError)) {
                             for (mlir::Type pt : packedTypes) (void)pt;
@@ -1808,7 +1833,7 @@ private:
                     },
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                         llvm::SmallVector<mlir::Value, 8> zeros;
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         for (mlir::Value r : ifOp.getResults()) {
                             sub.packSimdToValues(nloc, sub.makeZeroSimd(nloc, r.getType()), zeros);
                         }
@@ -1820,7 +1845,7 @@ private:
                 mlir::scf::IfOp::create(
                     b_, loc, anyExec,
                     [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                        SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                         sub.valueMap_ = valueMap_;
                         (void)sub.packetizeBlock(srcBB, bExec, curReal, outError);
                         mlir::scf::YieldOp::create(nb, nloc);
@@ -1899,7 +1924,7 @@ private:
         auto newWhile = mlir::scf::WhileOp::create(
             b_, loc, resTypes, initVals,
             [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange bArgs) {
-                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                 sub.valueMap_ = valueMap_;
                 mlir::Value loopExec = bArgs[0];
                 mlir::Value aliveMask = bArgs[1];
@@ -1951,7 +1976,7 @@ private:
                 mlir::scf::ConditionOp::create(nb, nloc, anyActive, condArgs);
             },
             [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::ValueRange aArgs) {
-                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                 sub.valueMap_ = valueMap_;
                 mlir::Value bodyExec = aArgs[0];
                 mlir::Value bodyAlive = aArgs[1];
@@ -2027,7 +2052,7 @@ private:
         auto nf = mlir::scf::ForOp::create(
             b_, loc, lb, ub, step, inits,
             [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value iv, mlir::ValueRange iterArgs) {
-                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
+                SimdPacketizer sub(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_, descCache_);
                 sub.valueMap_ = valueMap_;
                 mlir::Value ivVec = mlir::vector::BroadcastOp::create(nb, nloc, sub.vecTy(iv.getType()), iv);
                 sub.setMapped(forOp.getInductionVar(), {SimdVal::Kind::Vector, iv.getType(), ivVec, {}, {}});
@@ -2732,16 +2757,6 @@ private:
         return packetizeMathOp(call, op, outError);
     }
 
-    struct BufferDescInfo {
-        mlir::Value descP;
-        mlir::Value basePtr;
-        mlir::Value byteSize;
-        mlir::Value isReserved;
-        mlir::Value okPtr;
-        mlir::Value elemStride;
-        mlir::Value stride64;
-    };
-
     BufferDescInfo loadBufferDescInfo(
         mlir::Location loc,
         mlir::OpBuilder& nb,
@@ -2749,6 +2764,24 @@ private:
         mlir::Value descPtr,
         bool needElemStride,
         bool needStride64) {
+        mlir::Block* entryBlock = getFuncEntryBlock();
+        const bool canCache = (entryBlock != nullptr) && (descPtr.getParentBlock() == entryBlock);
+        DescInfoCacheKey key{descPtr, h.isRootConstants, h.stride, needElemStride, needStride64};
+        if (canCache) {
+            for (const auto& entry : *descCache_) {
+                if (entry.first == key) return entry.second;
+            }
+        }
+
+        mlir::OpBuilder::InsertionGuard guard(nb);
+        if (canCache) {
+            if (auto* defOp = descPtr.getDefiningOp()) {
+                nb.setInsertionPointAfter(defOp);
+            } else {
+                nb.setInsertionPointToStart(entryBlock);
+            }
+        }
+
         BufferDescInfo info;
         info.descP = descPtr;
         if (h.isRootConstants) {
@@ -2813,6 +2846,9 @@ private:
             info.stride64 = (h.stride > 0)
                                 ? mlir::Value(mlir::arith::ConstantIntOp::create(nb, loc, i64Ty(), h.stride))
                                 : mlir::Value(mlir::arith::ExtUIOp::create(nb, loc, i64Ty(), loadedEs));
+        }
+        if (canCache) {
+            descCache_->push_back({key, info});
         }
         return info;
     }
@@ -3210,21 +3246,64 @@ private:
             return {outVecs, splatInt(loc, i32Ty(), 1)};
         }
 
+        auto emitPerCompReserved = [&](mlir::OpBuilder& rb, mlir::Location rloc) -> llvm::SmallVector<mlir::Value, 17> {
+            mlir::Value allMapped = mlir::arith::ConstantIntOp::create(rb, rloc, i1Ty(), 1);
+            llvm::SmallVector<mlir::Value, 17> yielded;
+            yielded.reserve(activeComps.size() + 1);
+            for (unsigned c : activeComps) {
+                auto [cOff, ok] = compInBounds(rb, rloc, c);
+                auto [v, mapped] = emitReservedElemLoad(
+                    rb, rloc, elemTy, elemBytes, info.descP, info.basePtr, ok, cOff);
+                allMapped = mlir::arith::AndIOp::create(rb, rloc, allMapped, mapped);
+                yielded.push_back(v);
+            }
+            yielded.push_back(mlir::arith::ExtUIOp::create(rb, rloc, i32Ty(), allMapped));
+            return yielded;
+        };
+
         auto ifRes = mlir::scf::IfOp::create(
             b_, loc, info.isReserved,
             [&](mlir::OpBuilder& rb, mlir::Location rloc) {
-                mlir::Value allMapped = mlir::arith::ConstantIntOp::create(rb, rloc, i1Ty(), 1);
-                llvm::SmallVector<mlir::Value, 17> yielded;
-                yielded.reserve(activeComps.size() + 1);
-                for (unsigned c : activeComps) {
-                    auto [cOff, ok] = compInBounds(rb, rloc, c);
-                    auto [v, mapped] = emitReservedElemLoad(
-                        rb, rloc, elemTy, elemBytes, info.descP, info.basePtr, ok, cOff);
-                    allMapped = mlir::arith::AndIOp::create(rb, rloc, allMapped, mapped);
-                    yielded.push_back(v);
+                if (activeComps.size() <= 1) {
+                    mlir::scf::YieldOp::create(rb, rloc, emitPerCompReserved(rb, rloc));
+                    return;
                 }
-                yielded.push_back(mlir::arith::ExtUIOp::create(rb, rloc, i32Ty(), allMapped));
-                mlir::scf::YieldOp::create(rb, rloc, yielded);
+                auto [lastOff, fullOk] = compInBounds(rb, rloc, activeComps.back());
+                (void)lastOff;
+                uint32_t spanBytes = (activeComps.back() + 1u) * elemBytes;
+                auto fastIf = mlir::scf::IfOp::create(
+                    rb, rloc, fullOk,
+                    [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                        mlir::Value spanPtr = resolveReservedBufferElemPtr(
+                            tb, tloc, info.descP, info.basePtr, byteOff, spanBytes);
+                        mlir::Value nullP = mlir::LLVM::ZeroOp::create(tb, tloc, ptrTy());
+                        mlir::Value samePageMapped = mlir::LLVM::ICmpOp::create(
+                            tb, tloc, mlir::LLVM::ICmpPredicate::ne, spanPtr, nullP);
+                        auto innerIf = mlir::scf::IfOp::create(
+                            tb, tloc, samePageMapped,
+                            [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                llvm::SmallVector<mlir::Value, 17> vals;
+                                vals.reserve(activeComps.size() + 1);
+                                for (unsigned c : activeComps) {
+                                    mlir::Value ep = (c == 0)
+                                                         ? spanPtr
+                                                         : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                               lb, lloc, ptrTy(), i8Ty(), spanPtr,
+                                                               llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
+                                    vals.push_back(mlir::LLVM::LoadOp::create(lb, lloc, elemTy, ep));
+                                }
+                                vals.push_back(mlir::arith::ConstantIntOp::create(lb, lloc, i32Ty(), 1));
+                                mlir::scf::YieldOp::create(lb, lloc, vals);
+                            },
+                            [&](mlir::OpBuilder& lb, mlir::Location lloc) {
+                                mlir::scf::YieldOp::create(lb, lloc, emitPerCompReserved(lb, lloc));
+                            });
+                        mlir::scf::YieldOp::create(tb, tloc, innerIf.getResults());
+                    },
+                    [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                        mlir::scf::YieldOp::create(tb, tloc, emitPerCompReserved(tb, tloc));
+                    });
+                mlir::scf::YieldOp::create(rb, rloc, fastIf.getResults());
             },
             [&](mlir::OpBuilder& rb, mlir::Location rloc) {
                 auto vals = emitNormalScalarLoads(rb, rloc);
@@ -6017,6 +6096,21 @@ private:
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
     mlir::Value scratchAlloca_;
+    DescInfoCache ownedDescCache_;
+    DescInfoCache* descCache_ = nullptr;
+
+    mlir::Block* getFuncEntryBlock() const {
+        mlir::Block* cur = b_.getInsertionBlock();
+        while (cur && cur->getParentOp() && !llvm::isa<mlir::func::FuncOp>(cur->getParentOp())) {
+            cur = cur->getParentOp()->getBlock();
+        }
+        if (cur && cur->getParentOp()) {
+            if (auto fn = llvm::dyn_cast<mlir::func::FuncOp>(cur->getParentOp())) {
+                return &fn.getBody().front();
+            }
+        }
+        return nullptr;
+    }
 
 public:
     llvm::DenseMap<mlir::Value, SimdVal> valueMap_;

@@ -781,12 +781,11 @@ bool emitVertexStageFunction(
     mlir::Value activeMask = mlir::arith::CmpIOp::create(
         b, loc, mlir::arith::CmpIPredicate::ult, h.laneIota(), acVec);
 
-    // Branchless SIMD prologue: load padded W-lane vertexIds & instanceIds vectors and mask inactive lanes to 0.
+    // Callers pad tail lanes of vertexIdsPtr & instanceIdsPtr to W; load directly without SelectOp
+    // so LLVM does not scalarize into W conditional scalar loads.
     mlir::Value zeroI32Vec = h.splatInt(i32Ty, 0);
-    mlir::Value vidVec = mlir::arith::SelectOp::create(
-        b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), vertexIdsPtr), zeroI32Vec);
-    mlir::Value iidVec = mlir::arith::SelectOp::create(
-        b, loc, activeMask, h.loadScalar(h.vecTy(i32Ty), instanceIdsPtr), zeroI32Vec);
+    mlir::Value vidVec = h.loadScalar(h.vecTy(i32Ty), vertexIdsPtr);
+    mlir::Value iidVec = h.loadScalar(h.vecTy(i32Ty), instanceIdsPtr);
 
     // Resolve InputLayout offsets per slot and match against VS input signatures.
     std::vector<uint32_t> elementByteOffsets(inputLayout.NumElements, 0);
