@@ -144,9 +144,6 @@ struct alignas(64) ChunkTransientScratch {
     int64_t fixedX[kMaxChunkVerts]{};
     int64_t fixedY[kMaxChunkVerts]{};
 
-    std::vector<ShadedVertex> polyA;
-    std::vector<ShadedVertex> polyB;
-
     inline uint32_t advanceGen() {
         if (++curGen == 0) {
             std::memset(cacheGen, 0, sizeof(cacheGen));
@@ -156,45 +153,51 @@ struct alignas(64) ChunkTransientScratch {
     }
 };
 
-// Clip polygon against one homogeneous plane f(v) >= 0.
-template <typename EvalFn>
-void clipPolygonPlane(
-    const std::vector<ShadedVertex>& inPoly,
-    std::vector<ShadedVertex>& outPoly,
-    uint32_t numAttrScalars,
-    EvalFn&& eval) {
-    outPoly.clear();
-    if (inPoly.empty()) return;
+struct ClipVertex {
+    float clipX;
+    float clipY;
+    float clipZ;
+    float clipW;
+    float origBary[3];
+};
 
-    const size_t n = inPoly.size();
-    ShadedVertex prev = inPoly[n - 1];
+struct ClipPoly {
+    static constexpr uint32_t kMaxVerts = 24;
+    ClipVertex v[kMaxVerts];
+    uint32_t count = 0;
+};
+
+// Clip polygon against one homogeneous plane f(v) >= 0 using lightweight 28-byte ClipVertex.
+template <typename EvalFn>
+inline void clipClipPolyPlane(const ClipPoly& inPoly, ClipPoly& outPoly, EvalFn&& eval) {
+    outPoly.count = 0;
+    const uint32_t n = inPoly.count;
+    if (n == 0) return;
+
+    ClipVertex prev = inPoly.v[n - 1];
     float prevD = eval(prev);
     bool prevIn = (prevD >= 0.0f);
 
-    for (size_t i = 0; i < n; ++i) {
-        const ShadedVertex& curr = inPoly[i];
+    for (uint32_t i = 0; i < n; ++i) {
+        const ClipVertex& curr = inPoly.v[i];
         float currD = eval(curr);
         bool currIn = (currD >= 0.0f);
 
-        if (currIn != prevIn) {
+        if (currIn != prevIn && outPoly.count < ClipPoly::kMaxVerts) {
             float denom = prevD - currD;
             float t = (std::fabs(denom) > 1e-20f) ? (prevD / denom) : 0.0f;
             t = std::clamp(t, 0.0f, 1.0f);
-            ShadedVertex interp;
+            ClipVertex& interp = outPoly.v[outPoly.count++];
             interp.clipX = prev.clipX + t * (curr.clipX - prev.clipX);
             interp.clipY = prev.clipY + t * (curr.clipY - prev.clipY);
             interp.clipZ = prev.clipZ + t * (curr.clipZ - prev.clipZ);
             interp.clipW = prev.clipW + t * (curr.clipW - prev.clipW);
-            for (int k = 0; k < 3; ++k) {
-                interp.origBary[k] = prev.origBary[k] + t * (curr.origBary[k] - prev.origBary[k]);
-            }
-            for (uint32_t s = 0; s < numAttrScalars; ++s) {
-                interp.attrs[s] = prev.attrs[s] + t * (curr.attrs[s] - prev.attrs[s]);
-            }
-            outPoly.push_back(interp);
+            interp.origBary[0] = prev.origBary[0] + t * (curr.origBary[0] - prev.origBary[0]);
+            interp.origBary[1] = prev.origBary[1] + t * (curr.origBary[1] - prev.origBary[1]);
+            interp.origBary[2] = prev.origBary[2] + t * (curr.origBary[2] - prev.origBary[2]);
         }
-        if (currIn) {
-            outPoly.push_back(curr);
+        if (currIn && outPoly.count < ClipPoly::kMaxVerts) {
+            outPoly.v[outPoly.count++] = curr;
         }
         prev = curr;
         prevD = currD;
@@ -253,11 +256,12 @@ inline float evalDepthBias(
     return depthBiasVal;
 }
 
-void setupClippedTriangle(
-    const ShadedVertex& v0,
-    const ShadedVertex& v1,
-    const ShadedVertex& v2,
-    const float* flatAttrsV0,
+template <typename GetTriAttrsFn>
+void setupClippedBaryTriangle(
+    const ClipVertex& v0,
+    const ClipVertex& v1,
+    const ClipVertex& v2,
+    GetTriAttrsFn&& getTriAttrs,
     uint32_t primitiveId,
     uint32_t viewportIndex,
     uint32_t shadingRate,
@@ -266,7 +270,7 @@ void setupClippedTriangle(
     const D3D12_RASTERIZER_DESC& rast,
     const RasterScene& sceneCfg,
     TriangleEmitTarget& target,
-    bool unclipped = false) {
+    bool unclipped) {
     if (v0.clipW <= 1e-7f || v1.clipW <= 1e-7f || v2.clipW <= 1e-7f) return;
 
     float iw0 = 1.0f / v0.clipW;
@@ -289,12 +293,12 @@ void setupClippedTriangle(
     float sy2 = vp.TopLeftY + (-ndcY2 * 0.5f + 0.5f) * vp.Height;
     float sz2 = vp.MinDepth + ndcZ2 * (vp.MaxDepth - vp.MinDepth);
 
-    int64_t fx0 = std::llround(static_cast<double>(sx0) * 256.0);
-    int64_t fy0 = std::llround(static_cast<double>(sy0) * 256.0);
-    int64_t fx1 = std::llround(static_cast<double>(sx1) * 256.0);
-    int64_t fy1 = std::llround(static_cast<double>(sy1) * 256.0);
-    int64_t fx2 = std::llround(static_cast<double>(sx2) * 256.0);
-    int64_t fy2 = std::llround(static_cast<double>(sy2) * 256.0);
+    int64_t fx0 = static_cast<int64_t>(std::nearbyintf(sx0 * 256.0f));
+    int64_t fy0 = static_cast<int64_t>(std::nearbyintf(sy0 * 256.0f));
+    int64_t fx1 = static_cast<int64_t>(std::nearbyintf(sx1 * 256.0f));
+    int64_t fy1 = static_cast<int64_t>(std::nearbyintf(sy1 * 256.0f));
+    int64_t fx2 = static_cast<int64_t>(std::nearbyintf(sx2 * 256.0f));
+    int64_t fy2 = static_cast<int64_t>(std::nearbyintf(sy2 * 256.0f));
 
     int64_t signedArea256 = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
     if (signedArea256 == 0) return;
@@ -391,9 +395,20 @@ void setupClippedTriangle(
 
         for (uint32_t s = 0; s < numScalars; ++s) {
             int16_t srcSlot = sceneCfg.psInputFromPreRastSlot[s];
-            float raw0 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v0.attrs[srcSlot] : 0.0f;
-            float raw1 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v1.attrs[srcSlot] : 0.0f;
-            float raw2 = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) ? v2.attrs[srcSlot] : 0.0f;
+            float raw0 = 0.0f, raw1 = 0.0f, raw2 = 0.0f;
+            float orig0 = 0.0f, orig1 = 0.0f, orig2 = 0.0f;
+            if (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars) {
+                getTriAttrs(static_cast<uint32_t>(srcSlot), orig0, orig1, orig2);
+                if (unclipped) {
+                    raw0 = orig0;
+                    raw1 = orig1;
+                    raw2 = orig2;
+                } else {
+                    raw0 = v0.origBary[0] * orig0 + v0.origBary[1] * orig1 + v0.origBary[2] * orig2;
+                    raw1 = v1.origBary[0] * orig0 + v1.origBary[1] * orig1 + v1.origBary[2] * orig2;
+                    raw2 = v2.origBary[0] * orig0 + v2.origBary[1] * orig1 + v2.origBary[2] * orig2;
+                }
+            }
             float a0 = raw0 * iw0;
             float a1 = raw1 * iw1;
             float a2 = raw2 * iw2;
@@ -401,9 +416,7 @@ void setupClippedTriangle(
             baseDst[s * 3 + 1] = a1 - a0;
             baseDst[s * 3 + 2] = a2 - a0;
             if (flatDst) {
-                flatDst[s] = (srcSlot >= 0 && static_cast<uint32_t>(srcSlot) < kMaxPSInputScalars)
-                                 ? flatAttrsV0[srcSlot]
-                                 : 0.0f;
+                flatDst[s] = orig0;
             }
         }
     }
@@ -411,6 +424,87 @@ void setupClippedTriangle(
     uint32_t localTriIdx = static_cast<uint32_t>(target.triangles->size());
     target.triangles->push_back(tri);
     target.recordBinIfActive(tri, localTriIdx);
+}
+
+template <typename GetTriAttrsFn>
+void clipAndEmitBaryTriangle(
+    const ClipVertex& cv0,
+    const ClipVertex& cv1,
+    const ClipVertex& cv2,
+    GetTriAttrsFn&& getTriAttrs,
+    uint32_t primitiveId,
+    uint32_t vpIdx,
+    uint32_t shadingRate,
+    const D3D12_VIEWPORT& vp,
+    const D3D12_RECT& scissor,
+    const D3D12_RASTERIZER_DESC& rast,
+    const RasterScene& sceneCfg,
+    TriangleEmitTarget& target) {
+    uint8_t outMask = 0;
+    auto markOut = [&](const ClipVertex& v) {
+        if (v.clipW < 1e-6f) outMask |= 0x01u;
+        if (v.clipX < -v.clipW) outMask |= 0x02u;
+        if (v.clipX >  v.clipW) outMask |= 0x04u;
+        if (v.clipY < -v.clipW) outMask |= 0x08u;
+        if (v.clipY >  v.clipW) outMask |= 0x10u;
+        if (v.clipZ <  0.0f)    outMask |= 0x20u;
+        if (v.clipZ >  v.clipW) outMask |= 0x40u;
+    };
+    markOut(cv0);
+    markOut(cv1);
+    markOut(cv2);
+
+    if (outMask == 0 && sceneCfg.clipDistMask == 0) {
+        setupClippedBaryTriangle(
+            cv0, cv1, cv2, getTriAttrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target, /*unclipped=*/true);
+        return;
+    }
+
+    ClipPoly polyBufA, polyBufB;
+    polyBufA.v[0] = cv0;
+    polyBufA.v[1] = cv1;
+    polyBufA.v[2] = cv2;
+    polyBufA.count = 3;
+
+    ClipPoly* cur = &polyBufA;
+    ClipPoly* nxt = &polyBufB;
+    auto runPlane = [&](uint8_t bit, auto&& eval) {
+        if ((outMask & bit) == 0) return true;
+        clipClipPolyPlane(*cur, *nxt, eval);
+        std::swap(cur, nxt);
+        return cur->count >= 3;
+    };
+
+    if (!runPlane(0x01u, [](const ClipVertex& v) { return v.clipW - 1e-6f; })) return;
+    if (!runPlane(0x02u, [](const ClipVertex& v) { return v.clipX + v.clipW; })) return;
+    if (!runPlane(0x04u, [](const ClipVertex& v) { return v.clipW - v.clipX; })) return;
+    if (!runPlane(0x08u, [](const ClipVertex& v) { return v.clipY + v.clipW; })) return;
+    if (!runPlane(0x10u, [](const ClipVertex& v) { return v.clipW - v.clipY; })) return;
+    if (!runPlane(0x20u, [](const ClipVertex& v) { return v.clipZ; })) return;
+    if (!runPlane(0x40u, [](const ClipVertex& v) { return v.clipW - v.clipZ; })) return;
+
+    if (sceneCfg.clipDistMask != 0) {
+        for (uint32_t k = 0; k < 8; ++k) {
+            if (!(sceneCfg.clipDistMask & (1u << k))) continue;
+            uint32_t s = sceneCfg.clipAttrOffset + k;
+            if (s >= kMaxPSInputScalars) continue;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+            getTriAttrs(s, a0, a1, a2);
+            if (a0 >= 0.0f && a1 >= 0.0f && a2 >= 0.0f) continue;
+            if (a0 < 0.0f && a1 < 0.0f && a2 < 0.0f) return;
+            clipClipPolyPlane(*cur, *nxt, [a0, a1, a2](const ClipVertex& v) {
+                return v.origBary[0] * a0 + v.origBary[1] * a1 + v.origBary[2] * a2;
+            });
+            std::swap(cur, nxt);
+            if (cur->count < 3) return;
+        }
+    }
+
+    for (uint32_t k = 1; k + 1 < cur->count; ++k) {
+        setupClippedBaryTriangle(
+            cur->v[0], cur->v[k], cur->v[k + 1], getTriAttrs,
+            primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target, /*unclipped=*/false);
+    }
 }
 
 void processTriangle(
@@ -421,10 +515,8 @@ void processTriangle(
     const D3D12_RASTERIZER_DESC& rast,
     const RasterScene& sceneCfg,
     TriangleEmitTarget& target,
-    std::vector<ShadedVertex>& polyA,
-    std::vector<ShadedVertex>& polyB) {
-    const uint32_t numPreRastScalars = sceneCfg.preRastScalarAttrs;
-
+    std::vector<ShadedVertex>& /*polyA*/,
+    std::vector<ShadedVertex>& /*polyB*/) {
     uint32_t rawVpIdx = 0;
     if (sceneCfg.hasViewportArrayIndex && sceneCfg.vpIndexAttrOffset < kMaxPSInputScalars) {
         std::memcpy(&rawVpIdx, &v0.attrs[sceneCfg.vpIndexAttrOffset], sizeof(rawVpIdx));
@@ -463,6 +555,16 @@ void processTriangle(
         return;
     }
 
+    auto getTriAttrs = [&](uint32_t srcSlot, float& a0, float& a1, float& a2) {
+        a0 = v0.attrs[srcSlot];
+        a1 = v1.attrs[srcSlot];
+        a2 = v2.attrs[srcSlot];
+    };
+
+    ClipVertex cv0{v0.clipX, v0.clipY, v0.clipZ, v0.clipW, {1.0f, 0.0f, 0.0f}};
+    ClipVertex cv1{v1.clipX, v1.clipY, v1.clipZ, v1.clipW, {0.0f, 1.0f, 0.0f}};
+    ClipVertex cv2{v2.clipX, v2.clipY, v2.clipZ, v2.clipW, {0.0f, 0.0f, 1.0f}};
+
     auto insideGuardBand = [&](const ShadedVertex& v) {
         if (!(v.clipW > 1e-6f && v.clipZ >= 0.0f && v.clipZ <= v.clipW)) {
             return false;
@@ -483,49 +585,13 @@ void processTriangle(
         return true;
     };
     if (insideGuardBand(v0) && insideGuardBand(v1) && insideGuardBand(v2)) {
-        setupClippedTriangle(
-            v0, v1, v2, v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target, /*unclipped=*/true);
+        setupClippedBaryTriangle(
+            cv0, cv1, cv2, getTriAttrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target, /*unclipped=*/true);
         return;
     }
 
-    polyA.clear();
-    polyA.push_back(v0);
-    polyA.push_back(v1);
-    polyA.push_back(v2);
-    polyA[0].origBary[0] = 1.0f; polyA[0].origBary[1] = 0.0f; polyA[0].origBary[2] = 0.0f;
-    polyA[1].origBary[0] = 0.0f; polyA[1].origBary[1] = 1.0f; polyA[1].origBary[2] = 0.0f;
-    polyA[2].origBary[0] = 0.0f; polyA[2].origBary[1] = 0.0f; polyA[2].origBary[2] = 1.0f;
-
-    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - 1e-6f; });
-    if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipX + v.clipW; });
-    if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipX; });
-    if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipY + v.clipW; });
-    if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipY; });
-    if (polyB.size() < 3) return;
-    clipPolygonPlane(polyB, polyA, numPreRastScalars, [](const ShadedVertex& v) { return v.clipZ; });
-    if (polyA.size() < 3) return;
-    clipPolygonPlane(polyA, polyB, numPreRastScalars, [](const ShadedVertex& v) { return v.clipW - v.clipZ; });
-    if (polyB.size() < 3) return;
-
-    if (sceneCfg.clipDistMask != 0) {
-        for (uint32_t k = 0; k < 8; ++k) {
-            if (!(sceneCfg.clipDistMask & (1u << k))) continue;
-            uint32_t s = sceneCfg.clipAttrOffset + k;
-            if (s >= kMaxPSInputScalars) continue;
-            clipPolygonPlane(polyB, polyA, numPreRastScalars, [s](const ShadedVertex& v) { return v.attrs[s]; });
-            std::swap(polyA, polyB);
-            if (polyB.size() < 3) return;
-        }
-    }
-
-    for (size_t k = 1; k + 1 < polyB.size(); ++k) {
-        setupClippedTriangle(
-            polyB[0], polyB[k], polyB[k + 1], v0.attrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target);
-    }
+    clipAndEmitBaryTriangle(
+        cv0, cv1, cv2, getTriAttrs, primitiveId, vpIdx, shadingRate, vp, scissor, rast, sceneCfg, target);
 }
 
 void executeVertexTriangleChunk(
@@ -879,11 +945,41 @@ void executeVertexTriangleChunk(
         }
 
         // Guard-band straddling or user clip/cull/viewport-array fallback
+        if (!specialPerPrimState) {
+            auto loadClipVert = [&](uint32_t u, float b0, float b1, float b2) -> ClipVertex {
+                const float* pBase = &scratch.posSOA[(u / W) * W * 4u + (u % W)];
+                return ClipVertex{pBase[0u * W], pBase[1u * W], pBase[2u * W], pBase[3u * W], {b0, b1, b2}};
+            };
+            ClipVertex cv0 = loadClipVert(u0, 1.0f, 0.0f, 0.0f);
+            ClipVertex cv1 = loadClipVert(u1, 0.0f, 1.0f, 0.0f);
+            ClipVertex cv2 = loadClipVert(u2, 0.0f, 0.0f, 1.0f);
+            const float* aPtr0 = &scratch.attrsSOA[static_cast<size_t>(u0 / W) * batchAttrStride + (u0 % W)];
+            const float* aPtr1 = &scratch.attrsSOA[static_cast<size_t>(u1 / W) * batchAttrStride + (u1 % W)];
+            const float* aPtr2 = &scratch.attrsSOA[static_cast<size_t>(u2 / W) * batchAttrStride + (u2 % W)];
+            auto getTriAttrs = [&](uint32_t vsSlot, float& a0, float& a1, float& a2) {
+                if (vsSlot < vsAttrScalars) {
+                    size_t slotOff = static_cast<size_t>(vsSlot) * W;
+                    a0 = aPtr0[slotOff];
+                    a1 = aPtr1[slotOff];
+                    a2 = aPtr2[slotOff];
+                } else {
+                    a0 = 0.0f;
+                    a1 = 0.0f;
+                    a2 = 0.0f;
+                }
+            };
+            clipAndEmitBaryTriangle(
+                cv0, cv1, cv2, getTriAttrs, scratch.localPrimIds[lp], 0u, defaultShadingRate,
+                vp0, scissor0, rast, sceneCfg, target);
+            continue;
+        }
+
         ShadedVertex sv0, sv1, sv2;
         unpackFallbackVertex(u0, sv0);
         unpackFallbackVertex(u1, sv1);
         unpackFallbackVertex(u2, sv2);
-        processTriangle(sv0, sv1, sv2, scratch.localPrimIds[lp], rast, sceneCfg, target, scratch.polyA, scratch.polyB);
+        std::vector<ShadedVertex> unusedA, unusedB;
+        processTriangle(sv0, sv1, sv2, scratch.localPrimIds[lp], rast, sceneCfg, target, unusedA, unusedB);
     }
 }
 
