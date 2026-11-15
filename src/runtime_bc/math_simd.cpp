@@ -101,7 +101,12 @@ inline vf32<W> log2_v(vf32<W> x) {
     p = p * u2 + splat_f<W>(1.0f);
 
     vf32<W> log2_m = splat_f<W>(2.8853900818f) * u * p;
-    return __builtin_convertvector(e, vf32<W>) + log2_m;
+    vf32<W> res = __builtin_convertvector(e, vf32<W>) + log2_m;
+    vi32<W> is_zero = (x == splat_f<W>(0.0f));
+    vi32<W> is_neg = (x < splat_f<W>(0.0f));
+    res = select_v<W>(is_zero, bit_cast_v<vf32<W>>(splat_i<W>(static_cast<int32_t>(0xFF800000u))), res);
+    res = select_v<W>(is_neg, bit_cast_v<vf32<W>>(splat_i<W>(static_cast<int32_t>(0x7FC00000u))), res);
+    return res;
 }
 
 template <int W>
