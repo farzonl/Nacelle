@@ -177,13 +177,26 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
         o->AtomicInt64OnTypedResourceSupported = TRUE;
         o->AtomicInt64OnGroupSharedSupported = TRUE;
         o->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
-        o->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
+        o->WaveMMATier = D3D12_WAVE_MMA_TIER_1_0;
         return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
         if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11*>(pData);
         o->AtomicInt64OnDescriptorHeapResourceSupported = TRUE;
+        return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS21: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS21*>(pData);
+        std::memset(o, 0, sizeof(*o));
+        o->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_1;
+        return S_OK;
+    }
+    case D3D12_FEATURE_D3D12_OPTIONS22: {
+        if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS22)) return E_INVALIDARG;
+        auto* o = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS22*>(pData);
+        std::memset(o, 0, sizeof(*o));
         return S_OK;
     }
     case D3D12_FEATURE_ARCHITECTURE: {
@@ -212,7 +225,7 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CheckFeatureSupport(
     case D3D12_FEATURE_SHADER_MODEL: {
         if (size < sizeof(D3D12_FEATURE_DATA_SHADER_MODEL)) return E_INVALIDARG;
         auto* o = static_cast<D3D12_FEATURE_DATA_SHADER_MODEL*>(pData);
-        o->HighestShaderModel = std::min(o->HighestShaderModel, D3D_SHADER_MODEL_6_9);
+        o->HighestShaderModel = std::min(o->HighestShaderModel, D3D_SHADER_MODEL_6_10);
         return S_OK;
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
