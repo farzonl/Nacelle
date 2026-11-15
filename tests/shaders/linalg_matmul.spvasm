@@ -1,0 +1,124 @@
+; SPIR-V 1.6 Cooperative Matrix (SPV_KHR_cooperative_matrix) 32x32 tiled GEMM
+               OpCapability Shader
+               OpCapability VulkanMemoryModel
+               OpCapability CooperativeMatrixKHR
+               OpExtension "SPV_KHR_cooperative_matrix"
+               OpExtension "SPV_KHR_vulkan_memory_model"
+               OpMemoryModel Logical Vulkan
+               OpEntryPoint GLCompute %CSMain "CSMain" %gl_WorkGroupID %cbv %bufA %bufB %bufC
+               OpExecutionMode %CSMain LocalSize 32 1 1
+
+               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId
+               OpDecorate %MatDims Block
+               OpMemberDecorate %MatDims 0 Offset 0
+               OpMemberDecorate %MatDims 1 Offset 4
+               OpMemberDecorate %MatDims 2 Offset 8
+               OpDecorate %cbv DescriptorSet 0
+               OpDecorate %cbv Binding 16
+
+               OpDecorate %FloatArr ArrayStride 4
+               OpDecorate %BufBlock Block
+               OpMemberDecorate %BufBlock 0 Offset 0
+               OpDecorate %bufA DescriptorSet 0
+               OpDecorate %bufA Binding 0
+               OpDecorate %bufB DescriptorSet 0
+               OpDecorate %bufB Binding 1
+               OpDecorate %bufC DescriptorSet 0
+               OpDecorate %bufC Binding 8
+
+       %void = OpTypeVoid
+       %fnTy = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+      %float = OpTypeFloat 32
+      %v3uint = OpTypeVector %uint 3
+     %ptrInV3 = OpTypePointer Input %v3uint
+%gl_WorkGroupID = OpVariable %ptrInV3 Input
+
+    %MatDims = OpTypeStruct %uint %uint %uint
+   %ptrCbvTy = OpTypePointer Uniform %MatDims
+        %cbv = OpVariable %ptrCbvTy Uniform
+   %ptrCbvU  = OpTypePointer Uniform %uint
+
+   %FloatArr = OpTypeRuntimeArray %float
+   %BufBlock = OpTypeStruct %FloatArr
+   %ptrBufTy = OpTypePointer StorageBuffer %BufBlock
+       %bufA = OpVariable %ptrBufTy StorageBuffer
+       %bufB = OpVariable %ptrBufTy StorageBuffer
+       %bufC = OpVariable %ptrBufTy StorageBuffer
+   %ptrFloat = OpTypePointer StorageBuffer %float
+
+     %scopeSub = OpConstant %uint 3 ; Subgroup
+      %c32    = OpConstant %uint 32
+      %c0     = OpConstant %uint 0
+      %c1     = OpConstant %uint 1
+      %c2     = OpConstant %uint 2
+      %useA   = OpConstant %uint 0
+      %useB   = OpConstant %uint 1
+      %useAcc = OpConstant %uint 2
+      %rowMaj = OpConstant %uint 0
+      %f0     = OpConstant %float 0.0
+
+   %MatATy   = OpTypeCooperativeMatrixKHR %float %scopeSub %c32 %c32 %useA
+   %MatBTy   = OpTypeCooperativeMatrixKHR %float %scopeSub %c32 %c32 %useB
+   %MatAccTy = OpTypeCooperativeMatrixKHR %float %scopeSub %c32 %c32 %useAcc
+   %zeroAcc  = OpConstantComposite %MatAccTy %f0
+
+     %CSMain = OpFunction %void None %fnTy
+      %entry = OpLabel
+      %pM    = OpAccessChain %ptrCbvU %cbv %c0
+      %M     = OpLoad %uint %pM
+      %pN    = OpAccessChain %ptrCbvU %cbv %c1
+      %N     = OpLoad %uint %pN
+      %pK    = OpAccessChain %ptrCbvU %cbv %c2
+      %K     = OpLoad %uint %pK
+
+      %wg    = OpLoad %v3uint %gl_WorkGroupID
+      %gx    = OpCompositeExtract %uint %wg 0
+      %gy    = OpCompositeExtract %uint %wg 1
+      %colB  = OpIMul %uint %gx %c32
+      %rowB  = OpIMul %uint %gy %c32
+      %okR   = OpULessThan %bool %rowB %M
+      %okC   = OpULessThan %bool %colB %N
+      %ok    = OpLogicalAnd %bool %okR %okC
+               OpSelectionMerge %exit None
+               OpBranchConditional %ok %body %exit
+
+       %body = OpLabel
+      %rowAK = OpIMul %uint %rowB %K
+               OpBranch %loopHdr
+
+    %loopHdr = OpLabel
+      %k     = OpPhi %uint %c0 %body %kNext %loopCont
+      %acc   = OpPhi %MatAccTy %zeroAcc %body %accNext %loopCont
+      %kCond = OpULessThan %bool %k %K
+               OpLoopMerge %store %loopCont None
+               OpBranchConditional %kCond %loopBody %store
+
+   %loopBody = OpLabel
+      %aIdx  = OpIAdd %uint %rowAK %k
+      %aPtr  = OpAccessChain %ptrFloat %bufA %c0 %aIdx
+      %matA  = OpCooperativeMatrixLoadKHR %MatATy %aPtr %rowMaj %K
+
+      %bRow  = OpIMul %uint %k %N
+      %bIdx  = OpIAdd %uint %bRow %colB
+      %bPtr  = OpAccessChain %ptrFloat %bufB %c0 %bIdx
+      %matB  = OpCooperativeMatrixLoadKHR %MatBTy %bPtr %rowMaj %N
+
+    %accNext = OpCooperativeMatrixMulAddKHR %MatAccTy %matA %matB %acc
+               OpBranch %loopCont
+
+   %loopCont = OpLabel
+      %kNext = OpIAdd %uint %k %c32
+               OpBranch %loopHdr
+
+      %store = OpLabel
+      %cRow  = OpIMul %uint %rowB %N
+      %cIdx  = OpIAdd %uint %cRow %colB
+      %cPtr  = OpAccessChain %ptrFloat %bufC %c0 %cIdx
+               OpCooperativeMatrixStoreKHR %cPtr %acc %rowMaj %N
+               OpBranch %exit
+
+       %exit = OpLabel
+               OpReturn
+               OpFunctionEnd
