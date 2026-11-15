@@ -2985,47 +2985,32 @@ bool synthesizeGraphicsPSOMLIR(
 
         mlir::Value argsPtr = entry->getArgument(0);
         mlir::Value rootCtx = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, rootCtx)));
-        mlir::Value covMask32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMask)));
         mlir::Value isFront32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, isFrontFace)));
         mlir::Value primId32 = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, primitiveId)));
 
-        mlir::Value covVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), covMask32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-        mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, covVec, h.laneIota());
-        mlir::Value bitOne = mlir::LLVM::AndOp::create(b, loc, shifted, h.splatInt(i32Ty, 1));
-        mlir::Value initRealMask = mlir::LLVM::ICmpOp::create(
-            b, loc, mlir::LLVM::ICmpPredicate::ne, bitOne, h.splatInt(i32Ty, 0));
+        mlir::Value batchCountRaw = h.loadScalar(i32Ty, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, batchCount)));
+        mlir::Value batchCountNonZero = mlir::LLVM::ICmpOp::create(
+            b, loc, mlir::LLVM::ICmpPredicate::ne, batchCountRaw, h.cInt(i32Ty, 0));
+        mlir::Value batchCount32 = mlir::LLVM::SelectOp::create(
+            b, loc, batchCountNonZero, batchCountRaw, h.cInt(i32Ty, 1));
+        mlir::Value covMasksPtrRaw = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMasks)));
+        mlir::Value nullPtrVal = mlir::LLVM::ZeroOp::create(b, loc, ptrTy);
+        mlir::Value covMasksIsNull = mlir::LLVM::ICmpOp::create(
+            b, loc, mlir::LLVM::ICmpPredicate::eq, covMasksPtrRaw, nullPtrVal);
+        mlir::Value covMasksPtr = mlir::LLVM::SelectOp::create(
+            b, loc, covMasksIsNull, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMask)), covMasksPtrRaw);
 
-        // Load PixelBatchArgs vectors
-        auto loadVecFromArgField = [&](size_t fieldOffset) -> mlir::Value {
-            mlir::Value p = h.loadScalar(ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(fieldOffset)));
-            return mlir::LLVM::LoadOp::create(b, loc, h.vecTy(f32Ty), p, /*alignment=*/4);
-        };
-        mlir::Value pixelX = loadVecFromArgField(offsetof(PixelBatchArgs, pixelX));
-        mlir::Value pixelY = loadVecFromArgField(offsetof(PixelBatchArgs, pixelY));
-        mlir::Value baryI = loadVecFromArgField(offsetof(PixelBatchArgs, baryI));
-        mlir::Value baryJ = loadVecFromArgField(offsetof(PixelBatchArgs, baryJ));
-
-        // Load quad offsets (W/4 elements)
+        mlir::Value pixelXPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, pixelX)));
+        mlir::Value pixelYPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, pixelY)));
+        mlir::Value baryIPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, baryI)));
+        mlir::Value baryJPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, baryJ)));
         uint32_t numQuads = simdWidth / 4;
         mlir::Value quadOffPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, quadOffsets)));
-        llvm::SmallVector<mlir::Value, 4> quadOffsets(numQuads);
-        for (uint32_t q = 0; q < numQuads; ++q) {
-            quadOffsets[q] = h.loadScalar(i32Ty, h.gepBytes(quadOffPtr, static_cast<int64_t>(q * 4)));
-        }
 
-        // Interpolate Z from triDepth[0..2]
         mlir::Value triDepthPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, triDepth)));
         mlir::Value z0 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, triDepthPtr), simdWidth);
         mlir::Value dz1 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 4)), simdWidth);
         mlir::Value dz2 = llvmSplat(b, loc, f32Ty, h.loadScalar(f32Ty, h.gepBytes(triDepthPtr, 8)), simdWidth);
-        mlir::Value interpZ = mlir::LLVM::FAddOp::create(
-            b, loc, z0,
-            mlir::LLVM::FAddOp::create(
-                b, loc, mlir::LLVM::FMulOp::create(b, loc, baryI, dz1),
-                mlir::LLVM::FMulOp::create(b, loc, baryJ, dz2)));
-        if (!desc.RasterizerState.DepthClipEnable) {
-            interpZ = h.clamp01(interpZ);
-        }
 
         mlir::Value tileDepthBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileDepthSOA)));
         mlir::Value tileStencilBase = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, tileStencilSOA)));
@@ -3034,6 +3019,51 @@ bool synthesizeGraphicsPSOMLIR(
             tileColorBases[rt] = h.loadScalar(
                 ptrTy, h.gepBytes(argsPtr, static_cast<int64_t>(offsetof(PixelBatchArgs, tileColorSOA) + rt * 8)));
         }
+
+        bool batchEmitOk = true;
+        mlir::Value zeroI64 = h.cInt(h.i64Ty(), 0);
+        mlir::Value oneI64 = h.cInt(h.i64Ty(), 1);
+        mlir::Value batchCountI64 = mlir::LLVM::ZExtOp::create(b, loc, h.i64Ty(), batchCount32);
+        mlir::scf::ForOp::create(
+            b, loc, zeroI64, batchCountI64, oneI64, mlir::ValueRange{},
+            [&](mlir::OpBuilder& b, mlir::Location loc, mlir::Value batchIdxI64, mlir::ValueRange) {
+                IRHelpers h{b, loc, simdWidth};
+                mlir::Value covByteOff = mlir::LLVM::MulOp::create(b, loc, batchIdxI64, h.cInt(h.i64Ty(), 4));
+                mlir::Value covMask32 = h.loadScalar(i32Ty, h.gepBytesDyn(covMasksPtr, covByteOff));
+
+                mlir::Value covVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), covMask32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
+                mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, covVec, h.laneIota());
+                mlir::Value bitOne = mlir::LLVM::AndOp::create(b, loc, shifted, h.splatInt(i32Ty, 1));
+                mlir::Value initRealMask = mlir::LLVM::ICmpOp::create(
+                    b, loc, mlir::LLVM::ICmpPredicate::ne, bitOne, h.splatInt(i32Ty, 0));
+
+                mlir::Value laneVecByteOff = mlir::LLVM::MulOp::create(
+                    b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(simdWidth * 4)));
+                auto loadBatchVec = [&](mlir::Value basePtr) -> mlir::Value {
+                    return mlir::LLVM::LoadOp::create(
+                        b, loc, h.vecTy(f32Ty), h.gepBytesDyn(basePtr, laneVecByteOff), /*alignment=*/4);
+                };
+                mlir::Value pixelX = loadBatchVec(pixelXPtr);
+                mlir::Value pixelY = loadBatchVec(pixelYPtr);
+                mlir::Value baryI = loadBatchVec(baryIPtr);
+                mlir::Value baryJ = loadBatchVec(baryJPtr);
+
+                mlir::Value quadOffBatchByteOff = mlir::LLVM::MulOp::create(
+                    b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(numQuads * 4)));
+                mlir::Value quadOffBatchPtr = h.gepBytesDyn(quadOffPtr, quadOffBatchByteOff);
+                llvm::SmallVector<mlir::Value, 4> quadOffsets(numQuads);
+                for (uint32_t q = 0; q < numQuads; ++q) {
+                    quadOffsets[q] = h.loadScalar(i32Ty, h.gepBytes(quadOffBatchPtr, static_cast<int64_t>(q * 4)));
+                }
+
+                mlir::Value interpZ = mlir::LLVM::FAddOp::create(
+                    b, loc, z0,
+                    mlir::LLVM::FAddOp::create(
+                        b, loc, mlir::LLVM::FMulOp::create(b, loc, baryI, dz1),
+                        mlir::LLVM::FMulOp::create(b, loc, baryJ, dz2)));
+                if (!desc.RasterizerState.DepthClipEnable) {
+                    interpZ = h.clamp01(interpZ);
+                }
 
         // Helper lambdas for quad-swizzled depth & stencil SOA access (zero branches on loads, masked on writes)
         auto loadDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc) -> mlir::Value {
@@ -3206,7 +3236,9 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::func::FuncOp psSrcFunc = psMlirMod->lookupSymbol<mlir::func::FuncOp>(psLoaded.entryName);
             if (!psSrcFunc || psSrcFunc.getBody().empty()) {
                 outError = "Pixel shader entry function missing after MLIR SCF lift";
-                return false;
+                batchEmitOk = false;
+                mlir::scf::YieldOp::create(b, loc);
+                return;
             }
 
             auto emitPSBodyAndOM = [&](mlir::OpBuilder& pb, mlir::Location ploc, mlir::Value enterRealMask) {
@@ -3498,20 +3530,23 @@ bool synthesizeGraphicsPSOMLIR(
                             }
                         }
 
-                        // Load current tile color for all W lanes (needed for partial quad masking and blending)
+                        // Load current tile color only when blending is enabled; for opaque draws,
+                        // partial quads load destination pixels lazily inside the masked store branch.
                         mlir::Value dst[4];
                         auto v4f = mlir::VectorType::get({4}, f32Ty);
-                        for (int c = 0; c < 4; ++c) {
-                            dst[c] = oh.splatFlt(0.0);
-                            for (uint32_t q = 0; q < numQuads; ++q) {
-                                mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                    ob, oloc, quadOffsets[q], oh.cInt(i32Ty, c * 4096));
-                                mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                    ob, oloc, mlir::LLVM::ZExtOp::create(ob, oloc, oh.i64Ty(), pixIdx), oh.cInt(oh.i64Ty(), 4));
-                                mlir::Value q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
-                                for (uint32_t s = 0; s < 4; ++s) {
-                                    mlir::Value sc = llvmExtract(ob, oloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
-                                    dst[c] = llvmInsert(ob, oloc, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                        if (rtBlend.BlendEnable) {
+                            for (int c = 0; c < 4; ++c) {
+                                dst[c] = oh.splatFlt(0.0);
+                                for (uint32_t q = 0; q < numQuads; ++q) {
+                                    mlir::Value pixIdx = mlir::LLVM::AddOp::create(
+                                        ob, oloc, quadOffsets[q], oh.cInt(i32Ty, static_cast<int64_t>(c * kRasterTilePixels)));
+                                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
+                                        ob, oloc, mlir::LLVM::ZExtOp::create(ob, oloc, oh.i64Ty(), pixIdx), oh.cInt(oh.i64Ty(), 4));
+                                    mlir::Value q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
+                                    for (uint32_t s = 0; s < 4; ++s) {
+                                        mlir::Value sc = llvmExtract(ob, oloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
+                                        dst[c] = llvmInsert(ob, oloc, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                                    }
                                 }
                             }
                         }
@@ -3548,15 +3583,43 @@ bool synthesizeGraphicsPSOMLIR(
                             mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(ob, oloc, ob.getI1Type(), qMask);
                             mlir::scf::IfOp::create(ob, oloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
                                 IRHelpers qh{qb, qloc, simdWidth};
-                                for (int c = 0; c < 4; ++c) {
-                                    if (!(writeMask & (1u << c))) continue;
-                                    mlir::Value merged = mlir::LLVM::SelectOp::create(qb, qloc, curRealMask, outColor[c], dst[c]);
-                                    mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
-                                    mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                        qb, qloc, quadOffsets[q], qh.cInt(i32Ty, c * 4096));
-                                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                        qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), pixIdx), qh.cInt(qh.i64Ty(), 4));
-                                    mlir::LLVM::StoreOp::create(qb, qloc, q4, qh.gepBytesDyn(tileColorBases[rt], byteOff));
+                                mlir::Value allQ = rtBlend.BlendEnable
+                                    ? mlir::Value{}
+                                    : mlir::LLVM::vector_reduce_and::create(qb, qloc, qb.getI1Type(), qMask);
+                                auto writeQuadChannels = [&](mlir::OpBuilder& wb, mlir::Location wloc, bool loadDstForPartial) {
+                                    IRHelpers wh{wb, wloc, simdWidth};
+                                    for (int c = 0; c < 4; ++c) {
+                                        if (!(writeMask & (1u << c))) continue;
+                                        mlir::Value outQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, outColor[c], outColor[c], qIdx);
+                                        mlir::Value pixIdx = mlir::LLVM::AddOp::create(
+                                            wb, wloc, quadOffsets[q], wh.cInt(i32Ty, static_cast<int64_t>(c * kRasterTilePixels)));
+                                        mlir::Value byteOff = mlir::LLVM::MulOp::create(
+                                            wb, wloc, mlir::LLVM::ZExtOp::create(wb, wloc, wh.i64Ty(), pixIdx), wh.cInt(wh.i64Ty(), 4));
+                                        mlir::Value dstPtr = wh.gepBytesDyn(tileColorBases[rt], byteOff);
+                                        mlir::Value storeQ4 = outQ4;
+                                        if (rtBlend.BlendEnable) {
+                                            mlir::Value dstQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, dst[c], dst[c], qIdx);
+                                            storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
+                                        } else if (loadDstForPartial) {
+                                            mlir::Value dstQ4 = wh.loadScalar(v4f, dstPtr);
+                                            storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
+                                        }
+                                        mlir::LLVM::StoreOp::create(wb, wloc, storeQ4, dstPtr);
+                                    }
+                                };
+                                if (rtBlend.BlendEnable) {
+                                    writeQuadChannels(qb, qloc, false);
+                                } else {
+                                    mlir::scf::IfOp::create(
+                                        qb, qloc, allQ,
+                                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                            writeQuadChannels(tb, tloc, false);
+                                            mlir::scf::YieldOp::create(tb, tloc);
+                                        },
+                                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                            writeQuadChannels(eb, eloc, true);
+                                            mlir::scf::YieldOp::create(eb, eloc);
+                                        });
                                 }
                                 mlir::scf::YieldOp::create(qb, qloc);
                             });
@@ -3572,12 +3635,15 @@ bool synthesizeGraphicsPSOMLIR(
                     emitPSBodyAndOM(nb, nloc, realMaskAfterEarly);
                     mlir::scf::YieldOp::create(nb, nloc);
                 });
-                if (!outError.empty()) return false;
+                if (!outError.empty()) { batchEmitOk = false; }
             } else {
                 emitPSBodyAndOM(b, loc, realMaskAfterEarly);
-                if (!outError.empty()) return false;
+                if (!outError.empty()) { batchEmitOk = false; }
             }
         }
+                mlir::scf::YieldOp::create(b, loc);
+            });
+        if (!batchEmitOk) return false;
 
         mlir::func::ReturnOp::create(b, loc);
     }

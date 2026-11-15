@@ -22,7 +22,7 @@ struct alignas(64) TileScratch {
 };
 
 inline uint32_t quadSwizzlePixel(uint32_t tx, uint32_t ty) {
-    uint32_t quadIdx = (ty >> 1) * 32u + (tx >> 1);
+    uint32_t quadIdx = (ty >> 1) * (kTileSize / 2u) + (tx >> 1);
     return (quadIdx << 2) | ((ty & 1u) << 1) | (tx & 1u);
 }
 
@@ -358,33 +358,54 @@ inline bool blockOverlapsTriangle(const SetupTriangle& tri, int32_t bx, int32_t 
 }
 
 struct QuadBatchEmitter {
+    static constexpr uint32_t kMaxBatchGroups = 64;
     CompiledPixelQuadFn psFn = nullptr;
     PixelBatchArgs args{};
     uint32_t quadsPerBatch = 1;
     uint32_t qCount = 0;
+    uint32_t batchCount = 0;
     float sampleOffsetX = 0.0f;
     float sampleOffsetY = 0.0f;
-    alignas(64) uint32_t quadOffsets[kMaxSimdWidth / 4]{};
-    alignas(64) float pixelX[kMaxSimdWidth]{};
-    alignas(64) float pixelY[kMaxSimdWidth]{};
-    alignas(64) float baryI[kMaxSimdWidth]{};
-    alignas(64) float baryJ[kMaxSimdWidth]{};
+    alignas(64) uint32_t coverageMasks[kMaxBatchGroups]{};
+    alignas(64) uint32_t quadOffsets[kMaxBatchGroups * (kMaxSimdWidth / 4)]{};
+    alignas(64) float pixelX[kMaxBatchGroups * kMaxSimdWidth]{};
+    alignas(64) float pixelY[kMaxBatchGroups * kMaxSimdWidth]{};
+    alignas(64) float baryI[kMaxBatchGroups * kMaxSimdWidth]{};
+    alignas(64) float baryJ[kMaxBatchGroups * kMaxSimdWidth]{};
+
+    void finishGroup() {
+        ++batchCount;
+        qCount = 0;
+        if (batchCount == kMaxBatchGroups) {
+            flush();
+        } else {
+            coverageMasks[batchCount] = 0;
+        }
+    }
 
     void flush() {
-        if (qCount == 0) return;
-        for (uint32_t q = qCount; q < quadsPerBatch; ++q) {
-            quadOffsets[q] = 0;
-            for (uint32_t s = 0; s < 4; ++s) {
-                uint32_t lane = q * 4 + s;
-                pixelX[lane] = 0.0f;
-                pixelY[lane] = 0.0f;
-                baryI[lane] = 0.0f;
-                baryJ[lane] = 0.0f;
+        if (qCount > 0) {
+            uint32_t baseQ = batchCount * quadsPerBatch;
+            for (uint32_t q = qCount; q < quadsPerBatch; ++q) {
+                quadOffsets[baseQ + q] = 0;
+                uint32_t baseLane = (baseQ + q) * 4u;
+                for (uint32_t s = 0; s < 4; ++s) {
+                    uint32_t lane = baseLane + s;
+                    pixelX[lane] = 0.0f;
+                    pixelY[lane] = 0.0f;
+                    baryI[lane] = 0.0f;
+                    baryJ[lane] = 0.0f;
+                }
             }
+            ++batchCount;
+            qCount = 0;
         }
+        if (batchCount == 0) return;
+        args.batchCount = batchCount;
         psFn(&args);
+        batchCount = 0;
         qCount = 0;
-        args.coverageMask = 0;
+        coverageMasks[0] = 0;
     }
 
     static bool pointInDiamond(float x, float y, int32_t px, int32_t py, bool isYMajor) {
@@ -411,21 +432,23 @@ struct QuadBatchEmitter {
         uint32_t subHit = static_cast<uint32_t>(((py & 1) << 1) | (px & 1));
         uint32_t tx = static_cast<uint32_t>(gx - static_cast<int32_t>(tileOriginX));
         uint32_t ty = static_cast<uint32_t>(gy - static_cast<int32_t>(tileOriginY));
-        uint32_t quadOffset = ((ty >> 1) * 32u + (tx >> 1)) * 4u;
+        uint32_t quadOffset = ((ty >> 1) * (kTileSize / 2u) + (tx >> 1)) * 4u;
 
+        uint32_t baseQ = batchCount * quadsPerBatch;
         for (uint32_t q = 0; q < qCount; ++q) {
-            if (quadOffsets[q] == quadOffset) {
+            if (quadOffsets[baseQ + q] == quadOffset) {
                 uint32_t bit = 1u << (q * 4u + subHit);
-                if ((args.coverageMask & bit) == 0) {
-                    uint32_t lane = q * 4u + subHit;
+                if ((coverageMasks[batchCount] & bit) == 0) {
+                    uint32_t lane = (baseQ + q) * 4u + subHit;
                     pixelX[lane] = static_cast<float>(px) + 0.5f + sampleOffsetX;
                     pixelY[lane] = static_cast<float>(py) + 0.5f + sampleOffsetY;
                     baryI[lane] = t;
                     baryJ[lane] = 0.0f;
-                    args.coverageMask |= bit;
+                    coverageMasks[batchCount] |= bit;
                     return;
                 }
                 flush();
+                baseQ = 0;
                 break;
             }
         }
@@ -434,7 +457,7 @@ struct QuadBatchEmitter {
         float dy = tri.lineY1 - tri.lineY0;
         float lenSq = dx * dx + dy * dy;
 
-        quadOffsets[qCount] = quadOffset;
+        quadOffsets[baseQ + qCount] = quadOffset;
         for (uint32_t sub = 0; sub < 4; ++sub) {
             int32_t spx = gx + static_cast<int32_t>(sub & 1u);
             int32_t spy = gy + static_cast<int32_t>(sub >> 1);
@@ -445,16 +468,16 @@ struct QuadBatchEmitter {
                            : ((lenSq > 0.0f)
                                   ? std::clamp(((fx - tri.lineX0) * dx + (fy - tri.lineY0) * dy) / lenSq, 0.0f, 1.0f)
                                   : t);
-            uint32_t lane = qCount * 4u + sub;
+            uint32_t lane = (baseQ + qCount) * 4u + sub;
             pixelX[lane] = fx;
             pixelY[lane] = fy;
             baryI[lane] = st;
             baryJ[lane] = 0.0f;
         }
-        args.coverageMask |= ((1u << subHit) << (qCount * 4u));
+        coverageMasks[batchCount] |= ((1u << subHit) << (qCount * 4u));
         ++qCount;
         if (qCount == quadsPerBatch) {
-            flush();
+            finishGroup();
         }
     }
 
@@ -558,20 +581,22 @@ struct QuadBatchEmitter {
 
         uint32_t tx = static_cast<uint32_t>(gx - static_cast<int32_t>(tileOriginX));
         uint32_t ty = static_cast<uint32_t>(gy - static_cast<int32_t>(tileOriginY));
-        uint32_t quadIdx = (ty >> 1) * 32u + (tx >> 1);
+        uint32_t quadIdx = (ty >> 1) * (kTileSize / 2u) + (tx >> 1);
 
-        quadOffsets[qCount] = quadIdx * 4u;
+        uint32_t baseQ = batchCount * quadsPerBatch;
+        quadOffsets[baseQ + qCount] = quadIdx * 4u;
+        uint32_t baseLane = (baseQ + qCount) * 4u;
         for (uint32_t sub = 0; sub < 4; ++sub) {
-            uint32_t lane = qCount * 4u + sub;
+            uint32_t lane = baseLane + sub;
             pixelX[lane] = qPixX[sub];
             pixelY[lane] = qPixY[sub];
             baryI[lane] = qBaryI[sub];
             baryJ[lane] = qBaryJ[sub];
         }
-        args.coverageMask |= (quadMask << (qCount * 4u));
+        coverageMasks[batchCount] |= (quadMask << (qCount * 4u));
         ++qCount;
         if (qCount == quadsPerBatch) {
-            flush();
+            finishGroup();
         }
     }
 };
@@ -672,6 +697,7 @@ void rasterizeTiles(
             emitter.sampleOffsetX = static_cast<float>(dx16) / 16.0f;
             emitter.sampleOffsetY = static_cast<float>(dy16) / 16.0f;
             emitter.args.rootCtx = &state.rootCtx;
+            emitter.args.coverageMasks = emitter.coverageMasks;
             emitter.args.quadOffsets = emitter.quadOffsets;
             emitter.args.pixelX = emitter.pixelX;
             emitter.args.pixelY = emitter.pixelY;
