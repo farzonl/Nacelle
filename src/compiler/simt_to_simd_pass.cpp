@@ -3530,7 +3530,8 @@ private:
         bool nonStraddling,
         mlir::Value byteOff,
         unsigned totalComps,
-        llvm::ArrayRef<unsigned> activeComps) {
+        llvm::ArrayRef<unsigned> activeComps,
+        bool isFlatCBV = false) {
         mlir::Value zeroVec = mlir::isa<mlir::FloatType>(elemTy) ? splatFlt(loc, elemTy, 0.0) : splatInt(loc, elemTy, 0);
         if (activeComps.empty()) {
             return {llvm::SmallVector<mlir::Value, 16>(totalComps, zeroVec), splatInt(loc, i32Ty(), 1)};
@@ -3633,7 +3634,7 @@ private:
         };
 
         llvm::SmallVector<mlir::Value, 16> outVecs(totalComps, zeroVec);
-        if (isRootConstants) {
+        if (isRootConstants || isFlatCBV) {
             auto scalars = emitNormalScalarLoads(b_, loc);
             for (size_t i = 0; i < activeComps.size(); ++i) {
                 outVecs[activeComps[i]] = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(elemTy)).getElementType(), scalars[i]);
@@ -3834,7 +3835,8 @@ private:
             }
             BufferDescInfo info = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, /*needStride64=*/false);
             auto [compVecs, _] = emitCoalescedUniformBufferLoad(
-                loc, elemTy, elemBytes, info, h.isRootConstants, /*nonStraddling=*/false, byteOff, numFields, activeComps);
+                loc, elemTy, elemBytes, info, h.isRootConstants, /*nonStraddling=*/false, byteOff, numFields, activeComps,
+                /*isFlatCBV=*/true);
             SimdVal outSt;
             outSt.kind = SimdVal::Kind::Struct;
             outSt.origType = st;
@@ -3889,45 +3891,39 @@ private:
             };
 
             llvm::SmallVector<mlir::Value, 8> activeVecs;
-            if (h.isRootConstants) {
-                activeVecs = emitGatherCBuffer(b_, loc);
+            if (!h.isRootConstants && activeComps.size() >= 2 && numFields == 4 && elemBytes == 4) {
+                mlir::Value okPtrVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i1Ty())).getElementType(), info.okPtr);
+                mlir::Value byteSizeVec = llvmSplat(b_, loc, llvm::cast<mlir::VectorType>(vecTy(i64Ty())).getElementType(), info.byteSize);
+                mlir::Value end16Vec = mlir::LLVM::AddOp::create(b_, loc, off64Vec, splatInt(loc, i64Ty(), 16));
+                mlir::Value inBoundsVec = mlir::LLVM::AndOp::create(
+                    b_, loc, okPtrVec,
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ule, end16Vec, byteSizeVec));
+                mlir::Value allOk = mlir::LLVM::vector_reduce_and::create(b_, loc, i1Ty(), inBoundsVec);
+
+                llvm::SmallVector<mlir::Type, 8> resTypes(activeComps.size(), vecTy(elemTy));
+                auto ifOk = mlir::scf::IfOp::create(b_, loc, resTypes, allOk, /*withElseRegion=*/true);
+                {
+                    mlir::OpBuilder::InsertionGuard g(b_);
+                    b_.setInsertionPointToStart(&ifOk.getThenRegion().front());
+                    auto vec4Ty = mlir::VectorType::get({4}, elemTy);
+                    llvm::SmallVector<mlir::Value, 8> loaded(activeComps.size(), mlir::LLVM::PoisonOp::create(b_, loc, vecTy(elemTy)));
+                    for (uint32_t l = 0; l < W_; ++l) {
+                        mlir::Value offL = llvmExtract(b_, loc, off64Vec, l);
+                        mlir::Value ptrL = mlir::LLVM::GEPOp::create(b_, loc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{offL});
+                        mlir::Value v4 = mlir::LLVM::LoadOp::create(b_, loc, vec4Ty, ptrL, /*alignment=*/4);
+                        for (size_t i = 0; i < activeComps.size(); ++i) {
+                            mlir::Value comp = llvmExtract(b_, loc, v4, activeComps[i]);
+                            loaded[i] = llvmInsert(b_, loc, loaded[i], comp, l);
+                        }
+                    }
+                    mlir::scf::YieldOp::create(b_, loc, loaded);
+
+                    b_.setInsertionPointToStart(&ifOk.getElseRegion().front());
+                    mlir::scf::YieldOp::create(b_, loc, emitGatherCBuffer(b_, loc));
+                }
+                activeVecs.assign(ifOk.getResults().begin(), ifOk.getResults().end());
             } else {
-                auto ifRes = mlir::scf::IfOp::create(
-                    b_, loc, info.isReserved,
-                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
-                        mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
-                        mlir::Value cW = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(W_));
-                        llvm::SmallVector<mlir::Value, 8> initArgs(activeComps.size(), zeroElemVec);
-                        auto loop = mlir::scf::ForOp::create(
-                            nb, nloc, c0, cW, c1, initArgs,
-                            [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
-                                mlir::Value offL = mlir::LLVM::ExtractElementOp::create(lb, lloc, off64Vec, lIdx);
-                                llvm::SmallVector<mlir::Value, 8> nextArgs(iterArgs.begin(), iterArgs.end());
-                                for (size_t i = 0; i < activeComps.size(); ++i) {
-                                    unsigned f = activeComps[i];
-                                    mlir::Value cOff = (f == 0)
-                                                           ? offL
-                                                           : mlir::Value(mlir::LLVM::AddOp::create(
-                                                                 lb, lloc, offL,
-                                                                 mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), uint64_t(f) * elemBytes))));
-                                    mlir::Value cEnd = mlir::LLVM::AddOp::create(
-                                        lb, lloc, cOff, mlir::LLVM::ConstantOp::create(lb, lloc, i64Ty(), lb.getIntegerAttr(i64Ty(), elemBytes)));
-                                    mlir::Value inBounds = mlir::LLVM::AndOp::create(
-                                        lb, lloc, info.okPtr,
-                                        mlir::LLVM::ICmpOp::create(lb, lloc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
-                                    auto [val, _] = emitReservedElemLoad(
-                                        lb, lloc, elemTy, elemBytes, info.descP, info.basePtr, inBounds, cOff);
-                                    nextArgs[i] = mlir::LLVM::InsertElementOp::create(lb, lloc, nextArgs[i], val, lIdx);
-                                }
-                                mlir::scf::YieldOp::create(lb, lloc, nextArgs);
-                            });
-                        mlir::scf::YieldOp::create(nb, nloc, loop.getResults());
-                    },
-                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                        mlir::scf::YieldOp::create(nb, nloc, emitGatherCBuffer(nb, nloc));
-                    });
-                activeVecs.assign(ifRes.getResults().begin(), ifRes.getResults().end());
+                activeVecs = emitGatherCBuffer(b_, loc);
             }
 
             llvm::SmallVector<mlir::Value, 8> fieldVecs(numFields, zeroElemVec);
