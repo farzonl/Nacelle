@@ -1,0 +1,272 @@
+name: macOS Benchmarks
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: macos-benchmark-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-benchmark:
+    name: Benchmark (Nacelle vs Metal vs MoltenVK vs llvmpipe vs KosmicKrisp)
+    runs-on: macos-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure Ninja is installed (macOS)
+        run: |
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/DirectX-Headers \
+            third_party/DirectXMath \
+            third_party/bcdec \
+            third_party/thread-pool \
+            third_party/xxHash
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
+          echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore GPU SDK dependencies cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-bench-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+
+      - name: Install Vulkan SDK & Metal Shader Converter (macOS fallback)
+        id: install-sdk
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/include .sdk/lib .sdk/share/vulkan
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/bin/spirv-val .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/include/dxc .sdk/include/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libvulkan* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libMoltenVK* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/lib/libVkLayer_khronos_validation* .sdk/lib/
+          cp -a /tmp/vulkansdk/macOS/share/vulkan/icd.d .sdk/share/vulkan/
+          cp -a /tmp/vulkansdk/macOS/share/vulkan/explicit_layer.d .sdk/share/vulkan/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+          git clone --depth 1 https://github.com/MethanePowered/MetalShaderConverterBinary.git /tmp/msc
+          cp -a /tmp/msc/include/* .sdk/include/
+          unzip -q /tmp/msc/binaries/MacOS.zip -d /tmp/msc-bins
+          cp -a /tmp/msc-bins/bin/metal-shaderconverter .sdk/bin/
+          chmod +x .sdk/bin/metal-shaderconverter
+          cp -a /tmp/msc-bins/lib/libmetalirconverter* .sdk/lib/
+          rm -rf /tmp/msc /tmp/msc-bins
+
+      - name: Save GPU SDK dependencies cache
+        if: always() && steps.install-sdk.outcome == 'success' && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-bench-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0-msc1.1
+
+      - name: Resolve Homebrew cache directory
+        id: brew-paths
+        run: |
+          echo "cache=$(brew --cache)" >> "$GITHUB_OUTPUT"
+          echo "prefix=$(brew --prefix)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Homebrew Mesa (llvmpipe) bottle cache
+        id: cache-llvmpipe-brew
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.brew-paths.outputs.cache }}
+          key: nacelle-llvmpipe-brew-${{ runner.os }}-${{ runner.arch }}-mesa
+          restore-keys: |
+            nacelle-llvmpipe-brew-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install prebuilt Mesa (llvmpipe) via Homebrew
+        id: install-llvmpipe
+        run: |
+          BREW_PREFIX="${{ steps.brew-paths.outputs.prefix }}"
+          if ! ls "${BREW_PREFIX}/share/vulkan/icd.d/lvp_icd"*.json >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install mesa
+          fi
+          ls -la "${BREW_PREFIX}/share/vulkan/icd.d/"
+
+      - name: Save Homebrew Mesa (llvmpipe) bottle cache
+        if: always() && steps.install-llvmpipe.outcome == 'success' && steps.cache-llvmpipe-brew.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.brew-paths.outputs.cache }}
+          key: nacelle-llvmpipe-brew-${{ runner.os }}-${{ runner.arch }}-mesa
+
+      - name: Restore third_party LLVM/MLIR binaries cache (from CI)
+        id: cache-llvm
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build and install third_party LLVM/MLIR/Clang (fallback)
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.toolchains/llvm" \
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          rm -rf build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure and build nacelle-bench
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
+            -DLLVM_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="$GITHUB_WORKSPACE/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file"
+          cmake --build build --target nacelle-bench --parallel
+
+      - name: Run macOS benchmarks (Nacelle vs Metal vs MoltenVK vs llvmpipe vs KosmicKrisp)
+        run: |
+          BREW_PREFIX="${{ steps.brew-paths.outputs.prefix }}"
+          ICDS=()
+
+          MOLTENVK_ICD="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/MoltenVK_icd.json"
+          if [ -f "$MOLTENVK_ICD" ]; then
+            ICDS+=("$MOLTENVK_ICD")
+          fi
+
+          KOSMIC_ICD="$GITHUB_WORKSPACE/.sdk/share/vulkan/icd.d/libkosmickrisp_icd.json"
+          if [ ! -f "$KOSMIC_ICD" ]; then
+            KOSMIC_ICD="$(ls "${BREW_PREFIX}/share/vulkan/icd.d/kosmickrisp_mesa_icd"*.json 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$KOSMIC_ICD" ] && [ -f "$KOSMIC_ICD" ]; then
+            ICDS+=("$KOSMIC_ICD")
+          fi
+
+          LVP_ICD="$(ls "${BREW_PREFIX}/share/vulkan/icd.d/lvp_icd"*.json 2>/dev/null | head -n 1 || true)"
+          if [ -n "$LVP_ICD" ] && [ -f "$LVP_ICD" ]; then
+            ICDS+=("$LVP_ICD")
+          fi
+
+          if [ ${#ICDS[@]} -eq 0 ]; then
+            echo "Error: no Vulkan ICD manifests found."
+            exit 1
+          fi
+
+          ICD_LIST="$(IFS=:; echo "${ICDS[*]}")"
+          echo "Using Vulkan ICDs: $ICD_LIST"
+
+          export VK_ICD_FILENAMES="$ICD_LIST"
+          export VK_DRIVER_FILES="$ICD_LIST"
+          export VK_ADD_LAYER_PATH="$GITHUB_WORKSPACE/.sdk/share/vulkan/explicit_layer.d"
+          export VK_LOADER_DEBUG="error,warn"
+          export PATH="$GITHUB_WORKSPACE/.sdk/bin:$GITHUB_WORKSPACE/.toolchains/llvm/bin:$PATH"
+          export DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${BREW_PREFIX}/lib:${DYLD_LIBRARY_PATH:-}"
+
+          "$GITHUB_WORKSPACE/build/nacelle-bench" --iters 7 --json "$GITHUB_WORKSPACE/bench-results.json"
+
+      - name: Restore historical macOS benchmark data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .bench-cache
+          key: bench-history-macos-${{ github.event.workflow_run.head_sha || github.sha }}
+          restore-keys: |
+            bench-history-macos-
+
+      - name: Record macOS benchmark history and build GitHub Pages site
+        env:
+          GITHUB_EVENT_REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          TARGET_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          MSG="$(git log -1 --pretty=%s)"
+          AUTHOR="$(git log -1 --pretty=%an)"
+          TS="$(git log -1 --pretty=%cI)"
+          python3 scripts/record_bench_history.py \
+            --bench-json "$GITHUB_WORKSPACE/bench-results.json" \
+            --site-src "$GITHUB_WORKSPACE/pages" \
+            --out-dir "$GITHUB_WORKSPACE/_site" \
+            --sha "$TARGET_SHA" \
+            --message "$MSG" \
+            --author "$AUTHOR" \
+            --timestamp "$TS" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --pages-url "https://${{ github.repository_owner }}.github.io/$GITHUB_EVENT_REPOSITORY_NAME" \
+            --history-cache "$GITHUB_WORKSPACE/.bench-cache/bench-history-macos.json" \
+            --os macOS \
+            --history-filename bench-history-macos.json
+
+      - name: Save historical macOS benchmark data cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .bench-cache
+          key: bench-history-macos-${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

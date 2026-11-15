@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Nacelle — Windows Software Rasterizer Benchmarks</title>
+  <title>Nacelle — Shader &amp; Rasterizer Benchmarks</title>
   <script>
     (() => {
       try {
@@ -509,6 +509,11 @@
     <section aria-label="Global benchmark scope and summary" style="display: grid; gap: 1rem;">
       <div class="card-header">
         <div class="controls-row">
+          <label for="platform-select" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Platform:</label>
+          <select id="platform-select" class="meta-pill" aria-label="Select benchmark platform">
+            <option value="windows">Windows</option>
+            <option value="macos">macOS</option>
+          </select>
           <label for="global-scope" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Scope &amp; Metric:</label>
           <select id="global-scope" class="meta-pill" aria-label="Select global benchmark scope and metric"></select>
           <select id="commit-window" class="meta-pill" aria-label="Limit commits shown in trend charts">
@@ -631,6 +636,24 @@
       }
     ];
 
+    const FALLBACK_BENCH_MACOS = [
+      {
+        sha: "6bcd6be000000000000000000000000000000000",
+        shortSha: "6bcd6be",
+        message: "Sample preview (awaiting first macOS benchmark CI run)",
+        timestamp: new Date().toISOString(),
+        os: "macOS",
+        results: [
+          { backend: "Nacelle (SIMD-4)", shaderFormat: "DXIL", ran: true, compileMs: 11.2, medianMs: 6.4, minMs: 6.1, peakRssMb: 64.0, status: "OK" },
+          { backend: "Metal (IRConverter)", shaderFormat: "DXIL", ran: true, compileMs: 19.5, medianMs: 1.8, minMs: 1.6, peakRssMb: 88.0, status: "OK" },
+          { backend: "Vulkan (MoltenVK)", shaderFormat: "SPIR-V", ran: true, compileMs: 16.0, medianMs: 2.3, minMs: 2.1, peakRssMb: 82.0, status: "OK" },
+          { backend: "Vulkan (KosmicKrisp)", shaderFormat: "SPIR-V", ran: true, compileMs: 17.5, medianMs: 2.9, minMs: 2.7, peakRssMb: 85.0, status: "OK" },
+          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.0, medianMs: 10.5, minMs: 10.1, peakRssMb: 78.0, status: "OK" }
+        ]
+      }
+    ];
+
+    let activePlatform = "windows";
     let benchHistory = [];
     let selectedIndex = 0;
     let hoveredIndex = -1;
@@ -1316,6 +1339,13 @@
     }
 
     function setupInteraction() {
+      document.getElementById("platform-select")?.addEventListener("change", (e) => {
+        const nextPlatform = e.target.value === "macos" ? "macos" : "windows";
+        const url = new URL(window.location.href);
+        url.searchParams.set("os", nextPlatform);
+        window.history.replaceState({}, "", url);
+        loadPlatformData(nextPlatform);
+      });
       document.getElementById("global-scope")?.addEventListener("change", (e) => {
         const [mode, , field] = e.target.value.split(":");
         if (mode === "regime" && field) {
@@ -1364,19 +1394,36 @@
       attachTrendInteraction("mem-trend-canvas", "mem-trend-tooltip");
     }
 
-    async function init() {
+    async function loadPlatformData(platform) {
+      activePlatform = platform === "macos" ? "macos" : "windows";
+      const dataPath = activePlatform === "macos" ? "data/bench-history-macos.json" : "data/bench-history.json";
+      const fallback = activePlatform === "macos" ? FALLBACK_BENCH_MACOS : FALLBACK_BENCH;
+      const sel = document.getElementById("platform-select");
+      if (sel) sel.value = activePlatform;
+      document.title = activePlatform === "macos"
+        ? "Nacelle — macOS Shader & Rasterizer Benchmarks"
+        : "Nacelle — Windows Software Rasterizer Benchmarks";
       try {
-        const resp = await fetch("data/bench-history.json", { cache: "no-store" });
+        const resp = await fetch(dataPath, { cache: "no-store" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const json = await resp.json();
-        benchHistory = Array.isArray(json) && json.length ? json : FALLBACK_BENCH;
+        benchHistory = Array.isArray(json) && json.length ? json : fallback;
       } catch {
-        benchHistory = FALLBACK_BENCH;
+        benchHistory = fallback;
       }
-      setupThemeToggle();
       populateTrendSelector();
       selectedIndex = benchHistory.length - 1;
+      hoveredIndex = -1;
+      currentPage = 1;
       selectCommit(selectedIndex);
+    }
+
+    async function init() {
+      const params = new URLSearchParams(window.location.search);
+      const osParam = (params.get("os") || "").toLowerCase();
+      const initialPlatform = osParam === "macos" ? "macos" : "windows";
+      setupThemeToggle();
+      await loadPlatformData(initialPlatform);
       setupInteraction();
       new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("trend-wrap"));
       new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("mem-trend-wrap"));
