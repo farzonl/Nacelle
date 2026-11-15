@@ -127,11 +127,12 @@ void computeVertexStageHash(
     uint64_t& outLo,
     uint64_t& outHi);
 
-/// Converts lowered MLIR (SCF/Vector/Arith/Math/Func/LLVM) into LLVM IR and links texture_sampler.bc if referenced.
+/// Converts lowered MLIR (SCF/Vector/Arith/Math/Func/LLVM) into LLVM IR and optionally links runtime bitcode.
 std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     mlir::ModuleOp mlirMod,
     llvm::LLVMContext& llvmCtx,
-    std::string& outError);
+    std::string& outError,
+    bool linkRuntime = true);
 
 /// Checks memory & disk ObjectCache (<cacheDir>/<hex32>.o + .meta). If found, loads into LLJIT and resolves symbol(s).
 bool tryLoadComputePSOFromCache(
