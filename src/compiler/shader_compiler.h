@@ -88,6 +88,9 @@ using CompiledVertexFn = void (*)(
     float* outPosXYZW,  // [4 * W] SOA: comp * W + lane
     float* outAttrs);   // [numOutputScalars * W] SOA
 
+inline constexpr uint32_t kRasterTileSize = 32;
+inline constexpr uint32_t kRasterTilePixels = kRasterTileSize * kRasterTileSize;
+
 /// Pixel Uber-PSO quad batch kernel arguments.
 struct PixelBatchArgs {
     const DriverRootContext* rootCtx = nullptr;
@@ -95,20 +98,22 @@ struct PixelBatchArgs {
     const float* triAttrFlat = nullptr; // [numPSInputRegs * 4]: un-divided v0 attribute for flat/nointerpolation
     const float* triInvW = nullptr;     // [3]: (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
     const float* triOrigBary = nullptr; // [9]: for k in 0..2, (b0/w0, b1/w1 - b0/w0, b2/w2 - b0/w0)
-    const uint32_t* quadOffsets = nullptr; // [W/4]: pixel base index (quadIdx * 4) inside 64x64 tile SOA
+    const uint32_t* quadOffsets = nullptr; // [W/4]: pixel base index (quadIdx * 4) inside tile SOA
     const float* pixelX = nullptr;      // [W]
     const float* pixelY = nullptr;      // [W]
     const float* baryI = nullptr;       // [W]
     const float* baryJ = nullptr;       // [W]
     const float* triDepth = nullptr;    // [3]: (z0, z1 - z0, z2 - z0)
     uint32_t coverageMask = 0;
+    const uint32_t* coverageMasks = nullptr; // [batchCount]: optional per-batch coverage masks (falls back to &coverageMask when null)
+    uint32_t batchCount = 1;
     uint32_t isFrontFace = 1;
     uint32_t primitiveId = 0;
     uint32_t viewportArrayIndex = 0;
     uint32_t shadingRate = 0;
-    float* tileColorSOA[8]{};           // Each points to 4 * 4096 floats: plane c * 4096 + pixIdx
-    float* tileDepthSOA = nullptr;      // 4096 floats
-    uint8_t* tileStencilSOA = nullptr;  // 4096 uint8_t
+    float* tileColorSOA[8]{};           // Each points to 4 * kRasterTilePixels floats: plane c * kRasterTilePixels + pixIdx
+    float* tileDepthSOA = nullptr;      // kRasterTilePixels floats
+    uint8_t* tileStencilSOA = nullptr;  // kRasterTilePixels uint8_t
 };
 
 using CompiledPixelQuadFn = void (*)(const PixelBatchArgs* args);

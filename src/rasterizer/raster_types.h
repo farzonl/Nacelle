@@ -4,12 +4,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "../compiler/shader_compiler.h"
 #include "rasterizer.h"
 
 namespace nacelle {
 
-constexpr uint32_t kTileSize = 64;
-constexpr uint32_t kTilePixels = kTileSize * kTileSize;
+constexpr uint32_t kTileSize = kRasterTileSize;
+constexpr uint32_t kTilePixels = kRasterTilePixels;
 constexpr uint32_t kMaxPSInputScalars = 128;
 
 struct ShadedVertex {

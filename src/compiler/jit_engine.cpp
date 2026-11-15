@@ -303,7 +303,7 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Default);
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Aggressive);
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
