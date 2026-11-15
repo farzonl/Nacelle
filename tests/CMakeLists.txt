@@ -274,6 +274,8 @@ set_tests_properties(hlsl_intrinsics_matrix_tier1_test PROPERTIES
 add_nacelle_test(texture_sampler_test texture_sampler_test.cpp)
 add_nacelle_test(tiled_resource_test tiled_resource_test.cpp)
 add_nacelle_test(mesh_shader_test mesh_shader_test.cpp)
+add_nacelle_test(linalg_test linalg_test.cpp)
+target_include_directories(linalg_test PRIVATE ${LLVM_INCLUDE_DIRS})
 
 # lit / FileCheck compiler IR tests
 file(GLOB NACELLE_LIT_TESTS "${CMAKE_CURRENT_SOURCE_DIR}/lit/*.test")

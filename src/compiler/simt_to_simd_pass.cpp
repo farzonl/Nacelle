@@ -514,6 +514,13 @@ public:
             return sv;
         }
         if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(origTy)) {
+            if (st.isIdentified() && st.getName().starts_with("dx.types.LinAlgMatrix")) {
+                SimdVal sv;
+                sv.kind = SimdVal::Kind::Lanes;
+                sv.origType = origTy;
+                sv.lanes.push_back(mlir::LLVM::ZeroOp::create(b_, loc, ptrTy()));
+                return sv;
+            }
             SimdVal sv;
             sv.kind = SimdVal::Kind::Struct;
             sv.origType = origTy;
@@ -738,9 +745,15 @@ public:
         } else if (mlir::isa<mlir::LLVM::LLVMPointerType>(origTy)) {
             outVecTypes.push_back(vecTy(ptrTy()));
         } else if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(origTy)) {
-            for (mlir::Type f : st.getBody()) flattenSimdTypes(f, outVecTypes);
+            if (st.isIdentified() && st.getName().starts_with("dx.types.LinAlgMatrix")) {
+                outVecTypes.push_back(vecTy(ptrTy()));
+            } else {
+                for (mlir::Type f : st.getBody()) flattenSimdTypes(f, outVecTypes);
+            }
         } else if (auto at = llvm::dyn_cast<mlir::LLVM::LLVMArrayType>(origTy)) {
             for (unsigned i = 0; i < at.getNumElements(); ++i) flattenSimdTypes(at.getElementType(), outVecTypes);
+        } else if (auto vt = llvm::dyn_cast<mlir::VectorType>(origTy)) {
+            for (int64_t i = 0; i < vt.getNumElements(); ++i) flattenSimdTypes(vt.getElementType(), outVecTypes);
         } else {
             outVecTypes.push_back(vecTy(i32Ty()));
         }
@@ -813,6 +826,16 @@ public:
             return sv;
         }
         if (auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(origTy)) {
+            if (st.isIdentified() && st.getName().starts_with("dx.types.LinAlgMatrix")) {
+                SimdVal sv;
+                sv.kind = SimdVal::Kind::Lanes;
+                sv.origType = origTy;
+                mlir::Value ptrVec = vals[cursor++];
+                for (uint32_t l = 0; l < W_; ++l) {
+                    sv.lanes.push_back(llvmExtract(loc, ptrVec, l));
+                }
+                return sv;
+            }
             SimdVal sv;
             sv.kind = SimdVal::Kind::Struct;
             sv.origType = origTy;
@@ -829,6 +852,16 @@ public:
             for (unsigned i = 0; i < at.getNumElements(); ++i) {
                 const SimdVal* fp = (proto && i < proto->fields.size()) ? &proto->fields[i] : nullptr;
                 sv.fields.push_back(unpackSimdFromValues(loc, at.getElementType(), vals, cursor, fp));
+            }
+            return sv;
+        }
+        if (auto vt = llvm::dyn_cast<mlir::VectorType>(origTy)) {
+            SimdVal sv;
+            sv.kind = SimdVal::Kind::Struct;
+            sv.origType = origTy;
+            for (int64_t i = 0; i < vt.getNumElements(); ++i) {
+                const SimdVal* fp = (proto && static_cast<size_t>(i) < proto->fields.size()) ? &proto->fields[i] : nullptr;
+                sv.fields.push_back(unpackSimdFromValues(loc, vt.getElementType(), vals, cursor, fp));
             }
             return sv;
         }
@@ -2828,7 +2861,995 @@ private:
             .getResult(0);
     }
 
+    // --- SM 6.10 Linear Algebra (dx.op.linAlg*) ---
+    struct LinAlgMatrixMeta {
+        uint32_t compType = 0;
+        uint32_t rows = 0;
+        uint32_t cols = 0;
+        uint32_t use = 0;
+        uint32_t scope = 0;
+    };
+
+    static bool parseLinAlgMatrixType(mlir::Type ty, LinAlgMatrixMeta& out) {
+        auto st = llvm::dyn_cast<mlir::LLVM::LLVMStructType>(ty);
+        if (!st || !st.isIdentified()) return false;
+        llvm::StringRef name = st.getName();
+        if (!name.consume_front("dx.types.LinAlgMatrix")) return false;
+        auto parseField = [&](char tag, uint32_t& val) -> bool {
+            if (!name.consume_front(llvm::StringRef(&tag, 1))) return false;
+            return !name.consumeInteger(10, val);
+        };
+        return parseField('C', out.compType) &&
+               parseField('M', out.rows) &&
+               parseField('N', out.cols) &&
+               parseField('U', out.use) &&
+               parseField('S', out.scope);
+    }
+
+    mlir::Type linAlgStorageType(uint32_t compType) const {
+        switch (compType) {
+        case 19: case 20: case 21: case 22: return i8Ty();
+        case 2: case 3: case 23: return b_.getIntegerType(16);
+        case 8: return b_.getF16Type();
+        case 4: case 5: return i32Ty();
+        case 9: return f32Ty();
+        case 6: case 7: return i64Ty();
+        case 10: return b_.getF64Type();
+        default: return i32Ty();
+        }
+    }
+
+    static uint32_t linAlgByteSize(uint32_t compType) {
+        switch (compType) {
+        case 19: case 20: case 21: case 22: return 1;
+        case 2: case 3: case 8: case 23: return 2;
+        case 6: case 7: case 10: return 8;
+        default: return 4;
+        }
+    }
+
+    static bool linAlgIsFloat(uint32_t compType) {
+        return compType == 8 || compType == 9 || compType == 10 ||
+               compType == 21 || compType == 22 || compType == 23;
+    }
+
+    static bool linAlgIsSignedInt(uint32_t compType) {
+        return compType == 2 || compType == 4 || compType == 6 || compType == 19;
+    }
+
+    static bool linAlgIsLayoutTransposed(uint32_t layout) {
+        return layout == 1 || layout == 3 || layout == 5;
+    }
+
+    SimdVal allocLinAlgMatrixBuf(mlir::Location loc, mlir::Type origTy, const LinAlgMatrixMeta& meta) {
+        mlir::Block* entry = hooks_.entryBlock ? hooks_.entryBlock : getFuncEntryBlock();
+        mlir::OpBuilder eb(entry, entry->begin());
+        mlir::Type elemTy = linAlgStorageType(meta.compType);
+        auto arrTy = mlir::LLVM::LLVMArrayType::get(elemTy, meta.rows * meta.cols);
+        mlir::Value one = mlir::LLVM::ConstantOp::create(eb, loc, i64Ty(), eb.getI64IntegerAttr(1));
+        SimdVal sv;
+        sv.kind = SimdVal::Kind::Lanes;
+        sv.origType = origTy;
+        uint32_t numBufs = (meta.scope == 0) ? W_ : 1;
+        for (uint32_t i = 0; i < numBufs; ++i) {
+            sv.lanes.push_back(mlir::LLVM::AllocaOp::create(eb, loc, ptrTy(), arrTy, one, 16));
+        }
+        return sv;
+    }
+
+    mlir::Value linAlgElemPtr(mlir::Location loc, mlir::Value basePtr, mlir::Type elemTy, mlir::Value idxI32) {
+        mlir::Value idx64 = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), idxI32);
+        return mlir::LLVM::GEPOp::create(b_, loc, ptrTy(), elemTy, basePtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{idx64});
+    }
+
+    mlir::Value linAlgF8ToF32(mlir::Location loc, mlir::Value v8, bool isE5M2) {
+        mlir::Value v32 = mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), v8);
+        mlir::Value sign = mlir::LLVM::ShlOp::create(
+            b_, loc, mlir::LLVM::AndOp::create(b_, loc, v32, cInt(loc, i32Ty(), 0x80)), cInt(loc, i32Ty(), 24));
+        if (!isE5M2) { // E4M3FN: 1 sign, 4 exp (bias 7), 3 mant
+            mlir::Value exp = mlir::LLVM::AndOp::create(
+                b_, loc, mlir::LLVM::LShrOp::create(b_, loc, v32, cInt(loc, i32Ty(), 3)), cInt(loc, i32Ty(), 0xF));
+            mlir::Value mant = mlir::LLVM::AndOp::create(b_, loc, v32, cInt(loc, i32Ty(), 0x7));
+            mlir::Value isNan = mlir::LLVM::AndOp::create(
+                b_, loc,
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, exp, cInt(loc, i32Ty(), 15)),
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, mant, cInt(loc, i32Ty(), 7)));
+            mlir::Value isZeroExp = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, exp, cInt(loc, i32Ty(), 0));
+
+            mlir::Value normExp = mlir::LLVM::ShlOp::create(
+                b_, loc, mlir::LLVM::AddOp::create(b_, loc, exp, cInt(loc, i32Ty(), 120)), cInt(loc, i32Ty(), 23));
+            mlir::Value normMant = mlir::LLVM::ShlOp::create(b_, loc, mant, cInt(loc, i32Ty(), 20));
+            mlir::Value normBits = mlir::LLVM::OrOp::create(b_, loc, sign, mlir::LLVM::OrOp::create(b_, loc, normExp, normMant));
+            mlir::Value normF = mlir::LLVM::BitcastOp::create(b_, loc, f32Ty(), normBits);
+
+            // Subnormal/zero: sign * mant * 2^-9
+            mlir::Value mantF = mlir::LLVM::UIToFPOp::create(b_, loc, f32Ty(), mant);
+            mlir::Value subF = mlir::LLVM::FMulOp::create(b_, loc, mantF, cFlt(loc, f32Ty(), 1.0 / 512.0));
+            mlir::Value subBits = mlir::LLVM::OrOp::create(b_, loc, sign, mlir::LLVM::BitcastOp::create(b_, loc, i32Ty(), subF));
+            mlir::Value subSigned = mlir::LLVM::BitcastOp::create(b_, loc, f32Ty(), subBits);
+
+            mlir::Value nanF = mlir::LLVM::BitcastOp::create(
+                b_, loc, f32Ty(), mlir::LLVM::OrOp::create(b_, loc, sign, cInt(loc, i32Ty(), 0x7FC00000)));
+            mlir::Value sel0 = mlir::LLVM::SelectOp::create(b_, loc, isZeroExp, subSigned, normF);
+            return mlir::LLVM::SelectOp::create(b_, loc, isNan, nanF, sel0);
+        } else { // E5M2: 1 sign, 5 exp (bias 15), 2 mant
+            mlir::Value exp = mlir::LLVM::AndOp::create(
+                b_, loc, mlir::LLVM::LShrOp::create(b_, loc, v32, cInt(loc, i32Ty(), 2)), cInt(loc, i32Ty(), 0x1F));
+            mlir::Value mant = mlir::LLVM::AndOp::create(b_, loc, v32, cInt(loc, i32Ty(), 0x3));
+            mlir::Value isSpecial = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, exp, cInt(loc, i32Ty(), 31));
+            mlir::Value isZeroExp = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, exp, cInt(loc, i32Ty(), 0));
+
+            mlir::Value normBits = mlir::LLVM::OrOp::create(
+                b_, loc, sign,
+                mlir::LLVM::OrOp::create(
+                    b_, loc,
+                    mlir::LLVM::ShlOp::create(b_, loc, mlir::LLVM::AddOp::create(b_, loc, exp, cInt(loc, i32Ty(), 112)), cInt(loc, i32Ty(), 23)),
+                    mlir::LLVM::ShlOp::create(b_, loc, mant, cInt(loc, i32Ty(), 21))));
+            mlir::Value normF = mlir::LLVM::BitcastOp::create(b_, loc, f32Ty(), normBits);
+
+            mlir::Value mantF = mlir::LLVM::UIToFPOp::create(b_, loc, f32Ty(), mant);
+            mlir::Value subF = mlir::LLVM::FMulOp::create(b_, loc, mantF, cFlt(loc, f32Ty(), 1.0 / 65536.0));
+            mlir::Value subSigned = mlir::LLVM::BitcastOp::create(
+                b_, loc, f32Ty(), mlir::LLVM::OrOp::create(b_, loc, sign, mlir::LLVM::BitcastOp::create(b_, loc, i32Ty(), subF)));
+
+            mlir::Value specBits = mlir::LLVM::OrOp::create(
+                b_, loc, sign,
+                mlir::LLVM::OrOp::create(b_, loc, cInt(loc, i32Ty(), 0x7F800000),
+                                         mlir::LLVM::ShlOp::create(b_, loc, mant, cInt(loc, i32Ty(), 21))));
+            mlir::Value specF = mlir::LLVM::BitcastOp::create(b_, loc, f32Ty(), specBits);
+            mlir::Value sel0 = mlir::LLVM::SelectOp::create(b_, loc, isZeroExp, subSigned, normF);
+            return mlir::LLVM::SelectOp::create(b_, loc, isSpecial, specF, sel0);
+        }
+    }
+
+    mlir::Value linAlgF32ToF8(mlir::Location loc, mlir::Value f32Val, bool isE5M2) {
+        mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, i32Ty(), f32Val);
+        mlir::Value sign = mlir::LLVM::AndOp::create(
+            b_, loc, mlir::LLVM::LShrOp::create(b_, loc, bits, cInt(loc, i32Ty(), 24)), cInt(loc, i32Ty(), 0x80));
+        mlir::Value absBits = mlir::LLVM::AndOp::create(b_, loc, bits, cInt(loc, i32Ty(), 0x7FFFFFFF));
+        mlir::Value isNan = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ugt, absBits, cInt(loc, i32Ty(), 0x7F800000));
+        if (!isE5M2) { // E4M3FN: max = 448.0 (0x43E00000 -> 0x7E)
+            mlir::Value clamped = mlir::LLVM::MinNumOp::create(
+                b_, loc, mlir::LLVM::FAbsOp::create(b_, loc, f32Val), cFlt(loc, f32Ty(), 448.0));
+            mlir::Value cBits = mlir::LLVM::BitcastOp::create(b_, loc, i32Ty(), clamped);
+            mlir::Value exp = mlir::LLVM::LShrOp::create(b_, loc, cBits, cInt(loc, i32Ty(), 23));
+            mlir::Value mant = mlir::LLVM::AndOp::create(b_, loc, cBits, cInt(loc, i32Ty(), 0x7FFFFF));
+            // Normal path: exp >= 121 (unbiased -6)
+            mlir::Value isSub = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, exp, cInt(loc, i32Ty(), 121));
+            mlir::Value newExp = mlir::LLVM::SubOp::create(b_, loc, exp, cInt(loc, i32Ty(), 120));
+            mlir::Value packedNorm = mlir::LLVM::OrOp::create(
+                b_, loc, mlir::LLVM::ShlOp::create(b_, loc, newExp, cInt(loc, i32Ty(), 3)),
+                mlir::LLVM::LShrOp::create(b_, loc, mant, cInt(loc, i32Ty(), 20)));
+            // Round-to-nearest-even for normal
+            mlir::Value rem = mlir::LLVM::AndOp::create(b_, loc, mant, cInt(loc, i32Ty(), 0xFFFFF));
+            mlir::Value lsb = mlir::LLVM::AndOp::create(b_, loc, packedNorm, cInt(loc, i32Ty(), 1));
+            mlir::Value roundUp = mlir::LLVM::OrOp::create(
+                b_, loc,
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ugt, rem, cInt(loc, i32Ty(), 0x80000)),
+                mlir::LLVM::AndOp::create(
+                    b_, loc,
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, rem, cInt(loc, i32Ty(), 0x80000)),
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, lsb, cInt(loc, i32Ty(), 0))));
+            packedNorm = mlir::LLVM::AddOp::create(b_, loc, packedNorm, mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), roundUp));
+            packedNorm = mlir::LLVM::UMinOp::create(b_, loc, packedNorm, cInt(loc, i32Ty(), 0x7E));
+
+            // Subnormal path: round(clamped * 512.0)
+            mlir::Value subScaled = mlir::LLVM::FMulOp::create(b_, loc, clamped, cFlt(loc, f32Ty(), 512.0));
+            mlir::Value subInt = mlir::LLVM::FPToUIOp::create(
+                b_, loc, i32Ty(), mlir::LLVM::RoundEvenOp::create(b_, loc, subScaled));
+            subInt = mlir::LLVM::UMinOp::create(b_, loc, subInt, cInt(loc, i32Ty(), 8));
+
+            mlir::Value mag = mlir::LLVM::SelectOp::create(b_, loc, isSub, subInt, packedNorm);
+            mag = mlir::LLVM::SelectOp::create(b_, loc, isNan, cInt(loc, i32Ty(), 0x7F), mag);
+            return mlir::LLVM::TruncOp::create(b_, loc, i8Ty(), mlir::LLVM::OrOp::create(b_, loc, sign, mag));
+        } else { // E5M2
+            mlir::Value absF = mlir::LLVM::FAbsOp::create(b_, loc, f32Val);
+            mlir::Value isInf = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, absBits, cInt(loc, i32Ty(), 0x7F800000));
+            mlir::Value isOverflow = mlir::LLVM::FCmpOp::create(b_, loc, mlir::LLVM::FCmpPredicate::ogt, absF, cFlt(loc, f32Ty(), 57344.0));
+            mlir::Value exp = mlir::LLVM::LShrOp::create(b_, loc, absBits, cInt(loc, i32Ty(), 23));
+            mlir::Value mant = mlir::LLVM::AndOp::create(b_, loc, absBits, cInt(loc, i32Ty(), 0x7FFFFF));
+            mlir::Value isSub = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, exp, cInt(loc, i32Ty(), 113));
+            mlir::Value newExp = mlir::LLVM::SubOp::create(b_, loc, exp, cInt(loc, i32Ty(), 112));
+            mlir::Value packedNorm = mlir::LLVM::OrOp::create(
+                b_, loc, mlir::LLVM::ShlOp::create(b_, loc, newExp, cInt(loc, i32Ty(), 2)),
+                mlir::LLVM::LShrOp::create(b_, loc, mant, cInt(loc, i32Ty(), 21)));
+            mlir::Value rem = mlir::LLVM::AndOp::create(b_, loc, mant, cInt(loc, i32Ty(), 0x1FFFFF));
+            mlir::Value lsb = mlir::LLVM::AndOp::create(b_, loc, packedNorm, cInt(loc, i32Ty(), 1));
+            mlir::Value roundUp = mlir::LLVM::OrOp::create(
+                b_, loc,
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ugt, rem, cInt(loc, i32Ty(), 0x100000)),
+                mlir::LLVM::AndOp::create(
+                    b_, loc,
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::eq, rem, cInt(loc, i32Ty(), 0x100000)),
+                    mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ne, lsb, cInt(loc, i32Ty(), 0))));
+            packedNorm = mlir::LLVM::AddOp::create(b_, loc, packedNorm, mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), roundUp));
+
+            mlir::Value subScaled = mlir::LLVM::FMulOp::create(b_, loc, absF, cFlt(loc, f32Ty(), 65536.0));
+            mlir::Value subInt = mlir::LLVM::FPToUIOp::create(
+                b_, loc, i32Ty(), mlir::LLVM::RoundEvenOp::create(b_, loc, subScaled));
+            subInt = mlir::LLVM::UMinOp::create(b_, loc, subInt, cInt(loc, i32Ty(), 4));
+
+            mlir::Value mag = mlir::LLVM::SelectOp::create(b_, loc, isSub, subInt, packedNorm);
+            mag = mlir::LLVM::SelectOp::create(
+                b_, loc, mlir::LLVM::OrOp::create(b_, loc, isInf, isOverflow), cInt(loc, i32Ty(), 0x7C), mag);
+            mag = mlir::LLVM::SelectOp::create(b_, loc, isNan, cInt(loc, i32Ty(), 0x7F), mag);
+            return mlir::LLVM::TruncOp::create(b_, loc, i8Ty(), mlir::LLVM::OrOp::create(b_, loc, sign, mag));
+        }
+    }
+
+    mlir::Value linAlgToF64(mlir::Location loc, mlir::Value val, uint32_t compType) {
+        switch (compType) {
+        case 10: return val; // F64
+        case 9: return mlir::LLVM::FPExtOp::create(b_, loc, b_.getF64Type(), val); // F32
+        case 8: return mlir::LLVM::FPExtOp::create(b_, loc, b_.getF64Type(), val); // F16
+        case 23: { // BFloat16
+            mlir::Value shl = mlir::LLVM::ShlOp::create(
+                b_, loc, mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), val), cInt(loc, i32Ty(), 16));
+            mlir::Value f32v = mlir::LLVM::BitcastOp::create(b_, loc, f32Ty(), shl);
+            return mlir::LLVM::FPExtOp::create(b_, loc, b_.getF64Type(), f32v);
+        }
+        case 21: return mlir::LLVM::FPExtOp::create(b_, loc, b_.getF64Type(), linAlgF8ToF32(loc, val, false));
+        case 22: return mlir::LLVM::FPExtOp::create(b_, loc, b_.getF64Type(), linAlgF8ToF32(loc, val, true));
+        case 19: case 2: case 4: case 6:
+            return mlir::LLVM::SIToFPOp::create(b_, loc, b_.getF64Type(), val);
+        case 20: case 3: case 5: case 7:
+            return mlir::LLVM::UIToFPOp::create(b_, loc, b_.getF64Type(), val);
+        default:
+            return cFlt(loc, b_.getF64Type(), 0.0);
+        }
+    }
+
+    mlir::Value linAlgFromF64(mlir::Location loc, mlir::Value f64Val, uint32_t dstCompType) {
+        switch (dstCompType) {
+        case 10: return f64Val;
+        case 9: return mlir::LLVM::FPTruncOp::create(b_, loc, f32Ty(), f64Val);
+        case 8: return mlir::LLVM::FPTruncOp::create(b_, loc, b_.getF16Type(), f64Val);
+        case 23: { // F64 -> F32 -> BFloat16 (round-to-nearest-even)
+            mlir::Value f32v = mlir::LLVM::FPTruncOp::create(b_, loc, f32Ty(), f64Val);
+            mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, i32Ty(), f32v);
+            mlir::Value lsb = mlir::LLVM::AndOp::create(
+                b_, loc, mlir::LLVM::LShrOp::create(b_, loc, bits, cInt(loc, i32Ty(), 16)), cInt(loc, i32Ty(), 1));
+            mlir::Value bias = mlir::LLVM::AddOp::create(b_, loc, cInt(loc, i32Ty(), 0x7FFF), lsb);
+            mlir::Value rounded = mlir::LLVM::LShrOp::create(
+                b_, loc, mlir::LLVM::AddOp::create(b_, loc, bits, bias), cInt(loc, i32Ty(), 16));
+            mlir::Value isNan = mlir::LLVM::FCmpOp::create(b_, loc, mlir::LLVM::FCmpPredicate::uno, f32v, f32v);
+            mlir::Value nanBf = mlir::LLVM::OrOp::create(
+                b_, loc, mlir::LLVM::LShrOp::create(b_, loc, bits, cInt(loc, i32Ty(), 16)), cInt(loc, i32Ty(), 0x0040));
+            return mlir::LLVM::TruncOp::create(
+                b_, loc, b_.getIntegerType(16), mlir::LLVM::SelectOp::create(b_, loc, isNan, nanBf, rounded));
+        }
+        case 21: return linAlgF32ToF8(loc, mlir::LLVM::FPTruncOp::create(b_, loc, f32Ty(), f64Val), false);
+        case 22: return linAlgF32ToF8(loc, mlir::LLVM::FPTruncOp::create(b_, loc, f32Ty(), f64Val), true);
+        case 19: case 2: case 4: case 6: { // Saturating float -> signed int
+            mlir::Type dstTy = linAlgStorageType(dstCompType);
+            double minV = (dstCompType == 19) ? -128.0 : (dstCompType == 2) ? -32768.0 : (dstCompType == 4) ? -2147483648.0 : -9223372036854775808.0;
+            double maxV = (dstCompType == 19) ? 127.0 : (dstCompType == 2) ? 32767.0 : (dstCompType == 4) ? 2147483647.0 : 9223372036854774784.0;
+            mlir::Value isNan = mlir::LLVM::FCmpOp::create(b_, loc, mlir::LLVM::FCmpPredicate::uno, f64Val, f64Val);
+            mlir::Value clamped = mlir::LLVM::MaxNumOp::create(
+                b_, loc, cFlt(loc, b_.getF64Type(), minV),
+                mlir::LLVM::MinNumOp::create(b_, loc, cFlt(loc, b_.getF64Type(), maxV), f64Val));
+            clamped = mlir::LLVM::SelectOp::create(b_, loc, isNan, cFlt(loc, b_.getF64Type(), 0.0), clamped);
+            return mlir::LLVM::FPToSIOp::create(b_, loc, dstTy, clamped);
+        }
+        case 20: case 3: case 5: case 7: { // Saturating float -> unsigned int
+            mlir::Type dstTy = linAlgStorageType(dstCompType);
+            double maxV = (dstCompType == 20) ? 255.0 : (dstCompType == 3) ? 65535.0 : (dstCompType == 5) ? 4294967295.0 : 18446744073709549568.0;
+            mlir::Value isNan = mlir::LLVM::FCmpOp::create(b_, loc, mlir::LLVM::FCmpPredicate::uno, f64Val, f64Val);
+            mlir::Value clamped = mlir::LLVM::MaxNumOp::create(
+                b_, loc, cFlt(loc, b_.getF64Type(), 0.0),
+                mlir::LLVM::MinNumOp::create(b_, loc, cFlt(loc, b_.getF64Type(), maxV), f64Val));
+            clamped = mlir::LLVM::SelectOp::create(b_, loc, isNan, cFlt(loc, b_.getF64Type(), 0.0), clamped);
+            return mlir::LLVM::FPToUIOp::create(b_, loc, dstTy, clamped);
+        }
+        default:
+            return cInt(loc, i32Ty(), 0);
+        }
+    }
+
+    mlir::Value linAlgConvertScalar(mlir::Location loc, mlir::Value val, uint32_t srcCompType, uint32_t dstCompType) {
+        if (srcCompType == dstCompType) return val;
+        if (!linAlgIsFloat(srcCompType) && !linAlgIsFloat(dstCompType)) {
+            bool srcSigned = linAlgIsSignedInt(srcCompType);
+            bool dstSigned = linAlgIsSignedInt(dstCompType);
+            mlir::Value v64 = srcSigned ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), val))
+                                        : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), val));
+            mlir::Type dstTy = linAlgStorageType(dstCompType);
+            unsigned dstBits = dstTy.getIntOrFloatBitWidth();
+            if (dstBits < 64) {
+                if (dstSigned) {
+                    int64_t lo = -(1LL << (dstBits - 1));
+                    int64_t hi = (1LL << (dstBits - 1)) - 1;
+                    if (!srcSigned) {
+                        v64 = mlir::LLVM::UMinOp::create(b_, loc, v64, cInt(loc, i64Ty(), static_cast<uint64_t>(hi)));
+                    } else {
+                        v64 = mlir::LLVM::SMaxOp::create(b_, loc, cInt(loc, i64Ty(), static_cast<uint64_t>(lo)),
+                                                         mlir::LLVM::SMinOp::create(b_, loc, cInt(loc, i64Ty(), static_cast<uint64_t>(hi)), v64));
+                    }
+                } else {
+                    uint64_t hi = (1ULL << dstBits) - 1;
+                    if (srcSigned) {
+                        v64 = mlir::LLVM::SMaxOp::create(b_, loc, cInt(loc, i64Ty(), 0), v64);
+                    }
+                    v64 = mlir::LLVM::UMinOp::create(b_, loc, v64, cInt(loc, i64Ty(), hi));
+                }
+                return mlir::LLVM::TruncOp::create(b_, loc, dstTy, v64);
+            }
+            return v64;
+        }
+        return linAlgFromF64(loc, linAlgToF64(loc, val, srcCompType), dstCompType);
+    }
+
+    uint32_t inferDxilValCompType(mlir::Type scalarTy, bool isSigned) {
+        if (scalarTy.isF64()) return 10;
+        if (scalarTy.isF32()) return 9;
+        if (scalarTy.isF16()) return 8;
+        if (scalarTy.isInteger(8)) return isSigned ? 19 : 20;
+        if (scalarTy.isInteger(16)) return isSigned ? 2 : 3;
+        if (scalarTy.isInteger(32)) return isSigned ? 4 : 5;
+        if (scalarTy.isInteger(64)) return isSigned ? 6 : 7;
+        return 9;
+    }
+
+    bool packetizeLinAlgOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
+        mlir::Location loc = call.getLoc();
+        auto arg = [&](unsigned i) -> mlir::Value { return i < call.getNumOperands() ? call.getOperand(i) : mlir::Value(); };
+        auto resTy = [&]() -> mlir::Type { return call.getNumResults() ? call.getResult().getType() : mlir::Type(); };
+        mlir::Value activeMask = mlir::LLVM::AndOp::create(b_, loc, execMask, realMask);
+
+        auto getMatBufForLane = [&](const SimdVal& sv, const LinAlgMatrixMeta& meta, uint32_t l) -> mlir::Value {
+            return (meta.scope == 0 && sv.lanes.size() > l) ? sv.lanes[l] : sv.lanes[0];
+        };
+
+        auto shouldRunLane = [&](const LinAlgMatrixMeta& meta, uint32_t l) -> bool {
+            return meta.scope == 0 || l == 0;
+        };
+
+        auto laneIdxVec = [&]() -> mlir::Value {
+            mlir::Value v = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(i32Ty()));
+            for (uint32_t i = 0; i < W_; ++i) {
+                v = llvmInsert(loc, v, cInt(loc, i32Ty(), i), i);
+            }
+            return v;
+        };
+
+        switch (op) {
+        case 333: { // LinAlgMatrixQueryAccumulatorLayout() -> i32
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
+            return true;
+        }
+        case 323: { // LinAlgFillMatrix(isInputSigned, value) -> matrix
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(resTy(), meta)) {
+                outError = "LinAlgFillMatrix: invalid matrix return type";
+                return false;
+            }
+            bool isSigned = getConstIntValue(arg(1)).value_or(0) != 0;
+            SimdVal valSv = getMapped(loc, arg(2));
+            mlir::Value valVec = asVec(loc, valSv);
+            uint32_t srcComp = inferDxilValCompType(arg(2).getType(), isSigned);
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), meta);
+            mlir::Type dstElemTy = linAlgStorageType(meta.compType);
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(meta, l)) continue;
+                mlir::Value rawV = llvmExtract(loc, valVec, l);
+                mlir::Value cvtV = linAlgConvertScalar(loc, rawV, srcComp, meta.compType);
+                mlir::Value buf = getMatBufForLane(outMat, meta, l);
+                for (uint32_t idx = 0; idx < meta.rows * meta.cols; ++idx) {
+                    mlir::LLVM::StoreOp::create(b_, loc, cvtV, linAlgElemPtr(loc, buf, dstElemTy, cInt(loc, i32Ty(), idx)));
+                }
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 324: { // LinAlgCopyConvertMatrix(srcMatrix, transpose) -> matrix
+            LinAlgMatrixMeta srcMeta, dstMeta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), srcMeta) || !parseLinAlgMatrixType(resTy(), dstMeta)) {
+                outError = "LinAlgCopyConvertMatrix: invalid matrix type";
+                return false;
+            }
+            bool transpose = getConstIntValue(arg(2)).value_or(0) != 0;
+            SimdVal srcMat = getMapped(loc, arg(1));
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), dstMeta);
+            mlir::Type srcElemTy = linAlgStorageType(srcMeta.compType);
+            mlir::Type dstElemTy = linAlgStorageType(dstMeta.compType);
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(dstMeta, l)) continue;
+                mlir::Value srcBuf = getMatBufForLane(srcMat, srcMeta, l);
+                mlir::Value dstBuf = getMatBufForLane(outMat, dstMeta, l);
+                for (uint32_t r = 0; r < dstMeta.rows; ++r) {
+                    for (uint32_t c = 0; c < dstMeta.cols; ++c) {
+                        uint32_t sr = transpose ? c : r;
+                        uint32_t sc = transpose ? r : c;
+                        uint32_t sIdx = sr * srcMeta.cols + sc;
+                        uint32_t dIdx = r * dstMeta.cols + c;
+                        mlir::Value sv = mlir::LLVM::LoadOp::create(b_, loc, srcElemTy, linAlgElemPtr(loc, srcBuf, srcElemTy, cInt(loc, i32Ty(), sIdx)));
+                        mlir::Value cv = linAlgConvertScalar(loc, sv, srcMeta.compType, dstMeta.compType);
+                        mlir::LLVM::StoreOp::create(b_, loc, cv, linAlgElemPtr(loc, dstBuf, dstElemTy, cInt(loc, i32Ty(), dIdx)));
+                    }
+                }
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 325:   // LinAlgMatrixLoadFromDescriptor(handle, offset, stride, layout, align)
+        case 331:   // LinAlgMatrixStoreToDescriptor(matrix, handle, offset, stride, layout, align)
+        case 338: { // LinAlgMatrixAccumulateToDescriptor(matrix, handle, offset, stride, layout, align)
+            const bool isLoad = (op == 325);
+            const bool isAccum = (op == 338);
+            mlir::Type matTy = isLoad ? resTy() : arg(1).getType();
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(matTy, meta)) {
+                outError = "LinAlgDescriptorIO: invalid matrix type";
+                return false;
+            }
+            SimdVal handle = getMapped(loc, arg(isLoad ? 1 : 2));
+            mlir::Value offVec = asVec(loc, getMapped(loc, arg(isLoad ? 2 : 3)));
+            mlir::Value strideVec = asVec(loc, getMapped(loc, arg(isLoad ? 3 : 4)));
+            uint32_t layout = static_cast<uint32_t>(getConstIntValue(arg(isLoad ? 4 : 5)).value_or(0));
+            bool colMajor = linAlgIsLayoutTransposed(layout);
+            uint32_t elemBytes = linAlgByteSize(meta.compType);
+            mlir::Type elemTy = linAlgStorageType(meta.compType);
+
+            SimdVal srcMat = isLoad ? SimdVal{} : getMapped(loc, arg(1));
+            SimdVal outMat = isLoad ? allocLinAlgMatrixBuf(loc, matTy, meta) : SimdVal{};
+
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(meta, l)) continue;
+                BufferDescInfo info = loadBufferDescInfo(
+                    loc, b_, handle, maskDescPtrForLane(loc, handle, realMask, l), /*needElemStride=*/false, /*needStride64=*/false);
+                mlir::Value baseOff = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), llvmExtract(loc, offVec, l));
+                mlir::Value stride = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), llvmExtract(loc, strideVec, l));
+                mlir::Value matBuf = getMatBufForLane(isLoad ? outMat : srcMat, meta, l);
+
+                for (uint32_t r = 0; r < meta.rows; ++r) {
+                    for (uint32_t c = 0; c < meta.cols; ++c) {
+                        uint64_t majorIdx = colMajor ? c : r;
+                        uint64_t minorIdx = colMajor ? r : c;
+                        mlir::Value byteOff = mlir::LLVM::AddOp::create(
+                            b_, loc, baseOff,
+                            mlir::LLVM::AddOp::create(
+                                b_, loc,
+                                mlir::LLVM::MulOp::create(b_, loc, cInt(loc, i64Ty(), majorIdx), stride),
+                                cInt(loc, i64Ty(), minorIdx * elemBytes)));
+                        mlir::Value cEnd = mlir::LLVM::AddOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
+                        mlir::Value inBounds = mlir::LLVM::AndOp::create(
+                            b_, loc, info.okPtr,
+                            mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize));
+                        mlir::Value mPtr = linAlgElemPtr(loc, matBuf, elemTy, cInt(loc, i32Ty(), r * meta.cols + c));
+
+                        if (isLoad) {
+                            mlir::Value loaded = mlir::scf::IfOp::create(
+                                b_, loc, inBounds,
+                                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                                    mlir::Value ep = mlir::LLVM::GEPOp::create(
+                                        nb, nloc, ptrTy(), i8Ty(), info.basePtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+                                    mlir::Value v = mlir::LLVM::LoadOp::create(nb, nloc, elemTy, ep);
+                                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{v});
+                                },
+                                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                                    mlir::Value z = mlir::isa<mlir::FloatType>(elemTy)
+                                                        ? mlir::Value(mlir::LLVM::ConstantOp::create(
+                                                              nb, nloc, elemTy, nb.getFloatAttr(llvm::cast<mlir::FloatType>(elemTy), 0.0)))
+                                                        : mlir::Value(mlir::LLVM::ConstantOp::create(
+                                                              nb, nloc, elemTy, nb.getIntegerAttr(elemTy, 0)));
+                                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{z});
+                                }).getResult(0);
+                            mlir::LLVM::StoreOp::create(b_, loc, loaded, mPtr);
+                        } else {
+                            mlir::Value mVal = mlir::LLVM::LoadOp::create(b_, loc, elemTy, mPtr);
+                            mlir::scf::IfOp::create(
+                                b_, loc, inBounds,
+                                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                                    mlir::Value ep = mlir::LLVM::GEPOp::create(
+                                        nb, nloc, ptrTy(), i8Ty(), info.basePtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+                                    if (isAccum) {
+                                        mlir::Value prev = mlir::LLVM::LoadOp::create(nb, nloc, elemTy, ep);
+                                        mlir::OpBuilder::InsertionGuard g(b_);
+                                        b_.setInsertionPointToEnd(nb.getInsertionBlock());
+                                        mlir::Value sum = linAlgIsFloat(meta.compType)
+                                                              ? linAlgFromF64(nloc, mlir::LLVM::FAddOp::create(
+                                                                  b_, nloc, linAlgToF64(nloc, prev, meta.compType),
+                                                                  linAlgToF64(nloc, mVal, meta.compType)), meta.compType)
+                                                              : mlir::Value(mlir::LLVM::AddOp::create(b_, nloc, prev, mVal));
+                                        mlir::LLVM::StoreOp::create(b_, nloc, sum, ep);
+                                    } else {
+                                        mlir::LLVM::StoreOp::create(nb, nloc, mVal, ep);
+                                    }
+                                    mlir::scf::YieldOp::create(nb, nloc);
+                                });
+                        }
+                    }
+                }
+            }
+            if (isLoad) setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 326:   // LinAlgMatrixLoadFromMemory(memoryPtr, offset, stride, layout)
+        case 332:   // LinAlgMatrixStoreToMemory(matrix, memoryPtr, offset, stride, layout)
+        case 339: { // LinAlgMatrixAccumulateToMemory(matrix, memoryPtr, offset, stride, layout)
+            const bool isLoad = (op == 326);
+            const bool isAccum = (op == 339);
+            mlir::Type matTy = isLoad ? resTy() : arg(1).getType();
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(matTy, meta)) {
+                outError = "LinAlgMemoryIO: invalid matrix type";
+                return false;
+            }
+            SimdVal memSv = getMapped(loc, arg(isLoad ? 1 : 2));
+            mlir::Value offVec = asVec(loc, getMapped(loc, arg(isLoad ? 2 : 3)));
+            mlir::Value strideVec = asVec(loc, getMapped(loc, arg(isLoad ? 3 : 4)));
+            uint32_t layout = static_cast<uint32_t>(getConstIntValue(arg(isLoad ? 4 : 5)).value_or(0));
+            bool colMajor = linAlgIsLayoutTransposed(layout);
+            mlir::Type elemTy = linAlgStorageType(meta.compType);
+
+            SimdVal srcMat = isLoad ? SimdVal{} : getMapped(loc, arg(1));
+            SimdVal outMat = isLoad ? allocLinAlgMatrixBuf(loc, matTy, meta) : SimdVal{};
+
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(meta, l)) continue;
+                mlir::Value memPtr = laneValue(loc, memSv, l);
+                mlir::Value baseOff = llvmExtract(loc, offVec, l);
+                mlir::Value stride = llvmExtract(loc, strideVec, l);
+                mlir::Value matBuf = getMatBufForLane(isLoad ? outMat : srcMat, meta, l);
+
+                for (uint32_t r = 0; r < meta.rows; ++r) {
+                    for (uint32_t c = 0; c < meta.cols; ++c) {
+                        uint32_t majorIdx = colMajor ? c : r;
+                        uint32_t minorIdx = colMajor ? r : c;
+                        mlir::Value elemOff = mlir::LLVM::AddOp::create(
+                            b_, loc, baseOff,
+                            mlir::LLVM::AddOp::create(
+                                b_, loc,
+                                mlir::LLVM::MulOp::create(b_, loc, cInt(loc, i32Ty(), majorIdx), stride),
+                                cInt(loc, i32Ty(), minorIdx)));
+                        mlir::Value gsPtr = linAlgElemPtr(loc, memPtr, elemTy, elemOff);
+                        mlir::Value mPtr = linAlgElemPtr(loc, matBuf, elemTy, cInt(loc, i32Ty(), r * meta.cols + c));
+                        if (isLoad) {
+                            mlir::Value v = mlir::LLVM::LoadOp::create(b_, loc, elemTy, gsPtr);
+                            mlir::LLVM::StoreOp::create(b_, loc, v, mPtr);
+                        } else {
+                            mlir::Value mVal = mlir::LLVM::LoadOp::create(b_, loc, elemTy, mPtr);
+                            if (isAccum) {
+                                mlir::Value prev = mlir::LLVM::LoadOp::create(b_, loc, elemTy, gsPtr);
+                                mlir::Value sum = linAlgIsFloat(meta.compType)
+                                                      ? linAlgFromF64(loc, mlir::LLVM::FAddOp::create(
+                                                          b_, loc, linAlgToF64(loc, prev, meta.compType),
+                                                          linAlgToF64(loc, mVal, meta.compType)), meta.compType)
+                                                      : mlir::Value(mlir::LLVM::AddOp::create(b_, loc, prev, mVal));
+                                mlir::LLVM::StoreOp::create(b_, loc, sum, gsPtr);
+                            } else {
+                                mlir::LLVM::StoreOp::create(b_, loc, mVal, gsPtr);
+                            }
+                        }
+                    }
+                }
+            }
+            if (isLoad) setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 327: { // LinAlgMatrixLength(matrix) -> i32
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), meta)) {
+                outError = "LinAlgMatrixLength: invalid matrix type";
+                return false;
+            }
+            uint32_t total = meta.rows * meta.cols;
+            if (meta.scope == 0) {
+                setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), total), {}, {}});
+                return true;
+            }
+            uint32_t groupThreads = (meta.scope == 1)
+                                        ? W_
+                                        : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
+            mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+            mlir::Value totalV = splatInt(loc, i32Ty(), total);
+            mlir::Value grpV = splatInt(loc, i32Ty(), groupThreads);
+            mlir::Value hasAny = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, tidVec, totalV);
+            mlir::Value rem = mlir::LLVM::SubOp::create(b_, loc, totalV, tidVec);
+            mlir::Value len = mlir::LLVM::UDivOp::create(
+                b_, loc, mlir::LLVM::AddOp::create(b_, loc, rem, splatInt(loc, i32Ty(), groupThreads - 1)), grpV);
+            len = mlir::LLVM::SelectOp::create(b_, loc, hasAny, len, splatInt(loc, i32Ty(), 0));
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), len, {}, {}});
+            return true;
+        }
+        case 328: { // LinAlgMatrixGetCoordinate(matrix, threadLocalIndex) -> <2 x i32> (col, row)
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), meta)) {
+                outError = "LinAlgMatrixGetCoordinate: invalid matrix type";
+                return false;
+            }
+            mlir::Value idxVec = asVec(loc, getMapped(loc, arg(2)));
+            mlir::Value linearVec = idxVec;
+            if (meta.scope != 0) {
+                uint32_t groupThreads = (meta.scope == 1)
+                                            ? W_
+                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
+                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                linearVec = mlir::LLVM::AddOp::create(
+                    b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
+            }
+            mlir::Value colsV = splatInt(loc, i32Ty(), meta.cols);
+            mlir::Value colV = mlir::LLVM::URemOp::create(b_, loc, linearVec, colsV);
+            mlir::Value rowV = mlir::LLVM::UDivOp::create(b_, loc, linearVec, colsV);
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = resTy();
+            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), colV, {}, {}});
+            outSt.fields.push_back({SimdVal::Kind::Vector, i32Ty(), rowV, {}, {}});
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+        case 329: { // LinAlgMatrixGetElement(matrix, threadLocalIndex) -> scalar
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), meta)) {
+                outError = "LinAlgMatrixGetElement: invalid matrix type";
+                return false;
+            }
+            SimdVal matSv = getMapped(loc, arg(1));
+            mlir::Value idxVec = asVec(loc, getMapped(loc, arg(2)));
+            mlir::Value linearVec = idxVec;
+            if (meta.scope != 0) {
+                uint32_t groupThreads = (meta.scope == 1)
+                                            ? W_
+                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
+                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                linearVec = mlir::LLVM::AddOp::create(
+                    b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
+            }
+            mlir::Type storageTy = linAlgStorageType(meta.compType);
+            mlir::Type retElemTy = resTy();
+            mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(retElemTy));
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value buf = getMatBufForLane(matSv, meta, l);
+                mlir::Value lin = mlir::LLVM::UMinOp::create(
+                    b_, loc, llvmExtract(loc, linearVec, l), cInt(loc, i32Ty(), meta.rows * meta.cols - 1));
+                mlir::Value loaded = mlir::LLVM::LoadOp::create(b_, loc, storageTy, linAlgElemPtr(loc, buf, storageTy, lin));
+                if (storageTy != retElemTy) {
+                    loaded = linAlgConvertScalar(loc, loaded, meta.compType, inferDxilValCompType(retElemTy, linAlgIsSignedInt(meta.compType)));
+                }
+                outVec = llvmInsert(loc, outVec, loaded, l);
+            }
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, retElemTy, outVec, {}, {}});
+            return true;
+        }
+        case 330: { // LinAlgMatrixSetElement(matrix, threadLocalIndex, value) -> matrix
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), meta)) {
+                outError = "LinAlgMatrixSetElement: invalid matrix type";
+                return false;
+            }
+            SimdVal srcMat = getMapped(loc, arg(1));
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), meta);
+            mlir::Value idxVec = asVec(loc, getMapped(loc, arg(2)));
+            mlir::Value valVec = asVec(loc, getMapped(loc, arg(3)));
+            mlir::Value linearVec = idxVec;
+            if (meta.scope != 0) {
+                uint32_t groupThreads = (meta.scope == 1)
+                                            ? W_
+                                            : std::max(1u, shader_.threadGroupSize[0] * shader_.threadGroupSize[1] * shader_.threadGroupSize[2]);
+                mlir::Value tidVec = (meta.scope == 1) ? laneIdxVec() : hooks_.flatGroupId;
+                linearVec = mlir::LLVM::AddOp::create(
+                    b_, loc, tidVec, mlir::LLVM::MulOp::create(b_, loc, idxVec, splatInt(loc, i32Ty(), groupThreads)));
+            }
+            mlir::Type storageTy = linAlgStorageType(meta.compType);
+            uint32_t total = meta.rows * meta.cols;
+            // Copy source matrix to new SSA buffer
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(meta, l)) continue;
+                mlir::Value sb = getMatBufForLane(srcMat, meta, l);
+                mlir::Value db = getMatBufForLane(outMat, meta, l);
+                for (uint32_t i = 0; i < total; ++i) {
+                    mlir::Value v = mlir::LLVM::LoadOp::create(b_, loc, storageTy, linAlgElemPtr(loc, sb, storageTy, cInt(loc, i32Ty(), i)));
+                    mlir::LLVM::StoreOp::create(b_, loc, v, linAlgElemPtr(loc, db, storageTy, cInt(loc, i32Ty(), i)));
+                }
+            }
+            // Write per-lane element if active and in-bounds
+            uint32_t valComp = inferDxilValCompType(arg(3).getType(), linAlgIsSignedInt(meta.compType));
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value mL = llvmExtract(loc, activeMask, l);
+                mlir::Value lin = llvmExtract(loc, linearVec, l);
+                mlir::Value inB = mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ult, lin, cInt(loc, i32Ty(), total));
+                mlir::Value cond = mlir::LLVM::AndOp::create(b_, loc, mL, inB);
+                mlir::Value vL = llvmExtract(loc, valVec, l);
+                if (storageTy != arg(3).getType()) {
+                    vL = linAlgConvertScalar(loc, vL, valComp, meta.compType);
+                }
+                mlir::Value db = getMatBufForLane(outMat, meta, l);
+                mlir::scf::IfOp::create(
+                    b_, loc, cond,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value lin64 = mlir::LLVM::ZExtOp::create(nb, nloc, i64Ty(), lin);
+                        mlir::Value ep = mlir::LLVM::GEPOp::create(
+                            nb, nloc, ptrTy(), storageTy, db,
+                            llvm::ArrayRef<mlir::LLVM::GEPArg>{lin64});
+                        mlir::LLVM::StoreOp::create(nb, nloc, vL, ep);
+                        mlir::scf::YieldOp::create(nb, nloc);
+                    });
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 334:   // LinAlgMatrixMultiply(matA, matB) -> matOut
+        case 322: { // LinAlgMatrixMultiplyAccumulate(matA, matB, matC) -> matOut
+            const bool hasAcc = (op == 322);
+            LinAlgMatrixMeta metaA, metaB, metaC, metaOut;
+            if (!parseLinAlgMatrixType(arg(1).getType(), metaA) ||
+                !parseLinAlgMatrixType(arg(2).getType(), metaB) ||
+                !parseLinAlgMatrixType(resTy(), metaOut) ||
+                (hasAcc && !parseLinAlgMatrixType(arg(3).getType(), metaC))) {
+                outError = "LinAlgMatrixMultiply: invalid matrix type";
+                return false;
+            }
+            SimdVal matA = getMapped(loc, arg(1));
+            SimdVal matB = getMapped(loc, arg(2));
+            SimdVal matC = hasAcc ? getMapped(loc, arg(3)) : SimdVal{};
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), metaOut);
+            mlir::Type tyA = linAlgStorageType(metaA.compType);
+            mlir::Type tyB = linAlgStorageType(metaB.compType);
+            mlir::Type tyOut = linAlgStorageType(metaOut.compType);
+            const bool isFlt = linAlgIsFloat(metaOut.compType);
+            const uint32_t M = metaOut.rows, N = metaOut.cols, K = metaA.cols;
+
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(metaOut, l)) continue;
+                mlir::Value bA = getMatBufForLane(matA, metaA, l);
+                mlir::Value bB = getMatBufForLane(matB, metaB, l);
+                mlir::Value bC = hasAcc ? getMatBufForLane(matC, metaC, l) : mlir::Value();
+                mlir::Value bOut = getMatBufForLane(outMat, metaOut, l);
+                for (uint32_t i = 0; i < M; ++i) {
+                    for (uint32_t j = 0; j < N; ++j) {
+                        mlir::Value acc;
+                        if (hasAcc) {
+                            mlir::Value cVal = mlir::LLVM::LoadOp::create(
+                                b_, loc, tyOut, linAlgElemPtr(loc, bC, tyOut, cInt(loc, i32Ty(), i * N + j)));
+                            acc = isFlt ? linAlgToF64(loc, cVal, metaC.compType)
+                                        : (linAlgIsSignedInt(metaC.compType)
+                                               ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), cVal))
+                                               : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), cVal)));
+                        } else {
+                            acc = isFlt ? cFlt(loc, b_.getF64Type(), 0.0) : cInt(loc, i64Ty(), 0);
+                        }
+                        for (uint32_t k = 0; k < K; ++k) {
+                            mlir::Value aVal = mlir::LLVM::LoadOp::create(
+                                b_, loc, tyA, linAlgElemPtr(loc, bA, tyA, cInt(loc, i32Ty(), i * K + k)));
+                            mlir::Value bVal = mlir::LLVM::LoadOp::create(
+                                b_, loc, tyB, linAlgElemPtr(loc, bB, tyB, cInt(loc, i32Ty(), k * N + j)));
+                            if (isFlt) {
+                                mlir::Value af = linAlgToF64(loc, aVal, metaA.compType);
+                                mlir::Value bf = linAlgToF64(loc, bVal, metaB.compType);
+                                acc = mlir::LLVM::FAddOp::create(b_, loc, acc, mlir::LLVM::FMulOp::create(b_, loc, af, bf));
+                            } else {
+                                mlir::Value ai = linAlgIsSignedInt(metaA.compType)
+                                                     ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), aVal))
+                                                     : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), aVal));
+                                mlir::Value bi = linAlgIsSignedInt(metaB.compType)
+                                                     ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), bVal))
+                                                     : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), bVal));
+                                acc = mlir::LLVM::AddOp::create(b_, loc, acc, mlir::LLVM::MulOp::create(b_, loc, ai, bi));
+                            }
+                        }
+                        mlir::Value outV = isFlt ? linAlgFromF64(loc, acc, metaOut.compType)
+                                                 : (tyOut.getIntOrFloatBitWidth() < 64
+                                                        ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, tyOut, acc))
+                                                        : acc);
+                        mlir::LLVM::StoreOp::create(b_, loc, outV, linAlgElemPtr(loc, bOut, tyOut, cInt(loc, i32Ty(), i * N + j)));
+                    }
+                }
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 335: { // LinAlgMatrixAccumulate(matLHS, matRHS) -> matOut
+            LinAlgMatrixMeta metaL, metaR, metaOut;
+            if (!parseLinAlgMatrixType(arg(1).getType(), metaL) ||
+                !parseLinAlgMatrixType(arg(2).getType(), metaR) ||
+                !parseLinAlgMatrixType(resTy(), metaOut)) {
+                outError = "LinAlgMatrixAccumulate: invalid matrix type";
+                return false;
+            }
+            SimdVal matL = getMapped(loc, arg(1));
+            SimdVal matR = getMapped(loc, arg(2));
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), metaOut);
+            mlir::Type tyL = linAlgStorageType(metaL.compType);
+            mlir::Type tyR = linAlgStorageType(metaR.compType);
+            mlir::Type tyO = linAlgStorageType(metaOut.compType);
+            const bool isFlt = linAlgIsFloat(metaOut.compType);
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(metaOut, l)) continue;
+                mlir::Value bL = getMatBufForLane(matL, metaL, l);
+                mlir::Value bR = getMatBufForLane(matR, metaR, l);
+                mlir::Value bO = getMatBufForLane(outMat, metaOut, l);
+                for (uint32_t i = 0; i < metaOut.rows * metaOut.cols; ++i) {
+                    mlir::Value idx = cInt(loc, i32Ty(), i);
+                    mlir::Value vl = mlir::LLVM::LoadOp::create(b_, loc, tyL, linAlgElemPtr(loc, bL, tyL, idx));
+                    mlir::Value vr = mlir::LLVM::LoadOp::create(b_, loc, tyR, linAlgElemPtr(loc, bR, tyR, idx));
+                    mlir::Value sum = isFlt
+                                          ? linAlgFromF64(loc, mlir::LLVM::FAddOp::create(
+                                              b_, loc, linAlgToF64(loc, vl, metaL.compType),
+                                              linAlgToF64(loc, vr, metaR.compType)), metaOut.compType)
+                                          : mlir::Value(mlir::LLVM::AddOp::create(
+                                              b_, loc, vl, linAlgConvertScalar(loc, vr, metaR.compType, metaL.compType)));
+                    mlir::LLVM::StoreOp::create(b_, loc, sum, linAlgElemPtr(loc, bO, tyO, idx));
+                }
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 336:   // LinAlgMatVecMul(matrix, isOutputSigned, inputVector, interpretation)
+        case 337: { // LinAlgMatVecMulAdd(matrix, isOutputSigned, inputVector, inputInterpretation, biasVector)
+            const bool hasBias = (op == 337);
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(arg(1).getType(), meta)) {
+                outError = "LinAlgMatVecMul: invalid matrix type";
+                return false;
+            }
+            bool outSigned = getConstIntValue(arg(2)).value_or(0) != 0;
+            SimdVal vecSv = getMapped(loc, arg(3));
+            uint32_t inInterp = static_cast<uint32_t>(getConstIntValue(arg(4)).value_or(9));
+            SimdVal biasSv = hasBias ? getMapped(loc, arg(5)) : SimdVal{};
+            auto outVt = llvm::dyn_cast<mlir::VectorType>(resTy());
+            mlir::Type outElemTy = outVt ? outVt.getElementType() : resTy();
+            uint32_t outComp = inferDxilValCompType(outElemTy, outSigned);
+            const bool isFlt = linAlgIsFloat(outComp);
+            mlir::Type matElemTy = linAlgStorageType(meta.compType);
+            SimdVal matSv = getMapped(loc, arg(1));
+
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = resTy();
+            for (uint32_t r = 0; r < meta.rows; ++r) {
+                mlir::Value outLaneVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(outElemTy));
+                for (uint32_t l = 0; l < W_; ++l) {
+                    mlir::Value matBuf = getMatBufForLane(matSv, meta, l);
+                    mlir::Value acc = isFlt ? cFlt(loc, b_.getF64Type(), 0.0) : cInt(loc, i64Ty(), 0);
+                    for (uint32_t k = 0; k < meta.cols; ++k) {
+                        mlir::Value mVal = mlir::LLVM::LoadOp::create(
+                            b_, loc, matElemTy, linAlgElemPtr(loc, matBuf, matElemTy, cInt(loc, i32Ty(), r * meta.cols + k)));
+                        mlir::Value vVal = (k < vecSv.fields.size()) ? llvmExtract(loc, asVec(loc, vecSv.fields[k]), l) : cInt(loc, i32Ty(), 0);
+                        if (isFlt) {
+                            acc = mlir::LLVM::FAddOp::create(
+                                b_, loc, acc,
+                                mlir::LLVM::FMulOp::create(b_, loc, linAlgToF64(loc, mVal, meta.compType), linAlgToF64(loc, vVal, inInterp)));
+                        } else {
+                            mlir::Value mi = linAlgIsSignedInt(meta.compType)
+                                                 ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), mVal))
+                                                 : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), mVal));
+                            mlir::Value vi = linAlgIsSignedInt(inInterp)
+                                                 ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), vVal))
+                                                 : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), vVal));
+                            acc = mlir::LLVM::AddOp::create(b_, loc, acc, mlir::LLVM::MulOp::create(b_, loc, mi, vi));
+                        }
+                    }
+                    if (hasBias && r < biasSv.fields.size()) {
+                        mlir::Value bVal = llvmExtract(loc, asVec(loc, biasSv.fields[r]), l);
+                        if (isFlt) {
+                            acc = mlir::LLVM::FAddOp::create(b_, loc, acc, linAlgToF64(loc, bVal, outComp));
+                        } else {
+                            mlir::Value bi = outSigned ? mlir::Value(mlir::LLVM::SExtOp::create(b_, loc, i64Ty(), bVal))
+                                                       : mlir::Value(mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), bVal));
+                            acc = mlir::LLVM::AddOp::create(b_, loc, acc, bi);
+                        }
+                    }
+                    mlir::Value outS = isFlt ? linAlgFromF64(loc, acc, outComp)
+                                             : (outElemTy.getIntOrFloatBitWidth() < 64
+                                                    ? mlir::Value(mlir::LLVM::TruncOp::create(b_, loc, outElemTy, acc))
+                                                    : acc);
+                    outLaneVec = llvmInsert(loc, outLaneVec, outS, l);
+                }
+                outSt.fields.push_back({SimdVal::Kind::Vector, outElemTy, outLaneVec, {}, {}});
+            }
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+        case 340: { // LinAlgMatrixOuterProduct(isInputSigned, vectorA, vectorB) -> matOut
+            LinAlgMatrixMeta meta;
+            if (!parseLinAlgMatrixType(resTy(), meta)) {
+                outError = "LinAlgMatrixOuterProduct: invalid matrix type";
+                return false;
+            }
+            bool isSigned = getConstIntValue(arg(1)).value_or(0) != 0;
+            SimdVal vecA = getMapped(loc, arg(2));
+            SimdVal vecB = getMapped(loc, arg(3));
+            uint32_t compA = inferDxilValCompType(vecA.fields.empty() ? f32Ty() : vecA.fields[0].origType, isSigned);
+            uint32_t compB = inferDxilValCompType(vecB.fields.empty() ? f32Ty() : vecB.fields[0].origType, isSigned);
+            SimdVal outMat = allocLinAlgMatrixBuf(loc, resTy(), meta);
+            mlir::Type outTy = linAlgStorageType(meta.compType);
+            const bool isFlt = linAlgIsFloat(meta.compType);
+            for (uint32_t l = 0; l < W_; ++l) {
+                if (!shouldRunLane(meta, l)) continue;
+                mlir::Value outBuf = getMatBufForLane(outMat, meta, l);
+                for (uint32_t i = 0; i < meta.rows; ++i) {
+                    mlir::Value aL = (i < vecA.fields.size()) ? llvmExtract(loc, asVec(loc, vecA.fields[i]), l) : cInt(loc, i32Ty(), 0);
+                    for (uint32_t j = 0; j < meta.cols; ++j) {
+                        mlir::Value bL = (j < vecB.fields.size()) ? llvmExtract(loc, asVec(loc, vecB.fields[j]), l) : cInt(loc, i32Ty(), 0);
+                        mlir::Value prod = isFlt
+                                               ? linAlgFromF64(loc, mlir::LLVM::FMulOp::create(
+                                                   b_, loc, linAlgToF64(loc, aL, compA), linAlgToF64(loc, bL, compB)), meta.compType)
+                                               : linAlgConvertScalar(loc, mlir::LLVM::MulOp::create(
+                                                   b_, loc, linAlgConvertScalar(loc, aL, compA, meta.compType),
+                                                   linAlgConvertScalar(loc, bL, compB, meta.compType)), meta.compType, meta.compType);
+                        mlir::LLVM::StoreOp::create(b_, loc, prod, linAlgElemPtr(loc, outBuf, outTy, cInt(loc, i32Ty(), i * meta.cols + j)));
+                    }
+                }
+            }
+            setMapped(call.getResult(), outMat);
+            return true;
+        }
+        case 341: { // LinAlgConvert(inputVector, inputInterpretation, outputInterpretation) -> outVector
+            SimdVal inSv = getMapped(loc, arg(1));
+            uint32_t inInterp = static_cast<uint32_t>(getConstIntValue(arg(2)).value_or(9));
+            uint32_t outInterp = static_cast<uint32_t>(getConstIntValue(arg(3)).value_or(9));
+            auto outVt = llvm::dyn_cast<mlir::VectorType>(resTy());
+            mlir::Type outElemTy = outVt ? outVt.getElementType() : resTy();
+            SimdVal outSt;
+            outSt.kind = SimdVal::Kind::Struct;
+            outSt.origType = resTy();
+            for (size_t i = 0; i < inSv.fields.size(); ++i) {
+                mlir::Value inVec = asVec(loc, inSv.fields[i]);
+                mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vecTy(outElemTy));
+                for (uint32_t l = 0; l < W_; ++l) {
+                    mlir::Value s = llvmExtract(loc, inVec, l);
+                    mlir::Value cvt = linAlgConvertScalar(loc, s, inInterp, outInterp);
+                    if (cvt.getType() != outElemTy) {
+                        cvt = mlir::LLVM::BitcastOp::create(b_, loc, outElemTy, cvt);
+                    }
+                    outVec = llvmInsert(loc, outVec, cvt, l);
+                }
+                outSt.fields.push_back({SimdVal::Kind::Vector, outElemTy, outVec, {}, {}});
+            }
+            setMapped(call.getResult(), outSt);
+            return true;
+        }
+        case 342: { // LinAlgVectorAccumulateToDescriptor(handle, offset, align, vector) -> void
+            SimdVal handle = getMapped(loc, arg(1));
+            mlir::Value offVec = asVec(loc, getMapped(loc, arg(2)));
+            SimdVal vecSv = getMapped(loc, arg(4));
+            if (vecSv.fields.empty()) return true;
+            mlir::Type elemTy = vecSv.fields[0].origType;
+            uint32_t elemBytes = std::max<uint32_t>(1u, elemTy.getIntOrFloatBitWidth() / 8u);
+            uint32_t compType = inferDxilValCompType(elemTy, true);
+            const bool isFlt = linAlgIsFloat(compType);
+
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value mL = llvmExtract(loc, activeMask, l);
+                BufferDescInfo info = loadBufferDescInfo(
+                    loc, b_, handle, maskDescPtrForLane(loc, handle, realMask, l), /*needElemStride=*/false, /*needStride64=*/false);
+                mlir::Value baseOff = mlir::LLVM::ZExtOp::create(b_, loc, i64Ty(), llvmExtract(loc, offVec, l));
+                for (size_t i = 0; i < vecSv.fields.size(); ++i) {
+                    mlir::Value byteOff = mlir::LLVM::AddOp::create(b_, loc, baseOff, cInt(loc, i64Ty(), i * elemBytes));
+                    mlir::Value cEnd = mlir::LLVM::AddOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
+                    mlir::Value ok = mlir::LLVM::AndOp::create(
+                        b_, loc, mL,
+                        mlir::LLVM::AndOp::create(
+                            b_, loc, info.okPtr,
+                            mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ule, cEnd, info.byteSize)));
+                    mlir::Value valL = llvmExtract(loc, asVec(loc, vecSv.fields[i]), l);
+                    mlir::scf::IfOp::create(
+                        b_, loc, ok,
+                        [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                            mlir::Value ep = mlir::LLVM::GEPOp::create(
+                                nb, nloc, ptrTy(), i8Ty(), info.basePtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+                            mlir::Value prev = mlir::LLVM::LoadOp::create(nb, nloc, elemTy, ep);
+                            mlir::Value sum = isFlt
+                                                  ? mlir::Value(mlir::LLVM::FAddOp::create(nb, nloc, prev, valL))
+                                                  : mlir::Value(mlir::LLVM::AddOp::create(nb, nloc, prev, valL));
+                            mlir::LLVM::StoreOp::create(nb, nloc, sum, ep);
+                            mlir::scf::YieldOp::create(nb, nloc);
+                        });
+                }
+            }
+            return true;
+        }
+        default:
+            outError = "Unsupported dx.op.linAlg opcode: " + std::to_string(op);
+            return false;
+        }
+    }
+
     bool packetizeDxOp(mlir::LLVM::CallOp call, uint32_t op, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
+        if (op >= 322 && op <= 342) {
+            return packetizeLinAlgOp(call, op, execMask, realMask, outError);
+        }
         mlir::Location loc = call.getLoc();
         auto arg = [&](unsigned i) -> mlir::Value { return i < call.getNumOperands() ? call.getOperand(i) : mlir::Value(); };
         auto resTy = [&]() -> mlir::Type { return call.getNumResults() ? call.getResult().getType() : mlir::Type(); };
