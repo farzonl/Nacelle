@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.0.1)"
+        required: true
+        default: "v0.0.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-unix:
+    name: Build Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine release version and platform
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          VERSION="${TAG#v}"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            PLATFORM="linux"
+          else
+            PLATFORM="macos"
+          fi
+          case "${{ runner.arch }}" in
+            X64) ARCH="x64" ;;
+            ARM64) ARCH="arm64" ;;
+            *) ARCH="${{ runner.arch }}" ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "package=nacelle-${VERSION}-${PLATFORM}-${ARCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3 \
+            zlib1g-dev \
+            libzstd-dev \
+            libx11-dev \
+            libxext-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxfixes-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxtst-dev \
+            libwayland-dev \
+            libegl-dev \
+            libxkbcommon-dev \
+            libdecor-0-dev
+
+      - name: Ensure build tools are installed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/DirectX-Headers \
+            third_party/DirectXMath \
+            third_party/bcdec \
+            third_party/thread-pool \
+            third_party/xxHash
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
+          echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore DXC / GPU SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Install DirectXShaderCompiler (Linux)
+        if: runner.os == 'Linux' && steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk
+          curl -fsSL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz \
+            | tar -xzf - -C .sdk ./bin ./include ./lib
+
+      - name: Install DirectXShaderCompiler via Vulkan SDK (macOS)
+        if: runner.os == 'macOS' && steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/include .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/include/dxc .sdk/include/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+      - name: Save DXC / GPU SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+
+      - name: Restore third_party LLVM/MLIR binaries cache
+        id: cache-llvm
+        timeout-minutes: 5
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build and install third_party LLVM/MLIR/Clang
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.toolchains/llvm" \
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+            -DLLVM_TARGETS_TO_BUILD="host" \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          rm -rf build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure Nacelle
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+
+      - name: Build Nacelle release targets
+        run: cmake --build build --target nacelle_d3d12 nacelle nacelle-compile nacelle_viewer --parallel
+
+      - name: Package release archive
+        run: |
+          PKG="${{ steps.meta.outputs.package }}"
+          mkdir -p "dist/${PKG}"
+          cmake --install build --prefix "dist/${PKG}"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          fi
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package }}
+          path: |
+            dist/${{ steps.meta.outputs.package }}.tar.gz
+            dist/${{ steps.meta.outputs.package }}.tar.gz.sha256
+
+  build-windows:
+    name: Build Release (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine release version and platform
+        id: meta
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $version = $tag.TrimStart('v')
+          $pkg = "nacelle-$version-windows-x64"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "package=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Checkout core third_party submodules
+        run: |
+          git submodule update --init --depth 1 `
+            third_party/DirectX-Headers `
+            third_party/DirectXMath `
+            third_party/bcdec `
+            third_party/thread-pool `
+            third_party/xxHash
+
+      - name: Compute third_party LLVM revision
+        id: submodule-rev
+        run: |
+          $llvmRev = ((git ls-tree HEAD third_party/llvm-project) -split '\s+')[2]
+          "llvm=$llvmRev" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Install DirectXShaderCompiler (Windows)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path .sdk
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -OutFile dxc.zip
+          Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
+          Remove-Item dxc.zip
+
+      - name: Save DXC SDK cache
+        if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+
+      - name: Restore third_party LLVM/MLIR binaries cache
+        id: cache-llvm
+        timeout-minutes: 5
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+          restore-keys: |
+            nacelle-llvm-Windows-x64-
+
+      - name: Build and install third_party LLVM/MLIR/Clang
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 third_party/llvm-project
+          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/.toolchains/llvm" `
+            -DLLVM_ENABLE_PROJECTS="mlir;clang" `
+            -DLLVM_TARGETS_TO_BUILD="host" `
+            -DLLVM_BUILD_UTILS=ON `
+            -DLLVM_INSTALL_UTILS=ON `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_USE_CRT_RELEASE=MD `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DMLIR_INCLUDE_TESTS=OFF `
+            -DCLANG_INCLUDE_TESTS=OFF
+          cmake --build build-llvm --parallel
+          cmake --install build-llvm
+          Remove-Item -Recurse -Force build-llvm
+
+      - name: Save third_party LLVM/MLIR binaries cache
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/llvm
+          key: nacelle-llvm-Windows-x64-${{ steps.submodule-rev.outputs.llvm }}
+
+      - name: Configure Nacelle
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
+            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
+            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
+            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
+
+      - name: Build Nacelle release targets
+        run: cmake --build build --target nacelle_d3d12 nacelle nacelle-compile nacelle_viewer --parallel
+
+      - name: Package release archive
+        run: |
+          $pkg = "${{ steps.meta.outputs.package }}"
+          $stage = "dist/$pkg"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          cmake --install build --prefix $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$pkg.zip" -Force
+          $hash = (Get-FileHash -Path "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $pkg.zip" | Out-File -FilePath "dist/$pkg.zip.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.package }}
+          path: |
+            dist/${{ steps.meta.outputs.package }}.zip
+            dist/${{ steps.meta.outputs.package }}.zip.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS.txt
+        run: |
+          cd release-assets
+          cat *.sha256 > SHA256SUMS.txt
+          rm -f *.sha256
+          ls -la
+
+      - name: Determine release tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Nacelle ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: release-assets/*

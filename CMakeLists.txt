@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Nacelle LANGUAGES C CXX)
+project(Nacelle VERSION 0.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -497,3 +497,29 @@ endif()
 # 7. Tests
 enable_testing()
 add_subdirectory(tests)
+
+# 8. Install / Release Packaging
+include(GNUInstallDirs)
+
+install(TARGETS nacelle_d3d12
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
+install(TARGETS nacelle
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
+install(TARGETS nacelle-compile nacelle_viewer
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+if(WIN32 AND TARGET SDL3::SDL3-shared)
+    install(FILES "$<TARGET_FILE:SDL3::SDL3-shared>"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+endif()
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+    DESTINATION "."
+)
