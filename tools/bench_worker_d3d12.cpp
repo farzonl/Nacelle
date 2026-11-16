@@ -34,7 +34,9 @@ BenchRunResult runWarpComputeBench(
     uint32_t width,
     uint32_t height,
     uint32_t maxSteps,
-    uint32_t iters) {
+    uint32_t iters,
+    int32_t targetDeviceIdx = -1,
+    bool forceWarp = false) {
     BenchRunResult res;
     res.benchId = spec.id;
     res.benchName = spec.name;
@@ -54,11 +56,10 @@ BenchRunResult runWarpComputeBench(
     }
 
     using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
-    using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     using PFN_D3D12SerializeRootSignature = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
 
     auto pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiLib, "CreateDXGIFactory1"));
-    auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
+    auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDeviceFn>(GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
     auto pSerializeRS = reinterpret_cast<PFN_D3D12SerializeRootSignature>(GetProcAddress(d3d12Lib, "D3D12SerializeRootSignature"));
     if (!pCreateDXGIFactory1 || !pD3D12CreateDevice || !pSerializeRS) {
         FreeLibrary(d3d12Lib);
@@ -75,23 +76,24 @@ BenchRunResult runWarpComputeBench(
         return res;
     }
 
-    IDXGIAdapter1* warpAdapter = nullptr;
-    if (FAILED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&warpAdapter))) || !warpAdapter) {
+    IDXGIAdapter1* adapter = nullptr;
+    std::string selErr;
+    if (!selectD3D12Adapter(factory, pD3D12CreateDevice, targetDeviceIdx, forceWarp, &adapter, res.backend, selErr)) {
         factory->Release();
         FreeLibrary(d3d12Lib);
         FreeLibrary(dxgiLib);
-        res.status = "SKIPPED (WARP adapter unavailable)";
+        res.status = selErr;
         return res;
     }
 
     ID3D12Device* dev = nullptr;
-    HRESULT hr = pD3D12CreateDevice(warpAdapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
-    warpAdapter->Release();
+    HRESULT hr = pD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+    adapter->Release();
     factory->Release();
     if (FAILED(hr) || !dev) {
         FreeLibrary(d3d12Lib);
         FreeLibrary(dxgiLib);
-        res.status = "SKIPPED (WARP D3D12CreateDevice failed)";
+        res.status = "SKIPPED (D3D12CreateDevice failed)";
         return res;
     }
 
@@ -304,12 +306,29 @@ BenchRunResult runWarpComputeBench(
 } // namespace
 
 int main(int argc, char** argv) {
+    WorkerCliArgs parsed = parseWorkerCliArgs(argc, argv);
+    if (parsed.listDevices) {
+        auto devs = listD3D12Devices();
+        for (const auto& d : devs) {
+            std::cout << d.index << "\t" << d.backendName << "\n";
+        }
+        return 0;
+    }
+
     return runWorkerMain(argc, argv, [](const BenchmarkSpec& spec, const WorkerCliArgs& args) {
         std::vector<BenchRunResult> out;
+        int32_t devIdx = -1;
+        bool forceWarp = args.forceWarp;
+        if (args.singleBackend == "warp" || args.singleBackend == "d3d12:warp") {
+            forceWarp = true;
+        } else if (args.singleBackend.size() > 6 && args.singleBackend.rfind("d3d12:", 0) == 0) {
+            devIdx = std::stoi(args.singleBackend.substr(6));
+        }
+
         if (spec.kind == PipelineKind::Compute) {
             std::vector<uint8_t> dxil;
             if (readBinary(args.shaderDir + "/" + spec.csDxil, dxil)) {
-                out.push_back(runWarpComputeBench(spec, dxil, args.width, args.height, args.maxSteps, args.iters));
+                out.push_back(runWarpComputeBench(spec, dxil, args.width, args.height, args.maxSteps, args.iters, devIdx, forceWarp));
             }
         } else if (spec.kind == PipelineKind::GraphicsVSPS ||
                    spec.kind == PipelineKind::GraphicsVSGSPS ||
@@ -320,12 +339,12 @@ int main(int argc, char** argv) {
             if (!spec.hsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.hsDxil, hs)) return out;
             if (!spec.dsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.dsDxil, ds)) return out;
             if (!spec.gsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.gsDxil, gs)) return out;
-            out.push_back(runWarpGraphicsBench(spec, vs, hs, ds, gs, ps, args.width, args.height, args.iters));
+            out.push_back(runWarpGraphicsBench(spec, vs, hs, ds, gs, ps, args.width, args.height, args.iters, devIdx, forceWarp));
         } else if (spec.kind == PipelineKind::RayTracingInline ||
                    spec.kind == PipelineKind::RayTracingPipeline) {
             std::vector<uint8_t> rt;
             if (readBinary(args.shaderDir + "/" + spec.rtDxil, rt)) {
-                out.push_back(runWarpRaytracingBench(spec, rt, args.width, args.height, args.iters));
+                out.push_back(runWarpRaytracingBench(spec, rt, args.width, args.height, args.iters, devIdx, forceWarp));
             }
         }
         return out;
