@@ -99,17 +99,11 @@ static GemmBackend defaultGemmBackend() {
 }
 
 static GemmBackend getConfiguredGemmBackend() {
-    if (const char* force = std::getenv("NACELLE_FORCE_FALLBACK_GEMM")) {
-        if (force[0] == '1') return GemmBackend::Fallback;
-    }
     if (const char* env = std::getenv("NACELLE_GEMM_BACKEND")) {
-        std::string v(env);
-        for (char& ch : v) {
-            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-        }
-        if (v == "fallback") return GemmBackend::Fallback;
-        if (v == "openblas") return GemmBackend::OpenBLAS;
-        if (v == "accelerate" || v == "amx") return GemmBackend::Accelerate;
+        llvm::StringRef v(env);
+        if (v.equals_insensitive("fallback")) return GemmBackend::Fallback;
+        if (v.equals_insensitive("openblas")) return GemmBackend::OpenBLAS;
+        if (v.equals_insensitive("accelerate") || v.equals_insensitive("amx")) return GemmBackend::Accelerate;
     }
     return defaultGemmBackend();
 }
@@ -129,16 +123,15 @@ struct AppleOpenBlasDispatch {
 static const AppleOpenBlasDispatch& getAppleOpenBlasDispatch() {
     static AppleOpenBlasDispatch d = []() {
         AppleOpenBlasDispatch out;
-        const char* candidates[] = {
-            std::getenv("NACELLE_OPENBLAS_LIB"),
-            "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
-            "/usr/local/opt/openblas/lib/libopenblas.dylib",
-            "libopenblas.dylib",
-        };
-        for (const char* path : candidates) {
-            if (!path || !path[0]) continue;
-            void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-            if (!h) continue;
+        const char* path = std::getenv("NACELLE_OPENBLAS_LIB");
+        if (!path || !path[0]) {
+#ifdef NACELLE_OPENBLAS_DYLIB_PATH
+            path = NACELLE_OPENBLAS_DYLIB_PATH;
+#else
+            path = "libopenblas.dylib";
+#endif
+        }
+        if (void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL)) {
             auto s = reinterpret_cast<AppleOpenBlasDispatch::SgemmFn>(dlsym(h, "cblas_sgemm"));
             auto dg = reinterpret_cast<AppleOpenBlasDispatch::DgemmFn>(dlsym(h, "cblas_dgemm"));
             if (s && dg) {
@@ -152,7 +145,8 @@ static const AppleOpenBlasDispatch& getAppleOpenBlasDispatch() {
         }
         std::fprintf(
             stderr,
-            "[Nacelle] NACELLE_GEMM_BACKEND=openblas requested, but libopenblas.dylib was not found; falling back to fallbackGemm\n");
+            "[Nacelle] NACELLE_GEMM_BACKEND=openblas requested, but %s could not be loaded; falling back to fallbackGemm\n",
+            path);
         return out;
     }();
     return d;
