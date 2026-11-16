@@ -258,6 +258,50 @@ jobs:
             Remove-Item VulkanRT.exe
           }
 
+      - name: Resolve latest Microsoft.Direct3D.WARP NuGet version
+        id: warp-release
+        run: |
+          $idx = Invoke-RestMethod -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/index.json"
+          $stable = $idx.versions | Where-Object { $_ -notmatch '-' }
+          $ver = if ($stable) { $stable | Select-Object -Last 1 } else { $idx.versions | Select-Object -Last 1 }
+          if (-not $ver) { throw "Could not resolve Microsoft.Direct3D.WARP version from NuGet" }
+          Write-Host "Resolved Microsoft.Direct3D.WARP version: $ver"
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore Microsoft.Direct3D.WARP NuGet cache
+        id: cache-warp
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/warp
+          key: nacelle-warp-Windows-x64-${{ steps.warp-release.outputs.version }}
+
+      - name: Download Microsoft.Direct3D.WARP from NuGet
+        id: download-warp
+        if: steps.cache-warp.outputs.cache-hit != 'true'
+        run: |
+          $ver = "${{ steps.warp-release.outputs.version }}"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/$ver/microsoft.direct3d.warp.$ver.nupkg"
+          Invoke-WebRequest -Uri $url -OutFile warp.zip
+          Expand-Archive -Path warp.zip -DestinationPath warp-extract -Force
+          Remove-Item warp.zip
+          $dlls = Get-ChildItem -Path "warp-extract/build/native" -Recurse -Filter "*.dll" |
+            Where-Object { $_.DirectoryName -match '[\\/](x64|amd64)$' }
+          if (-not $dlls) { throw "No x64/amd64 WARP DLLs found in Microsoft.Direct3D.WARP $ver" }
+          New-Item -ItemType Directory -Force -Path .toolchains/warp | Out-Null
+          foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName .toolchains/warp/ -Force
+          }
+          Remove-Item -Recurse -Force warp-extract
+          Get-ChildItem .toolchains/warp
+
+      - name: Save Microsoft.Direct3D.WARP NuGet cache
+        if: always() && steps.download-warp.outcome == 'success' && steps.cache-warp.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/warp
+          key: nacelle-warp-Windows-x64-${{ steps.warp-release.outputs.version }}
+
       - name: Configure and build nacelle-bench
         run: |
           cmake -S . -B build -G Ninja `
@@ -293,7 +337,9 @@ jobs:
           $env:VK_ICD_FILENAMES = ($icds -join ";")
           $env:VK_DRIVER_FILES = $env:VK_ICD_FILENAMES
           $env:VK_LOADER_DEBUG = "error,warn"
-          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH;$env:GITHUB_WORKSPACE\.toolchains\llvmpipe\x64;$env:GITHUB_WORKSPACE\.toolchains\swiftshader"
+          # Place NuGet d3d10warp.dll beside nacelle-bench.exe so Windows loads it instead of System32\d3d10warp.dll
+          Copy-Item "$env:GITHUB_WORKSPACE\.toolchains\warp\*.dll" "$env:GITHUB_WORKSPACE\build\" -Force
+          $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\warp;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH;$env:GITHUB_WORKSPACE\.toolchains\llvmpipe\x64;$env:GITHUB_WORKSPACE\.toolchains\swiftshader"
           & "$env:GITHUB_WORKSPACE\build\nacelle-bench.exe" --iters 7 --json "$env:GITHUB_WORKSPACE\bench-results.json"
           if ($LASTEXITCODE -ne 0) { throw "nacelle-bench failed with exit code $LASTEXITCODE" }
 
