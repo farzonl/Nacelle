@@ -80,6 +80,11 @@
 namespace nacelle {
 
 #if !defined(__APPLE__)
+static BS::thread_pool<>& getFallbackGemmPool() {
+    static BS::thread_pool<> pool;
+    return pool;
+}
+
 template <typename T>
 static void fallbackGemm(
     const T* A,
@@ -90,22 +95,41 @@ static void fallbackGemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
-    if (hasC && C) {
-        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(T));
-    } else {
-        std::memset(Out, 0, static_cast<size_t>(M) * N * sizeof(T));
-    }
-    for (uint32_t i = 0; i < M; ++i) {
-        T* outRow = Out + static_cast<size_t>(i) * N;
-        const T* aRow = A + static_cast<size_t>(i) * K;
-        for (uint32_t k = 0; k < K; ++k) {
-            const T aVal = aRow[k];
-            const T* bRow = B + static_cast<size_t>(k) * N;
-            for (uint32_t j = 0; j < N; ++j) {
-                outRow[j] += aVal * bRow[j];
+    if (M == 0 || N == 0) return;
+
+    auto runRows = [&](uint32_t iBegin, uint32_t iEnd) {
+        const size_t rowBytes = static_cast<size_t>(N) * sizeof(T);
+        for (uint32_t i = iBegin; i < iEnd; ++i) {
+            T* outRow = Out + static_cast<size_t>(i) * N;
+            if (hasC && C) {
+                std::memcpy(outRow, C + static_cast<size_t>(i) * N, rowBytes);
+            } else {
+                std::memset(outRow, 0, rowBytes);
+            }
+            const T* aRow = A + static_cast<size_t>(i) * K;
+            constexpr uint32_t kTileJ = 2048;
+            for (uint32_t j0 = 0; j0 < N; j0 += kTileJ) {
+                const uint32_t jEnd = std::min(N, j0 + kTileJ);
+                for (uint32_t k = 0; k < K; ++k) {
+                    const T aVal = aRow[k];
+                    const T* bRow = B + static_cast<size_t>(k) * N;
+                    for (uint32_t j = j0; j < jEnd; ++j) {
+                        outRow[j] += aVal * bRow[j];
+                    }
+                }
             }
         }
+    };
+
+    const uint64_t ops = static_cast<uint64_t>(M) * N * K;
+    if (ops >= 65536ull && M >= 16) {
+        auto& pool = getFallbackGemmPool();
+        if (pool.get_thread_count() > 1) {
+            pool.submit_blocks<uint32_t>(0, M, runRows).wait();
+            return;
+        }
     }
+    runRows(0, M);
 }
 #endif
 
