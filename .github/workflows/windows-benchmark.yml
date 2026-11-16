@@ -302,10 +302,60 @@ jobs:
           path: .toolchains/warp
           key: nacelle-warp-Windows-x64-${{ steps.warp-release.outputs.version }}
 
+      - name: Resolve latest Microsoft.Direct3D.D3D12 (Agility SDK) NuGet version
+        id: agility-release
+        run: |
+          $idx = Invoke-RestMethod -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/index.json"
+          $ver = $idx.versions | Select-Object -Last 1
+          if (-not $ver -or $ver -notmatch '^1\.(\d+)(\.|$)') {
+            throw "Could not resolve Microsoft.Direct3D.D3D12 version from NuGet: $ver"
+          }
+          $sdkVer = $Matches[1]
+          Write-Host "Resolved Microsoft.Direct3D.D3D12 version: $ver (D3D12SDKVersion=$sdkVer)"
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sdk_version=$sdkVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore Microsoft.Direct3D.D3D12 (Agility SDK) NuGet cache
+        id: cache-agility
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/agility-sdk
+          key: nacelle-agility-Windows-x64-${{ steps.agility-release.outputs.version }}
+
+      - name: Download Microsoft.Direct3D.D3D12 (Agility SDK) from NuGet
+        id: download-agility
+        if: steps.cache-agility.outputs.cache-hit != 'true'
+        run: |
+          $ver = "${{ steps.agility-release.outputs.version }}"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/$ver/microsoft.direct3d.d3d12.$ver.nupkg"
+          Invoke-WebRequest -Uri $url -OutFile agility.zip
+          Expand-Archive -Path agility.zip -DestinationPath agility-extract -Force
+          Remove-Item agility.zip
+          $binDir = "agility-extract/build/native/bin/x64"
+          if (-not (Test-Path "$binDir/D3D12Core.dll")) {
+            throw "D3D12Core.dll not found in Microsoft.Direct3D.D3D12 $ver"
+          }
+          New-Item -ItemType Directory -Force -Path .toolchains/agility-sdk | Out-Null
+          Copy-Item "$binDir/D3D12Core.dll" .toolchains/agility-sdk/ -Force
+          if (Test-Path "$binDir/d3d12SDKLayers.dll") {
+            Copy-Item "$binDir/d3d12SDKLayers.dll" .toolchains/agility-sdk/ -Force
+          }
+          Remove-Item -Recurse -Force agility-extract
+          Get-ChildItem .toolchains/agility-sdk
+
+      - name: Save Microsoft.Direct3D.D3D12 (Agility SDK) NuGet cache
+        if: always() && steps.download-agility.outcome == 'success' && steps.cache-agility.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/agility-sdk
+          key: nacelle-agility-Windows-x64-${{ steps.agility-release.outputs.version }}
+
       - name: Configure and build nacelle-bench
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DNACELLE_D3D12_SDK_VERSION="${{ steps.agility-release.outputs.sdk_version }}" `
             -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
             -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
             -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
@@ -337,8 +387,10 @@ jobs:
           $env:VK_ICD_FILENAMES = ($icds -join ";")
           $env:VK_DRIVER_FILES = $env:VK_ICD_FILENAMES
           $env:VK_LOADER_DEBUG = "error,warn"
-          # Place NuGet d3d10warp.dll beside nacelle-bench.exe so Windows loads it instead of System32\d3d10warp.dll
+          # Place NuGet d3d10warp.dll beside nacelle-bench.exe and Agility SDK DLLs in build\D3D12\
           Copy-Item "$env:GITHUB_WORKSPACE\.toolchains\warp\*.dll" "$env:GITHUB_WORKSPACE\build\" -Force
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\build\D3D12" | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\.toolchains\agility-sdk\*.dll" "$env:GITHUB_WORKSPACE\build\D3D12\" -Force
           $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\warp;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH;$env:GITHUB_WORKSPACE\.toolchains\llvmpipe\x64;$env:GITHUB_WORKSPACE\.toolchains\swiftshader"
           & "$env:GITHUB_WORKSPACE\build\nacelle-bench.exe" --iters 7 --json "$env:GITHUB_WORKSPACE\bench-results.json"
           if ($LASTEXITCODE -ne 0) { throw "nacelle-bench failed with exit code $LASTEXITCODE" }

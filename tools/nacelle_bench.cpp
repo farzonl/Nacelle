@@ -40,6 +40,13 @@
 #include "metal_bench.h"
 #endif
 
+#if defined(_WIN32) && defined(NACELLE_D3D12_SDK_VERSION) && NACELLE_D3D12_SDK_VERSION > 0
+extern "C" {
+__declspec(dllexport) extern const unsigned int D3D12SDKVersion = NACELLE_D3D12_SDK_VERSION;
+__declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+}
+#endif
+
 namespace {
 
 using namespace nacelle_bench;
