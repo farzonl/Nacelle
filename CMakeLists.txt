@@ -325,6 +325,12 @@ target_include_directories(nacelle-bench PRIVATE
 target_compile_definitions(nacelle-bench PRIVATE
     NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
 )
+set(NACELLE_D3D12_SDK_VERSION "0" CACHE STRING "DirectX 12 Agility SDK version number")
+if(WIN32 AND NACELLE_D3D12_SDK_VERSION GREATER 0)
+    target_compile_definitions(nacelle-bench PRIVATE
+        NACELLE_D3D12_SDK_VERSION=${NACELLE_D3D12_SDK_VERSION}
+    )
+endif()
 target_link_libraries(nacelle-bench PRIVATE nacelle)
 if(UNIX AND NOT APPLE)
     target_link_libraries(nacelle-bench PRIVATE dl)
