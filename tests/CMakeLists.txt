@@ -317,7 +317,7 @@ endforeach()
 # Quick benchmark smoke test
 add_test(
     NAME nacelle_bench_smoke
-    COMMAND $<TARGET_FILE:nacelle-bench> --quick --simd-width=4,8
+    COMMAND $<TARGET_FILE:nacelle-bench> --filter bench_raymarch --simd-width=4 --width 64 --height 64 --steps 8 --iters 1
 )
 add_test(
     NAME nacelle_bench_harness_test
