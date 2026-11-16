@@ -244,7 +244,7 @@ jobs:
           Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
           Remove-Item dxc.zip
           New-Item -ItemType Directory -Force -Path .sdk/openblas
-          Invoke-WebRequest -Uri "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.29/OpenBLAS-0.3.29-x64.zip" -OutFile openblas.zip
+          Invoke-WebRequest -Uri "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.29/OpenBLAS-0.3.29_x64.zip" -OutFile openblas.zip
           Expand-Archive -Path openblas.zip -DestinationPath .sdk/openblas -Force
           Remove-Item openblas.zip
 
