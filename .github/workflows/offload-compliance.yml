@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -97,12 +98,25 @@ jobs:
 
       - name: Restore third_party LLVM/MLIR binaries cache
         id: cache-llvm
+        timeout-minutes: 5
         uses: actions/cache/restore@v4
         with:
           path: .toolchains/llvm
           key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
           restore-keys: |
             nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fail if LLVM cache restore timed out
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY="nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}"
+          COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=${KEY}" --jq '.total_count')
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "Error: LLVM cache (${KEY}) exists but restore failed or timed out; aborting instead of rebuilding."
+            exit 1
+          fi
 
       - name: Build and install third_party LLVM/MLIR/Clang
         if: steps.cache-llvm.outputs.cache-hit != 'true'
