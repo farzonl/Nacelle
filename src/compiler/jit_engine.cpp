@@ -83,11 +83,20 @@
 namespace nacelle {
 
 enum class GemmBackend : uint8_t {
-    Auto = 0,
     Accelerate,
     OpenBLAS,
     Fallback,
 };
+
+static GemmBackend defaultGemmBackend() {
+#if defined(__APPLE__)
+    return GemmBackend::Accelerate;
+#elif defined(NACELLE_HAS_CBLAS)
+    return GemmBackend::OpenBLAS;
+#else
+    return GemmBackend::Fallback;
+#endif
+}
 
 static GemmBackend getConfiguredGemmBackend() {
     if (const char* force = std::getenv("NACELLE_FORCE_FALLBACK_GEMM")) {
@@ -102,7 +111,7 @@ static GemmBackend getConfiguredGemmBackend() {
         if (v == "openblas") return GemmBackend::OpenBLAS;
         if (v == "accelerate" || v == "amx") return GemmBackend::Accelerate;
     }
-    return GemmBackend::Auto;
+    return defaultGemmBackend();
 }
 
 #if defined(__APPLE__)
@@ -202,6 +211,84 @@ static void fallbackGemm(
     runRows(0, M);
 }
 
+template <typename T>
+static void dispatchGemm(
+    const T* A,
+    const T* B,
+    const T* C,
+    T* Out,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    uint32_t hasC) {
+    auto copyC = [&]() {
+        if (hasC && C) {
+            std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(T));
+        }
+    };
+    const T beta = (hasC && C) ? T(1) : T(0);
+
+    switch (getConfiguredGemmBackend()) {
+    case GemmBackend::Accelerate:
+#if defined(__APPLE__)
+        copyC();
+        if constexpr (std::is_same_v<T, float>) {
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0f, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+        } else {
+            cblas_dgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+        }
+        return;
+#else
+        break;
+#endif
+    case GemmBackend::OpenBLAS:
+#if defined(__APPLE__)
+        if (const auto& ob = getAppleOpenBlasDispatch(); ob.loaded) {
+            copyC();
+            if constexpr (std::is_same_v<T, float>) {
+                ob.sgemm(
+                    101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    1.0f, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+            } else {
+                ob.dgemm(
+                    101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
+                    static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                    1.0, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+            }
+            return;
+        }
+        break;
+#elif defined(NACELLE_HAS_CBLAS)
+        copyC();
+        if constexpr (std::is_same_v<T, float>) {
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0f, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+        } else {
+            cblas_dgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0, A, static_cast<int>(K), B, static_cast<int>(N), beta, Out, static_cast<int>(N));
+        }
+        return;
+#else
+        break;
+#endif
+    case GemmBackend::Fallback:
+        break;
+    }
+
+    fallbackGemm<T>(A, B, C, Out, M, N, K, hasC);
+}
+
 extern "C" void nacelle_accel_sgemm(
     const float* A,
     const float* B,
@@ -211,54 +298,7 @@ extern "C" void nacelle_accel_sgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
-    const GemmBackend backend = getConfiguredGemmBackend();
-    if (backend == GemmBackend::Fallback) {
-        fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
-        return;
-    }
-#if defined(__APPLE__)
-    if (backend == GemmBackend::OpenBLAS) {
-        const auto& ob = getAppleOpenBlasDispatch();
-        if (ob.loaded) {
-            if (hasC && C) {
-                std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
-            }
-            ob.sgemm(
-                101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                1.0f, A, static_cast<int>(K),
-                B, static_cast<int>(N),
-                (hasC && C) ? 1.0f : 0.0f,
-                Out, static_cast<int>(N));
-            return;
-        }
-        fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
-        return;
-    }
-    if (hasC && C) {
-        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
-    }
-    cblas_sgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-        1.0f, A, static_cast<int>(K),
-        B, static_cast<int>(N),
-        (hasC && C) ? 1.0f : 0.0f,
-        Out, static_cast<int>(N));
-#elif defined(NACELLE_HAS_CBLAS)
-    if (hasC && C) {
-        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
-    }
-    cblas_sgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-        1.0f, A, static_cast<int>(K),
-        B, static_cast<int>(N),
-        (hasC && C) ? 1.0f : 0.0f,
-        Out, static_cast<int>(N));
-#else
-    fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
-#endif
+    dispatchGemm<float>(A, B, C, Out, M, N, K, hasC);
 }
 
 extern "C" void nacelle_accel_dgemm(
@@ -270,54 +310,7 @@ extern "C" void nacelle_accel_dgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
-    const GemmBackend backend = getConfiguredGemmBackend();
-    if (backend == GemmBackend::Fallback) {
-        fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
-        return;
-    }
-#if defined(__APPLE__)
-    if (backend == GemmBackend::OpenBLAS) {
-        const auto& ob = getAppleOpenBlasDispatch();
-        if (ob.loaded) {
-            if (hasC && C) {
-                std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
-            }
-            ob.dgemm(
-                101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
-                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                1.0, A, static_cast<int>(K),
-                B, static_cast<int>(N),
-                (hasC && C) ? 1.0 : 0.0,
-                Out, static_cast<int>(N));
-            return;
-        }
-        fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
-        return;
-    }
-    if (hasC && C) {
-        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
-    }
-    cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-        1.0, A, static_cast<int>(K),
-        B, static_cast<int>(N),
-        (hasC && C) ? 1.0 : 0.0,
-        Out, static_cast<int>(N));
-#elif defined(NACELLE_HAS_CBLAS)
-    if (hasC && C) {
-        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
-    }
-    cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-        1.0, A, static_cast<int>(K),
-        B, static_cast<int>(N),
-        (hasC && C) ? 1.0 : 0.0,
-        Out, static_cast<int>(N));
-#else
-    fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
-#endif
+    dispatchGemm<double>(A, B, C, Out, M, N, K, hasC);
 }
 
 bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError);
