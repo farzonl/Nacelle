@@ -1,7 +1,7 @@
 #pragma once
 
 #include "bench_types.h"
-#include "bench_nacelle_runners.h"
+#include "bench_common.h"
 
 #if defined(_WIN32)
 #include <windows.h>
