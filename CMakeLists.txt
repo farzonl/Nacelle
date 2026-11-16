@@ -240,6 +240,8 @@ if(NOT APPLE AND NACELLE_USE_OPENBLAS)
     find_package(OpenBLAS CONFIG QUIET)
     if(TARGET OpenBLAS::OpenBLAS)
         set(NACELLE_CBLAS_LINK_LIBS OpenBLAS::OpenBLAS)
+    elseif(OpenBLAS_FOUND AND OpenBLAS_LIBRARIES)
+        set(NACELLE_CBLAS_LINK_LIBS ${OpenBLAS_LIBRARIES})
     else()
         set(_nacelle_prev_bla_vendor "${BLA_VENDOR}")
         set(BLA_VENDOR OpenBLAS)
@@ -254,8 +256,19 @@ if(NOT APPLE AND NACELLE_USE_OPENBLAS)
         endif()
     endif()
 
+    if(NOT NACELLE_CBLAS_LINK_LIBS)
+        find_library(NACELLE_OPENBLAS_LIB
+            NAMES openblas libopenblas
+            PATH_SUFFIXES lib lib64
+        )
+        if(NACELLE_OPENBLAS_LIB)
+            set(NACELLE_CBLAS_LINK_LIBS "${NACELLE_OPENBLAS_LIB}")
+        endif()
+    endif()
+
     find_path(NACELLE_CBLAS_INC_DIR
         NAMES cblas.h openblas/cblas.h
+        HINTS ${OpenBLAS_INCLUDE_DIRS}
         PATH_SUFFIXES include include/openblas openblas
     )
     if(NACELLE_CBLAS_LINK_LIBS AND NACELLE_CBLAS_INC_DIR)
