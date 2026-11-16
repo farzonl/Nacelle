@@ -33,6 +33,12 @@ inline std::string wideToUtf8(const WCHAR* wstr) {
     return out;
 }
 
+inline bool isSoftwareOrBasicRenderAdapter(const DXGI_ADAPTER_DESC1& desc) {
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) return true;
+    // Microsoft Basic Render Driver (WARP) may be enumerated without FLAG_SOFTWARE on VMs.
+    return desc.VendorId == 0x1414 && desc.DeviceId == 0x008c;
+}
+
 inline bool selectD3D12Adapter(
     IDXGIFactory4* factory,
     PFN_D3D12CreateDeviceFn pD3D12CreateDevice,
@@ -63,7 +69,7 @@ inline bool selectD3D12Adapter(
         if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{};
         a->GetDesc1(&desc);
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        if (isSoftwareOrBasicRenderAdapter(desc)) {
             a->Release();
             continue;
         }
@@ -128,7 +134,7 @@ inline std::vector<D3D12DeviceInfo> listD3D12Devices() {
             if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
             DXGI_ADAPTER_DESC1 desc{};
             a->GetDesc1(&desc);
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            if (!isSoftwareOrBasicRenderAdapter(desc) &&
                 SUCCEEDED(pD3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
                 std::string name = wideToUtf8(desc.Description);
                 out.push_back({idx++, name.empty() ? "DirectX 12" : ("DirectX 12: " + name), false});
@@ -939,9 +945,9 @@ inline BenchRunResult runWarpMeshBench(
     res.shaderFormat = "DXIL";
 
     MemorySnapshot memBefore = queryProcessMemory();
-    D3D12BenchContext ctx;
+    WarpDeviceContext ctx;
     std::string err;
-    if (!ctx.init(devIdx, forceWarp, err)) {
+    if (!ctx.init(err, devIdx, forceWarp)) {
         res.status = err;
         return res;
     }
@@ -957,8 +963,8 @@ inline BenchRunResult runWarpMeshBench(
 
     ID3D12Device2* dev2 = nullptr;
     ID3D12GraphicsCommandList6* cmd6 = nullptr;
-    if (FAILED(ctx.dev->QueryInterface(IID_PPV_ARGS(&dev2))) || !dev2 ||
-        FAILED(ctx.cmd->QueryInterface(IID_PPV_ARGS(&cmd6))) || !cmd6) {
+    if (FAILED(ctx.dev->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&dev2))) || !dev2 ||
+        FAILED(ctx.cmd->QueryInterface(__uuidof(ID3D12GraphicsCommandList6), reinterpret_cast<void**>(&cmd6))) || !cmd6) {
         res.status = "UNSUPPORTED (no ID3D12Device2/CmdList6)";
         if (cmd6) cmd6->Release();
         if (dev2) dev2->Release();
@@ -974,9 +980,9 @@ inline BenchRunResult runWarpMeshBench(
     rsDesc.pParameters = &param;
     ID3DBlob* rsBlob = nullptr;
     ID3D12RootSignature* rootSig = nullptr;
-    if (FAILED(ctx.pD3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr)) ||
+    if (FAILED(ctx.pSerializeRS(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr)) ||
         !rsBlob ||
-        FAILED(ctx.dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig)))) {
+        FAILED(ctx.dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&rootSig)))) {
         if (rsBlob) rsBlob->Release();
         res.status = "FAILED (RootSignature)";
         cmd6->Release();
@@ -1011,7 +1017,7 @@ inline BenchRunResult runWarpMeshBench(
     D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(stream), &stream};
     auto t0 = std::chrono::steady_clock::now();
     ID3D12PipelineState* pso = nullptr;
-    HRESULT hr = dev2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&pso));
+    HRESULT hr = dev2->CreatePipelineState(&streamDesc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
     auto t1 = std::chrono::steady_clock::now();
     res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     MemorySnapshot memAfterCompile = queryProcessMemory();
@@ -1026,14 +1032,28 @@ inline BenchRunResult runWarpMeshBench(
     }
 
     const uint32_t rw = 128, rh = 128;
-    ID3D12Resource* rtvTex = createD3D12RTTexture(ctx.dev, rw, rh);
+    D3D12_HEAP_PROPERTIES defHeap{};
+    defHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rtDesc{};
+    rtDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rtDesc.Width = rw;
+    rtDesc.Height = rh;
+    rtDesc.DepthOrArraySize = 1;
+    rtDesc.MipLevels = 1;
+    rtDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtDesc.SampleDesc.Count = 1;
+    rtDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource* rtvTex = nullptr;
+    ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &rtDesc,
+                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                     __uuidof(ID3D12Resource), reinterpret_cast<void**>(&rtvTex));
     D3D12_DESCRIPTOR_HEAP_DESC rtvHD{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     ID3D12DescriptorHeap* rtvHeap = nullptr;
-    ctx.dev->CreateDescriptorHeap(&rtvHD, IID_PPV_ARGS(&rtvHeap));
+    ctx.dev->CreateDescriptorHeap(&rtvHD, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&rtvHeap));
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     ctx.dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
-    ID3D12Resource* cbBuf = createD3D12Buffer(ctx.dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    ID3D12Resource* rbBuf = createD3D12Buffer(ctx.dev, static_cast<size_t>(rw) * rh * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource* cbBuf = createWarpBuffer(ctx.dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* rbBuf = createWarpBuffer(ctx.dev, static_cast<size_t>(rw) * rh * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
     auto runMesh = [&](uint32_t groups) -> double {
         void* p = nullptr;
