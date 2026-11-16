@@ -243,7 +243,7 @@ std::vector<BenchRunResult> parseWorkerOutput(const std::string& rawOutput) {
 
 std::vector<VkDeviceInfo> listVulkanDevicesViaWorker(const std::filesystem::path& binDir) {
     std::vector<VkDeviceInfo> out;
-    std::string vkWorker = workerBinaryPath(binDir, "nacelle-bench-vulkan");
+    std::string vkWorker = workerBinaryPath(binDir, "bench-worker-vulkan");
     if (!std::filesystem::exists(vkWorker)) return out;
 
     std::string rawOut, errStatus;
@@ -266,16 +266,16 @@ std::vector<VkDeviceInfo> listVulkanDevicesViaWorker(const std::filesystem::path
 
 std::string resolveWorkerForBackend(const std::filesystem::path& binDir, const std::string& backendToken) {
     if (backendToken.rfind("nacelle-", 0) == 0) {
-        return workerBinaryPath(binDir, "nacelle-bench-nacelle");
+        return workerBinaryPath(binDir, "bench-worker-nacelle");
     }
     if (backendToken.rfind("vulkan", 0) == 0) {
-        return workerBinaryPath(binDir, "nacelle-bench-vulkan");
+        return workerBinaryPath(binDir, "bench-worker-vulkan");
     }
     if (backendToken == "metal") {
-        return workerBinaryPath(binDir, "nacelle-bench-metal");
+        return workerBinaryPath(binDir, "bench-worker-metal");
     }
     if (backendToken == "warp") {
-        return workerBinaryPath(binDir, "nacelle-bench-warp");
+        return workerBinaryPath(binDir, "bench-worker-warp");
     }
     return "";
 }
