@@ -262,7 +262,7 @@ MetalBenchResult runMetalComputeBench(
                 0.0f, 1.1f, 1.5f, 0.5f,
             };
             std::memcpy([srv0 contents], spheres, sizeof(spheres));
-        } else if (benchId == "matmul" || benchId == "linalg_matmul") {
+        } else if (benchId == "matmul" || benchId == "tiled_matmul" || benchId == "linalg_matmul") {
             auto* a = static_cast<float*>([srv0 contents]);
             auto* b = static_cast<float*>([srv1 contents]);
             for (size_t i = 0; i < 256 * 256; ++i) {
@@ -306,8 +306,9 @@ MetalBenchResult runMetalComputeBench(
         }
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
-        bool is2D = (benchId == "bench_raymarch" || benchId == "matmul");
+        bool is2D = (benchId == "bench_raymarch" || benchId == "matmul" || benchId == "tiled_matmul");
         MTLSize tgSize = (benchId == "linalg_matmul") ? MTLSizeMake(32, 1, 1)
+                       : (benchId == "tiled_matmul")  ? MTLSizeMake(16, 16, 1)
                                                       : (is2D ? MTLSizeMake(8, 8, 1) : MTLSizeMake(64, 1, 1));
 
         auto getDims = [&](int mode, uint32_t& gx, uint32_t& gy, uint32_t& cbW, uint32_t& cbH, uint32_t& cbSteps) {
@@ -324,6 +325,13 @@ MetalBenchResult runMetalComputeBench(
                 cbSteps = n;
                 gx = (n + 7) / 8;
                 gy = (n + 7) / 8;
+            } else if (benchId == "tiled_matmul") {
+                uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
+                cbW = n;
+                cbH = n;
+                cbSteps = n;
+                gx = (n + 15) / 16;
+                gy = (n + 15) / 16;
             } else if (benchId == "linalg_matmul") {
                 uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
                 cbW = n;
@@ -344,7 +352,7 @@ MetalBenchResult runMetalComputeBench(
             if (benchId == "bench_raymarch") {
                 RaymarchCB cb{cbW, cbH, cbSteps, 0.0f};
                 std::memcpy([cbBuf contents], &cb, sizeof(cb));
-            } else if (benchId == "matmul" || benchId == "linalg_matmul") {
+            } else if (benchId == "matmul" || benchId == "tiled_matmul" || benchId == "linalg_matmul") {
                 MatmulCB cb{cbW, cbH, cbSteps, 0};
                 std::memcpy([cbBuf contents], &cb, sizeof(cb));
             }

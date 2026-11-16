@@ -79,6 +79,7 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
 
     addCompute("bench_raymarch", "Raymarcher (ALU+CF)", "main", "bench_raymarch.dxil", "bench_raymarch.spv");
     addCompute("matmul", "MatMul 128x128 (FMA+Mem)", "CSMain", "matmul.dxil", "matmul.spv");
+    addCompute("tiled_matmul", "Tiled MatMul 128x128 (Shared+Mem)", "CSMain", "tiled_matmul.dxil", "tiled_matmul.spv");
     addCompute("linalg_matmul", "LinAlg MatMul 128x128 (CoopMat)", "CSMain", "linalg_matmul.dxil", "linalg_matmul.spv");
     addCompute("prefix_sum_groupshared", "Prefix Sum (Groupshared)", "CSMain", "prefix_sum_groupshared.dxil", "prefix_sum_groupshared.spv");
     addCompute("divergent_cf_atomics", "Divergent CF + Atomics", "CSMain", "divergent_cf_atomics.dxil", "divergent_cf_atomics.spv");

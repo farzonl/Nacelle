@@ -897,6 +897,18 @@ public:
         return packetizeBlockRange(srcBlock.begin(), srcBlock.end(), execMask, realMask, outError);
     }
 
+    bool packetizePrologueOp(mlir::Operation& op, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
+        return packetizeOp(op, execMask, realMask, outError);
+    }
+
+    BufferDescInfo resolveBufferDescInfo(
+        mlir::Location loc,
+        mlir::OpBuilder& nb,
+        const SimdVal& h,
+        mlir::Value descPtr) {
+        return loadBufferDescInfo(loc, nb, h, descPtr, false, false);
+    }
+
 private:
     mlir::Value gepByteOffset(mlir::Location loc, mlir::Value basePtr, int64_t byteOff) {
         if (byteOff == 0) return basePtr;
@@ -8405,6 +8417,643 @@ bool packetizeThreadGroupRegion(
     return outError.empty();
 }
 
+namespace {
+
+struct MatchedGemmKernel {
+    mlir::Value srvA;
+    mlir::Value srvB;
+    mlir::Value uavC;
+    mlir::Value mVal;
+    mlir::Value nVal;
+    mlir::Value kVal;
+};
+
+static std::optional<int64_t> getGemmConstInt(mlir::Value v) {
+    if (!v) return std::nullopt;
+    if (auto cOp = v.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+        if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(cOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    return std::nullopt;
+}
+
+static bool isGemmDxOp(mlir::Operation* op, llvm::StringRef name) {
+    auto call = mlir::dyn_cast_or_null<mlir::LLVM::CallOp>(op);
+    if (!call || !call.getCallee()) return false;
+    llvm::StringRef callee = *call.getCallee();
+    return callee == name || callee.starts_with((name + ".").str());
+}
+
+static mlir::Value stripGemmAddZero(mlir::Value v) {
+    while (auto addOp = v.getDefiningOp<mlir::LLVM::AddOp>()) {
+        auto lhsC = getGemmConstInt(addOp.getLhs());
+        auto rhsC = getGemmConstInt(addOp.getRhs());
+        if (rhsC && *rhsC == 0) {
+            v = addOp.getLhs();
+        } else if (lhsC && *lhsC == 0) {
+            v = addOp.getRhs();
+        } else {
+            break;
+        }
+    }
+    return v;
+}
+
+static mlir::Value stripGemmMulConst(mlir::Value v, int64_t expectedC) {
+    v = stripGemmAddZero(v);
+    if (auto mulOp = v.getDefiningOp<mlir::LLVM::MulOp>()) {
+        if (auto rhsC = getGemmConstInt(mulOp.getRhs()); rhsC && *rhsC == expectedC) {
+            return mulOp.getLhs();
+        }
+        if (auto lhsC = getGemmConstInt(mulOp.getLhs()); lhsC && *lhsC == expectedC) {
+            return mulOp.getRhs();
+        }
+    }
+    if (expectedC > 0 && (expectedC & (expectedC - 1)) == 0) {
+        int64_t shift = 0;
+        while ((int64_t(1) << shift) < expectedC) ++shift;
+        if (auto shlOp = v.getDefiningOp<mlir::LLVM::ShlOp>()) {
+            if (auto rhsC = getGemmConstInt(shlOp.getRhs()); rhsC && *rhsC == shift) {
+                return shlOp.getLhs();
+            }
+        }
+    }
+    return nullptr;
+}
+
+static std::optional<int> getGemmDxDim(mlir::Value v, llvm::StringRef opName) {
+    auto call = v.getDefiningOp<mlir::LLVM::CallOp>();
+    if (!call || !isGemmDxOp(call, opName) || call.getNumOperands() < 2) return std::nullopt;
+    auto dimC = getGemmConstInt(call.getOperand(1));
+    if (!dimC) return std::nullopt;
+    return static_cast<int>(*dimC);
+}
+
+// Matches `(groupId(dim) * T) + threadIdInGroup(dim)` and returns `dim` (0 or 1), or -1.
+static int matchGemmTidCoord(mlir::Value v, uint32_t expectedT) {
+    auto addOp = v.getDefiningOp<mlir::LLVM::AddOp>();
+    if (!addOp) return -1;
+    auto checkPair = [&](mlir::Value mulSide, mlir::Value tidSide) -> int {
+        auto tidDim = getGemmDxDim(tidSide, "dx.op.threadIdInGroup");
+        if (!tidDim || (*tidDim != 0 && *tidDim != 1)) return -1;
+        mlir::Value gidVal = stripGemmMulConst(mulSide, static_cast<int64_t>(expectedT));
+        if (!gidVal) return -1;
+        auto gidDim = getGemmDxDim(gidVal, "dx.op.groupId");
+        if (!gidDim || *gidDim != *tidDim) return -1;
+        return *tidDim;
+    };
+    int d = checkPair(addOp.getLhs(), addOp.getRhs());
+    if (d >= 0) return d;
+    return checkPair(addOp.getRhs(), addOp.getLhs());
+}
+
+// Matches `(trunc(loopIter) * T) + threadIdInGroup(expectedDim)`.
+static bool matchGemmTileLoopCoord(
+    mlir::Value v,
+    mlir::Value loopIterI64,
+    uint32_t expectedT,
+    int expectedDim) {
+    auto addOp = v.getDefiningOp<mlir::LLVM::AddOp>();
+    if (!addOp) return false;
+    auto checkPair = [&](mlir::Value mulSide, mlir::Value tidSide) -> bool {
+        auto tidDim = getGemmDxDim(tidSide, "dx.op.threadIdInGroup");
+        if (!tidDim || *tidDim != expectedDim) return false;
+        mlir::Value tVal = stripGemmMulConst(mulSide, static_cast<int64_t>(expectedT));
+        if (!tVal) return false;
+        if (auto truncOp = tVal.getDefiningOp<mlir::LLVM::TruncOp>()) {
+            return truncOp.getArg() == loopIterI64;
+        }
+        return tVal == loopIterI64;
+    };
+    return checkPair(addOp.getLhs(), addOp.getRhs()) || checkPair(addOp.getRhs(), addOp.getLhs());
+}
+
+// Matches `major * stride + minor` (in either operand order of add and mul).
+static bool matchGemmLinear2D(
+    mlir::Value v,
+    const std::function<bool(mlir::Value)>& isMajor,
+    const std::function<bool(mlir::Value)>& isMinor,
+    mlir::Value& outStride) {
+    auto addOp = v.getDefiningOp<mlir::LLVM::AddOp>();
+    if (!addOp) return false;
+    auto trySide = [&](mlir::Value mulSide, mlir::Value minorSide) -> bool {
+        if (!isMinor(minorSide)) return false;
+        auto mulOp = mulSide.getDefiningOp<mlir::LLVM::MulOp>();
+        if (!mulOp) return false;
+        if (isMajor(mulOp.getLhs())) {
+            outStride = mulOp.getRhs();
+            return true;
+        }
+        if (isMajor(mulOp.getRhs())) {
+            outStride = mulOp.getLhs();
+            return true;
+        }
+        return false;
+    };
+    return trySide(addOp.getLhs(), addOp.getRhs()) || trySide(addOp.getRhs(), addOp.getLhs());
+}
+
+static bool matchGemmCmpLt(mlir::Value cmpVal, mlir::Value& outLhs, mlir::Value& outRhs) {
+    auto icmp = cmpVal.getDefiningOp<mlir::LLVM::ICmpOp>();
+    if (!icmp) return false;
+    auto pred = icmp.getPredicate();
+    if (pred == mlir::LLVM::ICmpPredicate::slt || pred == mlir::LLVM::ICmpPredicate::ult) {
+        outLhs = icmp.getLhs();
+        outRhs = icmp.getRhs();
+        return true;
+    }
+    return false;
+}
+
+static bool matchGemmRowColBounds(
+    mlir::Value cond,
+    uint32_t expectedT,
+    mlir::Value& outM,
+    mlir::Value& outN) {
+    mlir::Value c0, c1;
+    if (auto sel = cond.getDefiningOp<mlir::LLVM::SelectOp>()) {
+        auto falseC = getGemmConstInt(sel.getFalseValue());
+        if (!falseC || *falseC != 0) return false;
+        c0 = sel.getCondition();
+        c1 = sel.getTrueValue();
+    } else if (auto andOp = cond.getDefiningOp<mlir::LLVM::AndOp>()) {
+        c0 = andOp.getLhs();
+        c1 = andOp.getRhs();
+    } else {
+        return false;
+    }
+    mlir::Value lhs0, rhs0, lhs1, rhs1;
+    if (!matchGemmCmpLt(c0, lhs0, rhs0) || !matchGemmCmpLt(c1, lhs1, rhs1)) return false;
+    int d0 = matchGemmTidCoord(lhs0, expectedT);
+    int d1 = matchGemmTidCoord(lhs1, expectedT);
+    if (d0 == 1 && d1 == 0) {
+        outM = rhs0;
+        outN = rhs1;
+        return true;
+    }
+    if (d0 == 0 && d1 == 1) {
+        outN = rhs0;
+        outM = rhs1;
+        return true;
+    }
+    return false;
+}
+
+static mlir::Value traceGemmGsPtr(mlir::Value ptr) {
+    if (auto gep = ptr.getDefiningOp<mlir::LLVM::GEPOp>()) {
+        ptr = gep.getBase();
+    }
+    auto call = ptr.getDefiningOp<mlir::LLVM::CallOp>();
+    if (call && call.getCallee() && *call.getCallee() == "nacelle.groupshared.ptr") {
+        return call.getResult();
+    }
+    return nullptr;
+}
+
+static bool isGemmCbufferLoad(mlir::Operation* op) {
+    return isGemmDxOp(op, "dx.op.cbufferLoadLegacy") || isGemmDxOp(op, "dx.op.cbufferLoad");
+}
+
+static bool isSameGemmCbufferVal(mlir::Value a, mlir::Value b) {
+    if (a == b) return true;
+    auto ea = a.getDefiningOp<mlir::LLVM::ExtractValueOp>();
+    auto eb = b.getDefiningOp<mlir::LLVM::ExtractValueOp>();
+    if (!ea || !eb) return false;
+    if (ea.getPosition() != eb.getPosition()) return false;
+    auto ca = ea.getContainer().getDefiningOp<mlir::LLVM::CallOp>();
+    auto cb = eb.getContainer().getDefiningOp<mlir::LLVM::CallOp>();
+    if (!ca || !cb || ca.getNumOperands() < 3 || cb.getNumOperands() < 3) return false;
+    return isGemmCbufferLoad(ca) && isGemmCbufferLoad(cb) &&
+           ca.getOperand(1) == cb.getOperand(1) &&
+           getGemmConstInt(ca.getOperand(2)) == getGemmConstInt(cb.getOperand(2));
+}
+
+static bool matchTiledF32GemmKernel(
+    mlir::func::FuncOp srcFunc,
+    const DxilLoadedShader& shader,
+    MatchedGemmKernel& out) {
+    if (shader.stage != "cs" || !srcFunc.getBody().hasOneBlock()) return false;
+    const uint32_t T = shader.threadGroupSize[0];
+    if (T < 4 || shader.threadGroupSize[1] != T || shader.threadGroupSize[2] != 1) return false;
+
+    mlir::Block& entry = srcFunc.getBody().front();
+    mlir::scf::WhileOp whileOp;
+    mlir::scf::IfOp guardLoopIf;
+    mlir::scf::IfOp storeIfOp;
+    mlir::Value accResult;
+
+    for (mlir::Operation& op : entry) {
+        if (auto w = mlir::dyn_cast<mlir::scf::WhileOp>(op)) {
+            if (whileOp || guardLoopIf) return false;
+            whileOp = w;
+            if (w.getNumResults() < 1) return false;
+            accResult = w.getResult(0);
+        } else if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
+            if (!whileOp && !guardLoopIf && ifOp.getNumResults() == 1) {
+                // dxc pattern: `if (numTiles == 0) { yield 0.0 } else { while ... }`
+                if (!ifOp.getThenRegion().hasOneBlock() || !ifOp.getElseRegion().hasOneBlock()) return false;
+                for (mlir::Operation& sub : ifOp.getElseRegion().front()) {
+                    if (auto w = mlir::dyn_cast<mlir::scf::WhileOp>(sub)) {
+                        if (whileOp) return false;
+                        whileOp = w;
+                    }
+                }
+                if (!whileOp) return false;
+                guardLoopIf = ifOp;
+                accResult = ifOp.getResult(0);
+            } else if ((whileOp || guardLoopIf) && !storeIfOp && ifOp.getNumResults() == 0) {
+                storeIfOp = ifOp;
+            } else {
+                return false;
+            }
+        } else if (mlir::isa<mlir::scf::ForOp>(op)) {
+            return false;
+        } else if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(op)) {
+            if (!call.getCallee()) return false;
+            llvm::StringRef cname = *call.getCallee();
+            const bool allowed =
+                cname == "nacelle.groupshared.ptr" ||
+                cname.starts_with("dx.op.threadIdInGroup") ||
+                cname.starts_with("dx.op.groupId") ||
+                cname.starts_with("dx.op.createHandle") ||
+                cname.starts_with("dx.op.annotateHandle") ||
+                cname.starts_with("dx.op.cbufferLoad");
+            if (!allowed) return false;
+        }
+    }
+    if (!whileOp || !storeIfOp || !accResult) return false;
+
+    // 1. Verify storeIfOp: either `if (row < M && col < N) store` or nested `if (row < M) { if (col < N) { store } }`.
+    mlir::LLVM::CallOp storeCall;
+    bool storeIsRaw = false;
+    if (storeIfOp.getElseRegion().empty() && storeIfOp.getThenRegion().hasOneBlock()) {
+        mlir::scf::IfOp innerIf;
+        for (mlir::Operation& op : storeIfOp.getThenRegion().front()) {
+            if (auto nested = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
+                if (innerIf) return false;
+                innerIf = nested;
+            } else if (isGemmDxOp(&op, "dx.op.rawBufferStore.f32")) {
+                if (storeCall) return false;
+                storeCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                storeIsRaw = true;
+            } else if (isGemmDxOp(&op, "dx.op.bufferStore.f32")) {
+                if (storeCall) return false;
+                storeCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                storeIsRaw = false;
+            }
+        }
+        if (innerIf && !storeCall) {
+            // Nested `if (row < M) { if (col < N) { store } }`
+            if (!innerIf.getElseRegion().empty() || !innerIf.getThenRegion().hasOneBlock()) return false;
+            mlir::Value lhs0, rhs0, lhs1, rhs1;
+            if (!matchGemmCmpLt(storeIfOp.getCondition(), lhs0, rhs0) ||
+                !matchGemmCmpLt(innerIf.getCondition(), lhs1, rhs1)) {
+                return false;
+            }
+            if (matchGemmTidCoord(lhs0, T) != 1 || matchGemmTidCoord(lhs1, T) != 0) return false;
+            out.mVal = rhs0;
+            out.nVal = rhs1;
+            for (mlir::Operation& op : innerIf.getThenRegion().front()) {
+                if (isGemmDxOp(&op, "dx.op.rawBufferStore.f32")) {
+                    if (storeCall) return false;
+                    storeCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                    storeIsRaw = true;
+                } else if (isGemmDxOp(&op, "dx.op.bufferStore.f32")) {
+                    if (storeCall) return false;
+                    storeCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                    storeIsRaw = false;
+                }
+            }
+        } else if (storeCall) {
+            if (!matchGemmRowColBounds(storeIfOp.getCondition(), T, out.mVal, out.nVal)) return false;
+        }
+    }
+    if (!storeCall || storeCall.getNumOperands() < 5) return false;
+    if (storeCall.getOperand(4) != accResult) return false;
+    out.uavC = storeCall.getOperand(1);
+
+    mlir::Value storeElemOff = storeIsRaw ? stripGemmMulConst(storeCall.getOperand(2), 4) : storeCall.getOperand(2);
+    if (!storeElemOff) return false;
+    mlir::Value sStride;
+    if (!matchGemmLinear2D(
+            storeElemOff,
+            [&](mlir::Value v) { return matchGemmTidCoord(v, T) == 1; },
+            [&](mlir::Value v) { return matchGemmTidCoord(v, T) == 0; },
+            sStride)) {
+        return false;
+    }
+    if (!isSameGemmCbufferVal(sStride, out.nVal)) return false;
+
+    // 2. Verify whileOp header and init values.
+    if (whileOp.getInits().size() < 2 || !whileOp.getBefore().hasOneBlock() || !whileOp.getAfter().hasOneBlock()) {
+        return false;
+    }
+    auto initAcc = whileOp.getInits()[0].getDefiningOp<mlir::LLVM::ConstantOp>();
+    auto initIter = getGemmConstInt(whileOp.getInits()[1]);
+    if (!initAcc || !initIter || *initIter != 0) return false;
+    if (auto fpAttr = mlir::dyn_cast<mlir::FloatAttr>(initAcc.getValue())) {
+        if (fpAttr.getValueAsDouble() != 0.0) return false;
+    } else {
+        return false;
+    }
+
+    // Body may be in `after` (llvm/llc) or `before` (dxc).
+    auto countLoadIfs = [](mlir::Block& bb) -> uint32_t {
+        uint32_t n = 0;
+        for (mlir::Operation& op : bb) {
+            if (mlir::isa<mlir::scf::IfOp>(op)) ++n;
+        }
+        return n;
+    };
+    const bool bodyInBefore = (countLoadIfs(whileOp.getBefore().front()) >= 2);
+    mlir::Block& bodyBB = bodyInBefore ? whileOp.getBefore().front() : whileOp.getAfter().front();
+    mlir::Value accArg = bodyBB.getArgument(0);
+    mlir::Value iterArg = bodyBB.getArgument(1);
+
+    // 3. Verify whileOp body: two tile-load scf.if ops, two barriers, T fmul+fadd steps.
+    llvm::SmallVector<mlir::scf::IfOp, 2> loadIfs;
+    uint32_t barrierCount = 0;
+    for (mlir::Operation& op : bodyBB) {
+        if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
+            loadIfs.push_back(ifOp);
+        } else if (isGemmDxOp(&op, "dx.op.barrier")) {
+            ++barrierCount;
+        } else if (mlir::isa<mlir::scf::WhileOp, mlir::scf::ForOp>(op)) {
+            return false;
+        } else if (auto call = mlir::dyn_cast<mlir::LLVM::CallOp>(op)) {
+            if (!isGemmCbufferLoad(call)) return false;
+        }
+    }
+    if (loadIfs.size() != 2 || barrierCount != 2) return false;
+
+    auto extractLoadFromIf = [&](mlir::scf::IfOp ifOp,
+                                 const std::function<bool(mlir::Value)>& isMajor,
+                                 const std::function<bool(mlir::Value)>& isMinor,
+                                 mlir::Value& outHandle,
+                                 mlir::Value& outStride,
+                                 mlir::Value& outGsPtr) -> bool {
+        if (ifOp.getNumResults() != 1 || !ifOp.getThenRegion().hasOneBlock() || !ifOp.getElseRegion().hasOneBlock()) {
+            return false;
+        }
+        auto elseYield = mlir::dyn_cast<mlir::scf::YieldOp>(ifOp.getElseRegion().front().getTerminator());
+        if (!elseYield || elseYield.getNumOperands() != 1) return false;
+        auto elseC = elseYield.getOperand(0).getDefiningOp<mlir::LLVM::ConstantOp>();
+        if (!elseC) return false;
+        if (auto fpAttr = mlir::dyn_cast<mlir::FloatAttr>(elseC.getValue())) {
+            if (fpAttr.getValueAsDouble() != 0.0) return false;
+        } else {
+            return false;
+        }
+
+        // Unwrap optional inner `scf.if` (dxc emits `if (row < M) { if (col < K) { load } }`).
+        mlir::Block* loadBB = &ifOp.getThenRegion().front();
+        for (mlir::Operation& op : *loadBB) {
+            if (auto innerIf = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
+                if (innerIf.getNumResults() != 1 || !innerIf.getThenRegion().hasOneBlock() ||
+                    !innerIf.getElseRegion().hasOneBlock()) {
+                    return false;
+                }
+                loadBB = &innerIf.getThenRegion().front();
+                break;
+            }
+        }
+
+        mlir::LLVM::CallOp loadCall;
+        bool isRaw = false;
+        for (mlir::Operation& op : *loadBB) {
+            if (isGemmDxOp(&op, "dx.op.rawBufferLoad.f32")) {
+                if (loadCall) return false;
+                loadCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                isRaw = true;
+            } else if (isGemmDxOp(&op, "dx.op.bufferLoad.f32")) {
+                if (loadCall) return false;
+                loadCall = mlir::cast<mlir::LLVM::CallOp>(op);
+                isRaw = false;
+            }
+        }
+        if (!loadCall || loadCall.getNumOperands() < 3) return false;
+        outHandle = loadCall.getOperand(1);
+        mlir::Value elemOff = isRaw ? stripGemmMulConst(loadCall.getOperand(2), 4) : loadCall.getOperand(2);
+        if (!elemOff || !matchGemmLinear2D(elemOff, isMajor, isMinor, outStride)) return false;
+
+        for (mlir::Operation* user : ifOp.getResult(0).getUsers()) {
+            if (auto st = mlir::dyn_cast<mlir::LLVM::StoreOp>(user)) {
+                if (st.getValue() == ifOp.getResult(0)) {
+                    outGsPtr = traceGemmGsPtr(st.getAddr());
+                    if (outGsPtr) return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    mlir::Value gsA, bStride, gsB;
+    if (!extractLoadFromIf(
+            loadIfs[0],
+            [&](mlir::Value v) { return matchGemmTidCoord(v, T) == 1; },
+            [&](mlir::Value v) { return matchGemmTileLoopCoord(v, iterArg, T, 0); },
+            out.srvA, out.kVal, gsA)) {
+        return false;
+    }
+    if (!extractLoadFromIf(
+            loadIfs[1],
+            [&](mlir::Value v) { return matchGemmTileLoopCoord(v, iterArg, T, 1); },
+            [&](mlir::Value v) { return matchGemmTidCoord(v, T) == 0; },
+            out.srvB, bStride, gsB)) {
+        return false;
+    }
+    if (gsA == gsB || out.srvA == out.srvB || out.uavC == out.srvA || out.uavC == out.srvB) {
+        return false;
+    }
+    if (!isSameGemmCbufferVal(bStride, out.nVal)) return false;
+
+    // 4. Verify the yielded accumulator is `accArg + sum_{p=0..T-1} (load(gsA) * load(gsB))`.
+    mlir::Operation* bodyTerm = bodyBB.getTerminator();
+    if (!bodyTerm || bodyTerm->getNumOperands() < (bodyInBefore ? 3u : 2u)) return false;
+    mlir::Value curAcc = bodyInBefore ? bodyTerm->getOperand(1) : bodyTerm->getOperand(0);
+    uint32_t fmaCount = 0;
+    while (curAcc != accArg) {
+        auto fadd = curAcc.getDefiningOp<mlir::LLVM::FAddOp>();
+        if (!fadd) return false;
+        mlir::Value nextAcc, prodVal;
+        if (fadd.getRhs().getDefiningOp<mlir::LLVM::FMulOp>()) {
+            nextAcc = fadd.getLhs();
+            prodVal = fadd.getRhs();
+        } else if (fadd.getLhs().getDefiningOp<mlir::LLVM::FMulOp>()) {
+            nextAcc = fadd.getRhs();
+            prodVal = fadd.getLhs();
+        } else {
+            return false;
+        }
+        auto fmul = prodVal.getDefiningOp<mlir::LLVM::FMulOp>();
+        auto l0 = fmul.getLhs().getDefiningOp<mlir::LLVM::LoadOp>();
+        auto l1 = fmul.getRhs().getDefiningOp<mlir::LLVM::LoadOp>();
+        if (!l0 || !l1) return false;
+        mlir::Value g0 = traceGemmGsPtr(l0.getAddr());
+        mlir::Value g1 = traceGemmGsPtr(l1.getAddr());
+        if (!((g0 == gsA && g1 == gsB) || (g0 == gsB && g1 == gsA))) return false;
+        ++fmaCount;
+        curAcc = nextAcc;
+    }
+    if (fmaCount != T) return false;
+
+    // 5. Ensure handles are in entry block, and M/N/K only depend on entry-block handles/constants.
+    auto inEntry = [&](mlir::Value v) -> bool {
+        mlir::Operation* def = v.getDefiningOp();
+        return def && def->getBlock() == &entry;
+    };
+    auto isValidDimVal = [&](mlir::Value v) -> bool {
+        if (inEntry(v)) return true;
+        auto ev = v.getDefiningOp<mlir::LLVM::ExtractValueOp>();
+        if (!ev) return false;
+        auto cb = ev.getContainer().getDefiningOp<mlir::LLVM::CallOp>();
+        return cb && isGemmCbufferLoad(cb) && cb.getNumOperands() >= 3 &&
+               inEntry(cb.getOperand(1)) && getGemmConstInt(cb.getOperand(2)).has_value();
+    };
+    return inEntry(out.srvA) && inEntry(out.srvB) && inEntry(out.uavC) &&
+           isValidDimVal(out.mVal) && isValidDimVal(out.nVal) && isValidDimVal(out.kVal);
+}
+
+static bool tryLowerGemmFastPath(
+    mlir::OpBuilder& b,
+    mlir::Location loc,
+    mlir::ModuleOp mod,
+    mlir::func::FuncOp srcFunc,
+    const DxilLoadedShader& shader,
+    const RootSignatureLayout& rootLayout,
+    uint32_t simdWidth,
+    mlir::Value rootCtx,
+    mlir::Value gx,
+    mlir::Value gy,
+    mlir::Value gz,
+    std::string& outError) {
+    if (const char* env = std::getenv("NACELLE_DISABLE_GEMM_FASTPATH")) {
+        if (env[0] == '1') return false;
+    }
+
+    MatchedGemmKernel gemm;
+    if (!matchTiledF32GemmKernel(srcFunc, shader, gemm)) {
+        return false;
+    }
+
+    // Collect minimal backward slice of ops in topological order needed for handles + M/N/K.
+    llvm::DenseSet<mlir::Operation*> visitedOps;
+    llvm::SmallVector<mlir::Operation*, 32> orderedOps;
+    std::function<void(mlir::Value)> collectSlice = [&](mlir::Value v) {
+        mlir::Operation* def = v.getDefiningOp();
+        if (!def || !visitedOps.insert(def).second) return;
+        for (mlir::Value opnd : def->getOperands()) {
+            collectSlice(opnd);
+        }
+        orderedOps.push_back(def);
+    };
+    collectSlice(gemm.srvA);
+    collectSlice(gemm.srvB);
+    collectSlice(gemm.uavC);
+    collectSlice(gemm.mVal);
+    collectSlice(gemm.nVal);
+    collectSlice(gemm.kVal);
+
+    mlir::Type i32Ty = b.getI32Type();
+    mlir::Type i64Ty = b.getI64Type();
+    mlir::Type i1Ty = b.getI1Type();
+    mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(b.getContext());
+
+    mlir::Value zero32 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getI32IntegerAttr(0));
+    mlir::Value gx0 = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, gx, zero32);
+    mlir::Value gy0 = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, gy, zero32);
+    mlir::Value gz0 = mlir::LLVM::ICmpOp::create(b, loc, mlir::LLVM::ICmpPredicate::eq, gz, zero32);
+    mlir::Value isFirstGroup = mlir::LLVM::AndOp::create(
+        b, loc, mlir::LLVM::AndOp::create(b, loc, gx0, gy0), gz0);
+
+    bool ok = true;
+    mlir::scf::IfOp::create(
+        b, loc, isFirstGroup,
+        [&](mlir::OpBuilder& ib, mlir::Location iloc) {
+            StageHooks hooks;
+            SimdPacketizer pkt(ib, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
+            mlir::Value allTrue = pkt.allTrueMask(iloc);
+            mlir::Value realMask = allTrue;
+
+            for (mlir::Operation* op : orderedOps) {
+                if (!pkt.packetizePrologueOp(*op, allTrue, realMask, outError)) {
+                    ok = false;
+                    return;
+                }
+            }
+
+            SimdVal hA = pkt.getMapped(iloc, gemm.srvA);
+            SimdVal hB = pkt.getMapped(iloc, gemm.srvB);
+            SimdVal hC = pkt.getMapped(iloc, gemm.uavC);
+            if (hA.lanes.empty() || hB.lanes.empty() || hC.lanes.empty()) {
+                ok = false;
+                return;
+            }
+            auto infoA = pkt.resolveBufferDescInfo(iloc, ib, hA, hA.lanes[0]);
+            auto infoB = pkt.resolveBufferDescInfo(iloc, ib, hB, hB.lanes[0]);
+            auto infoC = pkt.resolveBufferDescInfo(iloc, ib, hC, hC.lanes[0]);
+
+            mlir::Value mI32 = pkt.llvmExtract(iloc, pkt.asVec(iloc, pkt.getMapped(iloc, gemm.mVal)), 0);
+            mlir::Value nI32 = pkt.llvmExtract(iloc, pkt.asVec(iloc, pkt.getMapped(iloc, gemm.nVal)), 0);
+            mlir::Value kI32 = pkt.llvmExtract(iloc, pkt.asVec(iloc, pkt.getMapped(iloc, gemm.kVal)), 0);
+
+            mlir::Value mPos = mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::sgt, mI32, zero32);
+            mlir::Value nPos = mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::sgt, nI32, zero32);
+            mlir::Value kPos = mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::sgt, kI32, zero32);
+            mlir::Value dimsPos = mlir::LLVM::AndOp::create(
+                ib, iloc, mlir::LLVM::AndOp::create(ib, iloc, mPos, nPos), kPos);
+
+            mlir::Value m64 = mlir::LLVM::ZExtOp::create(ib, iloc, i64Ty, mI32);
+            mlir::Value n64 = mlir::LLVM::ZExtOp::create(ib, iloc, i64Ty, nI32);
+            mlir::Value k64 = mlir::LLVM::ZExtOp::create(ib, iloc, i64Ty, kI32);
+            mlir::Value four64 = mlir::LLVM::ConstantOp::create(ib, iloc, i64Ty, ib.getI64IntegerAttr(4));
+
+            mlir::Value reqA = mlir::LLVM::MulOp::create(ib, iloc, mlir::LLVM::MulOp::create(ib, iloc, m64, k64), four64);
+            mlir::Value reqB = mlir::LLVM::MulOp::create(ib, iloc, mlir::LLVM::MulOp::create(ib, iloc, k64, n64), four64);
+            mlir::Value reqC = mlir::LLVM::MulOp::create(ib, iloc, mlir::LLVM::MulOp::create(ib, iloc, m64, n64), four64);
+
+            mlir::Value okA = mlir::LLVM::AndOp::create(
+                ib, iloc, infoA.okPtr,
+                mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::uge, infoA.byteSize, reqA));
+            mlir::Value okB = mlir::LLVM::AndOp::create(
+                ib, iloc, infoB.okPtr,
+                mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::uge, infoB.byteSize, reqB));
+            mlir::Value okC = mlir::LLVM::AndOp::create(
+                ib, iloc, infoC.okPtr,
+                mlir::LLVM::ICmpOp::create(ib, iloc, mlir::LLVM::ICmpPredicate::uge, infoC.byteSize, reqC));
+
+            mlir::Value canRun = mlir::LLVM::AndOp::create(
+                ib, iloc, dimsPos,
+                mlir::LLVM::AndOp::create(ib, iloc, mlir::LLVM::AndOp::create(ib, iloc, okA, okB), okC));
+
+            mlir::scf::IfOp::create(
+                ib, iloc, canRun,
+                [&](mlir::OpBuilder& gb, mlir::Location gloc) {
+                    auto accelFn = mod.lookupSymbol<mlir::LLVM::LLVMFuncOp>("nacelle_accel_sgemm");
+                    if (!accelFn) {
+                        mlir::OpBuilder mb(mod.getBody(), mod.getBody()->begin());
+                        auto fnTy = mlir::LLVM::LLVMFunctionType::get(
+                            mlir::LLVM::LLVMVoidType::get(mb.getContext()),
+                            {ptrTy, ptrTy, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty});
+                        accelFn = mlir::LLVM::LLVMFuncOp::create(mb, gloc, "nacelle_accel_sgemm", fnTy);
+                    }
+                    mlir::Value nullPtr = mlir::LLVM::ZeroOp::create(gb, gloc, ptrTy);
+                    mlir::LLVM::CallOp::create(
+                        gb, gloc, accelFn,
+                        mlir::ValueRange{infoA.basePtr, infoB.basePtr, nullPtr, infoC.basePtr,
+                                         mI32, nI32, kI32, zero32});
+                    mlir::scf::YieldOp::create(gb, gloc);
+                });
+            mlir::scf::YieldOp::create(ib, iloc);
+        });
+
+    if (!ok) return false;
+    return outError.empty();
+}
+
+} // namespace
+
 bool packetizeComputeEntry(
     mlir::ModuleOp mod,
     const DxilLoadedShader& shader,
@@ -8438,10 +9087,14 @@ bool packetizeComputeEntry(
     mlir::Value gy = entry->getArgument(3);
     mlir::Value gz = entry->getArgument(4);
 
-    StageHooks baseHooks;
-    if (!packetizeThreadGroupRegion(b, loc, mod, srcFunc.getBody(), shader, rootLayout,
-                                    simdWidth, rootCtx, gsBase, gx, gy, gz, entry, baseHooks, outError)) {
-        return false;
+    if (!tryLowerGemmFastPath(
+            b, loc, mod, srcFunc, shader, rootLayout, simdWidth, rootCtx, gx, gy, gz, outError)) {
+        if (!outError.empty()) return false;
+        StageHooks baseHooks;
+        if (!packetizeThreadGroupRegion(b, loc, mod, srcFunc.getBody(), shader, rootLayout,
+                                        simdWidth, rootCtx, gsBase, gx, gy, gz, entry, baseHooks, outError)) {
+            return false;
+        }
     }
     mlir::func::ReturnOp::create(b, loc);
 

@@ -118,6 +118,7 @@ endfunction()
 # Compute shaders (DXIL)
 add_hlsl_dxil(vec_add.hlsl cs_6_0 CSMain vec_add.dxil)
 add_hlsl_dxil(matmul.hlsl cs_6_0 CSMain matmul.dxil)
+add_hlsl_dxil(tiled_matmul.hlsl cs_6_0 CSMain tiled_matmul.dxil)
 
 find_program(LLVM_AS_EXECUTABLE llvm-as HINTS "${LLVM_TOOLS_BINARY_DIR}" /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin REQUIRED)
 add_custom_command(
@@ -154,6 +155,7 @@ add_hlsl_dxil(tiled_resources.hlsl cs_6_2 TiledTextureCS tiled_texture_cs.dxil)
 add_hlsl_dxil(bench_raymarch.hlsl cs_6_0 main bench_raymarch.dxil)
 add_hlsl_spirv(bench_raymarch.hlsl cs_6_0 main bench_raymarch.spv)
 add_hlsl_spirv(matmul.hlsl cs_6_0 CSMain matmul.spv)
+add_hlsl_spirv(tiled_matmul.hlsl cs_6_0 CSMain tiled_matmul.spv)
 
 find_program(SPIRV_AS_EXECUTABLE spirv-as HINTS /opt/homebrew/bin /usr/local/bin)
 if(SPIRV_AS_EXECUTABLE)
