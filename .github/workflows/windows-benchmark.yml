@@ -66,15 +66,19 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609-openblas0.3.29
 
-      - name: Install DirectXShaderCompiler (Windows fallback)
+      - name: Install DirectXShaderCompiler & OpenBLAS (Windows fallback)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           New-Item -ItemType Directory -Force -Path .sdk
           Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -OutFile dxc.zip
           Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
           Remove-Item dxc.zip
+          New-Item -ItemType Directory -Force -Path .sdk/openblas
+          Invoke-WebRequest -Uri "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.29/OpenBLAS-0.3.29_x64.zip" -OutFile openblas.zip
+          Expand-Archive -Path openblas.zip -DestinationPath .sdk/openblas -Force
+          Remove-Item openblas.zip
 
       - name: Save DXC SDK cache
         if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
@@ -82,7 +86,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: nacelle-sdk-Windows-x64-dxc1.9.2609
+          key: nacelle-sdk-Windows-x64-dxc1.9.2609-openblas0.3.29
 
       - name: Restore third_party LLVM/MLIR binaries cache (from CI)
         id: cache-llvm
@@ -369,6 +373,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
             -DNACELLE_D3D12_SDK_VERSION="${{ steps.agility-release.outputs.sdk_version }}" `
             -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
             -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
