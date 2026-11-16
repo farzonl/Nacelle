@@ -75,11 +75,81 @@
 #if defined(__APPLE__)
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
+#include <dlfcn.h>
+#elif defined(NACELLE_HAS_CBLAS)
+#include NACELLE_CBLAS_HEADER
 #endif
 
 namespace nacelle {
 
-#if !defined(__APPLE__)
+enum class GemmBackend : uint8_t {
+    Auto = 0,
+    Accelerate,
+    OpenBLAS,
+    Fallback,
+};
+
+static GemmBackend getConfiguredGemmBackend() {
+    if (const char* force = std::getenv("NACELLE_FORCE_FALLBACK_GEMM")) {
+        if (force[0] == '1') return GemmBackend::Fallback;
+    }
+    if (const char* env = std::getenv("NACELLE_GEMM_BACKEND")) {
+        std::string v(env);
+        for (char& ch : v) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (v == "fallback") return GemmBackend::Fallback;
+        if (v == "openblas") return GemmBackend::OpenBLAS;
+        if (v == "accelerate" || v == "amx") return GemmBackend::Accelerate;
+    }
+    return GemmBackend::Auto;
+}
+
+#if defined(__APPLE__)
+struct AppleOpenBlasDispatch {
+    using SgemmFn = void (*)(
+        int, int, int, int, int, int, float, const float*, int, const float*, int, float, float*, int);
+    using DgemmFn = void (*)(
+        int, int, int, int, int, int, double, const double*, int, const double*, int, double, double*, int);
+    void* handle = nullptr;
+    SgemmFn sgemm = nullptr;
+    DgemmFn dgemm = nullptr;
+    bool loaded = false;
+};
+
+static const AppleOpenBlasDispatch& getAppleOpenBlasDispatch() {
+    static AppleOpenBlasDispatch d = []() {
+        AppleOpenBlasDispatch out;
+        const char* candidates[] = {
+            std::getenv("NACELLE_OPENBLAS_LIB"),
+            "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
+            "/usr/local/opt/openblas/lib/libopenblas.dylib",
+            "libopenblas.dylib",
+        };
+        for (const char* path : candidates) {
+            if (!path || !path[0]) continue;
+            void* h = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+            if (!h) continue;
+            auto s = reinterpret_cast<AppleOpenBlasDispatch::SgemmFn>(dlsym(h, "cblas_sgemm"));
+            auto dg = reinterpret_cast<AppleOpenBlasDispatch::DgemmFn>(dlsym(h, "cblas_dgemm"));
+            if (s && dg) {
+                out.handle = h;
+                out.sgemm = s;
+                out.dgemm = dg;
+                out.loaded = true;
+                return out;
+            }
+            dlclose(h);
+        }
+        std::fprintf(
+            stderr,
+            "[Nacelle] NACELLE_GEMM_BACKEND=openblas requested, but libopenblas.dylib was not found; falling back to fallbackGemm\n");
+        return out;
+    }();
+    return d;
+}
+#endif
+
 static BS::thread_pool<>& getFallbackGemmPool() {
     static BS::thread_pool<> pool;
     return pool;
@@ -131,7 +201,6 @@ static void fallbackGemm(
     }
     runRows(0, M);
 }
-#endif
 
 extern "C" void nacelle_accel_sgemm(
     const float* A,
@@ -142,7 +211,41 @@ extern "C" void nacelle_accel_sgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
+    const GemmBackend backend = getConfiguredGemmBackend();
+    if (backend == GemmBackend::Fallback) {
+        fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
+        return;
+    }
 #if defined(__APPLE__)
+    if (backend == GemmBackend::OpenBLAS) {
+        const auto& ob = getAppleOpenBlasDispatch();
+        if (ob.loaded) {
+            if (hasC && C) {
+                std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
+            }
+            ob.sgemm(
+                101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0f, A, static_cast<int>(K),
+                B, static_cast<int>(N),
+                (hasC && C) ? 1.0f : 0.0f,
+                Out, static_cast<int>(N));
+            return;
+        }
+        fallbackGemm<float>(A, B, C, Out, M, N, K, hasC);
+        return;
+    }
+    if (hasC && C) {
+        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
+    }
+    cblas_sgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+        1.0f, A, static_cast<int>(K),
+        B, static_cast<int>(N),
+        (hasC && C) ? 1.0f : 0.0f,
+        Out, static_cast<int>(N));
+#elif defined(NACELLE_HAS_CBLAS)
     if (hasC && C) {
         std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(float));
     }
@@ -167,7 +270,41 @@ extern "C" void nacelle_accel_dgemm(
     uint32_t N,
     uint32_t K,
     uint32_t hasC) {
+    const GemmBackend backend = getConfiguredGemmBackend();
+    if (backend == GemmBackend::Fallback) {
+        fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
+        return;
+    }
 #if defined(__APPLE__)
+    if (backend == GemmBackend::OpenBLAS) {
+        const auto& ob = getAppleOpenBlasDispatch();
+        if (ob.loaded) {
+            if (hasC && C) {
+                std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
+            }
+            ob.dgemm(
+                101 /*CblasRowMajor*/, 111 /*CblasNoTrans*/, 111 /*CblasNoTrans*/,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                1.0, A, static_cast<int>(K),
+                B, static_cast<int>(N),
+                (hasC && C) ? 1.0 : 0.0,
+                Out, static_cast<int>(N));
+            return;
+        }
+        fallbackGemm<double>(A, B, C, Out, M, N, K, hasC);
+        return;
+    }
+    if (hasC && C) {
+        std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
+    }
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+        1.0, A, static_cast<int>(K),
+        B, static_cast<int>(N),
+        (hasC && C) ? 1.0 : 0.0,
+        Out, static_cast<int>(N));
+#elif defined(NACELLE_HAS_CBLAS)
     if (hasC && C) {
         std::memcpy(Out, C, static_cast<size_t>(M) * N * sizeof(double));
     }
