@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -134,6 +135,7 @@ jobs:
 
       - name: Restore third_party LLVM/MLIR binaries cache (from CI)
         id: cache-llvm
+        timeout-minutes: 5
         uses: actions/cache/restore@v4
         with:
           path: .toolchains/llvm
@@ -141,33 +143,18 @@ jobs:
           restore-keys: |
             nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build and install third_party LLVM/MLIR/Clang (fallback)
+      - name: Fail if LLVM cache restore timed out
         if: steps.cache-llvm.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git submodule update --init --depth 1 third_party/llvm-project
-          cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/.toolchains/llvm" \
-            -DLLVM_ENABLE_PROJECTS="mlir;clang" \
-            -DLLVM_TARGETS_TO_BUILD="host" \
-            -DLLVM_BUILD_UTILS=ON \
-            -DLLVM_INSTALL_UTILS=ON \
-            -DLLVM_ENABLE_ASSERTIONS=OFF \
-            -DLLVM_INCLUDE_TESTS=OFF \
-            -DLLVM_INCLUDE_EXAMPLES=OFF \
-            -DMLIR_INCLUDE_TESTS=OFF \
-            -DCLANG_INCLUDE_TESTS=OFF
-          cmake --build build-llvm --parallel
-          cmake --install build-llvm
-          rm -rf build-llvm
-
-      - name: Save third_party LLVM/MLIR binaries cache
-        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: .toolchains/llvm
-          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          KEY="nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}"
+          COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=${KEY}" --jq '.total_count')
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            echo "Error: LLVM cache (${KEY}) exists but restore failed or timed out; aborting instead of rebuilding."
+            exit 1
+          fi
+          fail-on-cache-miss: true
 
       - name: Configure and build nacelle-bench
         run: |
