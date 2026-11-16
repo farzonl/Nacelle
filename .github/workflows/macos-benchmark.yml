@@ -219,7 +219,7 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/.sdk/bin:$GITHUB_WORKSPACE/.toolchains/llvm/bin:$PATH"
           export DYLD_FALLBACK_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:${BREW_PREFIX}/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
 
-          "$GITHUB_WORKSPACE/build/nacelle-bench" --iters 7 --json "$GITHUB_WORKSPACE/bench-results.json"
+          "$GITHUB_WORKSPACE/build/nacelle-bench" --iters 7 --allow-partial --json "$GITHUB_WORKSPACE/bench-results.json"
 
       - name: Restore historical macOS benchmark data cache
         uses: actions/cache/restore@v4

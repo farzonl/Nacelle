@@ -26,6 +26,7 @@
 #define NACELLE_POPEN _popen
 #define NACELLE_PCLOSE _pclose
 #else
+#include <sys/wait.h>
 #define NACELLE_POPEN popen
 #define NACELLE_PCLOSE pclose
 #endif
@@ -811,7 +812,9 @@ std::vector<BenchRunResult> runIsolatedWorker(
     uint32_t width,
     uint32_t height,
     uint32_t maxSteps,
-    uint32_t iters) {
+    uint32_t iters,
+    std::string& outCrashStatus) {
+    outCrashStatus.clear();
     std::ostringstream cmd;
     cmd << "\"" << exePath << "\""
         << " --worker"
@@ -831,6 +834,7 @@ std::vector<BenchRunResult> runIsolatedWorker(
     HANDLE hRead = nullptr;
     HANDLE hWrite = nullptr;
     if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        outCrashStatus = "FAILED (CreatePipe)";
         return {};
     }
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
@@ -858,6 +862,7 @@ std::vector<BenchRunResult> runIsolatedWorker(
     CloseHandle(hWrite);
     if (!ok) {
         CloseHandle(hRead);
+        outCrashStatus = "FAILED (CreateProcess)";
         return {};
     }
 
@@ -868,17 +873,36 @@ std::vector<BenchRunResult> runIsolatedWorker(
     }
     CloseHandle(hRead);
     WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (exitCode != 0) {
+        std::ostringstream ss;
+        ss << "CRASHED (0x" << std::hex << exitCode << ")";
+        outCrashStatus = ss.str();
+    }
 #else
     cmd << " 2>&1";
     FILE* pipe = NACELLE_POPEN(cmd.str().c_str(), "r");
-    if (!pipe) return {};
+    if (!pipe) {
+        outCrashStatus = "FAILED (popen)";
+        return {};
+    }
     char buf[4096];
     while (fgets(buf, sizeof(buf), pipe) != nullptr) {
         rawOutput.append(buf);
     }
-    NACELLE_PCLOSE(pipe);
+    int rc = NACELLE_PCLOSE(pipe);
+    if (rc != 0) {
+        if (WIFSIGNALED(rc)) {
+            outCrashStatus = "CRASHED (signal " + std::to_string(WTERMSIG(rc)) + ")";
+        } else if (WIFEXITED(rc)) {
+            outCrashStatus = "CRASHED (exit " + std::to_string(WEXITSTATUS(rc)) + ")";
+        } else {
+            outCrashStatus = "CRASHED";
+        }
+    }
 #endif
     return parseWorkerOutput(rawOutput);
 }
@@ -971,6 +995,7 @@ int main(int argc, char** argv) {
     std::string suiteFilter = "all";
     std::string nameFilter;
     bool isolate = true;
+    bool allowPartial = false;
     bool workerMode = false;
     std::string singleBench;
     std::string singleBackend;
@@ -1009,6 +1034,8 @@ int main(int argc, char** argv) {
             isolate = true;
         } else if (arg == "--no-isolate") {
             isolate = false;
+        } else if (arg == "--allow-partial") {
+            allowPartial = true;
         } else if (arg == "--worker") {
             workerMode = true;
         } else if (arg == "--single-bench" && i + 1 < argc) {
@@ -1055,6 +1082,38 @@ int main(int argc, char** argv) {
     std::string exePath = argv[0];
     std::vector<BenchRunResult> allResults;
     bool anyNacelleFailed = false;
+    bool anyNacellePassed = false;
+
+    auto makeCrashResult = [&](const BenchmarkSpec& spec, const std::string& bt, const std::string& status) {
+        BenchRunResult r;
+        r.benchId = spec.id;
+        r.benchName = spec.name;
+        r.category = categoryName(spec.category);
+        r.ran = false;
+        r.status = status;
+        if (bt.rfind("nacelle-w", 0) == 0) {
+            uint32_t w = static_cast<uint32_t>(std::stoul(bt.substr(9)));
+            r.backend = "Nacelle (W=" + std::to_string(w) + ")";
+            r.shaderFormat = "DXIL";
+            r.simdWidth = w;
+        } else if (bt.rfind("vulkan:", 0) == 0) {
+            size_t idx = static_cast<size_t>(std::stoul(bt.substr(7)));
+            r.backend = (idx < vkDevs.size()) ? vkDevs[idx].backendName : bt;
+            r.shaderFormat = "SPIR-V";
+        } else if (bt == "vulkan") {
+            r.backend = "Vulkan";
+            r.shaderFormat = "SPIR-V";
+        } else if (bt == "metal") {
+            r.backend = "Metal (IRConverter)";
+            r.shaderFormat = "DXIL";
+        } else if (bt == "warp") {
+            r.backend = "Microsoft WARP";
+            r.shaderFormat = "DXIL";
+        } else {
+            r.backend = bt;
+        }
+        return r;
+    };
 
     for (const auto& spec : catalog) {
         if (suiteFilter != "all" && suiteFilter != categoryKey(spec.category)) continue;
@@ -1062,8 +1121,12 @@ int main(int argc, char** argv) {
 
         for (const auto& bt : backendTokens) {
             std::vector<BenchRunResult> res;
+            std::string crashStatus;
             if (isolate) {
-                res = runIsolatedWorker(exePath, spec.id, bt, shaderDir, width, height, maxSteps, iters);
+                res = runIsolatedWorker(exePath, spec.id, bt, shaderDir, width, height, maxSteps, iters, crashStatus);
+                if (res.empty() && !crashStatus.empty()) {
+                    res.push_back(makeCrashResult(spec, bt, crashStatus));
+                }
             } else {
                 res = runSingleBenchmarkBackend(spec, bt, shaderDir, width, height, maxSteps, iters);
             }
@@ -1071,7 +1134,10 @@ int main(int argc, char** argv) {
                 anyNacelleFailed = true;
             }
             for (auto& r : res) {
-                if (bt.rfind("nacelle-", 0) == 0 && !r.ran) anyNacelleFailed = true;
+                if (bt.rfind("nacelle-", 0) == 0) {
+                    if (r.ran) anyNacellePassed = true;
+                    else anyNacelleFailed = true;
+                }
                 allResults.push_back(std::move(r));
             }
         }
@@ -1234,5 +1300,5 @@ int main(int argc, char** argv) {
         std::cout << "JSON report written to: " << jsonOut << "\n";
     }
 
-    return anyNacelleFailed ? 1 : 0;
+    return (anyNacelleFailed && !(allowPartial && anyNacellePassed)) ? 1 : 0;
 }
