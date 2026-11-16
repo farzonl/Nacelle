@@ -392,7 +392,13 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
+#if defined(__APPLE__)
+    // macOS secondary threads (std::thread) default to a 512 KB stack; RegAllocFast at
+    // CodeGenOptLevel::None does not reuse stack slots and can overflow 512 KB on large W=16 shaders.
+    auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
+#else
     auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::None);
+#endif
     if (!jtmbOrErr) {
         outError = llvm::toString(jtmbOrErr.takeError());
         return;
@@ -1259,6 +1265,8 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
             llvm::Type* voidTy = llvm::Type::getVoidTy(llvmCtx);
             llvm::Type* ptrTy = llvm::PointerType::getUnqual(llvmCtx);
             llvm::FunctionType* ptrFnTy = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+            llvm::DenseMap<std::pair<llvm::Function*, llvm::Type*>,
+                           std::pair<llvm::AllocaInst*, llvm::AllocaInst*>> mathScratchSlots;
             for (llvm::Function* oldDecl : mathDecls) {
                 std::string name = oldDecl->getName().str();
                 oldDecl->setName(name + ".vec_stub");
@@ -1271,14 +1279,17 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
                 }
                 for (llvm::CallInst* ci : calls) {
                     llvm::Function* caller = ci->getFunction();
-                    llvm::IRBuilder<> eb(&caller->getEntryBlock().front());
                     llvm::Type* vecTy = ci->getType();
-                    llvm::AllocaInst* inSlot = eb.CreateAlloca(vecTy, nullptr, "math.in");
-                    llvm::AllocaInst* outSlot = eb.CreateAlloca(vecTy, nullptr, "math.out");
+                    auto& slots = mathScratchSlots[{caller, vecTy}];
+                    if (!slots.first) {
+                        llvm::IRBuilder<> eb(&caller->getEntryBlock().front());
+                        slots.first = eb.CreateAlloca(vecTy, nullptr, "math.in");
+                        slots.second = eb.CreateAlloca(vecTy, nullptr, "math.out");
+                    }
                     llvm::IRBuilder<> cb(ci);
-                    cb.CreateStore(ci->getArgOperand(0), inSlot);
-                    cb.CreateCall(newCallee, {outSlot, inSlot});
-                    llvm::Value* loaded = cb.CreateLoad(vecTy, outSlot, "math.res");
+                    cb.CreateStore(ci->getArgOperand(0), slots.first);
+                    cb.CreateCall(newCallee, {slots.second, slots.first});
+                    llvm::Value* loaded = cb.CreateLoad(vecTy, slots.second, "math.res");
                     ci->replaceAllUsesWith(loaded);
                     ci->eraseFromParent();
                 }
