@@ -258,7 +258,7 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             };
             std::memcpy(ptr, spheres, sizeof(spheres));
             vk.vkUnmapMemory(dev, srv0.mem);
-        } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
+        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
             vk.vkMapMemory(dev, srv0.mem, 0, 256 * 256 * 4, 0, &ptr);
             float* a = static_cast<float*>(ptr);
             for (size_t i = 0; i < 256 * 256; ++i) a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
@@ -313,7 +313,7 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             if (spec.id == "bench_raymarch") {
                 uint32_t vals[4] = {cbW, cbH, cbSteps, 0};
                 std::memcpy(ptr, vals, sizeof(vals));
-            } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
+            } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
                 uint32_t vals[4] = {cbW, cbH, cbSteps, 0};
                 std::memcpy(ptr, vals, sizeof(vals));
             }
@@ -346,6 +346,11 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
                 cbW = n; cbH = n; cbSteps = n;
                 gx = (n + 7) / 8;
                 gy = (n + 7) / 8;
+            } else if (spec.id == "tiled_matmul") {
+                uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
+                cbW = n; cbH = n; cbSteps = n;
+                gx = (n + 15) / 16;
+                gy = (n + 15) / 16;
             } else if (spec.id == "linalg_matmul") {
                 uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
                 cbW = n; cbH = n; cbSteps = n;
@@ -374,7 +379,7 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             const float* fp = static_cast<const float*>(ptr);
             for (size_t i = 0; i < static_cast<size_t>(width) * height * 4; ++i) sum += fp[i];
             vk.vkUnmapMemory(dev, uav0.mem);
-        } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
+        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
             vk.vkMapMemory(dev, uav0.mem, 0, 128 * 128 * 4, 0, &ptr);
             const float* fp = static_cast<const float*>(ptr);
             for (size_t i = 0; i < 128 * 128; ++i) sum += fp[i];

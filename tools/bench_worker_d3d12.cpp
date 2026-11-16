@@ -183,7 +183,7 @@ BenchRunResult runWarpComputeBench(
         };
         std::memcpy(ptr, spheres, sizeof(spheres));
         srv0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
+    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
         srv0->Map(0, nullptr, &ptr);
         float* a = static_cast<float*>(ptr);
         for (size_t i = 0; i < 256 * 256; ++i) a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
@@ -214,7 +214,7 @@ BenchRunResult runWarpComputeBench(
         if (spec.id == "bench_raymarch") {
             RaymarchCB rcb{cbW, cbH, cbSteps, 0.0f};
             std::memcpy(ptr, &rcb, sizeof(rcb));
-        } else if (spec.id == "matmul" || spec.id == "linalg_matmul") {
+        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
             MatmulCB mcb{cbW, cbH, cbSteps, 0};
             std::memcpy(ptr, &mcb, sizeof(mcb));
         }
@@ -255,6 +255,11 @@ BenchRunResult runWarpComputeBench(
             cbW = n; cbH = n; cbSteps = n;
             gx = (n + 7) / 8;
             gy = (n + 7) / 8;
+        } else if (spec.id == "tiled_matmul") {
+            uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
+            cbW = n; cbH = n; cbSteps = n;
+            gx = (n + 15) / 16;
+            gy = (n + 15) / 16;
         } else if (spec.id == "linalg_matmul") {
             uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
             cbW = n; cbH = n; cbSteps = n;
