@@ -363,7 +363,7 @@ public:
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
-        if (baseName != "log2") {
+        if (elemTy.isF32() && baseName != "log2") {
             if (auto shuf = vecArg.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
                 llvm::ArrayRef<int32_t> mask = shuf.getMask();
                 if (!mask.empty() && llvm::all_of(mask, [](int32_t idx) { return idx == 0; })) {
