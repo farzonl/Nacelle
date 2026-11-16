@@ -86,28 +86,6 @@ inline ID3D12Resource* createNacelleRTTexture(ID3D12Device* dev, uint32_t w, uin
     return r;
 }
 
-inline void finalizeTimingAndMemory(
-    BenchRunResult& res,
-    const MemorySnapshot& memBefore,
-    const MemorySnapshot& memAfterCompile,
-    const std::vector<double>& samples) {
-    double total = 0.0;
-    for (double v : samples) total += v;
-    res.meanMs = samples.empty() ? 0.0 : (total / static_cast<double>(samples.size()));
-    res.medianMs = computeMedian(samples);
-    res.minMs = samples.empty() ? 0.0 : *std::min_element(samples.begin(), samples.end());
-    res.coldMs = res.compileMs + res.firstDispatchMs;
-
-    MemorySnapshot memAfterRun = queryProcessMemory();
-    res.rssBeforeMb = memBefore.currentRssMb;
-    res.rssAfterCompileMb = memAfterCompile.currentRssMb;
-    res.rssAfterRunMb = memAfterRun.currentRssMb;
-    res.rssDeltaMb = std::max(0.0, memAfterRun.currentRssMb - memBefore.currentRssMb);
-    res.peakRssMb = memAfterRun.peakRssMb;
-    res.ran = true;
-    res.status = "OK";
-}
-
 inline BenchRunResult runNacelleComputeBench(
     const BenchmarkSpec& spec,
     const std::vector<uint8_t>& dxil,

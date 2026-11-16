@@ -300,41 +300,74 @@ target_include_directories(nacelle-compile SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} $
 target_compile_definitions(nacelle-compile PRIVATE ${LLVM_DEFS_LIST})
 target_link_libraries(nacelle-compile PRIVATE nacelle ${NACELLE_MLIR_LIBS} ${NACELLE_LLVM_LIBS})
 
-if(APPLE)
-    add_executable(nacelle-bench tools/nacelle_bench.cpp tools/metal_bench.mm)
-    set_source_files_properties(tools/metal_bench.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    find_path(METAL_IRCONVERTER_INC metal_irconverter/metal_irconverter.h HINTS /usr/local/include /opt/homebrew/include)
-    find_library(METAL_IRCONVERTER_LIB metalirconverter HINTS /usr/local/lib /opt/homebrew/lib)
-    target_link_libraries(nacelle-bench PRIVATE "-framework Metal" "-framework Foundation")
-    if(METAL_IRCONVERTER_INC AND METAL_IRCONVERTER_LIB)
-        target_compile_definitions(nacelle-bench PRIVATE NACELLE_HAS_METAL_IRCONVERTER=1)
-        target_include_directories(nacelle-bench PRIVATE "${METAL_IRCONVERTER_INC}")
-        target_link_libraries(nacelle-bench PRIVATE "${METAL_IRCONVERTER_LIB}")
-        get_filename_component(METAL_IRCONVERTER_LIBDIR "${METAL_IRCONVERTER_LIB}" DIRECTORY)
-        set_target_properties(nacelle-bench PROPERTIES BUILD_RPATH "${METAL_IRCONVERTER_LIBDIR}")
-    endif()
-else()
-    add_executable(nacelle-bench tools/nacelle_bench.cpp)
-endif()
-add_dependencies(nacelle-bench nacelle_test_shaders)
-target_include_directories(nacelle-bench PRIVATE
+set(NACELLE_D3D12_SDK_VERSION "0" CACHE STRING "DirectX 12 Agility SDK version number")
+
+# Worker: Nacelle (links libnacelle / LLVM)
+add_executable(nacelle-bench-nacelle tools/bench_worker_nacelle.cpp)
+target_include_directories(nacelle-bench-nacelle PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/thread-pool/include"
 )
+target_compile_definitions(nacelle-bench-nacelle PRIVATE
+    NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
+)
+target_link_libraries(nacelle-bench-nacelle PRIVATE nacelle)
+
+# Worker: Vulkan (isolated from Nacelle/LLVM to avoid ICD libLLVM symbol collisions)
+add_executable(nacelle-bench-vulkan tools/bench_worker_vulkan.cpp)
+target_compile_definitions(nacelle-bench-vulkan PRIVATE
+    NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
+)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(nacelle-bench-vulkan PRIVATE dl)
+endif()
+
+set(NACELLE_BENCH_WORKERS nacelle-bench-nacelle nacelle-bench-vulkan)
+
+# Worker: Metal / IRConverter (macOS)
+if(APPLE)
+    add_executable(nacelle-bench-metal tools/bench_worker_metal.cpp tools/metal_bench.mm)
+    set_source_files_properties(tools/metal_bench.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    find_path(METAL_IRCONVERTER_INC metal_irconverter/metal_irconverter.h HINTS /usr/local/include /opt/homebrew/include)
+    find_library(METAL_IRCONVERTER_LIB metalirconverter HINTS /usr/local/lib /opt/homebrew/lib)
+    target_compile_definitions(nacelle-bench-metal PRIVATE
+        NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
+    )
+    target_link_libraries(nacelle-bench-metal PRIVATE "-framework Metal" "-framework Foundation")
+    if(METAL_IRCONVERTER_INC AND METAL_IRCONVERTER_LIB)
+        target_compile_definitions(nacelle-bench-metal PRIVATE NACELLE_HAS_METAL_IRCONVERTER=1)
+        target_include_directories(nacelle-bench-metal PRIVATE "${METAL_IRCONVERTER_INC}")
+        target_link_libraries(nacelle-bench-metal PRIVATE "${METAL_IRCONVERTER_LIB}")
+        get_filename_component(METAL_IRCONVERTER_LIBDIR "${METAL_IRCONVERTER_LIB}" DIRECTORY)
+        set_target_properties(nacelle-bench-metal PROPERTIES BUILD_RPATH "${METAL_IRCONVERTER_LIBDIR}")
+    endif()
+    list(APPEND NACELLE_BENCH_WORKERS nacelle-bench-metal)
+endif()
+
+# Worker: Microsoft WARP (Windows)
+if(WIN32)
+    add_executable(nacelle-bench-warp tools/bench_worker_warp.cpp)
+    target_include_directories(nacelle-bench-warp PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
+    )
+    target_compile_definitions(nacelle-bench-warp PRIVATE
+        NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
+    )
+    if(NACELLE_D3D12_SDK_VERSION GREATER 0)
+        target_compile_definitions(nacelle-bench-warp PRIVATE
+            NACELLE_D3D12_SDK_VERSION=${NACELLE_D3D12_SDK_VERSION}
+        )
+    endif()
+    list(APPEND NACELLE_BENCH_WORKERS nacelle-bench-warp)
+endif()
+
+# Harness: nacelle-bench (pure orchestrator; spawns per-backend worker binaries)
+add_executable(nacelle-bench tools/nacelle_bench.cpp)
+add_dependencies(nacelle-bench nacelle_test_shaders ${NACELLE_BENCH_WORKERS})
 target_compile_definitions(nacelle-bench PRIVATE
     NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
 )
-set(NACELLE_D3D12_SDK_VERSION "0" CACHE STRING "DirectX 12 Agility SDK version number")
-if(WIN32 AND NACELLE_D3D12_SDK_VERSION GREATER 0)
-    target_compile_definitions(nacelle-bench PRIVATE
-        NACELLE_D3D12_SDK_VERSION=${NACELLE_D3D12_SDK_VERSION}
-    )
-endif()
-target_link_libraries(nacelle-bench PRIVATE nacelle)
-if(UNIX AND NOT APPLE)
-    target_link_libraries(nacelle-bench PRIVATE dl)
-endif()
 
 # 6. SDL3 Interactive + Headless Viewer
 option(NACELLE_FETCH_SDL3 "Automatically fetch SDL3 when SDL3 is not installed on the system" ON)
