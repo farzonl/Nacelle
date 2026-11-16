@@ -93,15 +93,19 @@ bool compileDxilToMetalStage(
     std::string& errOut,
     bool enableGeomTessEmulation = false,
     const char* entryPoint = nullptr,
-    IRRayTracingPipelineConfiguration* rtCfg = nullptr) {
+    void* rtCfg = nullptr) {
     IRCompiler* compiler = IRCompilerCreate();
     IRCompilerSetGlobalRootSignature(compiler, rootSig);
     if (enableGeomTessEmulation) {
         IRCompilerEnableGeometryAndTessellationEmulation(compiler, true);
     }
+#if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
     if (rtCfg) {
-        IRCompilerSetRayTracingPipelineConfiguration(compiler, rtCfg);
+        IRCompilerSetRayTracingPipelineConfiguration(compiler, static_cast<IRRayTracingPipelineConfiguration*>(rtCfg));
     }
+#else
+    (void)rtCfg;
+#endif
 
     IRObject* dxilObj = IRObjectCreateFromDXIL(dxil.data(), dxil.size(), IRBytecodeOwnershipNone);
     IRError* irErr = nullptr;
@@ -476,6 +480,12 @@ MetalBenchResult runMetalGraphicsBench(
         const bool hasTess = (!hsDxil.empty() && !dsDxil.empty());
         const bool hasGS = !gsDxil.empty();
         const bool useEmulation = hasTess || hasGS;
+#if !defined(IR_VERSION_MAJOR) || (IR_VERSION_MAJOR < 3)
+        if (useEmulation) {
+            res.status = "SKIPPED (Metal IRConverter < 3.0)";
+            return res;
+        }
+#endif
 
         auto t0 = std::chrono::steady_clock::now();
 
@@ -519,8 +529,10 @@ MetalBenchResult runMetalGraphicsBench(
         NSError* mtlErr = nil;
         id<MTLRenderPipelineState> pso = nil;
         id<MTLDepthStencilState> dsState = nil;
+#if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
         IRRuntimeGeometryPipelineConfig geomCfg{};
         IRRuntimeTessellationPipelineConfig tessCfg{};
+#endif
 
         if (!useEmulation) {
             MTLRenderPipelineDescriptor* psoDesc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -563,6 +575,7 @@ MetalBenchResult runMetalGraphicsBench(
                 psoDesc.vertexDescriptor = vDesc;
             }
             pso = [device newRenderPipelineStateWithDescriptor:psoDesc error:&mtlErr];
+#if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
         } else if (!hasTess && hasGS) {
             MTLMeshRenderPipelineDescriptor* meshDesc = [[MTLMeshRenderPipelineDescriptor alloc] init];
             meshDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
@@ -626,6 +639,7 @@ MetalBenchResult runMetalGraphicsBench(
             tessDesc.basePipelineDescriptor = meshDesc;
             tessDesc.pipelineConfig = tessCfg;
             pso = IRRuntimeNewGeometryTessellationEmulationPipeline(device, &tessDesc, &mtlErr);
+#endif
         }
 
         auto t1 = std::chrono::steady_clock::now();
@@ -788,6 +802,7 @@ MetalBenchResult runMetalGraphicsBench(
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vc];
                 }
             } else {
+#if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
                 [enc useResource:cbBuf usage:MTLResourceUsageRead stages:MTLRenderStageObject | MTLRenderStageMesh | MTLRenderStageFragment];
                 [enc setObjectBuffer:emptyVBs offset:0 atIndex:0];
                 [enc setObjectBuffer:vsAB offset:0 atIndex:kIRArgumentBufferBindPoint];
@@ -804,6 +819,7 @@ MetalBenchResult runMetalGraphicsBench(
                 } else {
                     IRRuntimeDrawPrimitivesGeometryEmulation(enc, IRRuntimePrimitiveTypePoint, geomCfg, 1, vc, 0, 0);
                 }
+#endif
             }
             [enc endEncoding];
             [cmdBuf commit];
@@ -853,14 +869,14 @@ MetalBenchResult runMetalRaytracingBench(
     res.backend = "Metal (IRConverter)";
     res.shaderFormat = "DXIL->MTL";
 
-#if !defined(NACELLE_HAS_METAL_IRCONVERTER)
+#if !defined(NACELLE_HAS_METAL_IRCONVERTER) || !defined(IR_VERSION_MAJOR) || (IR_VERSION_MAJOR < 3)
     (void)benchId;
     (void)isInline;
     (void)dxil;
     (void)width;
     (void)height;
     (void)iters;
-    res.status = "SKIPPED (metal-shaderconverter not found)";
+    res.status = "SKIPPED (Metal IRConverter < 3.0)";
     return res;
 #else
     (void)benchId;
