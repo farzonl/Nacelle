@@ -203,6 +203,19 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         cat.push_back(std::move(s));
     }
 
+    {
+        BenchmarkSpec s;
+        s.id = "bench_mesh_stress";
+        s.name = "Meshlet Grid Expansion";
+        s.category = BenchCategory::Mesh;
+        s.kind = PipelineKind::GraphicsMSPS;
+        s.msDxil = "bench_mesh_stress_ms.dxil";
+        s.msSpv = "bench_mesh_stress_ms.spv";
+        s.psDxil = "bench_mesh_stress_ps.dxil";
+        s.psSpv = "bench_mesh_stress_ps.spv";
+        cat.push_back(std::move(s));
+    }
+
     return cat;
 }
 

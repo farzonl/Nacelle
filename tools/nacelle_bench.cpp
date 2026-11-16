@@ -1,10 +1,12 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -18,10 +20,12 @@
 #endif
 #include <windows.h>
 #else
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#define NACELLE_POPEN popen
-#define NACELLE_PCLOSE pclose
 #endif
 
 #if defined(__APPLE__)
@@ -74,9 +78,10 @@ std::string workerBinaryPath(const std::filesystem::path& binDir, const std::str
 #endif
 }
 
-bool runSubprocess(const std::string& cmdLine, std::string& outStdout, std::string& outStatus) {
+bool runSubprocess(const std::string& cmdLine, std::string& outStdout, std::string& outStatus, uint32_t timeoutSec = 60) {
     outStdout.clear();
     outStatus.clear();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSec);
 #if defined(_WIN32)
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -117,16 +122,43 @@ bool runSubprocess(const std::string& cmdLine, std::string& outStdout, std::stri
     }
 
     char buf[4096];
-    DWORD bytesRead = 0;
-    while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
-        outStdout.append(buf, bytesRead);
+    bool timedOut = false;
+    for (;;) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+            DWORD bytesRead = 0;
+            DWORD toRead = (avail < sizeof(buf)) ? avail : static_cast<DWORD>(sizeof(buf));
+            if (ReadFile(hRead, buf, toRead, &bytesRead, nullptr) && bytesRead > 0) {
+                outStdout.append(buf, bytesRead);
+            }
+            continue;
+        }
+        DWORD waitRc = WaitForSingleObject(pi.hProcess, 25);
+        if (waitRc == WAIT_OBJECT_0) {
+            while (PeekNamedPipe(hRead, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
+                DWORD bytesRead = 0;
+                DWORD toRead = (avail < sizeof(buf)) ? avail : static_cast<DWORD>(sizeof(buf));
+                if (!ReadFile(hRead, buf, toRead, &bytesRead, nullptr) || bytesRead == 0) break;
+                outStdout.append(buf, bytesRead);
+            }
+            break;
+        }
+        if (timeoutSec > 0 && std::chrono::steady_clock::now() >= deadline) {
+            timedOut = true;
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 2000);
+            break;
+        }
     }
     CloseHandle(hRead);
-    WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (timedOut) {
+        outStatus = "TIMED OUT (" + std::to_string(timeoutSec) + "s)";
+        return false;
+    }
     if (exitCode != 0) {
         std::ostringstream ss;
         ss << "CRASHED (0x" << std::hex << exitCode << ")";
@@ -135,17 +167,94 @@ bool runSubprocess(const std::string& cmdLine, std::string& outStdout, std::stri
     }
     return true;
 #else
-    std::string fullCmd = cmdLine + " 2>&1";
-    FILE* pipe = NACELLE_POPEN(fullCmd.c_str(), "r");
-    if (!pipe) {
-        outStatus = "FAILED (popen)";
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        outStatus = "FAILED (pipe)";
         return false;
     }
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
-        outStdout.append(buf);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        outStatus = "FAILED (fork)";
+        return false;
     }
-    int rc = NACELLE_PCLOSE(pipe);
+    if (pid == 0) {
+        setpgid(0, 0);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", cmdLine.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    char buf[4096];
+    bool timedOut = false;
+    bool eof = false;
+    while (!eof) {
+        if (timeoutSec > 0 && std::chrono::steady_clock::now() >= deadline) {
+            timedOut = true;
+            break;
+        }
+        struct pollfd pfd{};
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        int prc = poll(&pfd, 1, 100);
+        if (prc > 0) {
+            for (;;) {
+                ssize_t n = read(pipefd[0], buf, sizeof(buf));
+                if (n > 0) {
+                    outStdout.append(buf, static_cast<size_t>(n));
+                } else if (n == 0) {
+                    eof = true;
+                    break;
+                } else {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (errno == EINTR) continue;
+                    eof = true;
+                    break;
+                }
+            }
+        } else if (prc < 0 && errno != EINTR) {
+            break;
+        }
+    }
+    close(pipefd[0]);
+
+    int rc = 0;
+    if (timedOut) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+        waitpid(pid, &rc, 0);
+        outStatus = "TIMED OUT (" + std::to_string(timeoutSec) + "s)";
+        return false;
+    }
+
+    for (;;) {
+        pid_t w = waitpid(pid, &rc, WNOHANG);
+        if (w == pid) break;
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (timeoutSec > 0 && std::chrono::steady_clock::now() >= deadline) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            waitpid(pid, &rc, 0);
+            outStatus = "TIMED OUT (" + std::to_string(timeoutSec) + "s)";
+            return false;
+        }
+        usleep(20000);
+    }
+
     if (rc != 0) {
         if (WIFSIGNALED(rc)) {
             outStatus = "CRASHED (signal " + std::to_string(WTERMSIG(rc)) + ")";
@@ -289,6 +398,7 @@ std::vector<BenchRunResult> runIsolatedWorker(
     uint32_t height,
     uint32_t maxSteps,
     uint32_t iters,
+    uint32_t timeoutSec,
     std::string& outCrashStatus) {
     outCrashStatus.clear();
     std::string workerExe = resolveWorkerForBackend(binDir, backendToken);
@@ -308,7 +418,7 @@ std::vector<BenchRunResult> runIsolatedWorker(
         << " --iters " << iters;
 
     std::string rawOutput;
-    runSubprocess(cmd.str(), rawOutput, outCrashStatus);
+    runSubprocess(cmd.str(), rawOutput, outCrashStatus, timeoutSec);
     return parseWorkerOutput(rawOutput);
 }
 
@@ -398,6 +508,10 @@ int main(int argc, char** argv) {
     std::string shaderDir = NACELLE_SHADER_BIN_DIR;
     std::string suiteFilter = "all";
     std::string nameFilter;
+    uint32_t timeoutSec = 60;
+    std::string checkpointPath;
+    bool resumeFromCheckpoint = false;
+    std::vector<std::string> skipPatterns;
     bool allowPartial = false;
     bool forceWarp = false;
 
@@ -431,6 +545,18 @@ int main(int argc, char** argv) {
             suiteFilter = argv[++i];
         } else if (arg == "--filter" && i + 1 < argc) {
             nameFilter = argv[++i];
+        } else if (arg == "--timeout" && i + 1 < argc) {
+            timeoutSec = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--checkpoint" && i + 1 < argc) {
+            checkpointPath = argv[++i];
+        } else if (arg == "--resume") {
+            resumeFromCheckpoint = true;
+        } else if (arg == "--skip" && i + 1 < argc) {
+            std::stringstream ss(argv[++i]);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) skipPatterns.push_back(tok);
+            }
         } else if (arg == "--allow-partial") {
             allowPartial = true;
         } else if (arg == "--warp") {
@@ -516,6 +642,11 @@ int main(int argc, char** argv) {
         return r;
     };
 
+    struct BenchTask {
+        const BenchmarkSpec* spec;
+        std::string backendToken;
+    };
+    std::vector<BenchTask> tasks;
     for (const auto& spec : catalog) {
         if (suiteFilter != "all" && suiteFilter != categoryKey(spec.category)) continue;
         if (!nameFilter.empty() && spec.id.find(nameFilter) == std::string::npos) continue;
@@ -536,28 +667,173 @@ int main(int argc, char** argv) {
                 continue;
             }
 #endif
-            std::string crashStatus;
-            auto res = runIsolatedWorker(binDir, spec.id, bt, shaderDir, width, height, maxSteps, iters, crashStatus);
-            if (res.empty() && !crashStatus.empty()) {
-                res.push_back(makeCrashResult(spec, bt, crashStatus));
-            }
-            if (bt.rfind("nacelle-", 0) == 0 && res.empty()) {
-                anyNacelleFailed = true;
-            }
-            for (auto& r : res) {
-                if (bt.rfind("nacelle-", 0) == 0) {
-                    if (r.ran) anyNacellePassed = true;
-                    else anyNacelleFailed = true;
+            tasks.push_back({&spec, bt});
+        }
+    }
+
+    auto formatProgress = [](size_t done, size_t total) -> std::string {
+        constexpr size_t barWidth = 20;
+        size_t pct = (total > 0) ? (done * 100) / total : 100;
+        size_t filled = (total > 0) ? (done * barWidth) / total : barWidth;
+        std::string bar(barWidth, '-');
+        for (size_t i = 0; i < filled && i < barWidth; ++i) {
+            bar[i] = '=';
+        }
+        if (filled < barWidth && done > 0 && done < total) {
+            bar[filled] = '>';
+        }
+        std::ostringstream ss;
+        ss << "[" << std::setw(3) << done << "/" << std::setw(3) << total << "] "
+           << "[" << bar << "] " << std::setw(3) << pct << "%";
+        return ss.str();
+    };
+
+    auto summarizeStatus = [](const std::vector<BenchRunResult>& res, const std::string& crashStatus) -> std::string {
+        if (res.empty()) {
+            return crashStatus.empty() ? "NO OUTPUT" : crashStatus;
+        }
+        size_t ranCount = 0;
+        for (const auto& r : res) {
+            if (r.ran) ++ranCount;
+        }
+        if (ranCount == res.size()) return "OK";
+        if (ranCount > 0) return "PARTIAL";
+        return res[0].status.empty() ? "FAILED" : res[0].status;
+    };
+
+    if (resumeFromCheckpoint && checkpointPath.empty()) {
+        checkpointPath = jsonOut.empty() ? "nacelle-bench.checkpoint" : (jsonOut + ".checkpoint");
+    }
+
+    auto taskKey = [](const std::string& benchId, const std::string& bt) {
+        return benchId + "\t" + bt;
+    };
+
+    auto shouldSkipTask = [&](const std::string& benchId, const std::string& bt) {
+        std::string combined = benchId + "@" + bt;
+        std::string backendOnly = "@" + bt;
+        for (const auto& pat : skipPatterns) {
+            if (pat == combined || pat == benchId || pat == backendOnly) return true;
+        }
+        return false;
+    };
+
+    std::set<std::string> ckptStarted;
+    std::set<std::string> ckptDone;
+    if (resumeFromCheckpoint && !checkpointPath.empty() && std::filesystem::exists(checkpointPath)) {
+        std::ifstream ifs(checkpointPath);
+        std::string line;
+        while (std::getline(ifs, line)) {
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            if (line.rfind("START\t", 0) == 0) {
+                ckptStarted.insert(line.substr(6));
+            } else if (line.rfind("DONE\t", 0) == 0) {
+                ckptDone.insert(line.substr(5));
+            } else if (line.rfind("RESULT\t", 0) == 0) {
+                size_t p1 = line.find('\t', 7);
+                if (p1 == std::string::npos) continue;
+                size_t p2 = line.find('\t', p1 + 1);
+                if (p2 == std::string::npos) continue;
+                std::string bt = line.substr(p1 + 1, p2 - (p1 + 1));
+                std::string json = line.substr(p2 + 1);
+                BenchRunResult r;
+                if (parseWorkerJsonLine(json, r)) {
+                    if (bt.rfind("nacelle-", 0) == 0) {
+                        if (r.ran) anyNacellePassed = true;
+                        else anyNacelleFailed = true;
+                    }
+                    allResults.push_back(std::move(r));
                 }
-                allResults.push_back(std::move(r));
             }
         }
+        std::cerr << "Resuming from checkpoint " << checkpointPath
+                  << " (" << ckptDone.size() << " completed, "
+                  << (ckptStarted.size() > ckptDone.size() ? ckptStarted.size() - ckptDone.size() : 0)
+                  << " interrupted)\n" << std::flush;
+    }
+
+    std::ofstream ckptOut;
+    if (!checkpointPath.empty()) {
+        std::ios::openmode mode = resumeFromCheckpoint ? (std::ios::app | std::ios::out) : (std::ios::trunc | std::ios::out);
+        ckptOut.open(checkpointPath, mode);
+    }
+
+    auto recordResults = [&](const std::string& benchId, const std::string& bt, std::vector<BenchRunResult>& res) {
+        if (bt.rfind("nacelle-", 0) == 0 && res.empty()) {
+            anyNacelleFailed = true;
+        }
+        for (auto& r : res) {
+            if (bt.rfind("nacelle-", 0) == 0) {
+                if (r.ran) anyNacellePassed = true;
+                else anyNacelleFailed = true;
+            }
+            if (ckptOut.is_open()) {
+                ckptOut << "RESULT\t" << benchId << "\t" << bt << "\t" << serializeResultJson(r) << "\n";
+            }
+            allResults.push_back(std::move(r));
+        }
+        if (ckptOut.is_open()) {
+            ckptOut << "DONE\t" << benchId << "\t" << bt << "\n" << std::flush;
+        }
+    };
+
+    const size_t totalTasks = tasks.size();
+    for (size_t ti = 0; ti < totalTasks; ++ti) {
+        const auto& spec = *tasks[ti].spec;
+        const auto& bt = tasks[ti].backendToken;
+        const std::string key = taskKey(spec.id, bt);
+
+        if (ckptDone.count(key)) {
+            std::cerr << formatProgress(ti + 1, totalTasks)
+                      << " SKIP  " << spec.id << " @ " << bt << " (already in checkpoint)\n" << std::flush;
+            continue;
+        }
+        if (ckptStarted.count(key)) {
+            std::cerr << formatProgress(ti + 1, totalTasks)
+                      << " SKIP  " << spec.id << " @ " << bt << " (hung/interrupted in prior run)\n" << std::flush;
+            std::vector<BenchRunResult> skipped{makeCrashResult(spec, bt, "SKIPPED (hung in prior run)")};
+            recordResults(spec.id, bt, skipped);
+            continue;
+        }
+        if (shouldSkipTask(spec.id, bt)) {
+            std::cerr << formatProgress(ti + 1, totalTasks)
+                      << " SKIP  " << spec.id << " @ " << bt << " (--skip)\n" << std::flush;
+            std::vector<BenchRunResult> skipped{makeCrashResult(spec, bt, "SKIPPED (user)")};
+            recordResults(spec.id, bt, skipped);
+            continue;
+        }
+
+        if (ckptOut.is_open()) {
+            ckptOut << "START\t" << spec.id << "\t" << bt << "\n" << std::flush;
+        }
+
+        std::cerr << formatProgress(ti, totalTasks)
+                  << " START " << spec.id << " @ " << bt << "\n" << std::flush;
+
+        const auto tStart = std::chrono::steady_clock::now();
+        std::string crashStatus;
+        auto res = runIsolatedWorker(binDir, spec.id, bt, shaderDir, width, height, maxSteps, iters, timeoutSec, crashStatus);
+        const auto tEnd = std::chrono::steady_clock::now();
+        const double elapsedSec = std::chrono::duration<double>(tEnd - tStart).count();
+
+        std::ostringstream elapsedStr;
+        elapsedStr << std::fixed << std::setprecision(2) << elapsedSec;
+        std::cerr << formatProgress(ti + 1, totalTasks)
+                  << " STOP  " << spec.id << " @ " << bt
+                  << " (" << elapsedStr.str() << "s) -> "
+                  << summarizeStatus(res, crashStatus) << "\n" << std::flush;
+
+        if (res.empty() && !crashStatus.empty()) {
+            res.push_back(makeCrashResult(spec, bt, crashStatus));
+        }
+        recordResults(spec.id, bt, res);
     }
 
     // Compute Category Winners (lowest geomean dispatch time in ms)
     std::vector<BenchCategory> cats = {
         BenchCategory::Compute, BenchCategory::Vertex, BenchCategory::Pixel,
-        BenchCategory::Geometry, BenchCategory::Tessellation, BenchCategory::RayTracing
+        BenchCategory::Geometry, BenchCategory::Tessellation, BenchCategory::RayTracing,
+        BenchCategory::Mesh
     };
 
     std::map<std::string, std::vector<double>> backendCategoryMs;
@@ -585,7 +861,6 @@ int main(int argc, char** argv) {
         }
         categoryWinners.push_back({cname, bestBackend, (bestBackend == "N/A" ? 0.0 : bestMs), "ms"});
     }
-    categoryWinners.push_back({"Mesh", "NOT IMPLEMENTED (DispatchMesh stub)", 0.0, "ms"});
 
     // Overall Geomean Time (geomean of category geomean ms, lower is faster)
     std::map<std::string, double> overallMs;

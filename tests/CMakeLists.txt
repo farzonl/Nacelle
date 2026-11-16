@@ -67,6 +67,24 @@ function(add_hlsl_spirv_vk12 hlsl_name profile entry out_name)
     set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
 endfunction()
 
+function(add_hlsl_spirv_vk13 hlsl_name profile entry out_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
+    set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
+    add_custom_command(
+        OUTPUT "${dst}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NACELLE_SHADER_BIN_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -spirv -fspv-target-env=vulkan1.3
+                -fspv-extension=SPV_EXT_mesh_shader
+                -fvk-t-shift 0 0 -fvk-u-shift 8 0 -fvk-b-shift 16 0
+                ${ARGN}
+                -T ${profile} -E ${entry} -O3 -Fo "${dst}" "${src}"
+        DEPENDS "${src}"
+        COMMENT "Compiling HLSL -> SPIR-V (vk1.3): ${hlsl_name} (${profile}, ${entry}) -> ${out_name}"
+    )
+    list(APPEND NACELLE_SHADER_OUTPUTS "${dst}")
+    set(NACELLE_SHADER_OUTPUTS "${NACELLE_SHADER_OUTPUTS}" PARENT_SCOPE)
+endfunction()
+
 function(add_hlsl_spirv_lib_vk12 hlsl_name profile out_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${hlsl_name}")
     set(dst "${NACELLE_SHADER_BIN_DIR}/${out_name}")
@@ -167,6 +185,10 @@ add_hlsl_dxil(bench_geometry_stress.hlsl ps_6_0 PSMain bench_geometry_stress_ps.
 add_hlsl_spirv(bench_geometry_stress.hlsl vs_6_0 VSMain bench_geometry_stress_vs.spv)
 add_hlsl_spirv(bench_geometry_stress.hlsl gs_6_0 GSMain bench_geometry_stress_gs.spv)
 add_hlsl_spirv(bench_geometry_stress.hlsl ps_6_0 PSMain bench_geometry_stress_ps.spv)
+add_hlsl_dxil(bench_mesh_stress.hlsl ms_6_5 MSMain bench_mesh_stress_ms.dxil)
+add_hlsl_dxil(bench_mesh_stress.hlsl ps_6_5 PSMain bench_mesh_stress_ps.dxil)
+add_hlsl_spirv_vk13(bench_mesh_stress.hlsl ms_6_5 MSMain bench_mesh_stress_ms.spv)
+add_hlsl_spirv_vk13(bench_mesh_stress.hlsl ps_6_5 PSMain bench_mesh_stress_ps.spv)
 
 # Fullscreen quad & Shadertoy pixel shaders (SPIR-V for Vulkan comparison)
 add_hlsl_spirv(fullscreen_quad.hlsl vs_6_0 VSMain fullscreen_quad_vs.spv)
@@ -318,6 +340,11 @@ endforeach()
 add_test(
     NAME nacelle_bench_smoke
     COMMAND $<TARGET_FILE:nacelle-bench> --quick --simd-width=4,8
+)
+add_test(
+    NAME nacelle_bench_harness_test
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_nacelle_bench_harness.py"
+            --nacelle-bench $<TARGET_FILE:nacelle-bench>
 )
 
 # Viewer smoke tests (headless + SDL3 dummy driver when SDL3 is enabled)

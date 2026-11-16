@@ -819,6 +819,163 @@ MetalBenchResult runMetalGraphicsBench(
 #endif
 }
 
+MetalBenchResult runMetalMeshBench(
+    const std::string& benchId,
+    const std::vector<uint8_t>& msDxil,
+    const std::vector<uint8_t>& psDxil,
+    uint32_t iters) {
+    MetalBenchResult res;
+    res.backend = "Metal (IRConverter)";
+    res.shaderFormat = "DXIL->MTL";
+#if !defined(NACELLE_HAS_METAL_IRCONVERTER) || !defined(IR_VERSION_MAJOR) || (IR_VERSION_MAJOR < 3)
+    (void)benchId;
+    (void)msDxil;
+    (void)psDxil;
+    (void)iters;
+    res.status = "SKIPPED (Metal IRConverter < 3.0)";
+    return res;
+#else
+    (void)benchId;
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            res.status = "UNSUPPORTED (no Metal device)";
+            return res;
+        }
+        if (![device respondsToSelector:@selector(newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)]) {
+            res.status = "UNSUPPORTED (no Metal Mesh Shader)";
+            return res;
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (!queue) {
+            res.status = "FAILED (no command queue)";
+            return res;
+        }
+
+        IRRootParameter1 cbvParam{};
+        cbvParam.ParameterType = IRRootParameterTypeCBV;
+        cbvParam.ShaderVisibility = IRShaderVisibilityAll;
+        cbvParam.Descriptor.ShaderRegister = 0;
+        cbvParam.Descriptor.RegisterSpace = 0;
+        IRVersionedRootSignatureDescriptor rsDesc{};
+        rsDesc.version = IRRootSignatureVersion_1_1;
+        rsDesc.desc_1_1.NumParameters = 1;
+        rsDesc.desc_1_1.pParameters = &cbvParam;
+        rsDesc.desc_1_1.Flags = IRRootSignatureFlagNone;
+        IRError* rsErr = nullptr;
+        IRRootSignature* rootSig = IRRootSignatureCreateFromDescriptor(&rsDesc, &rsErr);
+        if (rsErr) IRErrorDestroy(rsErr);
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::string errMsg;
+        CompiledIRStage msStage, psStage;
+        bool ok = compileDxilToMetalStage(device, msDxil, rootSig, IRShaderStageMesh, msStage, errMsg) &&
+                  compileDxilToMetalStage(device, psDxil, rootSig, IRShaderStageFragment, psStage, errMsg);
+
+        if (!ok) {
+            res.status = "FAILED (IRConverter: " + errMsg + ")";
+            if (rootSig) IRRootSignatureDestroy(rootSig);
+            return res;
+        }
+
+        id<MTLFunction> msFn = [msStage.lib newFunctionWithName:[NSString stringWithUTF8String:msStage.entryName.c_str()]];
+        id<MTLFunction> psFn = [psStage.lib newFunctionWithName:[NSString stringWithUTF8String:psStage.entryName.c_str()]];
+        MTLMeshRenderPipelineDescriptor* meshDesc = [[MTLMeshRenderPipelineDescriptor alloc] init];
+        meshDesc.meshFunction = msFn;
+        meshDesc.fragmentFunction = psFn;
+        meshDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        meshDesc.maxTotalThreadsPerMeshThreadgroup = 32;
+
+        NSError* mtlErr = nil;
+        id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithMeshDescriptor:meshDesc
+                                                                                   options:MTLPipelineOptionNone
+                                                                                reflection:nil
+                                                                                     error:&mtlErr];
+        auto t1 = std::chrono::steady_clock::now();
+        res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (!pso) {
+            std::string desc = mtlErr ? [[mtlErr localizedDescription] UTF8String] : "unknown";
+            res.status = "FAILED (MTLMeshPSO: " + desc + ")";
+            if (rootSig) IRRootSignatureDestroy(rootSig);
+            return res;
+        }
+
+        const uint32_t rw = 128, rh = 128;
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:rw
+                                                                                     height:rh
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeManaged;
+        id<MTLTexture> rtTex = [device newTextureWithDescriptor:td];
+        id<MTLBuffer> cbBuf = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> msAB = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> psAB = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        uint64_t cbAddr = [cbBuf gpuAddress];
+        std::memcpy([msAB contents], &cbAddr, sizeof(uint64_t));
+        std::memcpy([psAB contents], &cbAddr, sizeof(uint64_t));
+
+        auto drawOnce = [&](uint32_t groups) -> double {
+            struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
+            std::memcpy([cbBuf contents], &cb, sizeof(cb));
+
+            auto s0 = std::chrono::steady_clock::now();
+            id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+            MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+            rpd.colorAttachments[0].texture = rtTex;
+            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+
+            id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+            [enc setRenderPipelineState:pso];
+            MTLViewport vp{0.0, 0.0, static_cast<double>(rw), static_cast<double>(rh), 0.0, 1.0};
+            [enc setViewport:vp];
+            [enc useResource:cbBuf usage:MTLResourceUsageRead stages:MTLRenderStageMesh | MTLRenderStageFragment];
+            [enc setMeshBuffer:msAB offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [enc setFragmentBuffer:psAB offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [enc drawMeshThreadgroups:MTLSizeMake(groups, 1, 1)
+          threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
+            threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cmdBuf commit];
+            [cmdBuf waitUntilCompleted];
+            auto s1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(s1 - s0).count();
+        };
+
+        res.firstDispatchMs = drawOnce(128);
+        std::vector<double> samples;
+        samples.reserve(iters);
+        for (uint32_t i = 0; i < iters; ++i) {
+            samples.push_back(drawOnce(128));
+        }
+
+        std::vector<uint8_t> px(static_cast<size_t>(rw) * rh * 4, 0);
+        [rtTex getBytes:px.data() bytesPerRow:rw * 4 fromRegion:MTLRegionMake2D(0, 0, rw, rh) mipmapLevel:0];
+        double sum = 0.0;
+        for (uint8_t b : px) sum += b;
+        res.checksum = sum;
+
+        res.shortJobMs = drawOnce(16);
+        res.longJobMs = drawOnce(512);
+
+        double total = 0.0;
+        for (double v : samples) total += v;
+        res.meanMs = samples.empty() ? 0.0 : (total / static_cast<double>(samples.size()));
+        std::sort(samples.begin(), samples.end());
+        res.medianMs = samples.empty() ? 0.0 : samples[samples.size() / 2];
+        res.minMs = samples.empty() ? 0.0 : samples.front();
+        res.ran = true;
+        res.status = "OK";
+
+        IRRootSignatureDestroy(rootSig);
+    }
+    return res;
+#endif
+}
+
 MetalBenchResult runMetalRaytracingBench(
     const std::string& benchId,
     bool isInline,

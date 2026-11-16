@@ -51,6 +51,7 @@ enum class PipelineKind {
     GraphicsVSPS,
     GraphicsVSGSPS,
     GraphicsTessGS,
+    GraphicsMSPS,
     RayTracingInline,
     RayTracingPipeline,
 };
@@ -72,6 +73,8 @@ struct BenchmarkSpec {
     std::string dsSpv;
     std::string gsDxil;
     std::string gsSpv;
+    std::string msDxil;
+    std::string msSpv;
     std::string psDxil;
     std::string psSpv;
     std::string rtDxil;

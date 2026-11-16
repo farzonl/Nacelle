@@ -911,4 +911,192 @@ inline BenchRunResult runNacelleRaytracingBench(
     return res;
 }
 
+inline BenchRunResult runNacelleMeshBench(
+    const BenchmarkSpec& spec,
+    const std::vector<uint8_t>& msDxil,
+    const std::vector<uint8_t>& psDxil,
+    uint32_t simdWidth,
+    uint32_t iters) {
+    BenchRunResult res;
+    res.benchId = spec.id;
+    res.benchName = spec.name;
+    res.category = categoryName(spec.category);
+    res.backend = "Nacelle (W=" + std::to_string(simdWidth) + ")";
+    res.shaderFormat = "DXIL";
+    res.simdWidth = simdWidth;
+
+    MemorySnapshot memBefore = queryProcessMemory();
+    nacelle::setSimdWidthOverride(simdWidth);
+    nacelle::clearInMemoryPSOCacheForTesting();
+
+    ID3D12Device* dev = nullptr;
+    if (FAILED(NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev))) || !dev) {
+        res.status = "FAILED (CreateDevice)";
+        return res;
+    }
+    ID3D12Device2* dev2 = nullptr;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dev2))) || !dev2) {
+        res.status = "FAILED (QI ID3D12Device2)";
+        dev->Release();
+        return res;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qDesc{};
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* queue = nullptr;
+    dev->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&queue));
+    ID3D12CommandAllocator* alloc = nullptr;
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
+    ID3D12GraphicsCommandList* cmd = nullptr;
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cmd));
+    ID3D12GraphicsCommandList6* cmd6 = nullptr;
+    if (FAILED(cmd->QueryInterface(IID_PPV_ARGS(&cmd6))) || !cmd6) {
+        res.status = "FAILED (QI ID3D12GraphicsCommandList6)";
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev2->Release();
+        dev->Release();
+        return res;
+    }
+    ID3D12Fence* fence = nullptr;
+    dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    param.Descriptor.ShaderRegister = 0;
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &param;
+    ID3DBlob* rsBlob = nullptr;
+    NacelleSerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
+    ID3D12RootSignature* rootSig = nullptr;
+    dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+    rsBlob->Release();
+
+    struct alignas(void*) MeshPsoStream {
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v; } rs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v; } ms;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; D3D12_SHADER_BYTECODE v; } ps;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v{}; } rast;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; D3D12_BLEND_DESC v{}; } blend;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL; D3D12_DEPTH_STENCIL_DESC v{}; } dss;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; } sampleMask;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; D3D12_PRIMITIVE_TOPOLOGY_TYPE v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; } topo;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; } rtfs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; } sampleDesc;
+    } stream;
+
+    stream.rs.v = rootSig;
+    stream.ms.v = {msDxil.data(), msDxil.size()};
+    stream.ps.v = {psDxil.data(), psDxil.size()};
+    stream.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.rast.v.CullMode = D3D12_CULL_MODE_NONE;
+    stream.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    stream.rtfs.v.NumRenderTargets = 1;
+    stream.rtfs.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(stream), &stream};
+    auto t0 = std::chrono::steady_clock::now();
+    ID3D12PipelineState* pso = nullptr;
+    HRESULT hr = dev2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&pso));
+    auto t1 = std::chrono::steady_clock::now();
+    res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    MemorySnapshot memAfterCompile = queryProcessMemory();
+
+    if (FAILED(hr) || !pso) {
+        res.status = "FAILED (CreatePipelineState Mesh)";
+        rootSig->Release();
+        fence->Release();
+        cmd6->Release();
+        cmd->Release();
+        alloc->Release();
+        queue->Release();
+        dev2->Release();
+        dev->Release();
+        return res;
+    }
+
+    const uint32_t rw = 128, rh = 128;
+    ID3D12Resource* rtvTex = createNacelleRTTexture(dev, rw, rh);
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHD{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap* rtvHeap = nullptr;
+    dev->CreateDescriptorHeap(&rtvHD, IID_PPV_ARGS(&rtvHeap));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
+    ID3D12Resource* cbBuf = createNacelleBuffer(dev, 256, false);
+
+    uint64_t fenceVal = 1;
+    auto runMesh = [&](uint32_t groups) -> double {
+        void* p = nullptr;
+        cbBuf->Map(0, nullptr, &p);
+        struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
+        std::memcpy(p, &cb, sizeof(cb));
+        cbBuf->Unmap(0, nullptr);
+
+        auto s0 = std::chrono::steady_clock::now();
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(rw), static_cast<LONG>(rh)};
+        const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        cmd->SetGraphicsRootSignature(rootSig);
+        cmd->SetPipelineState(pso);
+        cmd->SetGraphicsRootConstantBufferView(0, cbBuf->GetGPUVirtualAddress());
+        cmd->RSSetViewports(1, &vp);
+        cmd->RSSetScissorRects(1, &sc);
+        cmd->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        cmd6->DispatchMesh(groups, 1, 1);
+        cmd->Close();
+
+        ID3D12CommandList* lists[] = {cmd};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, fenceVal);
+        while (fence->GetCompletedValue() < fenceVal) {}
+        ++fenceVal;
+        alloc->Reset();
+        cmd->Reset(alloc, nullptr);
+        auto s1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(s1 - s0).count();
+    };
+
+    res.firstDispatchMs = runMesh(128);
+    nacelle::waitForAllAsyncJITTasks();
+    runMesh(128);
+
+    std::vector<double> samples;
+    samples.reserve(iters);
+    for (uint32_t i = 0; i < iters; ++i) {
+        samples.push_back(runMesh(128));
+    }
+
+    const uint8_t* px = nullptr;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(rw) * rh * 4};
+    if (SUCCEEDED(rtvTex->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&px)))) && px) {
+        double sum = 0.0;
+        for (size_t i = 0; i < static_cast<size_t>(rw) * rh * 4; ++i) sum += px[i];
+        rtvTex->Unmap(0, nullptr);
+        res.checksum = sum;
+    }
+
+    res.shortJobMs = runMesh(16);
+    res.longJobMs = runMesh(512);
+
+    finalizeTimingAndMemory(res, memBefore, memAfterCompile, samples);
+
+    cbBuf->Release();
+    rtvHeap->Release();
+    rtvTex->Release();
+    pso->Release();
+    rootSig->Release();
+    fence->Release();
+    cmd6->Release();
+    cmd->Release();
+    alloc->Release();
+    queue->Release();
+    dev2->Release();
+    dev->Release();
+    return res;
+}
+
 } // namespace nacelle_bench

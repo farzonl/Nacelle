@@ -28,6 +28,11 @@ int main(int argc, char** argv) {
             if (!spec.dsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.dsDxil, ds)) return out;
             if (!spec.gsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.gsDxil, gs)) return out;
             out.push_back(runNacelleGraphicsBench(spec, vs, ps, hs, ds, gs, w, args.width, args.height, args.iters));
+        } else if (spec.kind == PipelineKind::GraphicsMSPS) {
+            std::vector<uint8_t> ms, ps;
+            if (!readBinary(args.shaderDir + "/" + spec.msDxil, ms) ||
+                !readBinary(args.shaderDir + "/" + spec.psDxil, ps)) return out;
+            out.push_back(runNacelleMeshBench(spec, ms, ps, w, args.iters));
         } else if (spec.kind == PipelineKind::RayTracingInline ||
                    spec.kind == PipelineKind::RayTracingPipeline) {
             std::vector<uint8_t> rt;
