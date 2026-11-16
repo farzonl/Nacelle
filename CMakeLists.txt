@@ -276,6 +276,19 @@ if(NOT APPLE AND NACELLE_USE_OPENBLAS)
     endif()
 endif()
 
+if(APPLE AND NACELLE_USE_OPENBLAS)
+    find_library(NACELLE_APPLE_OPENBLAS_DYLIB
+        NAMES openblas libopenblas
+        HINTS /opt/homebrew/opt/openblas/lib /usr/local/opt/openblas/lib
+    )
+    if(NACELLE_APPLE_OPENBLAS_DYLIB)
+        message(STATUS "Found optional macOS OpenBLAS dylib (runtime dlopen): ${NACELLE_APPLE_OPENBLAS_DYLIB}")
+        target_compile_definitions(nacelle_objs PRIVATE
+            "NACELLE_OPENBLAS_DYLIB_PATH=\"${NACELLE_APPLE_OPENBLAS_DYLIB}\""
+        )
+    endif()
+endif()
+
 if(NACELLE_CBLAS_FOUND)
     target_include_directories(nacelle_objs SYSTEM PRIVATE "${NACELLE_CBLAS_INC_DIR}")
     target_compile_definitions(nacelle_objs PRIVATE
