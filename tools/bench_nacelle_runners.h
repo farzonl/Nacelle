@@ -158,12 +158,13 @@ inline BenchRunResult runNacelleComputeBench(
         };
         std::memcpy(sphPtr, spheres, sizeof(spheres));
         srv0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
+    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
         float* a = nullptr;
         float* b = nullptr;
         srv0->Map(0, nullptr, reinterpret_cast<void**>(&a));
         srv1->Map(0, nullptr, reinterpret_cast<void**>(&b));
-        for (size_t i = 0; i < 256 * 256; ++i) {
+        const size_t initCount = (spec.id == "tiled_matmul_large") ? (1024u * 1024u) : (256u * 256u);
+        for (size_t i = 0; i < initCount; ++i) {
             a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
             b[i] = static_cast<float>((i % 13) + 1) * 0.01f;
         }
@@ -183,7 +184,7 @@ inline BenchRunResult runNacelleComputeBench(
         if (spec.id == "bench_raymarch") {
             RaymarchCB cb{cbW, cbH, cbSteps, 0.0f};
             std::memcpy(cbPtr, &cb, sizeof(cb));
-        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
+        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
             MatmulCB cb{cbW, cbH, cbSteps, 0};
             std::memcpy(cbPtr, &cb, sizeof(cb));
         }
@@ -228,6 +229,11 @@ inline BenchRunResult runNacelleComputeBench(
             cbW = n; cbH = n; cbSteps = n;
             gx = (n + 15) / 16;
             gy = (n + 15) / 16;
+        } else if (spec.id == "tiled_matmul_large") {
+            uint32_t n = (mode == 0) ? 256 : (mode == 1 ? 512 : 1024);
+            cbW = n; cbH = n; cbSteps = n;
+            gx = (n + 15) / 16;
+            gy = (n + 15) / 16;
         } else if (spec.id == "linalg_matmul") {
             uint32_t n = (mode == 0) ? 64 : (mode == 1 ? 128 : 256);
             cbW = n; cbH = n; cbSteps = n;
@@ -266,10 +272,11 @@ inline BenchRunResult runNacelleComputeBench(
         size_t count = static_cast<size_t>(width) * height * 4;
         for (size_t i = 0; i < count; ++i) sum += outPtr[i];
         uav0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "linalg_matmul") {
+    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
         float* outPtr = nullptr;
         uav0->Map(0, nullptr, reinterpret_cast<void**>(&outPtr));
-        for (size_t i = 0; i < 128 * 128; ++i) sum += outPtr[i];
+        const size_t count = (spec.id == "tiled_matmul_large") ? (512u * 512u) : (128u * 128u);
+        for (size_t i = 0; i < count; ++i) sum += outPtr[i];
         uav0->Unmap(0, nullptr);
     } else {
         uint32_t* outPtr = nullptr;
