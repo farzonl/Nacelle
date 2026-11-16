@@ -360,10 +360,25 @@ public:
         return res;
     }
 
+    mlir::Value emitLlvmMathIntrinsic(mlir::Location loc, llvm::StringRef baseName, mlir::Type ty, mlir::Value arg) {
+        if (baseName == "sin") return createFp<mlir::LLVM::SinOp>(loc, ty, arg);
+        if (baseName == "cos") return createFp<mlir::LLVM::CosOp>(loc, ty, arg);
+        if (baseName == "tan") return createFp<mlir::LLVM::TanOp>(loc, ty, arg);
+        if (baseName == "acos") return createFp<mlir::LLVM::ACosOp>(loc, ty, arg);
+        if (baseName == "asin") return createFp<mlir::LLVM::ASinOp>(loc, ty, arg);
+        if (baseName == "atan") return createFp<mlir::LLVM::ATanOp>(loc, ty, arg);
+        if (baseName == "cosh") return createFp<mlir::LLVM::CoshOp>(loc, ty, arg);
+        if (baseName == "sinh") return createFp<mlir::LLVM::SinhOp>(loc, ty, arg);
+        if (baseName == "tanh") return createFp<mlir::LLVM::TanhOp>(loc, ty, arg);
+        if (baseName == "exp2") return createFp<mlir::LLVM::Exp2Op>(loc, ty, arg);
+        if (baseName == "log2") return createFp<mlir::LLVM::Log2Op>(loc, ty, arg);
+        llvm::report_fatal_error(llvm::Twine("Unsupported unary math intrinsic: ") + baseName);
+    }
+
     mlir::Value emitMathUnary(mlir::Location loc, llvm::StringRef baseName, mlir::Value vecArg) {
         auto vt = llvm::cast<mlir::VectorType>(vecArg.getType());
         mlir::Type elemTy = vt.getElementType();
-        if (elemTy.isF32() && baseName != "log2") {
+        if (baseName != "log2") {
             if (auto shuf = vecArg.getDefiningOp<mlir::LLVM::ShuffleVectorOp>()) {
                 llvm::ArrayRef<int32_t> mask = shuf.getMask();
                 if (!mask.empty() && llvm::all_of(mask, [](int32_t idx) { return idx == 0; })) {
@@ -376,9 +391,7 @@ public:
                     if (!scalarArg) {
                         scalarArg = llvmExtract(loc, shuf.getV1(), 0);
                     }
-                    std::string libmName = (elemTy.isF32() ? (baseName + "f") : baseName).str();
-                    mlir::LLVM::LLVMFuncOp libmFn = getOrDeclareLibmFn(loc, libmName, elemTy);
-                    mlir::Value r = mlir::LLVM::CallOp::create(b_, loc, libmFn, mlir::ValueRange{scalarArg}).getResult();
+                    mlir::Value r = emitLlvmMathIntrinsic(loc, baseName, elemTy, scalarArg);
                     return llvmSplat(loc, elemTy, r);
                 }
             }
@@ -395,35 +408,7 @@ public:
             }
             return mlir::func::CallOp::create(b_, loc, callee, mlir::ValueRange{vecArg}).getResult(0);
         }
-        if (baseName == "sin") return createFp<mlir::LLVM::SinOp>(loc, vt, vecArg);
-        if (baseName == "cos") return createFp<mlir::LLVM::CosOp>(loc, vt, vecArg);
-        if (baseName == "tan") return createFp<mlir::LLVM::TanOp>(loc, vt, vecArg);
-        if (baseName == "acos") return createFp<mlir::LLVM::ACosOp>(loc, vt, vecArg);
-        if (baseName == "asin") return createFp<mlir::LLVM::ASinOp>(loc, vt, vecArg);
-        if (baseName == "atan") return createFp<mlir::LLVM::ATanOp>(loc, vt, vecArg);
-        if (baseName == "cosh") return createFp<mlir::LLVM::CoshOp>(loc, vt, vecArg);
-        if (baseName == "sinh") return createFp<mlir::LLVM::SinhOp>(loc, vt, vecArg);
-        if (baseName == "tanh") return createFp<mlir::LLVM::TanhOp>(loc, vt, vecArg);
-        if (baseName == "exp2") return createFp<mlir::LLVM::Exp2Op>(loc, vt, vecArg);
-        if (baseName == "log2") return createFp<mlir::LLVM::Log2Op>(loc, vt, vecArg);
-        // Scalar libm fallback for strict-FP or non-f32 transcendental ops.
-        std::string libmName = (elemTy.isF32() ? (baseName + "f") : baseName).str();
-        mlir::LLVM::LLVMFuncOp libmFn = getOrDeclareLibmFn(loc, libmName, elemTy);
-        mlir::Value outVec = mlir::LLVM::PoisonOp::create(b_, loc, vt);
-        for (uint32_t l = 0; l < W_; ++l) {
-            mlir::Value x = llvmExtract(loc, vecArg, l);
-            mlir::Value r = mlir::LLVM::CallOp::create(b_, loc, libmFn, mlir::ValueRange{x}).getResult();
-            outVec = llvmInsert(loc, outVec, r, l);
-        }
-        return outVec;
-    }
-
-    mlir::LLVM::LLVMFuncOp getOrDeclareLibmFn(mlir::Location loc, llvm::StringRef name, mlir::Type ty) {
-        if (auto existing = mod_.lookupSymbol<mlir::LLVM::LLVMFuncOp>(name)) return existing;
-        mlir::OpBuilder mb(ctx_);
-        mb.setInsertionPointToStart(mod_.getBody());
-        auto fnTy = mlir::LLVM::LLVMFunctionType::get(ty, {ty});
-        return mlir::LLVM::LLVMFuncOp::create(mb, loc, name, fnTy);
+        return emitLlvmMathIntrinsic(loc, baseName, vt, vecArg);
     }
 
     mlir::Value orReduce(mlir::Location loc, mlir::Value vecI1) {
