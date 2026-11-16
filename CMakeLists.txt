@@ -232,15 +232,15 @@ target_link_libraries(nacelle_objs PUBLIC Microsoft::DirectX-Headers Microsoft::
 option(NACELLE_USE_OPENBLAS "Use OpenBLAS/BLAS for CPU GEMM on non-Apple platforms" ON)
 set(NACELLE_CBLAS_FOUND OFF)
 set(NACELLE_CBLAS_LINK_LIBS "")
-set(NACELLE_CBLAS_INC_DIR "")
+unset(NACELLE_CBLAS_INC_DIR)
 set(NACELLE_CBLAS_HEADER_NAME "cblas.h")
-set(NACELLE_OPENBLAS_DLL "")
+unset(NACELLE_OPENBLAS_DLL)
 
 if(NOT APPLE AND NACELLE_USE_OPENBLAS)
     find_package(OpenBLAS CONFIG QUIET)
     if(TARGET OpenBLAS::OpenBLAS)
         set(NACELLE_CBLAS_LINK_LIBS OpenBLAS::OpenBLAS)
-    elseif(OpenBLAS_FOUND AND OpenBLAS_LIBRARIES)
+    elseif(NOT WIN32 AND OpenBLAS_FOUND AND OpenBLAS_LIBRARIES)
         set(NACELLE_CBLAS_LINK_LIBS ${OpenBLAS_LIBRARIES})
     else()
         set(_nacelle_prev_bla_vendor "${BLA_VENDOR}")
@@ -259,6 +259,7 @@ if(NOT APPLE AND NACELLE_USE_OPENBLAS)
     if(NOT NACELLE_CBLAS_LINK_LIBS)
         find_library(NACELLE_OPENBLAS_LIB
             NAMES openblas libopenblas
+            HINTS "${OpenBLAS_INCLUDE_DIRS}/.."
             PATH_SUFFIXES lib lib64
         )
         if(NACELLE_OPENBLAS_LIB)
