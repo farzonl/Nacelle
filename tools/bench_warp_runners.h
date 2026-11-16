@@ -924,5 +924,225 @@ inline BenchRunResult runWarpRaytracingBench(
     return res;
 }
 
+inline BenchRunResult runWarpMeshBench(
+    const BenchmarkSpec& spec,
+    const std::vector<uint8_t>& msDxil,
+    const std::vector<uint8_t>& psDxil,
+    uint32_t iters,
+    int32_t devIdx = -1,
+    bool forceWarp = true) {
+    BenchRunResult res;
+    res.benchId = spec.id;
+    res.benchName = spec.name;
+    res.category = categoryName(spec.category);
+    res.backend = forceWarp ? "Microsoft WARP" : "D3D12 GPU";
+    res.shaderFormat = "DXIL";
+
+    MemorySnapshot memBefore = queryProcessMemory();
+    D3D12BenchContext ctx;
+    std::string err;
+    if (!ctx.init(devIdx, forceWarp, err)) {
+        res.status = err;
+        return res;
+    }
+    res.backend = ctx.backendName;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7{};
+    if (FAILED(ctx.dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opts7, sizeof(opts7))) ||
+        opts7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+        res.status = "UNSUPPORTED (no Mesh Shader Tier)";
+        ctx.destroy();
+        return res;
+    }
+
+    ID3D12Device2* dev2 = nullptr;
+    ID3D12GraphicsCommandList6* cmd6 = nullptr;
+    if (FAILED(ctx.dev->QueryInterface(IID_PPV_ARGS(&dev2))) || !dev2 ||
+        FAILED(ctx.cmd->QueryInterface(IID_PPV_ARGS(&cmd6))) || !cmd6) {
+        res.status = "UNSUPPORTED (no ID3D12Device2/CmdList6)";
+        if (cmd6) cmd6->Release();
+        if (dev2) dev2->Release();
+        ctx.destroy();
+        return res;
+    }
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    param.Descriptor.ShaderRegister = 0;
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &param;
+    ID3DBlob* rsBlob = nullptr;
+    ID3D12RootSignature* rootSig = nullptr;
+    if (FAILED(ctx.pD3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr)) ||
+        !rsBlob ||
+        FAILED(ctx.dev->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(&rootSig)))) {
+        if (rsBlob) rsBlob->Release();
+        res.status = "FAILED (RootSignature)";
+        cmd6->Release();
+        dev2->Release();
+        ctx.destroy();
+        return res;
+    }
+    rsBlob->Release();
+
+    struct alignas(void*) MeshPsoStream {
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v; } rs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v; } ms;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; D3D12_SHADER_BYTECODE v; } ps;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v{}; } rast;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; D3D12_BLEND_DESC v{}; } blend;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL; D3D12_DEPTH_STENCIL_DESC v{}; } dss;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; } sampleMask;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; D3D12_PRIMITIVE_TOPOLOGY_TYPE v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; } topo;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; } rtfs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; } sampleDesc;
+    } stream;
+
+    stream.rs.v = rootSig;
+    stream.ms.v = {msDxil.data(), msDxil.size()};
+    stream.ps.v = {psDxil.data(), psDxil.size()};
+    stream.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.rast.v.CullMode = D3D12_CULL_MODE_NONE;
+    stream.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    stream.rtfs.v.NumRenderTargets = 1;
+    stream.rtfs.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(stream), &stream};
+    auto t0 = std::chrono::steady_clock::now();
+    ID3D12PipelineState* pso = nullptr;
+    HRESULT hr = dev2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&pso));
+    auto t1 = std::chrono::steady_clock::now();
+    res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    MemorySnapshot memAfterCompile = queryProcessMemory();
+
+    if (FAILED(hr) || !pso) {
+        res.status = "FAILED (CreatePipelineState Mesh)";
+        rootSig->Release();
+        cmd6->Release();
+        dev2->Release();
+        ctx.destroy();
+        return res;
+    }
+
+    const uint32_t rw = 128, rh = 128;
+    ID3D12Resource* rtvTex = createD3D12RTTexture(ctx.dev, rw, rh);
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHD{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ID3D12DescriptorHeap* rtvHeap = nullptr;
+    ctx.dev->CreateDescriptorHeap(&rtvHD, IID_PPV_ARGS(&rtvHeap));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    ctx.dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
+    ID3D12Resource* cbBuf = createD3D12Buffer(ctx.dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* rbBuf = createD3D12Buffer(ctx.dev, static_cast<size_t>(rw) * rh * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    auto runMesh = [&](uint32_t groups) -> double {
+        void* p = nullptr;
+        if (SUCCEEDED(cbBuf->Map(0, nullptr, &p)) && p) {
+            struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
+            std::memcpy(p, &cb, sizeof(cb));
+            cbBuf->Unmap(0, nullptr);
+        }
+
+        auto s0 = std::chrono::steady_clock::now();
+        D3D12_RESOURCE_BARRIER b0{};
+        b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b0.Transition.pResource = rtvTex;
+        b0.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b0.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ctx.cmd->ResourceBarrier(1, &b0);
+
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(rw), static_cast<LONG>(rh)};
+        const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        ctx.cmd->SetGraphicsRootSignature(rootSig);
+        ctx.cmd->SetPipelineState(pso);
+        ctx.cmd->SetGraphicsRootConstantBufferView(0, cbBuf->GetGPUVirtualAddress());
+        ctx.cmd->RSSetViewports(1, &vp);
+        ctx.cmd->RSSetScissorRects(1, &sc);
+        ctx.cmd->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        cmd6->DispatchMesh(groups, 1, 1);
+
+        D3D12_RESOURCE_BARRIER b1 = b0;
+        b1.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b1.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        ctx.cmd->ResourceBarrier(1, &b1);
+        ctx.cmd->Close();
+
+        ID3D12CommandList* lists[] = {ctx.cmd};
+        ctx.queue->ExecuteCommandLists(1, lists);
+        ctx.waitFence();
+        ctx.alloc->Reset();
+        ctx.cmd->Reset(ctx.alloc, nullptr);
+        auto s1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(s1 - s0).count();
+    };
+
+    res.firstDispatchMs = runMesh(128);
+    runMesh(128);
+
+    std::vector<double> samples;
+    samples.reserve(iters);
+    for (uint32_t i = 0; i < iters; ++i) {
+        samples.push_back(runMesh(128));
+    }
+
+    D3D12_RESOURCE_BARRIER rb0{};
+    rb0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    rb0.Transition.pResource = rtvTex;
+    rb0.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    rb0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    rb0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ctx.cmd->ResourceBarrier(1, &rb0);
+    D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+    dstLoc.pResource = rbBuf;
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dstLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dstLoc.PlacedFootprint.Footprint.Width = rw;
+    dstLoc.PlacedFootprint.Footprint.Height = rh;
+    dstLoc.PlacedFootprint.Footprint.Depth = 1;
+    dstLoc.PlacedFootprint.Footprint.RowPitch = rw * 4;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc{};
+    srcLoc.pResource = rtvTex;
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    ctx.cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+    D3D12_RESOURCE_BARRIER rb1 = rb0;
+    rb1.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    rb1.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    ctx.cmd->ResourceBarrier(1, &rb1);
+    ctx.cmd->Close();
+    ID3D12CommandList* copyLists[] = {ctx.cmd};
+    ctx.queue->ExecuteCommandLists(1, copyLists);
+    ctx.waitFence();
+    ctx.alloc->Reset();
+    ctx.cmd->Reset(ctx.alloc, nullptr);
+
+    const uint8_t* px = nullptr;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(rw) * rh * 4};
+    if (SUCCEEDED(rbBuf->Map(0, &range, reinterpret_cast<void**>(const_cast<uint8_t**>(&px)))) && px) {
+        double sum = 0.0;
+        for (size_t i = 0; i < static_cast<size_t>(rw) * rh * 4; ++i) sum += px[i];
+        rbBuf->Unmap(0, nullptr);
+        res.checksum = sum;
+    }
+
+    res.shortJobMs = runMesh(16);
+    res.longJobMs = runMesh(512);
+
+    finalizeTimingAndMemory(res, memBefore, memAfterCompile, samples);
+
+    rbBuf->Release();
+    cbBuf->Release();
+    rtvHeap->Release();
+    rtvTex->Release();
+    pso->Release();
+    rootSig->Release();
+    cmd6->Release();
+    dev2->Release();
+    ctx.destroy();
+    return res;
+}
+
 } // namespace nacelle_bench
 #endif // _WIN32

@@ -41,6 +41,12 @@ MetalBenchResult runMetalGraphicsBench(
     const std::vector<uint8_t>& dsDxil = {},
     const std::vector<uint8_t>& gsDxil = {});
 
+MetalBenchResult runMetalMeshBench(
+    const std::string& benchId,
+    const std::vector<uint8_t>& msDxil,
+    const std::vector<uint8_t>& psDxil,
+    uint32_t iters);
+
 MetalBenchResult runMetalRaytracingBench(
     const std::string& benchId,
     bool isInline,

@@ -63,6 +63,16 @@ int main(int argc, char** argv) {
                 MemorySnapshot memAfter = queryProcessMemory();
                 recordMetal(mr, memBefore, memAfter);
             }
+        } else if (spec.kind == PipelineKind::GraphicsMSPS &&
+                   !spec.msDxil.empty() && !spec.psDxil.empty()) {
+            std::vector<uint8_t> msDxil, psDxil;
+            if (readBinary(args.shaderDir + "/" + spec.msDxil, msDxil) &&
+                readBinary(args.shaderDir + "/" + spec.psDxil, psDxil)) {
+                MemorySnapshot memBefore = queryProcessMemory();
+                auto mr = runMetalMeshBench(spec.id, msDxil, psDxil, args.iters);
+                MemorySnapshot memAfter = queryProcessMemory();
+                recordMetal(mr, memBefore, memAfter);
+            }
         } else if ((spec.kind == PipelineKind::RayTracingInline ||
                     spec.kind == PipelineKind::RayTracingPipeline) &&
                    !spec.rtDxil.empty()) {

@@ -57,7 +57,15 @@ int main(int argc, char** argv) {
                 auto vkRes = runVulkanGraphicsBench(spec, vsSpv, psSpv, args.width, args.height, args.iters, devIdx, gsSpv, hsSpv, dsSpv);
                 out.insert(out.end(), vkRes.begin(), vkRes.end());
             }
-        } else if ((spec.kind == PipelineKind::RayTracingInline || spec.kind == PipelineKind::RayTracingPipeline) &&
+        } else if (spec.kind == PipelineKind::GraphicsMSPS && !spec.msSpv.empty() && !spec.psSpv.empty()) {
+            std::vector<uint8_t> msSpv, psSpv;
+            std::string err;
+            if (readBinary(args.shaderDir + "/" + spec.msSpv, msSpv) && validateSpirvBinary(msSpv, err) &&
+                readBinary(args.shaderDir + "/" + spec.psSpv, psSpv) && validateSpirvBinary(psSpv, err)) {
+                auto vkRes = runVulkanMeshBench(spec, msSpv, psSpv, args.iters, devIdx);
+                out.insert(out.end(), vkRes.begin(), vkRes.end());
+            }
+        } else if ((spec.kind == PipelineKind::RayTracingInline || PipelineKind::RayTracingPipeline == spec.kind) &&
                    !spec.csSpv.empty()) {
             std::vector<uint8_t> rtSpv;
             std::string err;

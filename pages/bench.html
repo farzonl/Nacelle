@@ -390,6 +390,29 @@
       border: 1px solid var(--border);
       border-radius: var(--radius);
       padding: 1rem 1.1rem;
+      text-align: left;
+      font: inherit;
+      color: inherit;
+    }
+
+    button.winner-card {
+      cursor: pointer;
+      transition: border-color 0.15s ease, background-color 0.15s ease, transform 0.12s ease;
+    }
+
+    button.winner-card:hover {
+      border-color: var(--accent);
+      background: var(--surface-alt);
+    }
+
+    button.winner-card:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    button.winner-card.active-scope {
+      border-color: var(--accent);
+      background: var(--surface-alt);
     }
 
     .winner-card .w-label {
@@ -429,6 +452,102 @@
       font-family: var(--font-mono);
       font-size: 0.82rem;
       padding: 0.42rem 0.85rem;
+    }
+
+    select.meta-pill {
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    select.meta-pill optgroup {
+      font-family: var(--font-sans);
+      font-size: 0.78rem;
+      font-weight: 700;
+      line-height: 1.5;
+      color: var(--muted);
+      background: var(--surface);
+      padding: 0.35rem 0.5rem 0.15rem;
+      white-space: nowrap;
+    }
+
+    select.meta-pill option {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      font-weight: 400;
+      line-height: 1.5;
+      color: var(--text);
+      background: var(--surface);
+      padding: 0.35rem 0.6rem;
+      white-space: nowrap;
+    }
+
+    @supports (appearance: base-select) {
+      select.meta-pill,
+      select.meta-pill::picker(select) {
+        appearance: base-select;
+      }
+
+      select.meta-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+
+      select.meta-pill::picker-icon {
+        color: var(--muted);
+        transition: transform 0.15s ease;
+      }
+
+      select.meta-pill:open::picker-icon {
+        transform: rotate(180deg);
+      }
+
+      select.meta-pill::picker(select) {
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 0.4rem;
+        margin-block-start: 0.35rem;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+        min-inline-size: anchor-size(inline-size);
+        inline-size: max-content;
+        max-inline-size: min(92vw, 34rem);
+        max-block-size: min(60vh, 26rem);
+        overflow-y: auto;
+      }
+
+      select.meta-pill optgroup {
+        padding: 0.45rem 0.55rem 0.2rem;
+        letter-spacing: 0.03em;
+      }
+
+      select.meta-pill optgroup:not(:first-child) {
+        margin-top: 0.25rem;
+        border-top: 1px solid var(--border);
+        padding-top: 0.55rem;
+      }
+
+      select.meta-pill option {
+        border-radius: 6px;
+        cursor: pointer;
+        padding: 0.38rem 0.6rem;
+      }
+
+      select.meta-pill option:hover,
+      select.meta-pill option:focus-visible {
+        background: var(--surface-alt);
+        color: var(--accent);
+      }
+
+      select.meta-pill option:checked {
+        font-weight: 600;
+        color: var(--accent);
+      }
+
+      select.meta-pill option::checkmark {
+        color: var(--accent);
+      }
     }
 
     button.meta-pill:disabled {
@@ -533,7 +652,7 @@
     <section class="card" aria-labelledby="winners-title">
       <div class="card-header">
         <h2 id="winners-title">Category &amp; Regime Winners</h2>
-        <span class="meta-pill" id="overall-winner-pill">Overall Winner: —</span>
+        <button type="button" class="meta-pill" id="overall-winner-pill" data-scope="overall:all:medianMs">Overall Winner: —</button>
       </div>
       <div class="winners-grid" id="winners-grid"></div>
     </section>
@@ -738,7 +857,7 @@
       return fam ? (fam.cssVarName ? `var(${fam.cssVarName})` : fam.color) : "var(--accent)";
     }
 
-    function extractMetrics(entry, trendKey = "shader:bench_raymarch:medianMs") {
+    function extractMetrics(entry, trendKey = "overall:all:medianMs") {
       const suites = getEntrySuites(entry).filter(r => r.ran);
       const pickGroup = (items, field, agg = "min") => {
         if (!items.length) return null;
@@ -766,13 +885,18 @@
 
       if (mode === "overall") {
         const gms = entry.overallGeomeanMs || {};
+        const hasGms = Object.keys(gms).length > 0;
         const out = { unit: "ms" };
         for (const f of BACKEND_FAMILIES) {
-          let bestB = null, bestMs = Infinity;
-          for (const [b, ms] of Object.entries(gms)) {
-            if (f.match(b.toLowerCase()) && ms > 0 && ms < bestMs) { bestMs = ms; bestB = b; }
+          if (hasGms) {
+            let bestB = null, bestMs = Infinity;
+            for (const [b, ms] of Object.entries(gms)) {
+              if (f.match(b.toLowerCase()) && ms > 0 && ms < bestMs) { bestMs = ms; bestB = b; }
+            }
+            out[f.key] = bestB ? { val: bestMs, backend: bestB, minMs: bestMs } : null;
+          } else {
+            out[f.key] = pickGroup(buckets[f.key], "medianMs", "geomean");
           }
-          out[f.key] = bestB ? { val: bestMs, backend: bestB, minMs: bestMs } : null;
         }
         return out;
       }
@@ -801,7 +925,7 @@
     }
 
     function getGlobalScope() {
-      return document.getElementById("global-scope")?.value || "shader:bench_raymarch:medianMs";
+      return document.getElementById("global-scope")?.value || "overall:all:medianMs";
     }
 
     function getMemoryScopeKey(scope) {
@@ -855,6 +979,48 @@
       if (entry.runUrl) pill.href = entry.runUrl;
     }
 
+    function scopeForCategoryWinner(category) {
+      const scope = `cat:${category}:medianMs`;
+      const sel = document.getElementById("global-scope");
+      return sel && [...sel.options].some(o => o.value === scope) ? scope : null;
+    }
+
+    function scopeForRegimeWinner(regime) {
+      const map = {
+        "Cold JIT": "regime:all:coldMs",
+        "Hot JIT": "regime:all:medianMs",
+        "Short-Running Job": "regime:all:shortJobMs",
+        "Long-Running Job": "regime:all:longJobMs",
+        "Lowest Peak Memory": "regime:all:peakRssMb",
+      };
+      const scope = map[regime] || null;
+      if (!scope) return null;
+      const sel = document.getElementById("global-scope");
+      return sel && [...sel.options].some(o => o.value === scope) ? scope : null;
+    }
+
+    function syncActiveWinnerCard() {
+      const activeScope = getGlobalScope();
+      document.querySelectorAll("#winners-grid button.winner-card[data-scope]").forEach((btn) => {
+        const isActive = btn.dataset.scope === activeScope;
+        btn.classList.toggle("active-scope", isActive);
+        btn.setAttribute("aria-pressed", String(isActive));
+      });
+      const overallPill = document.getElementById("overall-winner-pill");
+      if (overallPill) {
+        const isOverall = activeScope === "overall:all:medianMs";
+        overallPill.setAttribute("aria-pressed", String(isOverall));
+      }
+    }
+
+    function selectGlobalScope(scope) {
+      const sel = document.getElementById("global-scope");
+      if (!sel || !scope) return;
+      if (![...sel.options].some(o => o.value === scope)) return;
+      sel.value = scope;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
     function renderWinners(entry) {
       const grid = document.getElementById("winners-grid");
       const overallPill = document.getElementById("overall-winner-pill");
@@ -868,22 +1034,27 @@
       const cards = [];
       for (const c of cats) {
         const val = c.geomean_ms || 0;
-        cards.push(`
-          <div class="winner-card">
+        const scope = val > 0 ? scopeForCategoryWinner(c.category) : null;
+        const inner = `
             <div class="w-label">${escapeHtml(c.category)} Winner</div>
             <div class="w-val">${escapeHtml(c.winner || "N/A")}</div>
-            <div class="w-sub">${val > 0 ? Number(val).toFixed(2) + " ms" : "—"}</div>
-          </div>`);
+            <div class="w-sub">${val > 0 ? Number(val).toFixed(2) + " ms" : "—"}</div>`;
+        cards.push(scope
+          ? `<button type="button" class="winner-card" data-scope="${escapeHtml(scope)}">${inner}</button>`
+          : `<div class="winner-card">${inner}</div>`);
       }
       for (const r of regs) {
-        cards.push(`
-          <div class="winner-card">
+        const scope = r.value > 0 ? scopeForRegimeWinner(r.regime) : null;
+        const inner = `
             <div class="w-label">${escapeHtml(r.regime)}</div>
             <div class="w-val">${escapeHtml(r.winner || "N/A")}</div>
-            <div class="w-sub">${r.value > 0 ? Number(r.value).toFixed(2) + " " + escapeHtml(r.unit || "") : "—"}</div>
-          </div>`);
+            <div class="w-sub">${r.value > 0 ? Number(r.value).toFixed(2) + " " + escapeHtml(r.unit || "") : "—"}</div>`;
+        cards.push(scope
+          ? `<button type="button" class="winner-card" data-scope="${escapeHtml(scope)}">${inner}</button>`
+          : `<div class="winner-card">${inner}</div>`);
       }
       grid.innerHTML = cards.length ? cards.join("") : `<p style="color:var(--muted)">Single-shader legacy entry (upgrade CI to v2 for full category winners).</p>`;
+      syncActiveWinnerCard();
     }
 
     let suiteFilter = "avg:all";
@@ -1261,6 +1432,7 @@
         { val: "regime:all:medianMs", label: "Regime: Hot JIT Time (geomean ms)" },
         { val: "regime:all:shortJobMs", label: "Regime: Short-Running Job (geomean ms)" },
         { val: "regime:all:longJobMs", label: "Regime: Long-Running Job (geomean ms)" },
+        { val: "regime:all:peakRssMb", label: "Regime: Lowest Peak Memory (geomean MB)" },
       ];
       const stageOpts = [
         { val: "cat:Compute:medianMs", label: "Stage Avg: Compute (ms)" },
@@ -1269,6 +1441,7 @@
         { val: "cat:Geometry:medianMs", label: "Stage Avg: Geometry (ms)" },
         { val: "cat:Tessellation:medianMs", label: "Stage Avg: Tessellation (ms)" },
         { val: "cat:Ray Tracing:medianMs", label: "Stage Avg: Ray Tracing (ms)" },
+        { val: "cat:Mesh:medianMs", label: "Stage Avg: Mesh (ms)" },
       ];
       const shaderOpts = [...seenShaders.entries()].map(([id, info]) => ({
         val: `shader:${id}:medianMs`,
@@ -1282,7 +1455,7 @@
         renderGroup("Overall & Regimes", overallOpts) +
         renderGroup("Per-Stage Averages", stageOpts) +
         renderGroup("Individual Shaders", shaderOpts);
-      sel.value = "shader:bench_raymarch:medianMs";
+      sel.value = "overall:all:medianMs";
     }
 
     function selectCommit(idx) {
@@ -1356,6 +1529,14 @@
         renderKPIs(selectedIndex);
         renderCommitData(benchHistory[selectedIndex]);
         drawTrendChart();
+        syncActiveWinnerCard();
+      });
+      document.getElementById("winners-grid")?.addEventListener("click", (e) => {
+        const btn = e.target.closest("button.winner-card[data-scope]");
+        if (btn) selectGlobalScope(btn.dataset.scope);
+      });
+      document.getElementById("overall-winner-pill")?.addEventListener("click", () => {
+        selectGlobalScope("overall:all:medianMs");
       });
       document.getElementById("commit-window")?.addEventListener("change", () => {
         drawTrendChart();
