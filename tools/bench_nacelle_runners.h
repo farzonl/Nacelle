@@ -13,40 +13,6 @@
 
 namespace nacelle_bench {
 
-struct RaymarchCB {
-    uint32_t width;
-    uint32_t height;
-    uint32_t maxSteps;
-    float time;
-};
-
-struct MatmulCB {
-    uint32_t M;
-    uint32_t N;
-    uint32_t K;
-    uint32_t pad;
-};
-
-struct ShadertoyCB {
-    float resX, resY, resZ;
-    float iTime;
-    float mouseX, mouseY, mouseZ, mouseW;
-};
-
-struct VertexStressCB {
-    float mvp[16];
-    float time;
-    uint32_t vertexCount;
-    float pad[2];
-};
-
-struct GeomStressCB {
-    float scale;
-    float time;
-    uint32_t pointCount;
-    float pad;
-};
-
 inline ID3D12Resource* createNacelleBuffer(ID3D12Device* dev, size_t bytes, bool allowUAV = true) {
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_CUSTOM;

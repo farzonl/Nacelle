@@ -144,6 +144,40 @@ inline std::string jsonEscape(const std::string& s) {
     return os.str();
 }
 
+struct RaymarchCB {
+    uint32_t width;
+    uint32_t height;
+    uint32_t maxSteps;
+    float time;
+};
+
+struct MatmulCB {
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t pad;
+};
+
+struct ShadertoyCB {
+    float resX, resY, resZ;
+    float iTime;
+    float mouseX, mouseY, mouseZ, mouseW;
+};
+
+struct VertexStressCB {
+    float mvp[16];
+    float time;
+    uint32_t vertexCount;
+    float pad[2];
+};
+
+struct GeomStressCB {
+    float scale;
+    float time;
+    uint32_t pointCount;
+    float pad;
+};
+
 struct MeshBenchVertex {
     float px, py, pz;          // offset 0:  R32G32B32_FLOAT    (POSITION0)
     int16_t nx, ny, nz, nw;    // offset 12: R16G16B16A16_SNORM (NORMAL0)

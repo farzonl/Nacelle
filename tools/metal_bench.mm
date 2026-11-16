@@ -19,45 +19,6 @@ namespace nacelle_bench {
 
 namespace {
 
-struct RaymarchCB {
-    uint32_t width;
-    uint32_t height;
-    uint32_t maxSteps;
-    float time;
-};
-
-struct MatmulCB {
-    uint32_t M;
-    uint32_t N;
-    uint32_t K;
-    uint32_t pad;
-};
-
-struct ShadertoyCB {
-    float resX;
-    float resY;
-    float time;
-    float timeDelta;
-    float mouseX;
-    float mouseY;
-    float mouseZ;
-    float mouseW;
-};
-
-struct VertexStressCB {
-    float mvp[16];
-    float time;
-    uint32_t vertexCount;
-    float pad[2];
-};
-
-struct GeomStressCB {
-    float scale;
-    float time;
-    uint32_t pointCount;
-    float pad;
-};
-
 void finalizeSamples(MetalBenchResult& res, const std::vector<double>& samples) {
     if (samples.empty()) return;
     double sum = 0.0;
