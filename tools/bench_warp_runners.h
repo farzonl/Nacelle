@@ -33,6 +33,12 @@ inline std::string wideToUtf8(const WCHAR* wstr) {
     return out;
 }
 
+inline bool isSoftwareOrBasicRenderAdapter(const DXGI_ADAPTER_DESC1& desc) {
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) return true;
+    // Microsoft Basic Render Driver (WARP) may be enumerated without FLAG_SOFTWARE on VMs.
+    return desc.VendorId == 0x1414 && desc.DeviceId == 0x008c;
+}
+
 inline bool selectD3D12Adapter(
     IDXGIFactory4* factory,
     PFN_D3D12CreateDeviceFn pD3D12CreateDevice,
@@ -63,7 +69,7 @@ inline bool selectD3D12Adapter(
         if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc{};
         a->GetDesc1(&desc);
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+        if (isSoftwareOrBasicRenderAdapter(desc)) {
             a->Release();
             continue;
         }
@@ -128,7 +134,7 @@ inline std::vector<D3D12DeviceInfo> listD3D12Devices() {
             if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
             DXGI_ADAPTER_DESC1 desc{};
             a->GetDesc1(&desc);
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            if (!isSoftwareOrBasicRenderAdapter(desc) &&
                 SUCCEEDED(pD3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
                 std::string name = wideToUtf8(desc.Description);
                 out.push_back({idx++, name.empty() ? "DirectX 12" : ("DirectX 12: " + name), false});
