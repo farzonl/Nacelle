@@ -346,11 +346,6 @@ add_test(
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_nacelle_bench_harness.py"
             --nacelle-bench $<TARGET_FILE:nacelle-bench>
 )
-add_test(
-    NAME nacelle_bench_harness_test
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_nacelle_bench_harness.py"
-            --nacelle-bench $<TARGET_FILE:nacelle-bench>
-)
 
 # Viewer smoke tests (headless + SDL3 dummy driver when SDL3 is enabled)
 add_test(
