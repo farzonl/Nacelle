@@ -229,6 +229,61 @@ target_include_directories(nacelle_objs SYSTEM PRIVATE
 target_compile_definitions(nacelle_objs PRIVATE ${LLVM_DEFS_LIST})
 target_link_libraries(nacelle_objs PUBLIC Microsoft::DirectX-Headers Microsoft::DirectX-Guids)
 
+option(NACELLE_USE_OPENBLAS "Use OpenBLAS/BLAS for CPU GEMM on non-Apple platforms" ON)
+set(NACELLE_CBLAS_FOUND OFF)
+set(NACELLE_CBLAS_LINK_LIBS "")
+set(NACELLE_CBLAS_INC_DIR "")
+set(NACELLE_CBLAS_HEADER_NAME "cblas.h")
+set(NACELLE_OPENBLAS_DLL "")
+
+if(NOT APPLE AND NACELLE_USE_OPENBLAS)
+    find_package(OpenBLAS CONFIG QUIET)
+    if(TARGET OpenBLAS::OpenBLAS)
+        set(NACELLE_CBLAS_LINK_LIBS OpenBLAS::OpenBLAS)
+    else()
+        set(_nacelle_prev_bla_vendor "${BLA_VENDOR}")
+        set(BLA_VENDOR OpenBLAS)
+        find_package(BLAS QUIET)
+        if(NOT BLAS_FOUND)
+            set(BLA_VENDOR All)
+            find_package(BLAS QUIET)
+        endif()
+        set(BLA_VENDOR "${_nacelle_prev_bla_vendor}")
+        if(BLAS_FOUND)
+            set(NACELLE_CBLAS_LINK_LIBS ${BLAS_LIBRARIES})
+        endif()
+    endif()
+
+    find_path(NACELLE_CBLAS_INC_DIR
+        NAMES cblas.h openblas/cblas.h
+        PATH_SUFFIXES include include/openblas openblas
+    )
+    if(NACELLE_CBLAS_LINK_LIBS AND NACELLE_CBLAS_INC_DIR)
+        if(EXISTS "${NACELLE_CBLAS_INC_DIR}/openblas/cblas.h" AND NOT EXISTS "${NACELLE_CBLAS_INC_DIR}/cblas.h")
+            set(NACELLE_CBLAS_HEADER_NAME "openblas/cblas.h")
+        endif()
+        set(NACELLE_CBLAS_FOUND ON)
+        message(STATUS "Found CBLAS/OpenBLAS: libs=${NACELLE_CBLAS_LINK_LIBS}, include=${NACELLE_CBLAS_INC_DIR} (${NACELLE_CBLAS_HEADER_NAME})")
+        if(WIN32)
+            find_file(NACELLE_OPENBLAS_DLL
+                NAMES libopenblas.dll openblas.dll
+                HINTS "${NACELLE_CBLAS_INC_DIR}/.."
+                PATH_SUFFIXES bin lib
+            )
+        endif()
+    else()
+        message(STATUS "OpenBLAS/CBLAS not found; non-Apple GEMM will use parallel fallbackGemm")
+    endif()
+endif()
+
+if(NACELLE_CBLAS_FOUND)
+    target_include_directories(nacelle_objs SYSTEM PRIVATE "${NACELLE_CBLAS_INC_DIR}")
+    target_compile_definitions(nacelle_objs PRIVATE
+        NACELLE_HAS_CBLAS=1
+        "NACELLE_CBLAS_HEADER=<${NACELLE_CBLAS_HEADER_NAME}>"
+    )
+endif()
+
 # Static library: libnacelle
 add_library(nacelle STATIC $<TARGET_OBJECTS:nacelle_objs>)
 target_include_directories(nacelle PUBLIC
@@ -245,6 +300,13 @@ target_link_libraries(nacelle
 )
 if(UNIX AND NOT APPLE)
     target_link_libraries(nacelle PRIVATE pthread dl)
+    if(NACELLE_CBLAS_FOUND)
+        target_link_libraries(nacelle PUBLIC ${NACELLE_CBLAS_LINK_LIBS})
+    endif()
+elseif(WIN32)
+    if(NACELLE_CBLAS_FOUND)
+        target_link_libraries(nacelle PUBLIC ${NACELLE_CBLAS_LINK_LIBS})
+    endif()
 elseif(APPLE)
     target_link_libraries(nacelle PRIVATE "-framework Accelerate")
 endif()
@@ -272,6 +334,13 @@ if(NOT WIN32)
 endif()
 target_include_directories(nacelle_d3d12 SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 target_compile_definitions(nacelle_d3d12 PRIVATE ${LLVM_DEFS_LIST} NACELLE_EXPORT_D3D12_SYMBOLS)
+if(NACELLE_CBLAS_FOUND)
+    target_include_directories(nacelle_d3d12 SYSTEM PRIVATE "${NACELLE_CBLAS_INC_DIR}")
+    target_compile_definitions(nacelle_d3d12 PRIVATE
+        NACELLE_HAS_CBLAS=1
+        "NACELLE_CBLAS_HEADER=<${NACELLE_CBLAS_HEADER_NAME}>"
+    )
+endif()
 target_link_libraries(nacelle_d3d12
     PUBLIC
         Microsoft::DirectX-Headers
@@ -282,6 +351,13 @@ target_link_libraries(nacelle_d3d12
 )
 if(UNIX AND NOT APPLE)
     target_link_libraries(nacelle_d3d12 PRIVATE pthread dl)
+    if(NACELLE_CBLAS_FOUND)
+        target_link_libraries(nacelle_d3d12 PRIVATE ${NACELLE_CBLAS_LINK_LIBS})
+    endif()
+elseif(WIN32)
+    if(NACELLE_CBLAS_FOUND)
+        target_link_libraries(nacelle_d3d12 PRIVATE ${NACELLE_CBLAS_LINK_LIBS})
+    endif()
 elseif(APPLE)
     target_link_libraries(nacelle_d3d12 PRIVATE "-framework Accelerate")
 endif()
@@ -482,7 +558,17 @@ if(SDL3_FOUND OR TARGET SDL3::SDL3)
     message(STATUS "Found SDL3; enabling windowed mode in nacelle_viewer")
     target_compile_definitions(nacelle_viewer PRIVATE NACELLE_HAS_SDL3=1)
     target_link_libraries(nacelle_viewer PRIVATE SDL3::SDL3)
-    if(WIN32 AND TARGET SDL3::SDL3-shared)
+    if(WIN32 AND NACELLE_OPENBLAS_DLL)
+    add_custom_command(TARGET nacelle_d3d12 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NACELLE_OPENBLAS_DLL}"
+            "$<TARGET_FILE_DIR:nacelle_d3d12>"
+    )
+    install(FILES "${NACELLE_OPENBLAS_DLL}"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+endif()
+if(WIN32 AND TARGET SDL3::SDL3-shared)
         add_custom_command(TARGET nacelle_viewer POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:SDL3::SDL3-shared>"
@@ -515,6 +601,16 @@ install(TARGETS nacelle-compile nacelle_viewer
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
+if(WIN32 AND NACELLE_OPENBLAS_DLL)
+    add_custom_command(TARGET nacelle_d3d12 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NACELLE_OPENBLAS_DLL}"
+            "$<TARGET_FILE_DIR:nacelle_d3d12>"
+    )
+    install(FILES "${NACELLE_OPENBLAS_DLL}"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+endif()
 if(WIN32 AND TARGET SDL3::SDL3-shared)
     install(FILES "$<TARGET_FILE:SDL3::SDL3-shared>"
         DESTINATION "${CMAKE_INSTALL_BINDIR}"
