@@ -180,20 +180,23 @@ def main() -> None:
             indent=2,
         )
 
-    # Preserve Windows benchmark history if already deployed on Pages
-    if args.pages_url and not (data_dir / "bench-history.json").exists():
-        try:
-            req = urllib.request.Request(
-                args.pages_url.rstrip("/") + "/data/bench-history.json",
-                headers={"User-Agent": "Nacelle-Compliance-CI"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                bench_hist = json.loads(resp.read().decode("utf-8"))
-                if isinstance(bench_hist, list):
-                    with open(data_dir / "bench-history.json", "w", encoding="utf-8") as f:
-                        json.dump(bench_hist, f, indent=2)
-        except Exception:
-            pass
+    # Preserve Windows and macOS benchmark histories if already deployed on Pages
+    if args.pages_url:
+        for fname in ("bench-history.json", "bench-history-macos.json"):
+            if (data_dir / fname).exists():
+                continue
+            try:
+                req = urllib.request.Request(
+                    args.pages_url.rstrip("/") + f"/data/{fname}",
+                    headers={"User-Agent": "Nacelle-Compliance-CI"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    bench_hist = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(bench_hist, list):
+                        with open(data_dir / fname, "w", encoding="utf-8") as f:
+                            json.dump(bench_hist, f, indent=2)
+            except Exception:
+                pass
 
     print(
         f"Recorded {entry['shortSha']}: {entry['passed']}/{entry['total']} passed "
