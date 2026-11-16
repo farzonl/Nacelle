@@ -16,6 +16,139 @@
 
 namespace nacelle_bench {
 
+struct D3D12DeviceInfo {
+    uint32_t index = 0;
+    std::string backendName;
+    bool isWarp = false;
+};
+
+using PFN_D3D12CreateDeviceFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+
+inline std::string wideToUtf8(const WCHAR* wstr) {
+    if (!wstr || !wstr[0]) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return "";
+    std::string out(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+inline bool selectD3D12Adapter(
+    IDXGIFactory4* factory,
+    PFN_D3D12CreateDeviceFn pD3D12CreateDevice,
+    int32_t targetIdx,
+    bool forceWarp,
+    IDXGIAdapter1** outAdapter,
+    std::string& outBackendName,
+    std::string& outErr) {
+    *outAdapter = nullptr;
+    if (forceWarp) {
+        IDXGIAdapter1* warp = nullptr;
+        if (FAILED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&warp))) || !warp) {
+            outErr = "SKIPPED (WARP adapter unavailable)";
+            return false;
+        }
+        *outAdapter = warp;
+        outBackendName = "Microsoft WARP";
+        return true;
+    }
+
+    struct Cand {
+        IDXGIAdapter1* adapter = nullptr;
+        std::string name;
+    };
+    std::vector<Cand> cands;
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1* a = nullptr;
+        if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        a->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+            a->Release();
+            continue;
+        }
+        if (SUCCEEDED(pD3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
+            std::string name = wideToUtf8(desc.Description);
+            cands.push_back({a, name.empty() ? "DirectX 12" : ("DirectX 12: " + name)});
+        } else {
+            a->Release();
+        }
+    }
+
+    IDXGIAdapter1* warp = nullptr;
+    if (SUCCEEDED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&warp))) && warp) {
+        if (SUCCEEDED(pD3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
+            cands.push_back({warp, "Microsoft WARP"});
+        } else {
+            warp->Release();
+        }
+    }
+
+    if (cands.empty()) {
+        outErr = "SKIPPED (no D3D12 adapters available)";
+        return false;
+    }
+
+    size_t idx = (targetIdx >= 0) ? static_cast<size_t>(targetIdx) : 0;
+    if (idx >= cands.size()) {
+        for (auto& c : cands) c.adapter->Release();
+        outErr = "SKIPPED (D3D12 device index out of range)";
+        return false;
+    }
+
+    for (size_t i = 0; i < cands.size(); ++i) {
+        if (i == idx) {
+            *outAdapter = cands[i].adapter;
+            outBackendName = cands[i].name;
+        } else {
+            cands[i].adapter->Release();
+        }
+    }
+    return true;
+}
+
+inline std::vector<D3D12DeviceInfo> listD3D12Devices() {
+    std::vector<D3D12DeviceInfo> out;
+    HMODULE dxgiLib = LoadLibraryA("dxgi.dll");
+    HMODULE d3d12Lib = LoadLibraryA("d3d12.dll");
+    if (!dxgiLib || !d3d12Lib) {
+        if (dxgiLib) FreeLibrary(dxgiLib);
+        if (d3d12Lib) FreeLibrary(d3d12Lib);
+        return out;
+    }
+    using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
+    auto pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiLib, "CreateDXGIFactory1"));
+    auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDeviceFn>(GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
+    IDXGIFactory4* factory = nullptr;
+    if (pCreateDXGIFactory1 && pD3D12CreateDevice &&
+        SUCCEEDED(pCreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory))) && factory) {
+        uint32_t idx = 0;
+        for (UINT i = 0;; ++i) {
+            IDXGIAdapter1* a = nullptr;
+            if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 desc{};
+            a->GetDesc1(&desc);
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                SUCCEEDED(pD3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
+                std::string name = wideToUtf8(desc.Description);
+                out.push_back({idx++, name.empty() ? "DirectX 12" : ("DirectX 12: " + name), false});
+            }
+            a->Release();
+        }
+        IDXGIAdapter1* warp = nullptr;
+        if (SUCCEEDED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&warp))) && warp) {
+            if (SUCCEEDED(pD3D12CreateDevice(warp, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
+                out.push_back({idx++, "Microsoft WARP", true});
+            }
+            warp->Release();
+        }
+        factory->Release();
+    }
+    FreeLibrary(d3d12Lib);
+    FreeLibrary(dxgiLib);
+    return out;
+}
+
 struct WarpDeviceContext {
     HMODULE dxgiLib = nullptr;
     HMODULE d3d12Lib = nullptr;
@@ -28,12 +161,13 @@ struct WarpDeviceContext {
     ID3D12Fence* fence = nullptr;
     HANDLE fenceEvent = nullptr;
     uint64_t fenceVal = 1;
+    std::string backendName = "Microsoft WARP";
 
     using PFN_D3D12SerializeRootSignature = HRESULT(WINAPI*)(
         const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
     PFN_D3D12SerializeRootSignature pSerializeRS = nullptr;
 
-    bool init(std::string& outErr) {
+    bool init(std::string& outErr, int32_t targetDeviceIdx = -1, bool forceWarp = false) {
         dxgiLib = LoadLibraryA("dxgi.dll");
         d3d12Lib = LoadLibraryA("d3d12.dll");
         if (!dxgiLib || !d3d12Lib) {
@@ -42,9 +176,8 @@ struct WarpDeviceContext {
             return false;
         }
         using PFN_CreateDXGIFactory1 = HRESULT(WINAPI*)(REFIID, void**);
-        using PFN_D3D12CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
         auto pCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(GetProcAddress(dxgiLib, "CreateDXGIFactory1"));
-        auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
+        auto pD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDeviceFn>(GetProcAddress(d3d12Lib, "D3D12CreateDevice"));
         pSerializeRS = reinterpret_cast<PFN_D3D12SerializeRootSignature>(GetProcAddress(d3d12Lib, "D3D12SerializeRootSignature"));
         if (!pCreateDXGIFactory1 || !pD3D12CreateDevice || !pSerializeRS) {
             outErr = "SKIPPED (D3D12 entry points missing)";
@@ -56,13 +189,12 @@ struct WarpDeviceContext {
             destroy();
             return false;
         }
-        if (FAILED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter))) || !adapter) {
-            outErr = "SKIPPED (WARP adapter unavailable)";
+        if (!selectD3D12Adapter(factory, pD3D12CreateDevice, targetDeviceIdx, forceWarp, &adapter, backendName, outErr)) {
             destroy();
             return false;
         }
         if (FAILED(pD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) {
-            outErr = "FAILED (WARP D3D12CreateDevice)";
+            outErr = "FAILED (D3D12CreateDevice)";
             destroy();
             return false;
         }
@@ -138,7 +270,9 @@ inline BenchRunResult runWarpGraphicsBench(
     const std::vector<uint8_t>& ps,
     uint32_t width,
     uint32_t height,
-    uint32_t iters) {
+    uint32_t iters,
+    int32_t targetDeviceIdx = -1,
+    bool forceWarp = false) {
     BenchRunResult res;
     res.benchId = spec.id;
     res.benchName = spec.name;
@@ -149,10 +283,11 @@ inline BenchRunResult runWarpGraphicsBench(
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;
     std::string initErr;
-    if (!ctx.init(initErr)) {
+    if (!ctx.init(initErr, targetDeviceIdx, forceWarp)) {
         res.status = initErr;
         return res;
     }
+    res.backend = ctx.backendName;
 
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -488,7 +623,9 @@ inline BenchRunResult runWarpRaytracingBench(
     const std::vector<uint8_t>& dxil,
     uint32_t width,
     uint32_t height,
-    uint32_t iters) {
+    uint32_t iters,
+    int32_t targetDeviceIdx = -1,
+    bool forceWarp = false) {
     BenchRunResult res;
     res.benchId = spec.id;
     res.benchName = spec.name;
@@ -499,10 +636,11 @@ inline BenchRunResult runWarpRaytracingBench(
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;
     std::string initErr;
-    if (!ctx.init(initErr)) {
+    if (!ctx.init(initErr, targetDeviceIdx, forceWarp)) {
         res.status = initErr;
         return res;
     }
+    res.backend = ctx.backendName;
 
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
     if (FAILED(ctx.dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) ||

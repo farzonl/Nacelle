@@ -345,21 +345,21 @@ if(APPLE)
     list(APPEND NACELLE_BENCH_WORKERS bench-worker-metal)
 endif()
 
-# Worker: Microsoft WARP (Windows)
+# Worker: DirectX 12 / WARP (Windows)
 if(WIN32)
-    add_executable(bench-worker-warp tools/bench_worker_warp.cpp)
-    target_include_directories(bench-worker-warp PRIVATE
+    add_executable(bench-worker-d3d12 tools/bench_worker_d3d12.cpp)
+    target_include_directories(bench-worker-d3d12 PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
     )
-    target_compile_definitions(bench-worker-warp PRIVATE
+    target_compile_definitions(bench-worker-d3d12 PRIVATE
         NACELLE_SHADER_BIN_DIR="${CMAKE_BINARY_DIR}/tests/shaders"
     )
     if(NACELLE_D3D12_SDK_VERSION GREATER 0)
-        target_compile_definitions(bench-worker-warp PRIVATE
+        target_compile_definitions(bench-worker-d3d12 PRIVATE
             NACELLE_D3D12_SDK_VERSION=${NACELLE_D3D12_SDK_VERSION}
         )
     endif()
-    list(APPEND NACELLE_BENCH_WORKERS bench-worker-warp)
+    list(APPEND NACELLE_BENCH_WORKERS bench-worker-d3d12)
 endif()
 
 # Harness: nacelle-bench (pure orchestrator; spawns per-backend worker binaries)

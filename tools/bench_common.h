@@ -245,6 +245,7 @@ struct WorkerCliArgs {
     std::string singleBench;
     std::string singleBackend;
     bool listDevices = false;
+    bool forceWarp = false;
 };
 
 inline WorkerCliArgs parseWorkerCliArgs(int argc, char** argv) {
@@ -267,6 +268,8 @@ inline WorkerCliArgs parseWorkerCliArgs(int argc, char** argv) {
             args.singleBackend = argv[++i];
         } else if (arg == "--list-devices") {
             args.listDevices = true;
+        } else if (arg == "--warp") {
+            args.forceWarp = true;
         }
     }
     return args;

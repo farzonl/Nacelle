@@ -241,13 +241,13 @@ std::vector<BenchRunResult> parseWorkerOutput(const std::string& rawOutput) {
     return out;
 }
 
-std::vector<VkDeviceInfo> listVulkanDevicesViaWorker(const std::filesystem::path& binDir) {
+std::vector<VkDeviceInfo> listDevicesViaWorker(const std::filesystem::path& binDir, const std::string& workerName) {
     std::vector<VkDeviceInfo> out;
-    std::string vkWorker = workerBinaryPath(binDir, "bench-worker-vulkan");
-    if (!std::filesystem::exists(vkWorker)) return out;
+    std::string workerExe = workerBinaryPath(binDir, workerName);
+    if (!std::filesystem::exists(workerExe)) return out;
 
     std::string rawOut, errStatus;
-    if (!runSubprocess("\"" + vkWorker + "\" --list-devices", rawOut, errStatus)) {
+    if (!runSubprocess("\"" + workerExe + "\" --list-devices", rawOut, errStatus)) {
         return out;
     }
 
@@ -274,8 +274,8 @@ std::string resolveWorkerForBackend(const std::filesystem::path& binDir, const s
     if (backendToken == "metal") {
         return workerBinaryPath(binDir, "bench-worker-metal");
     }
-    if (backendToken == "warp") {
-        return workerBinaryPath(binDir, "bench-worker-warp");
+    if (backendToken == "warp" || backendToken.rfind("d3d12", 0) == 0) {
+        return workerBinaryPath(binDir, "bench-worker-d3d12");
     }
     return "";
 }
@@ -399,6 +399,7 @@ int main(int argc, char** argv) {
     std::string suiteFilter = "all";
     std::string nameFilter;
     bool allowPartial = false;
+    bool forceWarp = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -432,6 +433,8 @@ int main(int argc, char** argv) {
             nameFilter = argv[++i];
         } else if (arg == "--allow-partial") {
             allowPartial = true;
+        } else if (arg == "--warp") {
+            forceWarp = true;
         }
     }
 
@@ -442,9 +445,27 @@ int main(int argc, char** argv) {
     for (uint32_t w : widths) {
         backendTokens.push_back("nacelle-w" + std::to_string(w));
     }
-    backendTokens.push_back("warp");
 
-    auto vkDevs = listVulkanDevicesViaWorker(binDir);
+    std::vector<VkDeviceInfo> d3d12Devs;
+#if defined(_WIN32)
+    if (forceWarp) {
+        backendTokens.push_back("d3d12:warp");
+    } else {
+        d3d12Devs = listDevicesViaWorker(binDir, "bench-worker-d3d12");
+        if (d3d12Devs.empty()) {
+            backendTokens.push_back("d3d12:warp");
+        } else {
+            for (const auto& d : d3d12Devs) {
+                backendTokens.push_back("d3d12:" + std::to_string(d.index));
+            }
+        }
+    }
+#else
+    (void)forceWarp;
+    backendTokens.push_back("warp");
+#endif
+
+    auto vkDevs = listDevicesViaWorker(binDir, "bench-worker-vulkan");
     if (vkDevs.empty()) {
         backendTokens.push_back("vulkan");
     } else {
@@ -482,8 +503,12 @@ int main(int argc, char** argv) {
         } else if (bt == "metal") {
             r.backend = "Metal (IRConverter)";
             r.shaderFormat = "DXIL";
-        } else if (bt == "warp") {
+        } else if (bt == "warp" || bt == "d3d12:warp") {
             r.backend = "Microsoft WARP";
+            r.shaderFormat = "DXIL";
+        } else if (bt.rfind("d3d12:", 0) == 0) {
+            size_t idx = static_cast<size_t>(std::stoul(bt.substr(6)));
+            r.backend = (idx < d3d12Devs.size()) ? d3d12Devs[idx].backendName : bt;
             r.shaderFormat = "DXIL";
         } else {
             r.backend = bt;
