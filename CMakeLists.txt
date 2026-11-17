@@ -459,6 +459,11 @@ elseif(WIN32)
     endif()
 elseif(APPLE)
     target_link_libraries(nacelle_d3d12 PRIVATE "-framework Accelerate")
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "LINKER:-no_warn_duplicate_libraries" NACELLE_HAS_NO_WARN_DUPLICATE_LIBRARIES)
+    if(NACELLE_HAS_NO_WARN_DUPLICATE_LIBRARIES)
+        target_link_options(nacelle_d3d12 PRIVATE "LINKER:-no_warn_duplicate_libraries")
+    endif()
 endif()
 
 # 5. CLI Tools
@@ -474,7 +479,7 @@ if(NOT WIN32)
 endif()
 target_include_directories(nacelle-compile SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 target_compile_definitions(nacelle-compile PRIVATE ${LLVM_DEFS_LIST})
-target_link_libraries(nacelle-compile PRIVATE nacelle ${NACELLE_MLIR_LIBS} ${NACELLE_LLVM_LIBS})
+target_link_libraries(nacelle-compile PRIVATE nacelle)
 
 set(NACELLE_D3D12_SDK_VERSION "0" CACHE STRING "DirectX 12 Agility SDK version number")
 

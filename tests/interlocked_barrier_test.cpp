@@ -250,8 +250,8 @@ void runInterlockedBarrierForWidth(uint32_t simdWidth) {
 } // namespace
 
 int main() {
-    if (const char* envW = std::getenv("NACELLE_SIMD_WIDTH")) {
-        runInterlockedBarrierForWidth(static_cast<uint32_t>(std::stoul(envW)));
+    if (auto envW = nacelle::getEnv("NACELLE_SIMD_WIDTH"); envW && !envW->empty()) {
+        runInterlockedBarrierForWidth(static_cast<uint32_t>(std::stoul(*envW)));
     } else {
         runInterlockedBarrierForWidth(4);
         runInterlockedBarrierForWidth(8);

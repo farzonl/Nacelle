@@ -184,7 +184,7 @@ void extractDxilMetadata(llvm::Module& mod, DxilLoadedShader& out, llvm::StringR
             if (!targetExport.empty()) {
                 if (!epFn) continue;
                 llvm::StringRef rawName = epFn->getName();
-                llvm::StringRef altName = mdAsString(ep->getOperand(1).get());
+                std::string altName = mdAsString(ep->getOperand(1).get());
                 if (rawName != targetExport && demangleDxilExportName(rawName) != targetExport &&
                     altName != targetExport && demangleDxilExportName(altName) != targetExport) {
                     continue;
@@ -333,7 +333,7 @@ uint32_t lowerGroupSharedGlobals(llvm::Module& mod, llvm::Function* entryFn) {
         llvm::FunctionType::get(ptrTy, {llvm::Type::getInt32Ty(ctx)}, false));
 
     uint32_t totalBytes = 0;
-    llvm::IRBuilder<> entryBuilder(&entryFn->getEntryBlock(), entryFn->getEntryBlock().getFirstInsertionPt());
+    llvm::IRBuilder<> entryBuilder(entryFn->getEntryBlock().getFirstInsertionPt());
     std::unordered_map<llvm::Value*, llvm::Value*> rewrittenPtrs;
 
     for (auto* gv : gsGlobals) {
