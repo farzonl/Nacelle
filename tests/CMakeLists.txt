@@ -177,6 +177,11 @@ add_hlsl_dxil(bench_vertex_stress.hlsl vs_6_0 VSMain bench_vertex_stress_vs.dxil
 add_hlsl_dxil(bench_vertex_stress.hlsl ps_6_0 PSMain bench_vertex_stress_ps.dxil)
 add_hlsl_spirv(bench_vertex_stress.hlsl vs_6_0 VSMain bench_vertex_stress_vs.spv)
 add_hlsl_spirv(bench_vertex_stress.hlsl ps_6_0 PSMain bench_vertex_stress_ps.spv)
+
+add_hlsl_dxil(bench_small_tri_ps.hlsl vs_6_0 VSMain bench_small_tri_ps_vs.dxil)
+add_hlsl_dxil(bench_small_tri_ps.hlsl ps_6_0 PSMain bench_small_tri_ps_ps.dxil)
+add_hlsl_spirv(bench_small_tri_ps.hlsl vs_6_0 VSMain bench_small_tri_ps_vs.spv)
+add_hlsl_spirv(bench_small_tri_ps.hlsl ps_6_0 PSMain bench_small_tri_ps_ps.spv)
 add_hlsl_dxil(bench_vertex_mesh.hlsl vs_6_0 VSMain bench_vertex_mesh_vs.dxil)
 add_hlsl_dxil(bench_vertex_mesh.hlsl ps_6_0 PSMain bench_vertex_mesh_ps.dxil)
 add_hlsl_spirv(bench_vertex_mesh.hlsl vs_6_0 VSMain bench_vertex_mesh_vs.spv -fvk-invert-y)
