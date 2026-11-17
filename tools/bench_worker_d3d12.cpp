@@ -8,6 +8,7 @@
 #include <dxgi1_4.h>
 
 #include "bench_common.h"
+#include "bench_gdeflate.h"
 #include "bench_memory.h"
 #include "bench_d3d12_runners.h"
 
@@ -98,11 +99,11 @@ BenchRunResult runWarpComputeBench(
     }
 
     D3D12_COMMAND_QUEUE_DESC qDesc{};
-    qDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ID3D12CommandQueue* queue = nullptr;
     dev->CreateCommandQueue(&qDesc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
 
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[8]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -113,9 +114,15 @@ BenchRunResult runWarpComputeBench(
     params[3].Descriptor.ShaderRegister = 0;
     params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[4].Descriptor.ShaderRegister = 1;
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[5].Descriptor.ShaderRegister = 2;
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[6].Descriptor.ShaderRegister = 3;
+    params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[7].Descriptor.ShaderRegister = 4;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 5;
+    rsDesc.NumParameters = 8;
     rsDesc.pParameters = params;
     ID3DBlob* rsBlob = nullptr;
     pSerializeRS(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
@@ -166,13 +173,29 @@ BenchRunResult runWarpComputeBench(
     }
 
     ID3D12Resource* cb = mkBuf(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    ID3D12Resource* srv0 = mkBuf(D3D12_HEAP_TYPE_UPLOAD, 4 * 1024 * 1024, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource* srv0 = mkBuf(D3D12_HEAP_TYPE_UPLOAD, 8 * 1024 * 1024, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* srv1 = mkBuf(D3D12_HEAP_TYPE_UPLOAD, 4 * 1024 * 1024, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* uav0 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, maxOutBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ID3D12Resource* uav1 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, 4 * 1024 * 1024, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* uav1 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, maxOutBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* uav2 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, 4 * 1024 * 1024, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* uav3 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, 4 * 1024 * 1024, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* uav4 = mkBuf(D3D12_HEAP_TYPE_DEFAULT, 64 * 1024, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12Resource* gdResetUpload = mkBuf(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* rb = mkBuf(D3D12_HEAP_TYPE_READBACK, maxOutBytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
     void* ptr = nullptr;
+    GDeflateStreamData gdShort, gdStd, gdLong;
+    uint32_t gdActiveMode = UINT32_MAX;
+    if (spec.id == "gdeflate") {
+        gdShort = buildGDeflateStream(4u);
+        gdStd = buildGDeflateStream(16u);
+        gdLong = buildGDeflateStream(64u);
+        gdResetUpload->Map(0, nullptr, &ptr);
+        std::memset(ptr, 0, 256);
+        std::memcpy(ptr, gdStd.controlWords.data(), gdStd.controlWords.size() * sizeof(uint32_t));
+        gdResetUpload->Unmap(0, nullptr);
+    }
+
     if (spec.id == "bench_raymarch") {
         srv0->Map(0, nullptr, &ptr);
         float spheres[16] = {
@@ -183,8 +206,8 @@ BenchRunResult runWarpComputeBench(
         };
         std::memcpy(ptr, spheres, sizeof(spheres));
         srv0->Unmap(0, nullptr);
-    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
-        const size_t initCount = (spec.id == "tiled_matmul_large") ? (1024u * 1024u) : (256u * 256u);
+    } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul" || spec.id == "coalesced_uniform_cs") {
+        const size_t initCount = (spec.id == "tiled_matmul_large" || spec.id == "coalesced_uniform_cs") ? (1024u * 1024u) : (256u * 256u);
         srv0->Map(0, nullptr, &ptr);
         float* a = static_cast<float*>(ptr);
         for (size_t i = 0; i < initCount; ++i) a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
@@ -201,9 +224,9 @@ BenchRunResult runWarpComputeBench(
     }
 
     ID3D12CommandAllocator* alloc = nullptr;
-    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&alloc));
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void**>(&alloc));
     ID3D12GraphicsCommandList* cl = nullptr;
-    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, alloc, pso, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&cl));
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, pso, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&cl));
     cl->Close();
     ID3D12Fence* fence = nullptr;
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
@@ -218,8 +241,54 @@ BenchRunResult runWarpComputeBench(
         } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
             MatmulCB mcb{cbW, cbH, cbSteps, 0};
             std::memcpy(ptr, &mcb, sizeof(mcb));
+        } else if (spec.id == "ethash_mine") {
+            EthashCB ecb{};
+            for (uint32_t k = 0; k < 8; ++k) ecb.header[k] = 0x12345678u + k;
+            ecb.startNonce[0] = 1u;
+            ecb.startNonce[1] = 0u;
+            ecb.numDatasetElements = 16384u;
+            std::memcpy(ptr, &ecb, sizeof(ecb));
+        } else if (spec.id == "coalesced_uniform_cs") {
+            CoalescedUniformCB ccb{cbW, cbSteps, 0.75f, 0.25f, {}};
+            for (uint32_t k = 0; k < 16; ++k) ccb.weights[k] = 0.25f + 0.03f * static_cast<float>(k);
+            std::memcpy(ptr, &ccb, sizeof(ccb));
         }
         cb->Unmap(0, nullptr);
+
+        if (spec.id == "gdeflate") {
+            const GDeflateStreamData& gd = (cbW <= 4u) ? gdShort : (cbW <= 16u ? gdStd : gdLong);
+            if (gdActiveMode != cbW) {
+                srv0->Map(0, nullptr, &ptr);
+                std::memcpy(ptr, gd.inputBytes.data(), gd.inputBytes.size());
+                srv0->Unmap(0, nullptr);
+                gdActiveMode = cbW;
+            }
+            alloc->Reset();
+            cl->Reset(alloc, nullptr);
+            D3D12_RESOURCE_BARRIER preBarriers[2]{};
+            preBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            preBarriers[0].Transition = {uav0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+            preBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            preBarriers[1].Transition = {uav2, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+            cl->ResourceBarrier(2, preBarriers);
+            cl->CopyBufferRegion(uav0, 0, gdResetUpload, 0, 16);
+            cl->CopyBufferRegion(uav2, 0, gdResetUpload, 64, 16);
+            D3D12_RESOURCE_BARRIER postBarriers[2]{};
+            postBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            postBarriers[0].Transition = {uav0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            postBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            postBarriers[1].Transition = {uav2, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            cl->ResourceBarrier(2, postBarriers);
+            cl->Close();
+            ID3D12CommandList* prepLists[] = {cl};
+            queue->ExecuteCommandLists(1, prepLists);
+            queue->Signal(fence, fenceVal);
+            if (fence->GetCompletedValue() < fenceVal) {
+                fence->SetEventOnCompletion(fenceVal, ev);
+                WaitForSingleObject(ev, INFINITE);
+            }
+            ++fenceVal;
+        }
 
         auto s0 = std::chrono::steady_clock::now();
         alloc->Reset();
@@ -230,6 +299,9 @@ BenchRunResult runWarpComputeBench(
         cl->SetComputeRootShaderResourceView(2, srv1->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(3, uav0->GetGPUVirtualAddress());
         cl->SetComputeRootUnorderedAccessView(4, uav1->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(5, uav2->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(6, uav3->GetGPUVirtualAddress());
+        cl->SetComputeRootUnorderedAccessView(7, uav4->GetGPUVirtualAddress());
         cl->Dispatch(gx, gy, 1);
         cl->Close();
         ID3D12CommandList* lists[] = {cl};
@@ -271,6 +343,21 @@ BenchRunResult runWarpComputeBench(
             cbW = n; cbH = n; cbSteps = n;
             gx = (n + 31) / 32;
             gy = (n + 31) / 32;
+        } else if (spec.id == "gdeflate") {
+            uint32_t tiles = (mode == 0) ? 4u : (mode == 1 ? 16u : 64u);
+            gx = tiles;
+            gy = 1;
+            cbW = tiles; cbH = 1; cbSteps = 1;
+        } else if (spec.id == "ethash_mine") {
+            gx = (mode == 0) ? 16u : (mode == 1 ? 64u : 256u);
+            gy = 1;
+            cbW = gx * 16u; cbH = 1; cbSteps = 1;
+        } else if (spec.id == "coalesced_uniform_cs") {
+            gx = (mode == 0) ? 256u : (mode == 1 ? 4096u : 16384u);
+            gy = 1;
+            cbW = gx * 64u;
+            cbH = 1;
+            cbSteps = (mode == 0) ? 16u : (mode == 1 ? 32u : 64u);
         } else {
             gx = (mode == 0) ? 64 : (mode == 1 ? 512 : 4096);
             gy = 1;
@@ -288,6 +375,41 @@ BenchRunResult runWarpComputeBench(
         samples.push_back(runOnce(gx, gy, cbW, cbH, cbSteps));
     }
 
+    if (spec.id == "gdeflate" || spec.id == "coalesced_uniform_cs") {
+        ID3D12Resource* srcUav = (spec.id == "gdeflate") ? uav1 : uav0;
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {srcUav, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cl->ResourceBarrier(1, &b);
+        cl->CopyBufferRegion(rb, 0, srcUav, 0, 4096 * sizeof(uint32_t));
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cl->ResourceBarrier(1, &b);
+        cl->Close();
+        ID3D12CommandList* rbLists[] = {cl};
+        queue->ExecuteCommandLists(1, rbLists);
+        queue->Signal(fence, fenceVal);
+        if (fence->GetCompletedValue() < fenceVal) {
+            fence->SetEventOnCompletion(fenceVal, ev);
+            WaitForSingleObject(ev, INFINITE);
+        }
+        ++fenceVal;
+        void* rbPtr = nullptr;
+        rb->Map(0, nullptr, &rbPtr);
+        double sum = 0.0;
+        if (spec.id == "gdeflate") {
+            const uint32_t* outPtr = static_cast<const uint32_t*>(rbPtr);
+            for (size_t i = 0; i < 4096; ++i) sum += static_cast<double>(outPtr[i] & 0xFFFFu);
+        } else {
+            const float* outPtr = static_cast<const float*>(rbPtr);
+            for (size_t i = 0; i < 4096; ++i) sum += outPtr[i];
+        }
+        rb->Unmap(0, nullptr);
+        res.checksum = sum;
+    }
+
     getDims(0, gx, gy, cbW, cbH, cbSteps);
     res.shortJobMs = runOnce(gx, gy, cbW, cbH, cbSteps);
     getDims(2, gx, gy, cbW, cbH, cbSteps);
@@ -300,6 +422,10 @@ BenchRunResult runWarpComputeBench(
     cl->Release();
     alloc->Release();
     rb->Release();
+    gdResetUpload->Release();
+    uav4->Release();
+    uav3->Release();
+    uav2->Release();
     uav1->Release();
     uav0->Release();
     srv1->Release();

@@ -2,6 +2,7 @@
 
 #include "bench_memory.h"
 #include "bench_types.h"
+#include "bench_gdeflate.h"
 #include "vk_minimal_loader.h"
 
 #include <chrono>
@@ -132,6 +133,16 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
         r.category = categoryName(spec.category);
         r.backend = queryVulkanBackendName(vk, pd);
         r.shaderFormat = "SPIR-V";
+        if (spec.id == "rt_inline_heavy" || spec.id == "rt_pipeline_heavy") {
+            r.status = "SKIPPED (64-instance heavy RT scene is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
+        if (spec.id == "state_heavy_ps") {
+            r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 
@@ -170,14 +181,17 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
         vk.vkCreateShaderModule(dev, &smci, nullptr, &sm);
 
         // Bindings matching DXC -fvk-t-shift 0 0 -fvk-u-shift 8 0 -fvk-b-shift 16 0
-        vkmin::VkDescriptorSetLayoutBinding bindings[5]{};
+        vkmin::VkDescriptorSetLayoutBinding bindings[8]{};
         bindings[0] = {16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[1] = {0, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[2] = {1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[3] = {8, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         bindings[4] = {9, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        bindings[5] = {10, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        bindings[6] = {11, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        bindings[7] = {12, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vkmin::VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
-        vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5, bindings};
+        vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 8, bindings};
         vkmin::VkDescriptorSetLayout dsl = 0;
         vk.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
 
@@ -242,10 +256,21 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
         }
 
         auto cb = mkBuf(256, vkmin::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        auto srv0 = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto srv0 = mkBuf(8 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         auto srv1 = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         auto uav0 = mkBuf(maxOutBytes, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        auto uav1 = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto uav1 = mkBuf(maxOutBytes, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto uav2 = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto uav3 = mkBuf(4 * 1024 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        auto uav4 = mkBuf(64 * 1024, vkmin::VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+        GDeflateStreamData gdShort, gdStd, gdLong;
+        uint32_t gdActiveMode = UINT32_MAX;
+        if (spec.id == "gdeflate") {
+            gdShort = buildGDeflateStream(4u);
+            gdStd = buildGDeflateStream(16u);
+            gdLong = buildGDeflateStream(64u);
+        }
 
         void* ptr = nullptr;
         if (spec.id == "bench_raymarch") {
@@ -258,8 +283,8 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             };
             std::memcpy(ptr, spheres, sizeof(spheres));
             vk.vkUnmapMemory(dev, srv0.mem);
-        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
-            const size_t initCount = (spec.id == "tiled_matmul_large") ? (1024u * 1024u) : (256u * 256u);
+        } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul" || spec.id == "coalesced_uniform_cs") {
+            const size_t initCount = (spec.id == "tiled_matmul_large" || spec.id == "coalesced_uniform_cs") ? (1024u * 1024u) : (256u * 256u);
             vk.vkMapMemory(dev, srv0.mem, 0, initCount * 4, 0, &ptr);
             float* a = static_cast<float*>(ptr);
             for (size_t i = 0; i < initCount; ++i) a[i] = static_cast<float>((i % 17) + 1) * 0.01f;
@@ -277,7 +302,7 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
 
         vkmin::VkDescriptorPoolSize psz[2] = {
             {vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+            {vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
         };
         vkmin::VkDescriptorPoolCreateInfo dpci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1, 2, psz};
         vkmin::VkDescriptorPool dp = 0;
@@ -287,20 +312,26 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
         vkmin::VkDescriptorSet ds = 0;
         vk.vkAllocateDescriptorSets(dev, &dsai, &ds);
 
-        vkmin::VkDescriptorBufferInfo bi[5] = {
+        vkmin::VkDescriptorBufferInfo bi[8] = {
             {cb.buf, 0, 256},
-            {srv0.buf, 0, 4 * 1024 * 1024},
+            {srv0.buf, 0, 8 * 1024 * 1024},
             {srv1.buf, 0, 4 * 1024 * 1024},
             {uav0.buf, 0, maxOutBytes},
-            {uav1.buf, 0, 4 * 1024 * 1024},
+            {uav1.buf, 0, maxOutBytes},
+            {uav2.buf, 0, 4 * 1024 * 1024},
+            {uav3.buf, 0, 4 * 1024 * 1024},
+            {uav4.buf, 0, 64 * 1024},
         };
-        vkmin::VkWriteDescriptorSet wds[5]{};
+        vkmin::VkWriteDescriptorSet wds[8]{};
         wds[0] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 16, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bi[0], nullptr};
         wds[1] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[1], nullptr};
         wds[2] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[2], nullptr};
         wds[3] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 8, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[3], nullptr};
         wds[4] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 9, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[4], nullptr};
-        vk.vkUpdateDescriptorSets(dev, 5, wds, 0, nullptr);
+        wds[5] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 10, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[5], nullptr};
+        wds[6] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 11, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[6], nullptr};
+        wds[7] = {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 12, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi[7], nullptr};
+        vk.vkUpdateDescriptorSets(dev, 8, wds, 0, nullptr);
 
         vkmin::VkCommandPoolCreateInfo cpci2{vkmin::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, vkmin::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, computeQF};
         vkmin::VkCommandPool cpool = nullptr;
@@ -317,8 +348,35 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             } else if (spec.id == "matmul" || spec.id == "tiled_matmul" || spec.id == "tiled_matmul_large" || spec.id == "linalg_matmul") {
                 uint32_t vals[4] = {cbW, cbH, cbSteps, 0};
                 std::memcpy(ptr, vals, sizeof(vals));
+            } else if (spec.id == "ethash_mine") {
+                EthashCB ecb{};
+                for (uint32_t k = 0; k < 8; ++k) ecb.header[k] = 0x12345678u + k;
+                ecb.startNonce[0] = 1u;
+                ecb.startNonce[1] = 0u;
+                ecb.numDatasetElements = 16384u;
+                std::memcpy(ptr, &ecb, sizeof(ecb));
+            } else if (spec.id == "coalesced_uniform_cs") {
+                CoalescedUniformCB ccb{cbW, cbSteps, 0.75f, 0.25f, {}};
+                for (uint32_t k = 0; k < 16; ++k) ccb.weights[k] = 0.25f + 0.03f * static_cast<float>(k);
+                std::memcpy(ptr, &ccb, sizeof(ccb));
             }
             vk.vkUnmapMemory(dev, cb.mem);
+
+            if (spec.id == "gdeflate") {
+                const GDeflateStreamData& gd = (cbW <= 4u) ? gdShort : (cbW <= 16u ? gdStd : gdLong);
+                if (gdActiveMode != cbW) {
+                    vk.vkMapMemory(dev, srv0.mem, 0, gd.inputBytes.size(), 0, &ptr);
+                    std::memcpy(ptr, gd.inputBytes.data(), gd.inputBytes.size());
+                    vk.vkUnmapMemory(dev, srv0.mem);
+                    gdActiveMode = cbW;
+                }
+                vk.vkMapMemory(dev, uav0.mem, 0, 16, 0, &ptr);
+                std::memcpy(ptr, gd.controlWords.data(), gd.controlWords.size() * sizeof(uint32_t));
+                vk.vkUnmapMemory(dev, uav0.mem);
+                vk.vkMapMemory(dev, uav2.mem, 0, 16, 0, &ptr);
+                std::memset(ptr, 0, 16);
+                vk.vkUnmapMemory(dev, uav2.mem);
+            }
 
             auto s0 = std::chrono::steady_clock::now();
             vk.vkResetCommandBuffer(cmdBuf, 0);
@@ -362,6 +420,21 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
                 cbW = n; cbH = n; cbSteps = n;
                 gx = (n + 31) / 32;
                 gy = (n + 31) / 32;
+            } else if (spec.id == "gdeflate") {
+                uint32_t tiles = (mode == 0) ? 4u : (mode == 1 ? 16u : 64u);
+                gx = tiles;
+                gy = 1;
+                cbW = tiles; cbH = 1; cbSteps = 1;
+            } else if (spec.id == "ethash_mine") {
+                gx = (mode == 0) ? 16u : (mode == 1 ? 64u : 256u);
+                gy = 1;
+                cbW = gx * 16u; cbH = 1; cbSteps = 1;
+            } else if (spec.id == "coalesced_uniform_cs") {
+                gx = (mode == 0) ? 256u : (mode == 1 ? 4096u : 16384u);
+                gy = 1;
+                cbW = gx * 64u;
+                cbH = 1;
+                cbSteps = (mode == 0) ? 16u : (mode == 1 ? 32u : 64u);
             } else {
                 gx = (mode == 0) ? 64 : (mode == 1 ? 512 : 4096);
                 gy = 1;
@@ -391,6 +464,21 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             const float* fp = static_cast<const float*>(ptr);
             for (size_t i = 0; i < count; ++i) sum += fp[i];
             vk.vkUnmapMemory(dev, uav0.mem);
+        } else if (spec.id == "gdeflate") {
+            vk.vkMapMemory(dev, uav1.mem, 0, 4096 * sizeof(uint32_t), 0, &ptr);
+            const uint32_t* up = static_cast<const uint32_t*>(ptr);
+            for (size_t i = 0; i < 4096; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+            vk.vkUnmapMemory(dev, uav1.mem);
+        } else if (spec.id == "ethash_mine") {
+            vk.vkMapMemory(dev, uav4.mem, 0, 24, 0, &ptr);
+            const uint32_t* up = static_cast<const uint32_t*>(ptr);
+            for (size_t i = 0; i < 6; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+            vk.vkUnmapMemory(dev, uav4.mem);
+        } else if (spec.id == "coalesced_uniform_cs") {
+            vk.vkMapMemory(dev, uav0.mem, 0, 4096 * sizeof(float), 0, &ptr);
+            const float* fp = static_cast<const float*>(ptr);
+            for (size_t i = 0; i < 4096; ++i) sum += fp[i];
+            vk.vkUnmapMemory(dev, uav0.mem);
         } else {
             vk.vkMapMemory(dev, uav0.mem, 0, 4096, 0, &ptr);
             const uint32_t* up = static_cast<const uint32_t*>(ptr);
@@ -409,7 +497,7 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
 
         vk.vkDestroyCommandPool(dev, cpool, nullptr);
         vk.vkDestroyDescriptorPool(dev, dp, nullptr);
-        for (auto& b : {cb, srv0, srv1, uav0, uav1}) {
+        for (auto& b : {cb, srv0, srv1, uav0, uav1, uav2, uav3, uav4}) {
             vk.vkDestroyBuffer(dev, b.buf, nullptr);
             vk.vkFreeMemory(dev, b.mem, nullptr);
         }
@@ -458,6 +546,16 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         r.category = categoryName(spec.category);
         r.backend = queryVulkanBackendName(vk, pd);
         r.shaderFormat = "SPIR-V";
+        if (spec.id == "rt_inline_heavy" || spec.id == "rt_pipeline_heavy") {
+            r.status = "SKIPPED (64-instance heavy RT scene is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
+        if (spec.id == "state_heavy_ps") {
+            r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 
@@ -1002,6 +1100,16 @@ inline std::vector<BenchRunResult> runVulkanRaytracingBench(
         r.category = categoryName(spec.category);
         r.backend = queryVulkanBackendName(vk, pd);
         r.shaderFormat = "SPIR-V";
+        if (spec.id == "rt_inline_heavy" || spec.id == "rt_pipeline_heavy") {
+            r.status = "SKIPPED (64-instance heavy RT scene is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
+        if (spec.id == "state_heavy_ps") {
+            r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
+            results.push_back(r);
+            continue;
+        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 

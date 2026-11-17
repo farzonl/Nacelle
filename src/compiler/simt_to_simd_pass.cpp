@@ -8497,6 +8497,85 @@ static bool packetizeComputeBlockWithBarriers(
     return true;
 }
 
+static void spliceRegionIntoBranch(
+    mlir::OpBuilder& builder,
+    mlir::Region& srcRegion,
+    mlir::Block* dstBlock) {
+    mlir::Block& srcBlock = srcRegion.front();
+    auto srcYield = llvm::cast<mlir::scf::YieldOp>(srcBlock.getTerminator());
+    llvm::SmallVector<mlir::Value, 8> yieldVals(srcYield.getResults().begin(), srcYield.getResults().end());
+    dstBlock->getOperations().splice(dstBlock->end(), srcBlock.getOperations(), srcBlock.begin(), srcYield->getIterator());
+    builder.setInsertionPointToEnd(dstBlock);
+    mlir::scf::YieldOp::create(builder, srcYield.getLoc(), yieldVals);
+}
+
+static void lowerBarrierIndexSwitches(mlir::Region& rootRegion) {
+    llvm::SmallVector<mlir::scf::IndexSwitchOp, 4> switches;
+    rootRegion.walk([&](mlir::scf::IndexSwitchOp swOp) {
+        if (opContainsBarrier(swOp)) {
+            switches.push_back(swOp);
+        }
+    });
+    for (mlir::scf::IndexSwitchOp swOp : switches) {
+        mlir::OpBuilder ib(swOp);
+        mlir::Location sloc = swOp.getLoc();
+        auto resultTypes = swOp.getResultTypes();
+        auto cases = swOp.getCases();
+        auto caseRegions = swOp.getCaseRegions();
+        mlir::Region& defaultRegion = swOp.getDefaultRegion();
+
+        if (cases.empty()) {
+            mlir::Block& defBlock = defaultRegion.front();
+            auto defYield = llvm::cast<mlir::scf::YieldOp>(defBlock.getTerminator());
+            swOp->getBlock()->getOperations().splice(
+                swOp->getIterator(), defBlock.getOperations(), defBlock.begin(), defYield->getIterator());
+            swOp.replaceAllUsesWith(defYield.getResults());
+            swOp.erase();
+            continue;
+        }
+
+        mlir::Value argInt;
+        if (auto ic = swOp.getArg().getDefiningOp<mlir::arith::IndexCastOp>()) {
+            if (ic.getIn().getType().isInteger(32) || ic.getIn().getType().isInteger(64)) {
+                argInt = ic.getIn();
+            }
+        } else if (auto icu = swOp.getArg().getDefiningOp<mlir::arith::IndexCastUIOp>()) {
+            if (icu.getIn().getType().isInteger(32) || icu.getIn().getType().isInteger(64)) {
+                argInt = icu.getIn();
+            }
+        }
+        if (!argInt) {
+            argInt = mlir::arith::IndexCastOp::create(ib, sloc, ib.getI64Type(), swOp.getArg());
+        }
+        mlir::Type cmpTy = argInt.getType();
+
+        std::function<mlir::scf::IfOp(mlir::OpBuilder&, size_t)> buildIfChain =
+            [&](mlir::OpBuilder& curBuilder, size_t idx) -> mlir::scf::IfOp {
+            mlir::Value caseConst = mlir::arith::ConstantOp::create(
+                curBuilder, sloc, curBuilder.getIntegerAttr(cmpTy, cases[idx]));
+            mlir::Value cond = mlir::arith::CmpIOp::create(
+                curBuilder, sloc, mlir::arith::CmpIPredicate::eq, argInt, caseConst);
+            auto ifOp = mlir::scf::IfOp::create(
+                curBuilder, sloc, resultTypes, cond, /*withElseRegion=*/true);
+            spliceRegionIntoBranch(curBuilder, caseRegions[idx], &ifOp.getThenRegion().front());
+            mlir::Block* elseBlk = &ifOp.getElseRegion().front();
+            if (idx + 1 < cases.size()) {
+                curBuilder.setInsertionPointToEnd(elseBlk);
+                mlir::scf::IfOp inner = buildIfChain(curBuilder, idx + 1);
+                curBuilder.setInsertionPointToEnd(elseBlk);
+                mlir::scf::YieldOp::create(curBuilder, sloc, inner.getResults());
+            } else {
+                spliceRegionIntoBranch(curBuilder, defaultRegion, elseBlk);
+            }
+            return ifOp;
+        };
+
+        mlir::scf::IfOp outerIf = buildIfChain(ib, 0);
+        swOp.replaceAllUsesWith(outerIf.getResults());
+        swOp.erase();
+    }
+}
+
 } // namespace
 
 bool packetizeThreadGroupRegion(
@@ -8554,6 +8633,7 @@ bool packetizeThreadGroupRegion(
                 });
         }
     } else {
+        lowerBarrierIndexSwitches(srcRegion);
         mlir::VectorType maskVecTy = mlir::VectorType::get({simdWidth}, b.getI1Type());
         mlir::Value waveMaskArr = mlir::LLVM::AllocaOp::create(
             b, loc, ptrTy, maskVecTy, mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, numWavesVal)),

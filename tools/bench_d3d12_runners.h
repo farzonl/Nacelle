@@ -2,6 +2,8 @@
 
 #include "bench_types.h"
 #include "bench_common.h"
+#include "bench_bcn_textures.h"
+#include "bench_rt_scene.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -295,13 +297,36 @@ inline BenchRunResult runWarpGraphicsBench(
     }
     res.backend = ctx.backendName;
 
-    D3D12_ROOT_PARAMETER param{};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    param.Descriptor = {0, 0};
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    const bool isStateHeavyPS = (spec.id == "state_heavy_ps");
+
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 2;
+    srvRange.BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor = {0, 0};
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC staticSamp{};
+    staticSamp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSamp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSamp.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSamp.ShaderRegister = 0;
+    staticSamp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 1;
-    rsDesc.pParameters = &param;
+    rsDesc.NumParameters = isStateHeavyPS ? 2u : 1u;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = isStateHeavyPS ? 1u : 0u;
+    rsDesc.pStaticSamplers = isStateHeavyPS ? &staticSamp : nullptr;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ID3DBlob* rsBlob = nullptr;
     ctx.pSerializeRS(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
@@ -312,6 +337,10 @@ inline BenchRunResult runWarpGraphicsBench(
 
     auto t0 = std::chrono::steady_clock::now();
     D3D12_INPUT_ELEMENT_DESC posLayout = {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    D3D12_INPUT_ELEMENT_DESC stateHeavyElems[2] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
     D3D12_INPUT_ELEMENT_DESC meshElems[5] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R16G16B16A16_SNORM, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -330,6 +359,7 @@ inline BenchRunResult runWarpGraphicsBench(
     if (!gs.empty()) psoDesc.GS = {gs.data(), gs.size()};
     psoDesc.PS = {ps.data(), ps.size()};
     if (isVertexMesh) psoDesc.InputLayout = {meshElems, 5};
+    else if (isStateHeavyPS) psoDesc.InputLayout = {stateHeavyElems, 2};
     else if (usesQuadVB) psoDesc.InputLayout = {&posLayout, 1};
     psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     psoDesc.SampleMask = UINT_MAX;
@@ -341,13 +371,32 @@ inline BenchRunResult runWarpGraphicsBench(
         psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
         psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    } else if (isStateHeavyPS) {
+        psoDesc.DepthStencilState.DepthEnable = TRUE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        psoDesc.DepthStencilState.StencilEnable = TRUE;
+        psoDesc.DepthStencilState.StencilReadMask = 0xFF;
+        psoDesc.DepthStencilState.StencilWriteMask = 0xFF;
+        D3D12_DEPTH_STENCILOP_DESC stOp{
+            D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_INCR_SAT, D3D12_COMPARISON_FUNC_ALWAYS};
+        psoDesc.DepthStencilState.FrontFace = stOp;
+        psoDesc.DepthStencilState.BackFace = stOp;
+        psoDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     psoDesc.PrimitiveTopologyType = (spec.kind == PipelineKind::GraphicsTessGS)
         ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH
         : (spec.kind == PipelineKind::GraphicsVSGSPS ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
     psoDesc.NumRenderTargets = 1;
     psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    psoDesc.SampleDesc.Count = 1;
+    psoDesc.SampleDesc.Count = isStateHeavyPS ? 4u : 1u;
 
     ID3D12PipelineState* pso = nullptr;
     HRESULT hr = ctx.dev->CreateGraphicsPipelineState(&psoDesc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
@@ -381,7 +430,7 @@ inline BenchRunResult runWarpGraphicsBench(
     rtDesc.DepthOrArraySize = 1;
     rtDesc.MipLevels = 1;
     rtDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    rtDesc.SampleDesc.Count = 1;
+    rtDesc.SampleDesc.Count = isStateHeavyPS ? 4u : 1u;
     rtDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE clearVal{};
     clearVal.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -392,24 +441,36 @@ inline BenchRunResult runWarpGraphicsBench(
                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&rtvTex));
     ctx.dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
 
+    ID3D12Resource* resolveTex = nullptr;
+    if (isStateHeavyPS) {
+        rtDesc.SampleDesc.Count = 1u;
+        ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &rtDesc,
+                                         D3D12_RESOURCE_STATE_COPY_SOURCE, &clearVal,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resolveTex));
+    }
+
     ID3D12Resource* dsvTex = nullptr;
     ID3D12DescriptorHeap* dsvHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle{};
+    ID3D12Resource* texBC1 = nullptr;
+    ID3D12Resource* texBC7 = nullptr;
+    ID3D12Resource* texUpload = nullptr;
+    ID3D12DescriptorHeap* srvHeap = nullptr;
     MeshBenchSceneData meshScenes[3];
     ID3D12Resource* meshVBs[3] = {nullptr, nullptr, nullptr};
     ID3D12Resource* meshIBs[3] = {nullptr, nullptr, nullptr};
-    if (isVertexMesh) {
+    if (isVertexMesh || isStateHeavyPS) {
         D3D12_RESOURCE_DESC dsDesc{};
         dsDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         dsDesc.Width = maxW;
         dsDesc.Height = maxH;
         dsDesc.DepthOrArraySize = 1;
         dsDesc.MipLevels = 1;
-        dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
-        dsDesc.SampleDesc.Count = 1;
+        dsDesc.Format = isStateHeavyPS ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT;
+        dsDesc.SampleDesc.Count = isStateHeavyPS ? 4u : 1u;
         dsDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         D3D12_CLEAR_VALUE dsClear{};
-        dsClear.Format = DXGI_FORMAT_D32_FLOAT;
+        dsClear.Format = dsDesc.Format;
         dsClear.DepthStencil.Depth = 1.0f;
         ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &dsDesc,
                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsClear,
@@ -420,6 +481,77 @@ inline BenchRunResult runWarpGraphicsBench(
         ctx.dev->CreateDescriptorHeap(&dsvHeapDesc, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&dsvHeap));
         dsvHandle = dsvHeap->GetCPUDescriptorHandleForHeapStart();
         ctx.dev->CreateDepthStencilView(dsvTex, nullptr, dsvHandle);
+    }
+
+    if (isStateHeavyPS) {
+        auto mkBC = [&](DXGI_FORMAT fmt) -> ID3D12Resource* {
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = 256;
+            td.Height = 256;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.Format = fmt;
+            td.SampleDesc.Count = 1;
+            ID3D12Resource* tex = nullptr;
+            ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &td,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             __uuidof(ID3D12Resource), reinterpret_cast<void**>(&tex));
+            return tex;
+        };
+        texBC1 = mkBC(DXGI_FORMAT_BC1_UNORM);
+        texBC7 = mkBC(DXGI_FORMAT_BC7_UNORM);
+        auto bc1Data = buildTestBC1Texture256();
+        auto bc7Data = buildTestBC7Texture256();
+        texUpload = createWarpBuffer(ctx.dev, 128 * 1024, D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* up = nullptr;
+        texUpload->Map(0, nullptr, &up);
+        std::memcpy(up, bc1Data.data(), bc1Data.size());
+        std::memcpy(static_cast<uint8_t*>(up) + 64 * 1024, bc7Data.data(), bc7Data.size());
+        texUpload->Unmap(0, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION d1{texBC1, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION s1{texUpload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        s1.PlacedFootprint.Offset = 0;
+        s1.PlacedFootprint.Footprint = {DXGI_FORMAT_BC1_UNORM, 256, 256, 1, 512};
+        ctx.cmd->CopyTextureRegion(&d1, 0, 0, 0, &s1, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION d2{texBC7, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION s2{texUpload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        s2.PlacedFootprint.Offset = 64 * 1024;
+        s2.PlacedFootprint.Footprint = {DXGI_FORMAT_BC7_UNORM, 256, 256, 1, 1024};
+        ctx.cmd->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
+
+        D3D12_RESOURCE_BARRIER b[2]{};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition = {texBC1, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[1].Transition = {texBC7, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        ctx.cmd->ResourceBarrier(2, b);
+        ctx.cmd->Close();
+        ID3D12CommandList* initLists[] = {ctx.cmd};
+        ctx.queue->ExecuteCommandLists(1, initLists);
+        ctx.waitFence();
+        ctx.alloc->Reset();
+        ctx.cmd->Reset(ctx.alloc, nullptr);
+
+        D3D12_DESCRIPTOR_HEAP_DESC srvHD{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        ctx.dev->CreateDescriptorHeap(&srvHD, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&srvHeap));
+        UINT inc = ctx.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE h0 = srvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        srvDesc.Format = DXGI_FORMAT_BC1_UNORM;
+        ctx.dev->CreateShaderResourceView(texBC1, &srvDesc, h0);
+        h0.ptr += inc;
+        srvDesc.Format = DXGI_FORMAT_BC7_UNORM;
+        ctx.dev->CreateShaderResourceView(texBC7, &srvDesc, h0);
+    }
+
+    if (isVertexMesh) {
 
         for (int m = 0; m < 3; ++m) {
             uint32_t g = 0, mrw = 0, mrh = 0;
@@ -448,24 +580,46 @@ inline BenchRunResult runWarpGraphicsBench(
                                              D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* vbBuf = nullptr;
     if (usesQuadVB) {
-        const float quadVerts[18] = {
-            -1.0f, -1.0f, 0.0f,  1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f,
-            -1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f, -1.0f,  1.0f, 0.0f,
-        };
-        vbBuf = createWarpBuffer(ctx.dev, sizeof(quadVerts),
-                                 D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
-                                 D3D12_RESOURCE_STATE_GENERIC_READ);
-        void* p = nullptr;
-        vbBuf->Map(0, nullptr, &p);
-        std::memcpy(p, quadVerts, sizeof(quadVerts));
-        vbBuf->Unmap(0, nullptr);
+        if (isStateHeavyPS) {
+            const float quadVerts[30] = {
+                -1.0f, -1.0f, 0.0f, 0.0f, 1.0f,
+                 1.0f, -1.0f, 0.0f, 1.0f, 1.0f,
+                 1.0f,  1.0f, 0.0f, 1.0f, 0.0f,
+                -1.0f, -1.0f, 0.0f, 0.0f, 1.0f,
+                 1.0f,  1.0f, 0.0f, 1.0f, 0.0f,
+                -1.0f,  1.0f, 0.0f, 0.0f, 0.0f,
+            };
+            vbBuf = createWarpBuffer(ctx.dev, sizeof(quadVerts),
+                                     D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* p = nullptr;
+            vbBuf->Map(0, nullptr, &p);
+            std::memcpy(p, quadVerts, sizeof(quadVerts));
+            vbBuf->Unmap(0, nullptr);
+        } else {
+            const float quadVerts[18] = {
+                -1.0f, -1.0f, 0.0f,  1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f,
+                -1.0f, -1.0f, 0.0f,  1.0f,  1.0f, 0.0f, -1.0f,  1.0f, 0.0f,
+            };
+            vbBuf = createWarpBuffer(ctx.dev, sizeof(quadVerts),
+                                     D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+            void* p = nullptr;
+            vbBuf->Map(0, nullptr, &p);
+            std::memcpy(p, quadVerts, sizeof(quadVerts));
+            vbBuf->Unmap(0, nullptr);
+        }
     }
 
     auto runDraw = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vertCount) -> double {
+        uint32_t layerCount = (mode == 0) ? 8u : (mode == 1 ? 16u : 32u);
         void* p = nullptr;
         cbBuf->Map(0, nullptr, &p);
         if (isVertexMesh) {
             std::memcpy(p, &meshScenes[mode].constants, sizeof(MeshBenchConstants));
+        } else if (isStateHeavyPS) {
+            struct { uint32_t layerCount; uint32_t width; uint32_t height; float time; } scb{layerCount, rw, rh, 1.25f};
+            std::memcpy(p, &scb, sizeof(scb));
         } else if (spec.category == BenchCategory::Pixel) {
             ShadertoyCB cb{static_cast<float>(rw), static_cast<float>(rh), 1.0f, 1.25f, 0.0f, 0.0f, 0.0f, 0.0f};
             std::memcpy(p, &cb, sizeof(cb));
@@ -485,11 +639,16 @@ inline BenchRunResult runWarpGraphicsBench(
         ctx.cmd->SetGraphicsRootSignature(rootSig);
         ctx.cmd->SetPipelineState(pso);
         ctx.cmd->SetGraphicsRootConstantBufferView(0, cbBuf->GetGPUVirtualAddress());
+        if (isStateHeavyPS) {
+            ID3D12DescriptorHeap* heaps[] = {srvHeap};
+            ctx.cmd->SetDescriptorHeaps(1, heaps);
+            ctx.cmd->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
+        }
         D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh), 0.0f, 1.0f};
         D3D12_RECT sc{0, 0, static_cast<LONG>(rw), static_cast<LONG>(rh)};
         ctx.cmd->RSSetViewports(1, &vp);
         ctx.cmd->RSSetScissorRects(1, &sc);
-        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, isVertexMesh ? &dsvHandle : nullptr);
+        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, (isVertexMesh || isStateHeavyPS) ? &dsvHandle : nullptr);
         const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         ctx.cmd->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
@@ -507,6 +666,24 @@ inline BenchRunResult runWarpGraphicsBench(
             ctx.cmd->IASetIndexBuffer(&ibv);
             ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.cmd->DrawIndexedInstanced(static_cast<UINT>(meshScenes[mode].indices.size()), 1, 0, 0, 0);
+        } else if (isStateHeavyPS) {
+            ctx.cmd->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+            D3D12_VERTEX_BUFFER_VIEW vbv{vbBuf->GetGPUVirtualAddress(), 30 * sizeof(float), 5 * sizeof(float)};
+            ctx.cmd->IASetVertexBuffers(0, 1, &vbv);
+            ctx.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.cmd->DrawInstanced(vertCount, layerCount, 0, 0);
+            D3D12_RESOURCE_BARRIER rb[2]{};
+            rb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb[0].Transition = {rtvTex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE};
+            rb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb[1].Transition = {resolveTex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST};
+            ctx.cmd->ResourceBarrier(2, rb);
+            ctx.cmd->ResolveSubresource(resolveTex, 0, rtvTex, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            rb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            rb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            rb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            ctx.cmd->ResourceBarrier(2, rb);
         } else {
             if (usesQuadVB) {
                 D3D12_VERTEX_BUFFER_VIEW vbv{vbBuf->GetGPUVirtualAddress(), 18 * sizeof(float), 3 * sizeof(float)};
@@ -563,23 +740,28 @@ inline BenchRunResult runWarpGraphicsBench(
     }
 
     // Copy RTV to readback buffer for checksum
-    D3D12_RESOURCE_BARRIER toSrc{};
-    toSrc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    toSrc.Transition = {rtvTex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
-    ctx.cmd->ResourceBarrier(1, &toSrc);
+    ID3D12Resource* srcReadTex = isStateHeavyPS ? resolveTex : rtvTex;
+    if (!isStateHeavyPS) {
+        D3D12_RESOURCE_BARRIER toSrc{};
+        toSrc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrc.Transition = {rtvTex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        ctx.cmd->ResourceBarrier(1, &toSrc);
+    }
     D3D12_TEXTURE_COPY_LOCATION dstLoc{};
     dstLoc.pResource = rbBuf;
     dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dstLoc.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, rw, rh, 1, static_cast<UINT>((rw * 4 + 255) & ~255u)};
     D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-    srcLoc.pResource = rtvTex;
+    srcLoc.pResource = srcReadTex;
     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_BOX box{0, 0, 0, rw, rh, 1};
     ctx.cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &box);
-    D3D12_RESOURCE_BARRIER toRt = toSrc;
-    toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    ctx.cmd->ResourceBarrier(1, &toRt);
+    if (!isStateHeavyPS) {
+        D3D12_RESOURCE_BARRIER toRt{};
+        toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toRt.Transition = {rtvTex, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET};
+        ctx.cmd->ResourceBarrier(1, &toRt);
+    }
     ctx.cmd->Close();
     ID3D12CommandList* copyLists[] = {ctx.cmd};
     ctx.queue->ExecuteCommandLists(1, copyLists);
@@ -611,6 +793,11 @@ inline BenchRunResult runWarpGraphicsBench(
         if (meshIBs[m]) meshIBs[m]->Release();
         if (meshVBs[m]) meshVBs[m]->Release();
     }
+    if (srvHeap) srvHeap->Release();
+    if (texUpload) texUpload->Release();
+    if (texBC7) texBC7->Release();
+    if (texBC1) texBC1->Release();
+    if (resolveTex) resolveTex->Release();
     if (dsvHeap) dsvHeap->Release();
     if (dsvTex) dsvTex->Release();
     if (vbBuf) vbBuf->Release();
@@ -685,19 +872,31 @@ inline BenchRunResult runWarpRaytracingBench(
                               __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&rootSig));
     rsBlob->Release();
 
+    const bool isHeavyRT = (spec.id == "rt_inline_heavy" || spec.id == "rt_pipeline_heavy");
+
     const float triVerts[9] = {0.0f, 1.0f, 0.0f, -1.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f};
-    ID3D12Resource* vb = createWarpBuffer(dev5, sizeof(triVerts), D3D12_HEAP_TYPE_UPLOAD,
+    std::vector<float> heavyVerts;
+    const float* vbSrc = triVerts;
+    size_t vbBytes = sizeof(triVerts);
+    uint32_t vtxCount = 3u;
+    if (isHeavyRT) {
+        heavyVerts = buildHeavyRTBlasVertices();
+        vbSrc = heavyVerts.data();
+        vbBytes = heavyVerts.size() * sizeof(float);
+        vtxCount = static_cast<uint32_t>(heavyVerts.size() / 3u);
+    }
+    ID3D12Resource* vb = createWarpBuffer(dev5, vbBytes, D3D12_HEAP_TYPE_UPLOAD,
                                           D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     vb->Map(0, nullptr, &mapped);
-    std::memcpy(mapped, triVerts, sizeof(triVerts));
+    std::memcpy(mapped, vbSrc, vbBytes);
     vb->Unmap(0, nullptr);
 
     D3D12_RAYTRACING_GEOMETRY_DESC geom{};
     geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
     geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
     geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    geom.Triangles.VertexCount = 3;
+    geom.Triangles.VertexCount = vtxCount;
     geom.Triangles.VertexBuffer.StartAddress = vb->GetGPUVirtualAddress();
     geom.Triangles.VertexBuffer.StrideInBytes = 12;
 
@@ -708,32 +907,44 @@ inline BenchRunResult runWarpRaytracingBench(
     blasIn.pGeometryDescs = &geom;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPre{};
     dev5->GetRaytracingAccelerationStructurePrebuildInfo(&blasIn, &blasPre);
-    ID3D12Resource* blasBuf = createWarpBuffer(dev5, std::max<UINT64>(4096, blasPre.ResultDataMaxSizeInBytes),
+    ID3D12Resource* blasBuf = createWarpBuffer(dev5, std::max<UINT64>(65536, blasPre.ResultDataMaxSizeInBytes),
                                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
-    ID3D12Resource* scratch = createWarpBuffer(dev5, std::max<UINT64>(4096, blasPre.ScratchDataSizeInBytes),
+    ID3D12Resource* scratch = createWarpBuffer(dev5, std::max<UINT64>(65536, blasPre.ScratchDataSizeInBytes),
                                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    D3D12_RAYTRACING_INSTANCE_DESC inst{};
-    inst.Transform[0][0] = 1.0f; inst.Transform[1][1] = 1.0f; inst.Transform[2][2] = 1.0f;
-    inst.InstanceID = 42;
-    inst.InstanceMask = 0xFF;
-    inst.AccelerationStructure = blasBuf->GetGPUVirtualAddress();
-    ID3D12Resource* instBuf = createWarpBuffer(dev5, sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
-                                               D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    instBuf->Map(0, nullptr, &mapped);
-    std::memcpy(mapped, &inst, sizeof(inst));
-    instBuf->Unmap(0, nullptr);
+    ID3D12Resource* instBuf = nullptr;
+    uint32_t numInstances = 1u;
+    if (isHeavyRT) {
+        auto insts = buildHeavyRTTlasInstances<D3D12_RAYTRACING_INSTANCE_DESC>(blasBuf->GetGPUVirtualAddress());
+        numInstances = static_cast<uint32_t>(insts.size());
+        instBuf = createWarpBuffer(dev5, insts.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC),
+                                   D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        instBuf->Map(0, nullptr, &mapped);
+        std::memcpy(mapped, insts.data(), insts.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+        instBuf->Unmap(0, nullptr);
+    } else {
+        D3D12_RAYTRACING_INSTANCE_DESC inst{};
+        inst.Transform[0][0] = 1.0f; inst.Transform[1][1] = 1.0f; inst.Transform[2][2] = 1.0f;
+        inst.InstanceID = 42;
+        inst.InstanceMask = 0xFF;
+        inst.AccelerationStructure = blasBuf->GetGPUVirtualAddress();
+        instBuf = createWarpBuffer(dev5, sizeof(inst), D3D12_HEAP_TYPE_UPLOAD,
+                                   D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        instBuf->Map(0, nullptr, &mapped);
+        std::memcpy(mapped, &inst, sizeof(inst));
+        instBuf->Unmap(0, nullptr);
+    }
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasIn{};
     tlasIn.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tlasIn.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tlasIn.NumDescs = 1;
+    tlasIn.NumDescs = numInstances;
     tlasIn.InstanceDescs = instBuf->GetGPUVirtualAddress();
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlasPre{};
     dev5->GetRaytracingAccelerationStructurePrebuildInfo(&tlasIn, &tlasPre);
-    ID3D12Resource* tlasBuf = createWarpBuffer(dev5, std::max<UINT64>(4096, tlasPre.ResultDataMaxSizeInBytes),
+    ID3D12Resource* tlasBuf = createWarpBuffer(dev5, std::max<UINT64>(65536, tlasPre.ResultDataMaxSizeInBytes),
                                                D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
 
@@ -780,8 +991,8 @@ inline BenchRunResult runWarpRaytracingBench(
         hg.HitGroupExport = L"TriangleHitGroup";
         hg.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
         hg.ClosestHitShaderImport = L"ClosestHitMain";
-        D3D12_RAYTRACING_SHADER_CONFIG scfg{sizeof(uint32_t), sizeof(float) * 2};
-        D3D12_RAYTRACING_PIPELINE_CONFIG pcfg{1};
+        D3D12_RAYTRACING_SHADER_CONFIG scfg{isHeavyRT ? 32u : static_cast<UINT>(sizeof(uint32_t)), sizeof(float) * 2};
+        D3D12_RAYTRACING_PIPELINE_CONFIG pcfg{isHeavyRT ? 4u : 1u};
         D3D12_GLOBAL_ROOT_SIGNATURE grs{rootSig};
         D3D12_STATE_SUBOBJECT subs[5]{};
         subs[0] = {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &libDesc};
@@ -852,7 +1063,11 @@ inline BenchRunResult runWarpRaytracingBench(
             ctx.cmd->SetPipelineState(pso);
             ctx.cmd->SetComputeRootShaderResourceView(0, tlasBuf->GetGPUVirtualAddress());
             ctx.cmd->SetComputeRootUnorderedAccessView(1, outBuf->GetGPUVirtualAddress());
-            ctx.cmd->Dispatch((w + 3) / 4, h, 1);
+            if (isHeavyRT) {
+                ctx.cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            } else {
+                ctx.cmd->Dispatch((w + 3) / 4, h, 1);
+            }
         } else {
             cmd4->SetPipelineState1(stateObj);
             ctx.cmd->SetComputeRootShaderResourceView(0, tlasBuf->GetGPUVirtualAddress());
