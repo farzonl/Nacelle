@@ -163,7 +163,8 @@ bool buildMeshRasterScene(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const MeshDispatchParams& dispatch,
-    RasterScene& outScene);
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins = nullptr);
 
 void binTrianglesToTiles(
     const RasterScene& scene,
