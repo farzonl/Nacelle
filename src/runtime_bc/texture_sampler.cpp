@@ -1143,14 +1143,38 @@ static inline __attribute__((always_inline)) void sample_mip_2d_fast_v(
 }
 
 template <int W>
-struct BC_SampleVecArgs {
-    tex_vf32<W> u, v, w, c3;
-    tex_vf32<W> ddxU, ddxV, ddxW, ddyU, ddyV, ddyW;
-    tex_vf32<W> bias, expLod, clampLod;
-    tex_vi32<W> offX, offY, offZ;
-    tex_vf32<W> outR, outG, outB, outA;
-    tex_vu32<W> outStatus;
+struct alignas(16) BC_SampleVecArgs {
+    float u[W], v[W], w[W], c3[W];
+    float ddxU[W], ddxV[W], ddxW[W], ddyU[W], ddyV[W], ddyW[W];
+    float bias[W], expLod[W], clampLod[W];
+    int32_t offX[W], offY[W], offZ[W];
+    float outR[W], outG[W], outB[W], outA[W];
+    uint32_t outStatus[W];
 };
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_load_vf(const float* p) {
+    tex_vf32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_load_vi(const int32_t* p) {
+    tex_vi32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vf(float* p, tex_vf32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vu(uint32_t* p, tex_vu32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
 
 template <int W>
 static inline __attribute__((always_inline)) void tex_sample_vec_impl(
@@ -1160,11 +1184,11 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
     uint32_t activeMask,
     BC_SampleVecArgs<W>* args) {
     if (activeMask == 0u || !tex || !tex->base_ptr) {
-        args->outR = tex_splat_f<W>(0.0f);
-        args->outG = tex_splat_f<W>(0.0f);
-        args->outB = tex_splat_f<W>(0.0f);
-        args->outA = tex_splat_f<W>(1.0f);
-        args->outStatus = tex_splat_u<W>(1u);
+        tex_store_vf<W>(args->outR, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outG, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outB, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outA, tex_splat_f<W>(1.0f));
+        tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
         return;
     }
 
@@ -1178,22 +1202,22 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
     const bool linearMip = (filter & 0x01u) != 0;
     const bool isAniso = (filter == 0x55u || filter == 0xD5u);
 
-    const tex_vf32<W> u = args->u;
-    const tex_vf32<W> v = args->v;
-    const tex_vf32<W> w = args->w;
-    const tex_vf32<W> c3 = args->c3;
-    const tex_vf32<W> ddxU = args->ddxU;
-    const tex_vf32<W> ddxV = args->ddxV;
-    const tex_vf32<W> ddxW = args->ddxW;
-    const tex_vf32<W> ddyU = args->ddyU;
-    const tex_vf32<W> ddyV = args->ddyV;
-    const tex_vf32<W> ddyW = args->ddyW;
-    const tex_vf32<W> bias = args->bias;
-    const tex_vf32<W> expLod = args->expLod;
-    const tex_vf32<W> clampLod = args->clampLod;
-    const tex_vi32<W> offX = args->offX;
-    const tex_vi32<W> offY = args->offY;
-    const tex_vi32<W> offZ = args->offZ;
+    const tex_vf32<W> u = tex_load_vf<W>(args->u);
+    const tex_vf32<W> v = tex_load_vf<W>(args->v);
+    const tex_vf32<W> w = tex_load_vf<W>(args->w);
+    const tex_vf32<W> c3 = tex_load_vf<W>(args->c3);
+    const tex_vf32<W> ddxU = tex_load_vf<W>(args->ddxU);
+    const tex_vf32<W> ddxV = tex_load_vf<W>(args->ddxV);
+    const tex_vf32<W> ddxW = tex_load_vf<W>(args->ddxW);
+    const tex_vf32<W> ddyU = tex_load_vf<W>(args->ddyU);
+    const tex_vf32<W> ddyV = tex_load_vf<W>(args->ddyV);
+    const tex_vf32<W> ddyW = tex_load_vf<W>(args->ddyW);
+    const tex_vf32<W> bias = tex_load_vf<W>(args->bias);
+    const tex_vf32<W> expLod = tex_load_vf<W>(args->expLod);
+    const tex_vf32<W> clampLod = tex_load_vf<W>(args->clampLod);
+    const tex_vi32<W> offX = tex_load_vi<W>(args->offX);
+    const tex_vi32<W> offY = tex_load_vi<W>(args->offY);
+    const tex_vi32<W> offZ = tex_load_vi<W>(args->offZ);
 
     if (!isTiled && (dim == 4u || dim == 5u)) {
         const uint32_t addrU = (sflags >> 8) & 0x7u;
@@ -1265,8 +1289,11 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
                 refLinear, reduction, addrU, addrV, borderKind, offX, offY, activeMask,
                 r0, g0, b0, a0);
             if (singleMipMode || m1 == m0 || allSmallFrac) {
-                args->outR = r0; args->outG = g0; args->outB = b0; args->outA = a0;
-                args->outStatus = tex_splat_u<W>(1u);
+                tex_store_vf<W>(args->outR, r0);
+                tex_store_vf<W>(args->outG, g0);
+                tex_store_vf<W>(args->outB, b0);
+                tex_store_vf<W>(args->outA, a0);
+                tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
                 return;
             }
             tex_vf32<W> r1, g1, b1, a1;
@@ -1276,22 +1303,22 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
                 r1, g1, b1, a1);
             tex_vf32<W> frac = lod - tex_splat_f<W>(float(m0));
             if (reduction == 2u) {
-                args->outR = tex_min_f<W>(r0, r1);
-                args->outG = tex_min_f<W>(g0, g1);
-                args->outB = tex_min_f<W>(b0, b1);
-                args->outA = tex_min_f<W>(a0, a1);
+                tex_store_vf<W>(args->outR, tex_min_f<W>(r0, r1));
+                tex_store_vf<W>(args->outG, tex_min_f<W>(g0, g1));
+                tex_store_vf<W>(args->outB, tex_min_f<W>(b0, b1));
+                tex_store_vf<W>(args->outA, tex_min_f<W>(a0, a1));
             } else if (reduction == 3u) {
-                args->outR = tex_max_f<W>(r0, r1);
-                args->outG = tex_max_f<W>(g0, g1);
-                args->outB = tex_max_f<W>(b0, b1);
-                args->outA = tex_max_f<W>(a0, a1);
+                tex_store_vf<W>(args->outR, tex_max_f<W>(r0, r1));
+                tex_store_vf<W>(args->outG, tex_max_f<W>(g0, g1));
+                tex_store_vf<W>(args->outB, tex_max_f<W>(b0, b1));
+                tex_store_vf<W>(args->outA, tex_max_f<W>(a0, a1));
             } else {
-                args->outR = tex_lerp_f<W>(r0, r1, frac);
-                args->outG = tex_lerp_f<W>(g0, g1, frac);
-                args->outB = tex_lerp_f<W>(b0, b1, frac);
-                args->outA = tex_lerp_f<W>(a0, a1, frac);
+                tex_store_vf<W>(args->outR, tex_lerp_f<W>(r0, r1, frac));
+                tex_store_vf<W>(args->outG, tex_lerp_f<W>(g0, g1, frac));
+                tex_store_vf<W>(args->outB, tex_lerp_f<W>(b0, b1, frac));
+                tex_store_vf<W>(args->outA, tex_lerp_f<W>(a0, a1, frac));
             }
-            args->outStatus = tex_splat_u<W>(1u);
+            tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
             return;
         }
     }
@@ -1312,8 +1339,11 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
             bias[l], expLod[l], lodMode, offX[l], offY[l], offZ[l], clampLod[l], tmp);
         r[l] = tmp[0]; g[l] = tmp[1]; b[l] = tmp[2]; a[l] = tmp[3];
     }
-    args->outR = r; args->outG = g; args->outB = b; args->outA = a;
-    args->outStatus = st;
+    tex_store_vf<W>(args->outR, r);
+    tex_store_vf<W>(args->outG, g);
+    tex_store_vf<W>(args->outB, b);
+    tex_store_vf<W>(args->outA, a);
+    tex_store_vu<W>(args->outStatus, st);
 }
 
 #define NACELLE_DEFINE_TEX_SAMPLE_V(W)                                                                     \
