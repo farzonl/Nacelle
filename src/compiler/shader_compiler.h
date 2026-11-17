@@ -129,6 +129,7 @@ struct PixelBatchArgs {
     uint8_t* tileStencilSOA = nullptr;  // kRasterTilePixels uint8_t
     const PixelTriData* triData = nullptr;    // [numTris]: optional per-triangle descriptors for packed batches
     const uint32_t* quadTriIndices = nullptr; // [batchCount * (W/4)]: optional per-quad index into triData (null = uniform triangle)
+    const uint32_t* sampleCoverageMasks = nullptr; // [batchCount * sampleCount]: optional per-sample coverage masks for pixel-freq MSAA
 };
 
 using CompiledPixelQuadFn = void (*)(const PixelBatchArgs* args);
@@ -307,6 +308,7 @@ struct CompiledGraphicsPSO {
     bool psWritesDepth = false;
     bool psUsesDiscard = false;
     bool psHasSideEffects = false;
+    bool psPixelFreqMSAA = false;
     std::vector<ShaderSigElement> vsInputs;
     std::vector<ShaderSigElement> vsOutputs;
     std::vector<ShaderSigElement> psInputs;

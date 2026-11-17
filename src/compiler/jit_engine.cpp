@@ -851,6 +851,7 @@ void applyGraphicsMeta(
     outPSO.psWritesDepth = meta.psWritesDepth != 0;
     outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
     outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
+    outPSO.psPixelFreqMSAA = meta.psPixelFreqMSAA != 0;
     outPSO.vsCacheHashLo = meta.vsHashLo;
     outPSO.vsCacheHashHi = meta.vsHashHi;
     outPSO.vsSymbolName = vsSym;
