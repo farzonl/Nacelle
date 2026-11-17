@@ -1666,7 +1666,8 @@ bool buildRasterScene(
         const char* forceSingleEnv = std::getenv("NACELLE_SINGLE_THREAD_GEOM");
         const bool allowParallel = !(forceSingleEnv && forceSingleEnv[0] == '1');
 
-        if (!allowParallel || totalPrims < kParallelPrimThreshold || pool.get_thread_count() <= 1) {
+        const uint32_t numChunks = static_cast<uint32_t>((totalPrims + kChunkPrims - 1u) / kChunkPrims);
+        if (!allowParallel || totalPrims < kParallelPrimThreshold || numChunks <= 1 || pool.get_thread_count() <= 1) {
             TriangleEmitTarget directTarget;
             directTarget.triangles = &outScene.triangles;
             directTarget.attrBaseArena = &outScene.attrBaseArena;
@@ -1683,7 +1684,6 @@ bool buildRasterScene(
         }
 
         // Parallel chunked geometry + lock-free deterministic tile binning
-        const uint32_t numChunks = static_cast<uint32_t>((totalPrims + kChunkPrims - 1u) / kChunkPrims);
         const size_t numTiles = static_cast<size_t>(outScene.numTilesX) * outScene.numTilesY;
         const bool fuseBinning = (optOutBins != nullptr) && (numTiles > 0) &&
                                  (static_cast<uint64_t>(numChunks) * numTiles <= kMaxFusedBinMatrixEntries);
@@ -1697,7 +1697,7 @@ bool buildRasterScene(
             chunkOutputs[c].reset(numTiles, fuseBinning);
         }
 
-        pool.detach_loop<uint32_t>(0, numChunks, [&](uint32_t c) {
+        parallelForDynamic(pool, numChunks, [&](uint32_t c) {
             uint64_t start = static_cast<uint64_t>(c) * kChunkPrims;
             uint64_t end = std::min<uint64_t>(totalPrims, start + kChunkPrims);
             ChunkOutput& co = chunkOutputs[c];
@@ -1716,7 +1716,6 @@ bool buildRasterScene(
                 start, end, primsPerInstance, isStrip, stripPtr, ibReader,
                 state, draw, vsFn, W, rast, outScene, chunkTarget);
         });
-        pool.wait();
 
         thread_local std::vector<size_t> tlChunkTriOffsets;
         auto& chunkTriOffsets = tlChunkTriOffsets;
@@ -1762,8 +1761,8 @@ bool buildRasterScene(
             }
         }
 
-        // Parallel scatter of triangles, arenas, and ordered tile indices into disjoint slices
-        pool.detach_loop<uint32_t>(0, numChunks, [&](uint32_t c) {
+        // Scatter triangles, arenas, and ordered tile indices into disjoint slices
+        auto scatterChunk = [&](uint32_t c) {
             const ChunkOutput& co = chunkOutputs[c];
             const size_t count = co.triangles.size();
             if (count == 0) return;
@@ -1801,8 +1800,14 @@ bool buildRasterScene(
                     (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
                 }
             }
-        });
-        pool.wait();
+        };
+        if (totalTris < 2048 || numChunks <= 2) {
+            for (uint32_t c = 0; c < numChunks; ++c) {
+                scatterChunk(c);
+            }
+        } else {
+            parallelForDynamic(pool, numChunks, scatterChunk);
+        }
 
         if (fuseBinning) {
             outScene.binsAlreadyPopulated = true;

@@ -988,11 +988,12 @@ void rasterizeTiles(
         }
     };
 
-    if (activeTiles.size() == 1) {
-        processTile(0);
+    if (activeTiles.size() <= 2) {
+        for (size_t i = 0; i < activeTiles.size(); ++i) {
+            processTile(i);
+        }
     } else {
-        pool.detach_loop<size_t>(0, activeTiles.size(), processTile);
-        pool.wait();
+        parallelForDynamic(pool, activeTiles.size(), processTile);
     }
 }
 
