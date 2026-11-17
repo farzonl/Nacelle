@@ -122,6 +122,112 @@ struct ChunkOutput {
     }
 };
 
+/// Merges per-chunk geometry outputs and optional fused tile-binning counts into `outScene`.
+static bool mergeChunkOutputsToScene(
+    BS::thread_pool<>& pool,
+    uint32_t numChunks,
+    const std::vector<ChunkOutput>& chunkOutputs,
+    bool fuseBinning,
+    size_t numTiles,
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins) {
+    thread_local std::vector<size_t> tlChunkTriOffsets;
+    auto& chunkTriOffsets = tlChunkTriOffsets;
+    chunkTriOffsets.resize(numChunks + 1);
+    chunkTriOffsets[0] = 0;
+    for (uint32_t c = 0; c < numChunks; ++c) {
+        chunkTriOffsets[c + 1] = chunkTriOffsets[c] + chunkOutputs[c].triangles.size();
+    }
+    const size_t totalTris = chunkTriOffsets[numChunks];
+    if (totalTris == 0) {
+        if (fuseBinning) {
+            optOutBins->resize(numTiles);
+            for (auto& b : *optOutBins) b.triIndices.clear();
+            outScene.binsAlreadyPopulated = true;
+        }
+        return false;
+    }
+
+    const size_t psScalars = static_cast<size_t>(outScene.numPSInputScalars);
+    outScene.triangles.resize(totalTris);
+    if (psScalars > 0) {
+        outScene.attrBaseArena.resize(totalTris * psScalars * 3);
+        if (outScene.needsFlatAttrs) {
+            outScene.attrFlatArena.resize(totalTris * psScalars);
+        }
+    }
+    if (outScene.needsOrigBary) {
+        outScene.origBaryArena.resize(totalTris * 9);
+    }
+
+    thread_local std::vector<uint32_t> tlChunkTileCursors;
+    auto& chunkTileCursors = tlChunkTileCursors;
+    if (fuseBinning) {
+        optOutBins->resize(numTiles);
+        chunkTileCursors.resize(static_cast<size_t>(numChunks) * numTiles);
+        for (size_t t = 0; t < numTiles; ++t) {
+            uint32_t sum = 0;
+            for (uint32_t c = 0; c < numChunks; ++c) {
+                chunkTileCursors[static_cast<size_t>(c) * numTiles + t] = sum;
+                sum += chunkOutputs[c].tileCounts[t];
+            }
+            (*optOutBins)[t].triIndices.resize(sum);
+        }
+    }
+
+    auto scatterChunk = [&](uint32_t c) {
+        const ChunkOutput& co = chunkOutputs[c];
+        const size_t count = co.triangles.size();
+        if (count == 0) return;
+
+        const size_t triBase = chunkTriOffsets[c];
+        std::memcpy(
+            outScene.triangles.data() + triBase,
+            co.triangles.data(),
+            count * sizeof(SetupTriangle));
+
+        if (psScalars > 0) {
+            std::memcpy(
+                outScene.attrBaseArena.data() + triBase * psScalars * 3,
+                co.attrBase.data(),
+                count * psScalars * 3 * sizeof(float));
+            if (outScene.needsFlatAttrs) {
+                std::memcpy(
+                    outScene.attrFlatArena.data() + triBase * psScalars,
+                    co.attrFlat.data(),
+                    count * psScalars * sizeof(float));
+            }
+        }
+        if (outScene.needsOrigBary) {
+            std::memcpy(
+                outScene.origBaryArena.data() + triBase * 9,
+                co.origBary.data(),
+                count * 9 * sizeof(float));
+        }
+
+        if (fuseBinning && !co.binPairs.empty()) {
+            uint32_t* cursors = &chunkTileCursors[static_cast<size_t>(c) * numTiles];
+            const uint32_t baseIdx32 = static_cast<uint32_t>(triBase);
+            for (const ChunkBinPair& bp : co.binPairs) {
+                uint32_t dstPos = cursors[bp.tileIdx]++;
+                (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
+            }
+        }
+    };
+    if (totalTris < 2048 || numChunks <= 2) {
+        for (uint32_t c = 0; c < numChunks; ++c) {
+            scatterChunk(c);
+        }
+    } else {
+        parallelForDynamic(pool, numChunks, scatterChunk);
+    }
+
+    if (fuseBinning) {
+        outScene.binsAlreadyPopulated = true;
+    }
+    return true;
+}
+
 struct alignas(64) ChunkTransientScratch {
     uint32_t cacheVId[kVtxCacheSize]{};
     uint32_t cacheGen[kVtxCacheSize]{};
@@ -1717,102 +1823,8 @@ bool buildRasterScene(
                 state, draw, vsFn, W, rast, outScene, chunkTarget);
         });
 
-        thread_local std::vector<size_t> tlChunkTriOffsets;
-        auto& chunkTriOffsets = tlChunkTriOffsets;
-        chunkTriOffsets.resize(numChunks + 1);
-        chunkTriOffsets[0] = 0;
-        for (uint32_t c = 0; c < numChunks; ++c) {
-            chunkTriOffsets[c + 1] = chunkTriOffsets[c] + chunkOutputs[c].triangles.size();
-        }
-        const size_t totalTris = chunkTriOffsets[numChunks];
-        if (totalTris == 0) {
-            if (fuseBinning) {
-                optOutBins->resize(numTiles);
-                for (auto& b : *optOutBins) b.triIndices.clear();
-                outScene.binsAlreadyPopulated = true;
-            }
-            return false;
-        }
-
-        const size_t psScalars = static_cast<size_t>(outScene.numPSInputScalars);
-        outScene.triangles.resize(totalTris);
-        if (psScalars > 0) {
-            outScene.attrBaseArena.resize(totalTris * psScalars * 3);
-            if (outScene.needsFlatAttrs) {
-                outScene.attrFlatArena.resize(totalTris * psScalars);
-            }
-        }
-        if (outScene.needsOrigBary) {
-            outScene.origBaryArena.resize(totalTris * 9);
-        }
-
-        thread_local std::vector<uint32_t> tlChunkTileCursors;
-        auto& chunkTileCursors = tlChunkTileCursors;
-        if (fuseBinning) {
-            optOutBins->resize(numTiles);
-            chunkTileCursors.resize(static_cast<size_t>(numChunks) * numTiles);
-            for (size_t t = 0; t < numTiles; ++t) {
-                uint32_t sum = 0;
-                for (uint32_t c = 0; c < numChunks; ++c) {
-                    chunkTileCursors[static_cast<size_t>(c) * numTiles + t] = sum;
-                    sum += chunkOutputs[c].tileCounts[t];
-                }
-                (*optOutBins)[t].triIndices.resize(sum);
-            }
-        }
-
-        // Scatter triangles, arenas, and ordered tile indices into disjoint slices
-        auto scatterChunk = [&](uint32_t c) {
-            const ChunkOutput& co = chunkOutputs[c];
-            const size_t count = co.triangles.size();
-            if (count == 0) return;
-
-            const size_t triBase = chunkTriOffsets[c];
-            std::memcpy(
-                outScene.triangles.data() + triBase,
-                co.triangles.data(),
-                count * sizeof(SetupTriangle));
-
-            if (psScalars > 0) {
-                std::memcpy(
-                    outScene.attrBaseArena.data() + triBase * psScalars * 3,
-                    co.attrBase.data(),
-                    count * psScalars * 3 * sizeof(float));
-                if (outScene.needsFlatAttrs) {
-                    std::memcpy(
-                        outScene.attrFlatArena.data() + triBase * psScalars,
-                        co.attrFlat.data(),
-                        count * psScalars * sizeof(float));
-                }
-            }
-            if (outScene.needsOrigBary) {
-                std::memcpy(
-                    outScene.origBaryArena.data() + triBase * 9,
-                    co.origBary.data(),
-                    count * 9 * sizeof(float));
-            }
-
-            if (fuseBinning && !co.binPairs.empty()) {
-                uint32_t* cursors = &chunkTileCursors[static_cast<size_t>(c) * numTiles];
-                const uint32_t baseIdx32 = static_cast<uint32_t>(triBase);
-                for (const ChunkBinPair& bp : co.binPairs) {
-                    uint32_t dstPos = cursors[bp.tileIdx]++;
-                    (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
-                }
-            }
-        };
-        if (totalTris < 2048 || numChunks <= 2) {
-            for (uint32_t c = 0; c < numChunks; ++c) {
-                scatterChunk(c);
-            }
-        } else {
-            parallelForDynamic(pool, numChunks, scatterChunk);
-        }
-
-        if (fuseBinning) {
-            outScene.binsAlreadyPopulated = true;
-        }
-        return true;
+        return mergeChunkOutputsToScene(
+            pool, numChunks, chunkOutputs, fuseBinning, numTiles, outScene, optOutBins);
     }
 
     // =========================================================================
@@ -1970,38 +1982,42 @@ bool buildRasterScene(
     const uint32_t gsMaxVerts = std::max<uint32_t>(1, compiled->gsMaxVertexCount);
     const uint32_t gsInstCount = std::max<uint32_t>(1, compiled->gsInstanceCount);
     const uint32_t gsOutScalars = outScene.preRastScalarAttrs;
-    auto& gsInPosSOA = tlGeo.gsInPosSOA;
-    auto& gsInAttrsSOA = tlGeo.gsInAttrsSOA;
-    auto& gsOutPos = tlGeo.gsOutPos;
-    auto& gsOutAttrs = tlGeo.gsOutAttrs;
-    auto& gsStripCounts = tlGeo.gsStripCounts;
-    auto& gsInstTotalVerts = tlGeo.gsInstTotalVerts;
-    auto& gsInstNumStrips = tlGeo.gsInstNumStrips;
-    if (hasGS && gsFn) {
-        gsOutPos.assign(static_cast<size_t>(gsInstCount) * W * gsMaxVerts * 4, 0.0f);
-        gsOutAttrs.assign(std::max<size_t>(1, static_cast<size_t>(gsInstCount) * W * gsMaxVerts * gsOutScalars), 0.0f);
-        gsStripCounts.assign(static_cast<size_t>(gsInstCount) * W * gsMaxVerts, 0u);
-        gsInstTotalVerts.assign(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
-        gsInstNumStrips.assign(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
-    }
 
-    auto runGSBatch = [&](const ShadedVertex* batchPrims, uint32_t primVertCount,
-                          const uint32_t* primIdList, uint32_t activePrims, uint32_t inAttrScalars) {
+    auto ensureGSOutputBuffers = [&](FallbackGeoScratch& geo) {
+        const size_t posSize = static_cast<size_t>(gsInstCount) * W * gsMaxVerts * 4;
+        const size_t attrSize = std::max<size_t>(1, static_cast<size_t>(gsInstCount) * W * gsMaxVerts * gsOutScalars);
+        const size_t stripSize = static_cast<size_t>(gsInstCount) * W * gsMaxVerts;
+        const size_t instVecSize = static_cast<size_t>(gsInstCount) * kMaxSimdWidth;
+        if (geo.gsOutPos.size() < posSize) geo.gsOutPos.assign(posSize, 0.0f);
+        if (geo.gsOutAttrs.size() < attrSize) geo.gsOutAttrs.assign(attrSize, 0.0f);
+        if (geo.gsStripCounts.size() < stripSize) geo.gsStripCounts.assign(stripSize, 0u);
+        if (geo.gsInstTotalVerts.size() < instVecSize) geo.gsInstTotalVerts.assign(instVecSize, 0u);
+        if (geo.gsInstNumStrips.size() < instVecSize) geo.gsInstNumStrips.assign(instVecSize, 0u);
+    };
+
+    auto runGSBatchWithScratch = [&](FallbackGeoScratch& geo, TriangleEmitTarget& target,
+                                     const ShadedVertex* batchPrims, uint32_t primVertCount,
+                                     const uint32_t* primIdList, uint32_t activePrims, uint32_t inAttrScalars) {
         if (activePrims == 0 || !gsFn) return;
-        gsInPosSOA.assign(static_cast<size_t>(primVertCount) * 4 * W, 0.0f);
-        gsInAttrsSOA.assign(std::max<size_t>(1, static_cast<size_t>(primVertCount) * inAttrScalars * W), 0.0f);
+        ensureGSOutputBuffers(geo);
+        const size_t inPosSize = static_cast<size_t>(primVertCount) * 4 * W;
+        const size_t inAttrSize = std::max<size_t>(1, static_cast<size_t>(primVertCount) * inAttrScalars * W);
+        if (geo.gsInPosSOA.size() < inPosSize) geo.gsInPosSOA.resize(inPosSize);
+        std::fill_n(geo.gsInPosSOA.begin(), inPosSize, 0.0f);
+        if (geo.gsInAttrsSOA.size() < inAttrSize) geo.gsInAttrsSOA.resize(inAttrSize);
+        std::fill_n(geo.gsInAttrsSOA.begin(), inAttrSize, 0.0f);
         alignas(64) uint32_t paddedPrimIds[kMaxSimdWidth]{};
 
         for (uint32_t l = 0; l < activePrims; ++l) {
             paddedPrimIds[l] = primIdList[l];
             for (uint32_t k = 0; k < primVertCount; ++k) {
                 const ShadedVertex& sv = batchPrims[l * primVertCount + k];
-                gsInPosSOA[(k * 4 + 0) * W + l] = sv.clipX;
-                gsInPosSOA[(k * 4 + 1) * W + l] = sv.clipY;
-                gsInPosSOA[(k * 4 + 2) * W + l] = sv.clipZ;
-                gsInPosSOA[(k * 4 + 3) * W + l] = sv.clipW;
+                geo.gsInPosSOA[(k * 4 + 0) * W + l] = sv.clipX;
+                geo.gsInPosSOA[(k * 4 + 1) * W + l] = sv.clipY;
+                geo.gsInPosSOA[(k * 4 + 2) * W + l] = sv.clipZ;
+                geo.gsInPosSOA[(k * 4 + 3) * W + l] = sv.clipW;
                 for (uint32_t s = 0; s < inAttrScalars; ++s) {
-                    gsInAttrsSOA[(k * inAttrScalars + s) * W + l] = sv.attrs[s];
+                    geo.gsInAttrsSOA[(k * inAttrScalars + s) * W + l] = sv.attrs[s];
                 }
             }
         }
@@ -2015,32 +2031,32 @@ bool buildRasterScene(
             alignas(64) uint32_t nsVec[kMaxSimdWidth]{};
             gsFn(
                 &state.rootCtx,
-                gsInPosSOA.data(),
-                gsInAttrsSOA.data(),
+                geo.gsInPosSOA.data(),
+                geo.gsInAttrsSOA.data(),
                 paddedPrimIds,
                 gInst,
                 activePrims,
-                &gsOutPos[gInst * posInstStride],
-                gsOutScalars > 0 ? &gsOutAttrs[gInst * attrInstStride] : gsOutAttrs.data(),
-                &gsStripCounts[gInst * stripInstStride],
+                &geo.gsOutPos[gInst * posInstStride],
+                gsOutScalars > 0 ? &geo.gsOutAttrs[gInst * attrInstStride] : geo.gsOutAttrs.data(),
+                &geo.gsStripCounts[gInst * stripInstStride],
                 tvVec,
                 nsVec);
-            std::memcpy(&gsInstTotalVerts[gInst * kMaxSimdWidth], tvVec, sizeof(tvVec));
-            std::memcpy(&gsInstNumStrips[gInst * kMaxSimdWidth], nsVec, sizeof(nsVec));
+            std::memcpy(&geo.gsInstTotalVerts[gInst * kMaxSimdWidth], tvVec, sizeof(tvVec));
+            std::memcpy(&geo.gsInstNumStrips[gInst * kMaxSimdWidth], nsVec, sizeof(nsVec));
         }
 
         // Emit primitives in exact D3D12 (inputPrimitive, gsInstance) stream order
         for (uint32_t l = 0; l < activePrims; ++l) {
             uint32_t primId = paddedPrimIds[l];
             for (uint32_t gInst = 0; gInst < gsInstCount; ++gInst) {
-                uint32_t numStrips = gsInstNumStrips[gInst * kMaxSimdWidth + l];
-                const float* lanePos = &gsOutPos[gInst * posInstStride + static_cast<size_t>(l) * gsMaxVerts * 4];
+                uint32_t numStrips = geo.gsInstNumStrips[gInst * kMaxSimdWidth + l];
+                const float* lanePos = &geo.gsOutPos[gInst * posInstStride + static_cast<size_t>(l) * gsMaxVerts * 4];
                 const float* laneAttrs =
                     gsOutScalars > 0
-                        ? &gsOutAttrs[gInst * attrInstStride + static_cast<size_t>(l) * gsMaxVerts * gsOutScalars]
+                        ? &geo.gsOutAttrs[gInst * attrInstStride + static_cast<size_t>(l) * gsMaxVerts * gsOutScalars]
                         : nullptr;
                 const uint32_t* laneStrips =
-                    &gsStripCounts[gInst * stripInstStride + static_cast<size_t>(l) * gsMaxVerts];
+                    &geo.gsStripCounts[gInst * stripInstStride + static_cast<size_t>(l) * gsMaxVerts];
 
                 auto makeGsVert = [&](uint32_t vIdx) {
                     ShadedVertex sv;
@@ -2070,7 +2086,7 @@ bool buildRasterScene(
                             uint32_t i2 = baseV + k + ((k & 1u) ? 1u : 2u);
                             processTriangle(
                                 makeGsVert(i0), makeGsVert(i1), makeGsVert(i2),
-                                primId, rast, outScene, sceneTarget, polyA, polyB);
+                                primId, rast, outScene, target, geo.polyA, geo.polyB);
                         }
                     }
                     baseV += sc;
@@ -2079,71 +2095,81 @@ bool buildRasterScene(
         }
     };
 
+    auto runGSBatch = [&](const ShadedVertex* batchPrims, uint32_t primVertCount,
+                          const uint32_t* primIdList, uint32_t activePrims, uint32_t inAttrScalars) {
+        runGSBatchWithScratch(tlGeo, sceneTarget, batchPrims, primVertCount, primIdList, activePrims, inAttrScalars);
+    };
+
     outScene.triangles.reserve((triVerts.size() / vertsPerPrim) * draw.instanceCount);
 
     for (uint32_t inst = 0; inst < draw.instanceCount; ++inst) {
         uint32_t instId = draw.startInstanceLocation + inst;
-        for (size_t base = 0; base < uniqueVIds.size(); base += W) {
-            uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, uniqueVIds.size() - base));
-            for (uint32_t l = 0; l < active; ++l) {
-                batchVIds[l] = uniqueVIds[base + l];
-                batchIIds[l] = instId;
-            }
-            for (uint32_t l = active; l < W; ++l) {
-                batchVIds[l] = uniqueVIds[base];
-                batchIIds[l] = instId;
-            }
+        const size_t numVSBatches = (uniqueVIds.size() + W - 1u) / W;
+        if (uniqueVIds.size() >= 128 && numVSBatches > 1 && pool.get_thread_count() > 1) {
+            parallelForDynamic(pool, numVSBatches, [&](size_t bIdx) {
+                const size_t base = bIdx * W;
+                const uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, uniqueVIds.size() - base));
+                alignas(64) uint32_t localVIds[kMaxSimdWidth]{};
+                alignas(64) uint32_t localIIds[kMaxSimdWidth]{};
+                alignas(64) float localPosXYZW[4 * kMaxSimdWidth]{};
+                float localOutAttrs[kMaxPSInputScalars * kMaxSimdWidth]{};
+                for (uint32_t l = 0; l < active; ++l) {
+                    localVIds[l] = uniqueVIds[base + l];
+                    localIIds[l] = instId;
+                }
+                for (uint32_t l = active; l < W; ++l) {
+                    localVIds[l] = uniqueVIds[base];
+                    localIIds[l] = instId;
+                }
+                vsFn(&state.rootCtx, localVIds, localIIds, active, localPosXYZW, localOutAttrs);
+                for (uint32_t l = 0; l < active; ++l) {
+                    ShadedVertex& sv = shadedVerts[base + l];
+                    sv.clipX = localPosXYZW[0 * W + l];
+                    sv.clipY = localPosXYZW[1 * W + l];
+                    sv.clipZ = localPosXYZW[2 * W + l];
+                    sv.clipW = localPosXYZW[3 * W + l];
+                    for (uint32_t s = 0; s < vsOutScalars; ++s) {
+                        sv.attrs[s] = localOutAttrs[s * W + l];
+                    }
+                }
+            });
+        } else {
+            for (size_t base = 0; base < uniqueVIds.size(); base += W) {
+                uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, uniqueVIds.size() - base));
+                for (uint32_t l = 0; l < active; ++l) {
+                    batchVIds[l] = uniqueVIds[base + l];
+                    batchIIds[l] = instId;
+                }
+                for (uint32_t l = active; l < W; ++l) {
+                    batchVIds[l] = uniqueVIds[base];
+                    batchIIds[l] = instId;
+                }
 
-            vsFn(&state.rootCtx, batchVIds, batchIIds, active, outPosXYZW, outAttrs.data());
+                vsFn(&state.rootCtx, batchVIds, batchIIds, active, outPosXYZW, outAttrs.data());
 
-            for (uint32_t l = 0; l < active; ++l) {
-                ShadedVertex& sv = shadedVerts[base + l];
-                sv.clipX = outPosXYZW[0 * W + l];
-                sv.clipY = outPosXYZW[1 * W + l];
-                sv.clipZ = outPosXYZW[2 * W + l];
-                sv.clipW = outPosXYZW[3 * W + l];
-                for (uint32_t s = 0; s < vsOutScalars; ++s) {
-                    sv.attrs[s] = outAttrs[s * W + l];
+                for (uint32_t l = 0; l < active; ++l) {
+                    ShadedVertex& sv = shadedVerts[base + l];
+                    sv.clipX = outPosXYZW[0 * W + l];
+                    sv.clipY = outPosXYZW[1 * W + l];
+                    sv.clipZ = outPosXYZW[2 * W + l];
+                    sv.clipW = outPosXYZW[3 * W + l];
+                    for (uint32_t s = 0; s < vsOutScalars; ++s) {
+                        sv.attrs[s] = outAttrs[s * W + l];
+                    }
                 }
             }
         }
 
         if (hasTess && hsFn && hsPcFn && dsFn) {
-            uint32_t inCPCount = vertsPerPrim;
-            uint32_t outCPCount = std::max<uint32_t>(1, compiled->hsOutputCPCount);
-            uint32_t inAttrScalars = std::max<uint32_t>(1, compiled->numHSInputScalars);
-            uint32_t outAttrScalars = std::max<uint32_t>(1, compiled->numHSOutputScalars);
-            uint32_t pcScalars = std::max<uint32_t>(1, compiled->numPatchConstScalars);
-            uint32_t dsOutScalars =
+            const uint32_t inCPCount = vertsPerPrim;
+            const uint32_t outCPCount = std::max<uint32_t>(1, compiled->hsOutputCPCount);
+            const uint32_t inAttrScalars = std::max<uint32_t>(1, compiled->numHSInputScalars);
+            const uint32_t outAttrScalars = std::max<uint32_t>(1, compiled->numHSOutputScalars);
+            const uint32_t pcScalars = std::max<uint32_t>(1, compiled->numPatchConstScalars);
+            const uint32_t dsOutScalars =
                 hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars)
                       : outScene.preRastScalarAttrs;
-
-            auto& inCPAttrs = tlGeo.inCPAttrs;
-            auto& outCPAttrs = tlGeo.outCPAttrs;
-            auto& hsOutCPSOA = tlGeo.hsOutCPSOA;
-            auto& patchConsts = tlGeo.patchConsts;
-            inCPAttrs.assign(inCPCount * inAttrScalars, 0.0f);
-            outCPAttrs.assign(outCPCount * outAttrScalars, 0.0f);
-            hsOutCPSOA.assign(outAttrScalars * W, 0.0f);
-            patchConsts.assign(pcScalars, 0.0f);
-            float tessFactors[6]{};
-            alignas(64) float dsPosSOA[4 * kMaxSimdWidth]{};
-            auto& dsAttrsSOA = tlGeo.dsAttrsSOA;
-            dsAttrsSOA.assign(std::max<uint32_t>(1, dsOutScalars) * W, 0.0f);
-            auto& patchDomU = tlGeo.patchDomU;
-            auto& patchDomV = tlGeo.patchDomV;
-            auto& patchDomW = tlGeo.patchDomW;
-            auto& patchDSVerts = tlGeo.patchDSVerts;
-            auto& triRowOffsets = tlGeo.triRowOffsets;
-            auto& gsPrimBuf = tlGeo.gsPrimBuf;
-            auto& gsPrimIdBuf = tlGeo.gsPrimIdBuf;
-            patchDomU.clear();
-            patchDomV.clear();
-            patchDomW.clear();
-            patchDSVerts.clear();
-            triRowOffsets.clear();
-            gsPrimBuf.clear();
-            gsPrimIdBuf.clear();
+            const uint32_t numPatches = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
 
             auto partitionTF = [&](float tf) -> uint32_t {
                 float clamped = std::clamp(tf, 1.0f, std::max(1.0f, compiled->hsMaxTessFactor));
@@ -2165,238 +2191,366 @@ bool buildRasterScene(
                 }
             };
 
-            uint32_t numPatches = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
-            for (uint32_t p = 0; p < numPatches; ++p) {
-                std::fill(inCPAttrs.begin(), inCPAttrs.end(), 0.0f);
-                for (uint32_t k = 0; k < inCPCount; ++k) {
-                    const ShadedVertex& sv = shadedVerts[triVerts[p * vertsPerPrim + k]];
-                    uint32_t copyCount = std::min<uint32_t>(vsOutScalars, inAttrScalars);
-                    for (uint32_t s = 0; s < copyCount; ++s) {
-                        inCPAttrs[k * inAttrScalars + s] = sv.attrs[s];
-                    }
+            auto executeTessPatchRange = [&](FallbackGeoScratch& geo, TriangleEmitTarget& target,
+                                             uint32_t patchStart, uint32_t patchEnd) {
+                auto& inCPAttrs = geo.inCPAttrs;
+                auto& outCPAttrs = geo.outCPAttrs;
+                auto& hsOutCPSOA = geo.hsOutCPSOA;
+                auto& patchConsts = geo.patchConsts;
+                if (inCPAttrs.size() < static_cast<size_t>(inCPCount) * inAttrScalars) {
+                    inCPAttrs.resize(static_cast<size_t>(inCPCount) * inAttrScalars);
                 }
-                std::fill(outCPAttrs.begin(), outCPAttrs.end(), 0.0f);
-                for (uint32_t baseCp = 0; baseCp < outCPCount; baseCp += W) {
-                    uint32_t activeCp = std::min<uint32_t>(W, outCPCount - baseCp);
-                    std::fill(hsOutCPSOA.begin(), hsOutCPSOA.end(), 0.0f);
-                    hsFn(&state.rootCtx, inCPAttrs.data(), p, baseCp, activeCp, hsOutCPSOA.data());
-                    for (uint32_t l = 0; l < activeCp; ++l) {
-                        float* dst = &outCPAttrs[(baseCp + l) * outAttrScalars];
-                        for (uint32_t s = 0; s < outAttrScalars; ++s) {
-                            dst[s] = hsOutCPSOA[s * W + l];
-                        }
-                    }
+                if (outCPAttrs.size() < static_cast<size_t>(outCPCount) * outAttrScalars) {
+                    outCPAttrs.resize(static_cast<size_t>(outCPCount) * outAttrScalars);
                 }
-
-                std::fill(patchConsts.begin(), patchConsts.end(), 0.0f);
-                std::fill(std::begin(tessFactors), std::end(tessFactors), 0.0f);
-                hsPcFn(&state.rootCtx, inCPAttrs.data(), outCPAttrs.data(), p, patchConsts.data(), tessFactors);
-
-                auto evalDSAllPoints = [&]() {
-                    const size_t totalPts = patchDomU.size();
-                    patchDSVerts.resize(totalPts);
-                    alignas(64) float uVec[kMaxSimdWidth]{};
-                    alignas(64) float vVec[kMaxSimdWidth]{};
-                    alignas(64) float wVec[kMaxSimdWidth]{};
-
-                    for (size_t base = 0; base < totalPts; base += W) {
-                        uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, totalPts - base));
-                        for (uint32_t l = 0; l < active; ++l) {
-                            uVec[l] = patchDomU[base + l];
-                            vVec[l] = patchDomV[base + l];
-                            wVec[l] = patchDomW[base + l];
-                        }
-                        for (uint32_t l = active; l < W; ++l) {
-                            uVec[l] = uVec[0];
-                            vVec[l] = vVec[0];
-                            wVec[l] = wVec[0];
-                        }
-                        std::memset(dsPosSOA, 0, sizeof(dsPosSOA));
-                        std::fill(dsAttrsSOA.begin(), dsAttrsSOA.end(), 0.0f);
-                        dsFn(
-                            &state.rootCtx, outCPAttrs.data(), patchConsts.data(), tessFactors,
-                            p, uVec, vVec, wVec, active, dsPosSOA, dsAttrsSOA.data());
-                        for (uint32_t l = 0; l < active; ++l) {
-                            ShadedVertex& sv = patchDSVerts[base + l];
-                            sv = ShadedVertex{};
-                            sv.clipX = dsPosSOA[0 * W + l];
-                            sv.clipY = dsPosSOA[1 * W + l];
-                            sv.clipZ = dsPosSOA[2 * W + l];
-                            sv.clipW = dsPosSOA[3 * W + l];
-                            for (uint32_t s = 0; s < dsOutScalars; ++s) {
-                                sv.attrs[s] = dsAttrsSOA[s * W + l];
-                            }
-                        }
-                    }
-                };
-
+                if (hsOutCPSOA.size() < static_cast<size_t>(outAttrScalars) * W) {
+                    hsOutCPSOA.resize(static_cast<size_t>(outAttrScalars) * W);
+                }
+                if (patchConsts.size() < pcScalars) {
+                    patchConsts.resize(pcScalars);
+                }
+                float tessFactors[6]{};
+                alignas(64) float dsPosSOA[4 * kMaxSimdWidth]{};
+                auto& dsAttrsSOA = geo.dsAttrsSOA;
+                const size_t dsAttrNeed = static_cast<size_t>(std::max<uint32_t>(1, dsOutScalars)) * W;
+                if (dsAttrsSOA.size() < dsAttrNeed) {
+                    dsAttrsSOA.resize(dsAttrNeed);
+                }
+                auto& patchDomU = geo.patchDomU;
+                auto& patchDomV = geo.patchDomV;
+                auto& patchDomW = geo.patchDomW;
+                auto& patchDSVerts = geo.patchDSVerts;
+                auto& triRowOffsets = geo.triRowOffsets;
+                auto& gsPrimBuf = geo.gsPrimBuf;
+                auto& gsPrimIdBuf = geo.gsPrimIdBuf;
                 gsPrimBuf.clear();
                 gsPrimIdBuf.clear();
+
                 auto flushGSBuf = [&](uint32_t primVCount) {
                     if (gsPrimIdBuf.empty()) return;
-                    runGSBatch(gsPrimBuf.data(), primVCount, gsPrimIdBuf.data(),
-                               static_cast<uint32_t>(gsPrimIdBuf.size()), dsOutScalars);
+                    runGSBatchWithScratch(
+                        geo, target, gsPrimBuf.data(), primVCount, gsPrimIdBuf.data(),
+                        static_cast<uint32_t>(gsPrimIdBuf.size()), dsOutScalars);
                     gsPrimBuf.clear();
                     gsPrimIdBuf.clear();
                 };
 
-                auto emitTri = [&](const ShadedVertex& a, const ShadedVertex& b, const ShadedVertex& c) {
-                    if (hasGS && gsFn) {
-                        gsPrimBuf.push_back(a);
-                        gsPrimBuf.push_back(b);
-                        gsPrimBuf.push_back(c);
-                        gsPrimIdBuf.push_back(p);
-                        if (gsPrimIdBuf.size() == W) flushGSBuf(3);
-                    } else {
-                        processTriangle(a, b, c, p, rast, outScene, sceneTarget, polyA, polyB);
-                    }
-                };
-                auto emitPoint = [&](const ShadedVertex& v) {
-                    if (hasGS && gsFn) {
-                        gsPrimBuf.push_back(v);
-                        gsPrimIdBuf.push_back(p);
-                        if (gsPrimIdBuf.size() == W) flushGSBuf(1);
-                    }
-                };
                 const bool pointOut = (compiled->tessOutputPrimitive == 1);
+                const uint32_t gsPrimVCount = pointOut ? 1u : 3u;
 
-                patchDomU.clear();
-                patchDomV.clear();
-                patchDomW.clear();
-
-                if (compiled->tessDomain == 1) { // Isoline
-                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f)) continue;
-                    uint32_t numLines = partitionTF(tessFactors[0]);
-                    uint32_t numSegs = partitionTF(tessFactors[1]);
-                    size_t totalPts = static_cast<size_t>(numLines) * (numSegs + 1);
-                    patchDomU.reserve(totalPts);
-                    patchDomV.reserve(totalPts);
-                    patchDomW.reserve(totalPts);
-                    for (uint32_t li = 0; li < numLines; ++li) {
-                        float v = static_cast<float>(li) / static_cast<float>(numLines);
-                        for (uint32_t si = 0; si <= numSegs; ++si) {
-                            float u = static_cast<float>(si) / static_cast<float>(numSegs);
-                            patchDomU.push_back(u);
-                            patchDomV.push_back(v);
-                            patchDomW.push_back(0.0f);
+                for (uint32_t p = patchStart; p < patchEnd; ++p) {
+                    std::fill_n(inCPAttrs.begin(), static_cast<size_t>(inCPCount) * inAttrScalars, 0.0f);
+                    for (uint32_t k = 0; k < inCPCount; ++k) {
+                        const ShadedVertex& sv = shadedVerts[triVerts[p * vertsPerPrim + k]];
+                        uint32_t copyCount = std::min<uint32_t>(vsOutScalars, inAttrScalars);
+                        for (uint32_t s = 0; s < copyCount; ++s) {
+                            inCPAttrs[k * inAttrScalars + s] = sv.attrs[s];
                         }
                     }
-                    evalDSAllPoints();
-                    if (pointOut) {
-                        for (const auto& sv : patchDSVerts) emitPoint(sv);
-                        flushGSBuf(1);
-                    }
-                } else if (compiled->tessDomain == 2) { // Tri
-                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) || !(tessFactors[2] > 0.0f)) continue;
-                    uint32_t n = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[1]),
-                                           partitionTF(tessFactors[2]), partitionTF(tessFactors[4])});
-                    triRowOffsets.resize(n + 1);
-                    uint32_t running = 0;
-                    for (uint32_t i = 0; i <= n; ++i) {
-                        triRowOffsets[i] = running;
-                        running += (n - i + 1);
-                    }
-                    patchDomU.reserve(running);
-                    patchDomV.reserve(running);
-                    patchDomW.reserve(running);
-                    for (uint32_t i = 0; i <= n; ++i) {
-                        for (uint32_t j = 0; j <= n - i; ++j) {
-                            float u = static_cast<float>(i) / static_cast<float>(n);
-                            float v = static_cast<float>(j) / static_cast<float>(n);
-                            float w = std::max(0.0f, 1.0f - u - v);
-                            patchDomU.push_back(u);
-                            patchDomV.push_back(v);
-                            patchDomW.push_back(w);
+                    std::fill_n(outCPAttrs.begin(), static_cast<size_t>(outCPCount) * outAttrScalars, 0.0f);
+                    for (uint32_t baseCp = 0; baseCp < outCPCount; baseCp += W) {
+                        uint32_t activeCp = std::min<uint32_t>(W, outCPCount - baseCp);
+                        std::fill_n(hsOutCPSOA.begin(), static_cast<size_t>(outAttrScalars) * W, 0.0f);
+                        hsFn(&state.rootCtx, inCPAttrs.data(), p, baseCp, activeCp, hsOutCPSOA.data());
+                        for (uint32_t l = 0; l < activeCp; ++l) {
+                            float* dst = &outCPAttrs[(baseCp + l) * outAttrScalars];
+                            for (uint32_t s = 0; s < outAttrScalars; ++s) {
+                                dst[s] = hsOutCPSOA[s * W + l];
+                            }
                         }
                     }
-                    evalDSAllPoints();
-                    if (pointOut) {
-                        for (const auto& sv : patchDSVerts) emitPoint(sv);
-                        flushGSBuf(1);
-                    } else {
-                        bool cw = (compiled->tessOutputPrimitive == 3);
-                        auto rowAt = [&](uint32_t i, uint32_t j) -> const ShadedVertex& {
-                            return patchDSVerts[triRowOffsets[i] + j];
-                        };
-                        for (uint32_t i = 0; i < n; ++i) {
-                            for (uint32_t j = 0; j < n - i; ++j) {
-                                if (cw) {
-                                    emitTri(rowAt(i, j), rowAt(i, j + 1), rowAt(i + 1, j));
-                                } else {
-                                    emitTri(rowAt(i, j), rowAt(i + 1, j), rowAt(i, j + 1));
+
+                    std::fill_n(patchConsts.begin(), pcScalars, 0.0f);
+                    std::fill(std::begin(tessFactors), std::end(tessFactors), 0.0f);
+                    hsPcFn(&state.rootCtx, inCPAttrs.data(), outCPAttrs.data(), p, patchConsts.data(), tessFactors);
+
+                    auto evalDSAllPoints = [&]() {
+                        const size_t totalPts = patchDomU.size();
+                        patchDSVerts.resize(totalPts);
+                        alignas(64) float uVec[kMaxSimdWidth]{};
+                        alignas(64) float vVec[kMaxSimdWidth]{};
+                        alignas(64) float wVec[kMaxSimdWidth]{};
+
+                        for (size_t base = 0; base < totalPts; base += W) {
+                            uint32_t active = static_cast<uint32_t>(std::min<size_t>(W, totalPts - base));
+                            for (uint32_t l = 0; l < active; ++l) {
+                                uVec[l] = patchDomU[base + l];
+                                vVec[l] = patchDomV[base + l];
+                                wVec[l] = patchDomW[base + l];
+                            }
+                            for (uint32_t l = active; l < W; ++l) {
+                                uVec[l] = uVec[0];
+                                vVec[l] = vVec[0];
+                                wVec[l] = wVec[0];
+                            }
+                            std::memset(dsPosSOA, 0, sizeof(dsPosSOA));
+                            std::fill_n(dsAttrsSOA.begin(), dsAttrNeed, 0.0f);
+                            dsFn(
+                                &state.rootCtx, outCPAttrs.data(), patchConsts.data(), tessFactors,
+                                p, uVec, vVec, wVec, active, dsPosSOA, dsAttrsSOA.data());
+                            for (uint32_t l = 0; l < active; ++l) {
+                                ShadedVertex& sv = patchDSVerts[base + l];
+                                sv = ShadedVertex{};
+                                sv.clipX = dsPosSOA[0 * W + l];
+                                sv.clipY = dsPosSOA[1 * W + l];
+                                sv.clipZ = dsPosSOA[2 * W + l];
+                                sv.clipW = dsPosSOA[3 * W + l];
+                                for (uint32_t s = 0; s < dsOutScalars; ++s) {
+                                    sv.attrs[s] = dsAttrsSOA[s * W + l];
                                 }
-                                if (i + j + 1 < n) {
+                            }
+                        }
+                    };
+
+                    auto emitTri = [&](const ShadedVertex& a, const ShadedVertex& b, const ShadedVertex& c) {
+                        if (hasGS && gsFn) {
+                            gsPrimBuf.push_back(a);
+                            gsPrimBuf.push_back(b);
+                            gsPrimBuf.push_back(c);
+                            gsPrimIdBuf.push_back(p);
+                            if (gsPrimIdBuf.size() == W) flushGSBuf(3);
+                        } else {
+                            processTriangle(a, b, c, p, rast, outScene, target, geo.polyA, geo.polyB);
+                        }
+                    };
+                    auto emitPoint = [&](const ShadedVertex& v) {
+                        if (hasGS && gsFn) {
+                            gsPrimBuf.push_back(v);
+                            gsPrimIdBuf.push_back(p);
+                            if (gsPrimIdBuf.size() == W) flushGSBuf(1);
+                        }
+                    };
+
+                    patchDomU.clear();
+                    patchDomV.clear();
+                    patchDomW.clear();
+
+                    if (compiled->tessDomain == 1) { // Isoline
+                        if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f)) continue;
+                        uint32_t numLines = partitionTF(tessFactors[0]);
+                        uint32_t numSegs = partitionTF(tessFactors[1]);
+                        size_t totalPts = static_cast<size_t>(numLines) * (numSegs + 1);
+                        patchDomU.reserve(totalPts);
+                        patchDomV.reserve(totalPts);
+                        patchDomW.reserve(totalPts);
+                        for (uint32_t li = 0; li < numLines; ++li) {
+                            float v = static_cast<float>(li) / static_cast<float>(numLines);
+                            for (uint32_t si = 0; si <= numSegs; ++si) {
+                                float u = static_cast<float>(si) / static_cast<float>(numSegs);
+                                patchDomU.push_back(u);
+                                patchDomV.push_back(v);
+                                patchDomW.push_back(0.0f);
+                            }
+                        }
+                        evalDSAllPoints();
+                        if (pointOut) {
+                            for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        }
+                    } else if (compiled->tessDomain == 2) { // Tri
+                        if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) || !(tessFactors[2] > 0.0f)) continue;
+                        uint32_t n = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[1]),
+                                               partitionTF(tessFactors[2]), partitionTF(tessFactors[4])});
+                        triRowOffsets.resize(n + 1);
+                        uint32_t running = 0;
+                        for (uint32_t i = 0; i <= n; ++i) {
+                            triRowOffsets[i] = running;
+                            running += (n - i + 1);
+                        }
+                        patchDomU.reserve(running);
+                        patchDomV.reserve(running);
+                        patchDomW.reserve(running);
+                        for (uint32_t i = 0; i <= n; ++i) {
+                            for (uint32_t j = 0; j <= n - i; ++j) {
+                                float u = static_cast<float>(i) / static_cast<float>(n);
+                                float v = static_cast<float>(j) / static_cast<float>(n);
+                                float w = std::max(0.0f, 1.0f - u - v);
+                                patchDomU.push_back(u);
+                                patchDomV.push_back(v);
+                                patchDomW.push_back(w);
+                            }
+                        }
+                        evalDSAllPoints();
+                        if (pointOut) {
+                            for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        } else {
+                            bool cw = (compiled->tessOutputPrimitive == 3);
+                            auto rowAt = [&](uint32_t i, uint32_t j) -> const ShadedVertex& {
+                                return patchDSVerts[triRowOffsets[i] + j];
+                            };
+                            for (uint32_t i = 0; i < n; ++i) {
+                                for (uint32_t j = 0; j < n - i; ++j) {
                                     if (cw) {
-                                        emitTri(rowAt(i + 1, j), rowAt(i, j + 1), rowAt(i + 1, j + 1));
+                                        emitTri(rowAt(i, j), rowAt(i, j + 1), rowAt(i + 1, j));
                                     } else {
-                                        emitTri(rowAt(i + 1, j), rowAt(i + 1, j + 1), rowAt(i, j + 1));
+                                        emitTri(rowAt(i, j), rowAt(i + 1, j), rowAt(i, j + 1));
+                                    }
+                                    if (i + j + 1 < n) {
+                                        if (cw) {
+                                            emitTri(rowAt(i + 1, j), rowAt(i, j + 1), rowAt(i + 1, j + 1));
+                                        } else {
+                                            emitTri(rowAt(i + 1, j), rowAt(i + 1, j + 1), rowAt(i, j + 1));
+                                        }
                                     }
                                 }
                             }
                         }
-                        flushGSBuf(3);
-                    }
-                } else if (compiled->tessDomain == 3) { // Quad
-                    if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) ||
-                        !(tessFactors[2] > 0.0f) || !(tessFactors[3] > 0.0f)) {
-                        continue;
-                    }
-                    uint32_t nu = std::max({partitionTF(tessFactors[1]), partitionTF(tessFactors[3]), partitionTF(tessFactors[4])});
-                    uint32_t nv = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[2]), partitionTF(tessFactors[5])});
-                    size_t totalPts = static_cast<size_t>(nv + 1) * (nu + 1);
-                    patchDomU.reserve(totalPts);
-                    patchDomV.reserve(totalPts);
-                    patchDomW.reserve(totalPts);
-                    for (uint32_t j = 0; j <= nv; ++j) {
-                        float v = static_cast<float>(j) / static_cast<float>(nv);
-                        for (uint32_t i = 0; i <= nu; ++i) {
-                            float u = static_cast<float>(i) / static_cast<float>(nu);
-                            patchDomU.push_back(u);
-                            patchDomV.push_back(v);
-                            patchDomW.push_back(0.0f);
+                    } else if (compiled->tessDomain == 3) { // Quad
+                        if (!(tessFactors[0] > 0.0f) || !(tessFactors[1] > 0.0f) ||
+                            !(tessFactors[2] > 0.0f) || !(tessFactors[3] > 0.0f)) {
+                            continue;
                         }
-                    }
-                    evalDSAllPoints();
-                    if (pointOut) {
-                        for (const auto& sv : patchDSVerts) emitPoint(sv);
-                        flushGSBuf(1);
-                    } else {
-                        bool cw = (compiled->tessOutputPrimitive == 3);
-                        for (uint32_t j = 0; j < nv; ++j) {
-                            for (uint32_t i = 0; i < nu; ++i) {
-                                const ShadedVertex& v00 = patchDSVerts[j * (nu + 1) + i];
-                                const ShadedVertex& v10 = patchDSVerts[j * (nu + 1) + (i + 1)];
-                                const ShadedVertex& v01 = patchDSVerts[(j + 1) * (nu + 1) + i];
-                                const ShadedVertex& v11 = patchDSVerts[(j + 1) * (nu + 1) + (i + 1)];
-                                if (cw) {
-                                    emitTri(v00, v11, v10);
-                                    emitTri(v00, v01, v11);
-                                } else {
-                                    emitTri(v00, v10, v11);
-                                    emitTri(v00, v11, v01);
+                        uint32_t nu = std::max({partitionTF(tessFactors[1]), partitionTF(tessFactors[3]), partitionTF(tessFactors[4])});
+                        uint32_t nv = std::max({partitionTF(tessFactors[0]), partitionTF(tessFactors[2]), partitionTF(tessFactors[5])});
+                        size_t totalPts = static_cast<size_t>(nv + 1) * (nu + 1);
+                        patchDomU.reserve(totalPts);
+                        patchDomV.reserve(totalPts);
+                        patchDomW.reserve(totalPts);
+                        for (uint32_t j = 0; j <= nv; ++j) {
+                            float v = static_cast<float>(j) / static_cast<float>(nv);
+                            for (uint32_t i = 0; i <= nu; ++i) {
+                                float u = static_cast<float>(i) / static_cast<float>(nu);
+                                patchDomU.push_back(u);
+                                patchDomV.push_back(v);
+                                patchDomW.push_back(0.0f);
+                            }
+                        }
+                        evalDSAllPoints();
+                        if (pointOut) {
+                            for (const auto& sv : patchDSVerts) emitPoint(sv);
+                        } else {
+                            bool cw = (compiled->tessOutputPrimitive == 3);
+                            for (uint32_t j = 0; j < nv; ++j) {
+                                for (uint32_t i = 0; i < nu; ++i) {
+                                    const ShadedVertex& v00 = patchDSVerts[j * (nu + 1) + i];
+                                    const ShadedVertex& v10 = patchDSVerts[j * (nu + 1) + (i + 1)];
+                                    const ShadedVertex& v01 = patchDSVerts[(j + 1) * (nu + 1) + i];
+                                    const ShadedVertex& v11 = patchDSVerts[(j + 1) * (nu + 1) + (i + 1)];
+                                    if (cw) {
+                                        emitTri(v00, v11, v10);
+                                        emitTri(v00, v01, v11);
+                                    } else {
+                                        emitTri(v00, v10, v11);
+                                        emitTri(v00, v11, v01);
+                                    }
                                 }
                             }
                         }
-                        flushGSBuf(3);
                     }
                 }
+                if (hasGS && gsFn) {
+                    flushGSBuf(gsPrimVCount);
+                }
+            };
+
+            const bool canParallelTess =
+                (draw.instanceCount == 1) && (numPatches >= 8) && (pool.get_thread_count() > 1) &&
+                (!hasGS || !gsFn || compiled->gsOutputTopology != 3);
+            if (canParallelTess) {
+                const uint32_t numWorkers = static_cast<uint32_t>(std::max<size_t>(1, pool.get_thread_count()));
+                const uint32_t targetChunks = std::min<uint32_t>(numPatches, numWorkers * 4u);
+                const uint32_t patchesPerChunk = std::max<uint32_t>(1u, (numPatches + targetChunks - 1u) / targetChunks);
+                const uint32_t numChunks = (numPatches + patchesPerChunk - 1u) / patchesPerChunk;
+                const size_t numTiles = static_cast<size_t>(outScene.numTilesX) * outScene.numTilesY;
+                const bool fuseBinning = (optOutBins != nullptr) && (numTiles > 0) &&
+                                         (static_cast<uint64_t>(numChunks) * numTiles <= kMaxFusedBinMatrixEntries);
+
+                thread_local std::vector<ChunkOutput> tlTessChunkOutputs;
+                auto& chunkOutputs = tlTessChunkOutputs;
+                if (chunkOutputs.size() < numChunks) chunkOutputs.resize(numChunks);
+                for (uint32_t c = 0; c < numChunks; ++c) chunkOutputs[c].reset(numTiles, fuseBinning);
+
+                thread_local std::vector<FallbackGeoScratch> tlWorkerGeoScratches;
+                auto& workerScratches = tlWorkerGeoScratches;
+                if (workerScratches.size() < numChunks) workerScratches.resize(numChunks);
+
+                parallelForDynamic(pool, numChunks, [&](uint32_t c) {
+                    uint32_t pStart = c * patchesPerChunk;
+                    uint32_t pEnd = std::min<uint32_t>(numPatches, pStart + patchesPerChunk);
+                    ChunkOutput& co = chunkOutputs[c];
+                    TriangleEmitTarget chunkTarget;
+                    chunkTarget.triangles = &co.triangles;
+                    chunkTarget.attrBaseArena = &co.attrBase;
+                    chunkTarget.attrFlatArena = &co.attrFlat;
+                    chunkTarget.origBaryArena = &co.origBary;
+                    if (fuseBinning) {
+                        chunkTarget.tileCounts = &co.tileCounts;
+                        chunkTarget.binPairs = &co.binPairs;
+                        chunkTarget.numTilesX = outScene.numTilesX;
+                        chunkTarget.numTilesY = outScene.numTilesY;
+                    }
+                    executeTessPatchRange(workerScratches[c], chunkTarget, pStart, pEnd);
+                });
+
+                return mergeChunkOutputsToScene(
+                    pool, numChunks, chunkOutputs, fuseBinning, numTiles, outScene, optOutBins);
             }
+            executeTessPatchRange(tlGeo, sceneTarget, 0, numPatches);
         } else if (hasGS && gsFn) {
-            uint32_t numPrims = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
-            auto& batchPrims = tlGeo.batchPrims;
-            batchPrims.resize(static_cast<size_t>(W) * vertsPerPrim);
-            uint32_t batchPrimIds[kMaxSimdWidth]{};
-            for (uint32_t baseP = 0; baseP < numPrims; baseP += W) {
-                uint32_t activeP = std::min<uint32_t>(W, numPrims - baseP);
-                for (uint32_t l = 0; l < activeP; ++l) {
-                    uint32_t p = baseP + l;
-                    batchPrimIds[l] = p;
-                    for (uint32_t k = 0; k < vertsPerPrim; ++k) {
-                        batchPrims[l * vertsPerPrim + k] = shadedVerts[triVerts[p * vertsPerPrim + k]];
+            const uint32_t numPrims = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
+            auto executeGSPrimRange = [&](FallbackGeoScratch& geo, TriangleEmitTarget& target,
+                                          uint32_t primStart, uint32_t primEnd) {
+                auto& batchPrims = geo.batchPrims;
+                const size_t need = static_cast<size_t>(W) * vertsPerPrim;
+                if (batchPrims.size() < need) batchPrims.resize(need);
+                uint32_t batchPrimIds[kMaxSimdWidth]{};
+                for (uint32_t baseP = primStart; baseP < primEnd; baseP += W) {
+                    uint32_t activeP = std::min<uint32_t>(W, primEnd - baseP);
+                    for (uint32_t l = 0; l < activeP; ++l) {
+                        uint32_t p = baseP + l;
+                        batchPrimIds[l] = p;
+                        for (uint32_t k = 0; k < vertsPerPrim; ++k) {
+                            batchPrims[l * vertsPerPrim + k] = shadedVerts[triVerts[p * vertsPerPrim + k]];
+                        }
                     }
+                    runGSBatchWithScratch(geo, target, batchPrims.data(), vertsPerPrim, batchPrimIds, activeP, vsOutScalars);
                 }
-                runGSBatch(batchPrims.data(), vertsPerPrim, batchPrimIds, activeP, vsOutScalars);
+            };
+
+            const bool canParallelGS =
+                (draw.instanceCount == 1) && (numPrims >= 32) && (pool.get_thread_count() > 1) &&
+                (compiled->gsOutputTopology != 3);
+            if (canParallelGS) {
+                const uint32_t numWorkers = static_cast<uint32_t>(std::max<size_t>(1, pool.get_thread_count()));
+                const uint32_t numBatches = (numPrims + W - 1u) / W;
+                const uint32_t targetChunks = std::min<uint32_t>(numBatches, numWorkers * 4u);
+                const uint32_t batchesPerChunk = std::max<uint32_t>(1u, (numBatches + targetChunks - 1u) / targetChunks);
+                const uint32_t primsPerChunk = batchesPerChunk * W;
+                const uint32_t numChunks = (numPrims + primsPerChunk - 1u) / primsPerChunk;
+                const size_t numTiles = static_cast<size_t>(outScene.numTilesX) * outScene.numTilesY;
+                const bool fuseBinning = (optOutBins != nullptr) && (numTiles > 0) &&
+                                         (static_cast<uint64_t>(numChunks) * numTiles <= kMaxFusedBinMatrixEntries);
+
+                thread_local std::vector<ChunkOutput> tlGSChunkOutputs;
+                auto& chunkOutputs = tlGSChunkOutputs;
+                if (chunkOutputs.size() < numChunks) chunkOutputs.resize(numChunks);
+                for (uint32_t c = 0; c < numChunks; ++c) chunkOutputs[c].reset(numTiles, fuseBinning);
+
+                thread_local std::vector<FallbackGeoScratch> tlWorkerGeoScratches;
+                auto& workerScratches = tlWorkerGeoScratches;
+                if (workerScratches.size() < numChunks) workerScratches.resize(numChunks);
+
+                parallelForDynamic(pool, numChunks, [&](uint32_t c) {
+                    uint32_t pStart = c * primsPerChunk;
+                    uint32_t pEnd = std::min<uint32_t>(numPrims, pStart + primsPerChunk);
+                    ChunkOutput& co = chunkOutputs[c];
+                    TriangleEmitTarget chunkTarget;
+                    chunkTarget.triangles = &co.triangles;
+                    chunkTarget.attrBaseArena = &co.attrBase;
+                    chunkTarget.attrFlatArena = &co.attrFlat;
+                    chunkTarget.origBaryArena = &co.origBary;
+                    if (fuseBinning) {
+                        chunkTarget.tileCounts = &co.tileCounts;
+                        chunkTarget.binPairs = &co.binPairs;
+                        chunkTarget.numTilesX = outScene.numTilesX;
+                        chunkTarget.numTilesY = outScene.numTilesY;
+                    }
+                    executeGSPrimRange(workerScratches[c], chunkTarget, pStart, pEnd);
+                });
+
+                return mergeChunkOutputsToScene(
+                    pool, numChunks, chunkOutputs, fuseBinning, numTiles, outScene, optOutBins);
             }
+            executeGSPrimRange(tlGeo, sceneTarget, 0, numPrims);
         } else if (vertsPerPrim == 2) {
             for (size_t t = 0; t + 1 < triVerts.size(); t += 2) {
                 processLine(
