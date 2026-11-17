@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.0.1)"
+        description: "Release tag (e.g. v0.0.3)"
         required: true
-        default: "v0.0.1"
+        default: "v0.0.3"
 
 permissions:
   contents: write
@@ -177,15 +177,54 @@ jobs:
           path: .toolchains/llvm
           key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
 
+      - name: Restore macOS PGO profile cache
+        id: cache-pgo
+        if: runner.os == 'macOS'
+        uses: actions/cache/restore@v4
+        with:
+          path: nacelle.profdata
+          key: nacelle-pgo-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            nacelle-pgo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Collect PGO profiles (macOS fallback)
+        if: runner.os == 'macOS' && steps.cache-pgo.outputs.cache-hit != 'true' && hashFiles('nacelle.profdata') == ''
+        run: |
+          cmake -S . -B build-pgo-gen -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNACELLE_ENABLE_THIN_LTO=ON \
+            -DNACELLE_PGO_MODE=GENERATE \
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.sdk" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+          cmake --build build-pgo-gen --target bench-worker-nacelle nacelle_test_shaders --parallel
+          for w in nacelle-w16 nacelle-w8 nacelle-w4; do
+            "${{ github.workspace }}/build-pgo-gen/bench-worker-nacelle" --single-backend "$w" --iters 3 > /dev/null
+          done
+          xcrun llvm-profdata merge -output="${{ github.workspace }}/nacelle.profdata" "${{ github.workspace }}/build-pgo-gen/pgo-profiles/"*.profraw
+          rm -rf "${{ github.workspace }}/build-pgo-gen"
+
       - name: Configure Nacelle
         run: |
+          EXTRA_CMAKE_ARGS=()
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            EXTRA_CMAKE_ARGS+=(
+              "-DNACELLE_ENABLE_THIN_LTO=ON"
+              "-DNACELLE_PGO_MODE=USE"
+              "-DNACELLE_PGO_PROFILE_FILE=${{ github.workspace }}/nacelle.profdata"
+            )
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
-            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file" \
+            "${EXTRA_CMAKE_ARGS[@]}"
 
       - name: Build Nacelle release targets
         run: cmake --build build --target nacelle_d3d12 nacelle nacelle-compile nacelle_viewer --parallel

@@ -178,6 +178,14 @@ jobs:
           xcrun llvm-profdata merge -output="$GITHUB_WORKSPACE/nacelle.profdata" "$GITHUB_WORKSPACE/build-pgo-gen/pgo-profiles/"*.profraw
           rm -rf "$GITHUB_WORKSPACE/build-pgo-gen"
 
+      - name: Save macOS PGO profile cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: nacelle.profdata
+          key: nacelle-pgo-${{ runner.os }}-${{ runner.arch }}-${{ github.event.workflow_run.head_sha || github.sha }}
+
       - name: Configure and build nacelle-bench (PGO + ThinLTO)
         run: |
           cmake -S . -B build -G Ninja \
