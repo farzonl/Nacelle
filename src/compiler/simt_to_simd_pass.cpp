@@ -1619,10 +1619,109 @@ private:
             }
             return true;
         }
+        auto makeAtomicIdentity = [&](mlir::OpBuilder& ib, mlir::Location iloc, mlir::Type iTy,
+                                      mlir::LLVM::AtomicBinOp binOp) -> std::optional<mlir::Value> {
+            uint64_t bw = iTy.getIntOrFloatBitWidth();
+            uint64_t allOnes = (bw == 64) ? ~0ull : ((1ull << bw) - 1ull);
+            uint64_t signBit = 1ull << (bw - 1u);
+            switch (binOp) {
+            case mlir::LLVM::AtomicBinOp::add:
+            case mlir::LLVM::AtomicBinOp::_or:
+            case mlir::LLVM::AtomicBinOp::_xor:
+            case mlir::LLVM::AtomicBinOp::umax:
+                return mlir::LLVM::ConstantOp::create(ib, iloc, iTy, ib.getIntegerAttr(iTy, 0)).getResult();
+            case mlir::LLVM::AtomicBinOp::_and:
+            case mlir::LLVM::AtomicBinOp::umin:
+                return mlir::LLVM::ConstantOp::create(ib, iloc, iTy, ib.getIntegerAttr(iTy, static_cast<int64_t>(allOnes))).getResult();
+            case mlir::LLVM::AtomicBinOp::min:
+                return mlir::LLVM::ConstantOp::create(ib, iloc, iTy, ib.getIntegerAttr(iTy, static_cast<int64_t>(signBit - 1ull))).getResult();
+            case mlir::LLVM::AtomicBinOp::max:
+                return mlir::LLVM::ConstantOp::create(ib, iloc, iTy, ib.getIntegerAttr(iTy, static_cast<int64_t>(signBit))).getResult();
+            default:
+                return std::nullopt;
+            }
+        };
+
+        auto emitWaveReducedUniformAtomic = [&](mlir::OpBuilder& ab, mlir::Location aloc, mlir::Value ptr,
+                                                mlir::LLVM::AtomicBinOp binOp, mlir::LLVM::AtomicOrdering ordering,
+                                                mlir::Value valVec, mlir::Value maskVec, mlir::Type elemTy,
+                                                bool needPrev) -> mlir::Value {
+            mlir::Value idScalar = *makeAtomicIdentity(ab, aloc, elemTy, binOp);
+            mlir::Value idVec = llvmSplat(ab, aloc, elemTy, idScalar);
+            mlir::Value masked = mlir::LLVM::SelectOp::create(ab, aloc, maskVec, valVec, idVec);
+
+            mlir::Value total;
+            switch (binOp) {
+            case mlir::LLVM::AtomicBinOp::add: total = mlir::LLVM::vector_reduce_add::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::_and: total = mlir::LLVM::vector_reduce_and::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::_or: total = mlir::LLVM::vector_reduce_or::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::_xor: total = mlir::LLVM::vector_reduce_xor::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::min: total = mlir::LLVM::vector_reduce_smin::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::max: total = mlir::LLVM::vector_reduce_smax::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::umin: total = mlir::LLVM::vector_reduce_umin::create(ab, aloc, elemTy, masked); break;
+            case mlir::LLVM::AtomicBinOp::umax: total = mlir::LLVM::vector_reduce_umax::create(ab, aloc, elemTy, masked); break;
+            default: break;
+            }
+
+            mlir::Value baseOld = mlir::LLVM::AtomicRMWOp::create(ab, aloc, binOp, ptr, total, ordering);
+            if (!needPrev) {
+                return idVec;
+            }
+
+            auto applyVecOp = [&](mlir::Value lhs, mlir::Value rhs) -> mlir::Value {
+                switch (binOp) {
+                case mlir::LLVM::AtomicBinOp::add: return mlir::LLVM::AddOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::_and: return mlir::LLVM::AndOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::_or: return mlir::LLVM::OrOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::_xor: return mlir::LLVM::XOrOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::min: return mlir::LLVM::SMinOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::max: return mlir::LLVM::SMaxOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::umin: return mlir::LLVM::UMinOp::create(ab, aloc, lhs, rhs);
+                case mlir::LLVM::AtomicBinOp::umax: return mlir::LLVM::UMaxOp::create(ab, aloc, lhs, rhs);
+                default: return lhs;
+                }
+            };
+
+            // Shift masked right by 1 lane (lane 0 becomes identity), then Hillis-Steele inclusive scan.
+            llvm::SmallVector<int32_t, 16> shuf1;
+            shuf1.push_back(static_cast<int32_t>(W_));
+            for (uint32_t l = 1; l < W_; ++l) shuf1.push_back(static_cast<int32_t>(l - 1u));
+            mlir::Value scan = mlir::LLVM::ShuffleVectorOp::create(ab, aloc, masked, idVec, shuf1);
+            for (uint32_t step = 1; step < W_; step <<= 1) {
+                llvm::SmallVector<int32_t, 16> shufStep;
+                for (uint32_t l = 0; l < W_; ++l) {
+                    shufStep.push_back((l < step) ? static_cast<int32_t>(W_) : static_cast<int32_t>(l - step));
+                }
+                mlir::Value shifted = mlir::LLVM::ShuffleVectorOp::create(ab, aloc, scan, idVec, shufStep);
+                scan = applyVecOp(scan, shifted);
+            }
+            mlir::Value baseOldVec = llvmSplat(ab, aloc, elemTy, baseOld);
+            return applyVecOp(baseOldVec, scan);
+        };
+
         if (auto rmw = llvm::dyn_cast<mlir::LLVM::AtomicRMWOp>(&op)) {
             SimdVal addr = getMapped(loc, rmw.getPtr());
             SimdVal val = getMapped(loc, rmw.getVal());
             mlir::Type ty = rmw.getRes().getType();
+            if (addr.isUniform() && mlir::isa<mlir::IntegerType>(ty) &&
+                makeAtomicIdentity(b_, loc, ty, rmw.getBinOp()).has_value()) {
+                mlir::Value anyActive = orReduce(loc, realMask);
+                mlir::Value valVec = asVec(loc, val);
+                mlir::Value addrScalar = laneValue(loc, addr, 0);
+                mlir::Value outVec = mlir::scf::IfOp::create(
+                    b_, loc, anyActive,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::Value res = emitWaveReducedUniformAtomic(
+                            nb, nloc, addrScalar, rmw.getBinOp(), rmw.getOrdering(),
+                            valVec, realMask, ty, !rmw.getRes().use_empty());
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{res});
+                    },
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ZeroOp::create(nb, nloc, vecTy(ty))});
+                    }).getResult(0);
+                setMapped(rmw.getRes(), {SimdVal::Kind::Vector, ty, outVec, {}, {}});
+                return true;
+            }
             mlir::Value outVec = mlir::isa<mlir::FloatType>(ty) ? splatFlt(loc, ty, 0.0) : splatInt(loc, ty, 0);
             for (uint32_t l = 0; l < W_; ++l) {
                 if (isLaneMaskConstFalse(realMask, l)) continue;
@@ -5979,6 +6078,121 @@ private:
         std::optional<BufferDescInfo> uniformBufInfo;
         if (!isTexAtomic && h.isUniform()) {
             uniformBufInfo = loadBufferDescInfo(loc, b_, h, h.lanes[0], /*needElemStride=*/false, needAtomicStride);
+        }
+
+        SimdVal off0SV = getMapped(loc, call.getOperand(offStart));
+        SimdVal off1SV = hasOff1 ? getMapped(loc, call.getOperand(offStart + 1)) : SimdVal{};
+        const bool isUniformOffset = off0SV.isUniform() && (!hasOff1 || off1SV.isUniform());
+        const mlir::LLVM::AtomicBinOp binOp = toBinOp(atomicOp);
+        const bool isAssociativeIntAtomic =
+            !isCmpXchg && !isFloat && atomicOp <= 7 && mlir::isa<mlir::IntegerType>(resTy);
+
+        if (uniformBufInfo.has_value() && isUniformOffset && isAssociativeIntAtomic) {
+            mlir::Value o0Scalar = laneValue(loc, off0SV, 0);
+            mlir::Value o1Scalar = hasOff1 ? laneValue(loc, off1SV, 0) : cInt(loc, i32Ty(), 0);
+            mlir::Value byteOff = computeBufferByteOffsetScalar(
+                loc, b_, h, uniformBufInfo->stride64, o0Scalar, o1Scalar, isRawBufAtomic, hasOff1);
+            mlir::Value cEnd = mlir::LLVM::AddOp::create(b_, loc, byteOff, cInt(loc, i64Ty(), elemBytes));
+            mlir::Value inBounds = mlir::LLVM::AndOp::create(
+                b_, loc, uniformBufInfo->okPtr,
+                mlir::LLVM::ICmpOp::create(b_, loc, mlir::LLVM::ICmpPredicate::ule, cEnd, uniformBufInfo->byteSize));
+            mlir::Value anyActive = orReduce(loc, realMask);
+            mlir::Value doWaveOp = mlir::LLVM::AndOp::create(b_, loc, anyActive, inBounds);
+
+            uint64_t bw = resTy.getIntOrFloatBitWidth();
+            uint64_t allOnes = (bw == 64) ? ~0ull : ((1ull << bw) - 1ull);
+            uint64_t signBit = 1ull << (bw - 1u);
+            uint64_t idConst = 0;
+            switch (binOp) {
+            case mlir::LLVM::AtomicBinOp::_and:
+            case mlir::LLVM::AtomicBinOp::umin: idConst = allOnes; break;
+            case mlir::LLVM::AtomicBinOp::min: idConst = signBit - 1ull; break;
+            case mlir::LLVM::AtomicBinOp::max: idConst = signBit; break;
+            default: idConst = 0; break;
+            }
+            const bool needPrev = !call.getResult().use_empty();
+            mlir::Value outVec = mlir::scf::IfOp::create(
+                b_, loc, doWaveOp,
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::Value ep = mlir::scf::IfOp::create(
+                        nb, nloc, uniformBufInfo->isReserved,
+                        [&](mlir::OpBuilder& rb, mlir::Location rloc) {
+                            mlir::scf::YieldOp::create(
+                                rb, rloc,
+                                mlir::ValueRange{resolveReservedBufferElemPtr(
+                                    rb, rloc, uniformBufInfo->descP, uniformBufInfo->basePtr, byteOff, elemBytes)});
+                        },
+                        [&](mlir::OpBuilder& rb, mlir::Location rloc) {
+                            mlir::scf::YieldOp::create(
+                                rb, rloc,
+                                mlir::ValueRange{mlir::LLVM::GEPOp::create(
+                                    rb, rloc, ptrTy(), i8Ty(), uniformBufInfo->basePtr, mlir::ValueRange{byteOff})});
+                        }).getResult(0);
+                    mlir::Value epValid = mlir::LLVM::ICmpOp::create(
+                        nb, nloc, mlir::LLVM::ICmpPredicate::ne, ep, mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()));
+                    mlir::Value resVec = mlir::scf::IfOp::create(
+                        nb, nloc, epValid,
+                        [&](mlir::OpBuilder& ab, mlir::Location aloc) {
+                            mlir::Value idScalar = mlir::LLVM::ConstantOp::create(
+                                ab, aloc, resTy, ab.getIntegerAttr(resTy, static_cast<int64_t>(idConst)));
+                            mlir::Value idVec = llvmSplat(ab, aloc, resTy, idScalar);
+                            mlir::Value masked = mlir::LLVM::SelectOp::create(ab, aloc, realMask, newValVec, idVec);
+                            mlir::Value total;
+                            switch (binOp) {
+                            case mlir::LLVM::AtomicBinOp::add: total = mlir::LLVM::vector_reduce_add::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::_and: total = mlir::LLVM::vector_reduce_and::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::_or: total = mlir::LLVM::vector_reduce_or::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::_xor: total = mlir::LLVM::vector_reduce_xor::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::min: total = mlir::LLVM::vector_reduce_smin::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::max: total = mlir::LLVM::vector_reduce_smax::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::umin: total = mlir::LLVM::vector_reduce_umin::create(ab, aloc, resTy, masked); break;
+                            case mlir::LLVM::AtomicBinOp::umax: total = mlir::LLVM::vector_reduce_umax::create(ab, aloc, resTy, masked); break;
+                            default: break;
+                            }
+                            mlir::Value baseOld = mlir::LLVM::AtomicRMWOp::create(
+                                ab, aloc, binOp, ep, total, mlir::LLVM::AtomicOrdering::seq_cst);
+                            if (!needPrev) {
+                                mlir::scf::YieldOp::create(ab, aloc, mlir::ValueRange{mlir::LLVM::ZeroOp::create(ab, aloc, vecTy(resTy))});
+                                return;
+                            }
+                            auto applyVecOp = [&](mlir::Value lhs, mlir::Value rhs) -> mlir::Value {
+                                switch (binOp) {
+                                case mlir::LLVM::AtomicBinOp::add: return mlir::LLVM::AddOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::_and: return mlir::LLVM::AndOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::_or: return mlir::LLVM::OrOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::_xor: return mlir::LLVM::XOrOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::min: return mlir::LLVM::SMinOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::max: return mlir::LLVM::SMaxOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::umin: return mlir::LLVM::UMinOp::create(ab, aloc, lhs, rhs);
+                                case mlir::LLVM::AtomicBinOp::umax: return mlir::LLVM::UMaxOp::create(ab, aloc, lhs, rhs);
+                                default: return lhs;
+                                }
+                            };
+                            llvm::SmallVector<int32_t, 16> shuf1;
+                            shuf1.push_back(static_cast<int32_t>(W_));
+                            for (uint32_t l = 1; l < W_; ++l) shuf1.push_back(static_cast<int32_t>(l - 1u));
+                            mlir::Value scan = mlir::LLVM::ShuffleVectorOp::create(ab, aloc, masked, idVec, shuf1);
+                            for (uint32_t step = 1; step < W_; step <<= 1) {
+                                llvm::SmallVector<int32_t, 16> shufStep;
+                                for (uint32_t l = 0; l < W_; ++l) {
+                                    shufStep.push_back((l < step) ? static_cast<int32_t>(W_) : static_cast<int32_t>(l - step));
+                                }
+                                mlir::Value shifted = mlir::LLVM::ShuffleVectorOp::create(ab, aloc, scan, idVec, shufStep);
+                                scan = applyVecOp(scan, shifted);
+                            }
+                            mlir::Value baseOldVec = llvmSplat(ab, aloc, resTy, baseOld);
+                            mlir::scf::YieldOp::create(ab, aloc, mlir::ValueRange{applyVecOp(baseOldVec, scan)});
+                        },
+                        [&](mlir::OpBuilder& ab, mlir::Location aloc) {
+                            mlir::scf::YieldOp::create(ab, aloc, mlir::ValueRange{mlir::LLVM::ZeroOp::create(ab, aloc, vecTy(resTy))});
+                        }).getResult(0);
+                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{resVec});
+                },
+                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ZeroOp::create(nb, nloc, vecTy(resTy))});
+                }).getResult(0);
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, resTy, outVec, {}, {}});
+            return true;
         }
 
         mlir::Value outVec = isFloat ? splatFlt(loc, resTy, 0.0) : splatInt(loc, resTy, 0);
