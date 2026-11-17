@@ -414,6 +414,9 @@ public:
     mlir::Value orReduce(mlir::Location loc, mlir::Value vecI1) {
         return mlir::LLVM::vector_reduce_or::create(b_, loc, i1Ty(), vecI1);
     }
+    mlir::Value andReduce(mlir::Location loc, mlir::Value vecI1) {
+        return mlir::LLVM::vector_reduce_and::create(b_, loc, i1Ty(), vecI1);
+    }
 
     mlir::Value allTrueMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 1); }
     mlir::Value allFalseMask(mlir::Location loc) { return splatInt(loc, i1Ty(), 0); }
@@ -5474,19 +5477,52 @@ private:
                             [&](mlir::OpBuilder& cb, mlir::Location cloc) {
                                 mlir::Value baseLane0Ptr = mlir::LLVM::GEPOp::create(
                                     cb, cloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{lane0Off});
-                                llvm::SmallVector<mlir::Value, 16> contigOut;
-                                contigOut.reserve(activeComps.size());
+                                llvm::SmallVector<mlir::Value, 16> ptrs;
+                                ptrs.reserve(activeComps.size());
+                                mlir::Value combinedMask = inBounds[0];
                                 for (size_t i = 0; i < activeComps.size(); ++i) {
                                     unsigned c = activeComps[i];
-                                    mlir::Value ptr0 = (c == 0)
-                                                           ? baseLane0Ptr
-                                                           : mlir::Value(mlir::LLVM::GEPOp::create(
-                                                                 cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
-                                                                 llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
-                                    contigOut.push_back(mlir::LLVM::MaskedLoadOp::create(
-                                        cb, cloc, vecTy(elemTy), ptr0, inBounds[i], zeroElemVec, /*alignment=*/1));
+                                    ptrs.push_back((c == 0)
+                                                       ? baseLane0Ptr
+                                                       : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                             cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
+                                                             llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)})));
+                                    if (i > 0 && !nonStraddling) {
+                                        combinedMask = mlir::LLVM::AndOp::create(cb, cloc, combinedMask, inBounds[i]);
+                                    }
                                 }
-                                mlir::scf::YieldOp::create(cb, cloc, contigOut);
+                                if (W_ > 1) {
+                                    mlir::Value allInBounds = mlir::LLVM::vector_reduce_and::create(cb, cloc, i1Ty(), combinedMask);
+                                    auto fastIf = mlir::scf::IfOp::create(
+                                        cb, cloc, allInBounds,
+                                        [&](mlir::OpBuilder& fb, mlir::Location floc) {
+                                            llvm::SmallVector<mlir::Value, 16> fastOut;
+                                            fastOut.reserve(activeComps.size());
+                                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                                fastOut.push_back(mlir::LLVM::LoadOp::create(
+                                                    fb, floc, vecTy(elemTy), ptrs[i], /*alignment=*/1));
+                                            }
+                                            mlir::scf::YieldOp::create(fb, floc, fastOut);
+                                        },
+                                        [&](mlir::OpBuilder& fb, mlir::Location floc) {
+                                            llvm::SmallVector<mlir::Value, 16> maskedOut;
+                                            maskedOut.reserve(activeComps.size());
+                                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                                maskedOut.push_back(mlir::LLVM::MaskedLoadOp::create(
+                                                    fb, floc, vecTy(elemTy), ptrs[i], inBounds[i], zeroElemVec, /*alignment=*/1));
+                                            }
+                                            mlir::scf::YieldOp::create(fb, floc, maskedOut);
+                                        });
+                                    mlir::scf::YieldOp::create(cb, cloc, fastIf.getResults());
+                                } else {
+                                    llvm::SmallVector<mlir::Value, 16> contigOut;
+                                    contigOut.reserve(activeComps.size());
+                                    for (size_t i = 0; i < activeComps.size(); ++i) {
+                                        contigOut.push_back(mlir::LLVM::MaskedLoadOp::create(
+                                            cb, cloc, vecTy(elemTy), ptrs[i], inBounds[i], zeroElemVec, /*alignment=*/1));
+                                    }
+                                    mlir::scf::YieldOp::create(cb, cloc, contigOut);
+                                }
                             },
                             [&](mlir::OpBuilder& cb, mlir::Location cloc) {
                                 mlir::scf::YieldOp::create(cb, cloc, emitGatherLoads(cb, cloc));
@@ -5739,15 +5775,43 @@ private:
                             [&](mlir::OpBuilder& cb, mlir::Location cloc) {
                                 mlir::Value baseLane0Ptr = mlir::LLVM::GEPOp::create(
                                     cb, cloc, ptrTy(), i8Ty(), info.basePtr, mlir::ValueRange{lane0Off});
+                                llvm::SmallVector<mlir::Value, 16> ptrs;
+                                ptrs.reserve(activeComps.size());
+                                mlir::Value combinedMask = doStores[0];
                                 for (size_t i = 0; i < activeComps.size(); ++i) {
                                     unsigned c = activeComps[i];
-                                    mlir::Value ptr0 = (c == 0)
-                                                           ? baseLane0Ptr
-                                                           : mlir::Value(mlir::LLVM::GEPOp::create(
-                                                                 cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
-                                                                 llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)}));
-                                    mlir::LLVM::MaskedStoreOp::create(
-                                        cb, cloc, activeValVecs[i], ptr0, doStores[i], /*alignment=*/1);
+                                    ptrs.push_back((c == 0)
+                                                       ? baseLane0Ptr
+                                                       : mlir::Value(mlir::LLVM::GEPOp::create(
+                                                             cb, cloc, ptrTy(), i8Ty(), baseLane0Ptr,
+                                                             llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(c * elemBytes)})));
+                                    if (i > 0 && !nonStraddling) {
+                                        combinedMask = mlir::LLVM::AndOp::create(cb, cloc, combinedMask, doStores[i]);
+                                    }
+                                }
+                                if (W_ > 1) {
+                                    mlir::Value allDoStore = mlir::LLVM::vector_reduce_and::create(cb, cloc, i1Ty(), combinedMask);
+                                    mlir::scf::IfOp::create(
+                                        cb, cloc, allDoStore,
+                                        [&](mlir::OpBuilder& fb, mlir::Location floc) {
+                                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                                mlir::LLVM::StoreOp::create(
+                                                    fb, floc, activeValVecs[i], ptrs[i], /*alignment=*/1);
+                                            }
+                                            mlir::scf::YieldOp::create(fb, floc);
+                                        },
+                                        [&](mlir::OpBuilder& fb, mlir::Location floc) {
+                                            for (size_t i = 0; i < activeComps.size(); ++i) {
+                                                mlir::LLVM::MaskedStoreOp::create(
+                                                    fb, floc, activeValVecs[i], ptrs[i], doStores[i], /*alignment=*/1);
+                                            }
+                                            mlir::scf::YieldOp::create(fb, floc);
+                                        });
+                                } else {
+                                    for (size_t i = 0; i < activeComps.size(); ++i) {
+                                        mlir::LLVM::MaskedStoreOp::create(
+                                            cb, cloc, activeValVecs[i], ptrs[i], doStores[i], /*alignment=*/1);
+                                    }
                                 }
                                 mlir::scf::YieldOp::create(cb, cloc);
                             },
