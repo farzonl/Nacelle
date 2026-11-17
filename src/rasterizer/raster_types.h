@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <type_traits>
@@ -33,6 +34,44 @@ struct NoInitAllocator : std::allocator<T> {
 
 template <typename T>
 using NoInitVec = std::vector<T, NoInitAllocator<T>>;
+
+/// Dynamic work-stealing parallel-for where the calling thread participates as a worker,
+/// reducing BS::thread_pool task-queue mutex contention, barrier overhead, and tail imbalance.
+template <typename IndexT, typename Fn>
+inline void parallelForDynamic(BS::thread_pool<>& pool, IndexT count, Fn&& fn) {
+    if (count == 0) return;
+    const size_t poolThreads = pool.get_thread_count();
+    if (count == 1 || poolThreads <= 1) {
+        for (IndexT i = 0; i < count; ++i) {
+            fn(i);
+        }
+        return;
+    }
+    const size_t workers = std::min<size_t>(static_cast<size_t>(count), poolThreads);
+    const IndexT grain = std::max<IndexT>(1, static_cast<IndexT>(count / (workers * 4)));
+    std::atomic<IndexT> nextIdx{0};
+    auto workerLoop = [&]() {
+        while (true) {
+            IndexT begin = nextIdx.fetch_add(grain, std::memory_order_relaxed);
+            if (begin >= count) break;
+            IndexT end = std::min<IndexT>(count, begin + grain);
+            for (IndexT i = begin; i < end; ++i) {
+                fn(i);
+            }
+        }
+    };
+    const size_t bgWorkers = workers - 1;
+    if (bgWorkers > 0) {
+        pool.detach_loop<size_t>(
+            0, bgWorkers,
+            [&](size_t) { workerLoop(); },
+            bgWorkers);
+    }
+    workerLoop();
+    if (bgWorkers > 0) {
+        pool.wait();
+    }
+}
 
 constexpr uint32_t kTileSize = kRasterTileSize;
 constexpr uint32_t kTilePixels = kRasterTilePixels;
