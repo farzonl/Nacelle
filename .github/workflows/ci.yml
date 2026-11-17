@@ -313,7 +313,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
             -DCMAKE_CXX_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
-            -DCMAKE_LINKER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/lld-link.exe" `
             -DCMAKE_C_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
             -DCMAKE_CXX_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
             -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
