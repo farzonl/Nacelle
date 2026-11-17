@@ -4331,7 +4331,6 @@ bool compileGraphicsPSO(
             return true;
         }
 
-        mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
         CachedVSMeta vsMeta{};
         CompiledVertexFn cachedVSFn = nullptr;
         std::vector<DxilSigRecord> vsOutputRecs;
@@ -4341,15 +4340,20 @@ bool compileGraphicsPSO(
             outPSO.vsSymbolName = vsSym;
             outPSO.vsFn.store(cachedVSFn, std::memory_order_release);
         } else {
-            mlir::OwningOpRef<mlir::ModuleOp> vsMod;
-            if (!synthesizeVertexStageMLIR(
-                    desc, rootLayout, simdWidth, vsSym, mlirCtx, vsMod, vsMeta,
-                    outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outError)) {
-                return false;
+            std::unique_ptr<llvm::LLVMContext> vsLlvmCtx;
+            std::unique_ptr<llvm::Module> vsLinkedMod;
+            {
+                mlir::MLIRContext vsMlirCtx(mlir::MLIRContext::Threading::DISABLED);
+                mlir::OwningOpRef<mlir::ModuleOp> vsMod;
+                if (!synthesizeVertexStageMLIR(
+                        desc, rootLayout, simdWidth, vsSym, vsMlirCtx, vsMod, vsMeta,
+                        outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outError)) {
+                    return false;
+                }
+                vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+                vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError, /*linkRuntime=*/false);
+                if (!vsLinkedMod) return false;
             }
-            auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
-            auto vsLinkedMod = translateMLIRToLinkedLLVMIR(*vsMod, *vsLlvmCtx, outError, /*linkRuntime=*/false);
-            if (!vsLinkedMod) return false;
             if (!jitCompileVertexStageTier1AndScheduleTier2(
                     std::move(vsLinkedMod), std::move(vsLlvmCtx), vsHashLo, vsHashHi, vsSym,
                     vsMeta, outPSO.vsInputs, outPSO.vsOutputs, vsOutputRecs, outPSO, outError)) {
@@ -4357,21 +4361,26 @@ bool compileGraphicsPSO(
             }
         }
 
-        mlir::OwningOpRef<mlir::ModuleOp> psMod;
         CachedPSOMeta meta{};
-        if (!synthesizeGraphicsPSOMLIR(
-                desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, psMod, meta,
-                outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError,
-                meshStages, /*skipVS=*/true, &vsMeta, &vsOutputRecs)) {
-            return false;
-        }
-        meta.separateVSObject = 1;
-        meta.vsHashLo = vsHashLo;
-        meta.vsHashHi = vsHashHi;
+        std::unique_ptr<llvm::LLVMContext> psLlvmCtx;
+        std::unique_ptr<llvm::Module> psLinkedMod;
+        {
+            mlir::MLIRContext psMlirCtx(mlir::MLIRContext::Threading::DISABLED);
+            mlir::OwningOpRef<mlir::ModuleOp> psMod;
+            if (!synthesizeGraphicsPSOMLIR(
+                    desc, rootLayout, simdWidth, vsSym, psSym, psMlirCtx, psMod, meta,
+                    outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError,
+                    meshStages, /*skipVS=*/true, &vsMeta, &vsOutputRecs)) {
+                return false;
+            }
+            meta.separateVSObject = 1;
+            meta.vsHashLo = vsHashLo;
+            meta.vsHashHi = vsHashHi;
 
-        auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
-        auto psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError, /*linkRuntime=*/false);
-        if (!psLinkedMod) return false;
+            psLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            psLinkedMod = translateMLIRToLinkedLLVMIR(*psMod, *psLlvmCtx, outError, /*linkRuntime=*/false);
+            if (!psLinkedMod) return false;
+        }
 
         populatePSOFromMeta(meta);
         return jitCompilePixelStageTier1AndScheduleTier2(
@@ -4383,18 +4392,22 @@ bool compileGraphicsPSO(
         return true;
     }
 
-    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
     CachedPSOMeta meta;
-    if (!synthesizeGraphicsPSOMLIR(
-            desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, combinedMod, meta,
-            outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError, meshStages)) {
-        return false;
-    }
+    std::unique_ptr<llvm::LLVMContext> outLlvmCtx;
+    std::unique_ptr<llvm::Module> linkedMod;
+    {
+        mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+        mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
+        if (!synthesizeGraphicsPSOMLIR(
+                desc, rootLayout, simdWidth, vsSym, psSym, mlirCtx, combinedMod, meta,
+                outPSO.vsInputs, outPSO.vsOutputs, outPSO.psInputs, outPSO.psOutputs, outError, meshStages)) {
+            return false;
+        }
 
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
-    if (!linkedMod) return false;
+        outLlvmCtx = std::make_unique<llvm::LLVMContext>();
+        linkedMod = translateMLIRToLinkedLLVMIR(*combinedMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
+        if (!linkedMod) return false;
+    }
 
     populatePSOFromMeta(meta);
     return jitCompileGraphicsTier1AndScheduleTier2(

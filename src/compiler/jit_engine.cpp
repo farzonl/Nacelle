@@ -488,15 +488,6 @@ BS::thread_pool<>& ensureTier2PoolReady(JitRuntime& rt) {
         rt.tier2PoolOwned = std::make_unique<BS::thread_pool<>>(poolThreads);
         rt.activeTier2Pool.store(rt.tier2PoolOwned.get(), std::memory_order_release);
 
-        llvm::LLVMContext initCtx;
-        llvm::Module initMod("__nacelle_warmup", initCtx);
-        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(initCtx), false);
-        auto* fn = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage, "__nacelle_warmup", initMod);
-        auto* bb = llvm::BasicBlock::Create(initCtx, "entry", fn);
-        llvm::ReturnInst::Create(initCtx, bb);
-        llvm::SmallVector<char, 0> dummyObj;
-        std::string dummyErr;
-        emitObjectBytesO3(initMod, dummyObj, dummyErr);
         std::atexit([]() {
             if (auto* pool = getJitRuntime().activeTier2Pool.load(std::memory_order_acquire)) {
                 pool->wait();
@@ -723,21 +714,14 @@ bool emitObjectBytesO3(
 }
 
 void runTier1Optimize(llvm::Module& mod) {
-    llvm::LoopAnalysisManager lam;
     llvm::FunctionAnalysisManager fam;
-    llvm::CGSCCAnalysisManager cgam;
-    llvm::ModuleAnalysisManager mam;
 
 #if LLVM_VERSION_MAJOR >= 24
     llvm::PassBuilder pb(mod.getContext());
 #else
     llvm::PassBuilder pb;
 #endif
-    pb.registerModuleAnalyses(mam);
-    pb.registerCGSCCAnalyses(cgam);
     pb.registerFunctionAnalyses(fam);
-    pb.registerLoopAnalyses(lam);
-    pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::FunctionPassManager fpm;
     fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
@@ -1740,9 +1724,9 @@ bool jitCompileComputeTier1AndScheduleTier2(
     const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
     // Snapshot unoptimized IR bitcode before Tier-1 mutates `llvmMod`.
-    llvm::SmallString<0> bcBytes;
+    std::string bcStr;
     if (scheduleTier2) {
-        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::raw_string_ostream bcOS(bcStr);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
@@ -1785,7 +1769,6 @@ bool jitCompileComputeTier1AndScheduleTier2(
 
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
-    std::string bcStr(bcBytes.data(), bcBytes.size());
 
     ensureTier2PoolReady(rt).detach_task([box, meta, symbolName, cacheDir, hex, bcStr = std::move(bcStr)]() mutable {
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
@@ -1839,9 +1822,9 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
     const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
-    llvm::SmallString<0> bcBytes;
+    std::string bcStr;
     if (scheduleTier2) {
-        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::raw_string_ostream bcOS(bcStr);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
@@ -1912,7 +1895,6 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
 
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
-    std::string bcStr(bcBytes.data(), bcBytes.size());
 
     ensureTier2PoolReady(rt).detach_task([box, meta, vsSym, psSym, cacheDir, hex, bcStr = std::move(bcStr)]() mutable {
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
@@ -1995,9 +1977,9 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
     const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
-    llvm::SmallString<0> bcBytes;
+    std::string bcStr;
     if (scheduleTier2) {
-        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::raw_string_ostream bcOS(bcStr);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
@@ -2050,7 +2032,6 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
 
     if (launchedTier2) {
-        std::string bcStr(bcBytes.data(), bcBytes.size());
         ensureTier2PoolReady(rt).detach_task([vsMeta, vsHashLo, vsHashHi, vsSym, cacheDir, vsHex, vsKey, bcStr = std::move(bcStr)]() mutable {
             auto ctx2 = std::make_unique<llvm::LLVMContext>();
             auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, vsHex + ".bc", false);
@@ -2118,9 +2099,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
     const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
     const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
 
-    llvm::SmallString<0> bcBytes;
+    std::string bcStr;
     if (scheduleTier2) {
-        llvm::raw_svector_ostream bcOS(bcBytes);
+        llvm::raw_string_ostream bcOS(bcStr);
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
@@ -2178,7 +2159,6 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
     }
 
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
-    std::string bcStr(bcBytes.data(), bcBytes.size());
 
     ensureTier2PoolReady(rt).detach_task([box, meta, psSym, cacheDir, hex, vsKey, bcStr = std::move(bcStr)]() mutable {
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
@@ -2255,44 +2235,62 @@ bool compileComputePSO(
     };
     const auto tStart = Clock::now();
 
-    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
-    DxilLoadedShader shader;
-    if (!loadAndUpgradeDXIL(desc.CS, *llvmCtx, shader, outError)) {
-        return false;
-    }
-    const auto tDxil = Clock::now();
-
-    const RootSignatureLayout& effectiveLayout =
-        (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
-            ? shader.embeddedRootSig
-            : rootLayout;
-
-    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
-    if (!mlirMod) return false;
-    const auto tLift = Clock::now();
-
-    bool singleGroupFastPath = false;
-    const uint32_t effectiveWidth = (shader.waveSize > 0) ? shader.waveSize : simdWidth;
-    if (!packetizeComputeEntry(
-            *mlirMod, shader, effectiveLayout, effectiveWidth, symbolName,
-            outError, &singleGroupFastPath)) {
-        return false;
-    }
-    const auto tPacketize = Clock::now();
-
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
-    if (!linkedMod) return false;
-    const auto tTranslate = Clock::now();
-
     CachedPSOMeta meta;
-    meta.simdWidth = simdWidth;
-    meta.threadGroupSize[0] = shader.threadGroupSize[0];
-    meta.threadGroupSize[1] = shader.threadGroupSize[1];
-    meta.threadGroupSize[2] = shader.threadGroupSize[2];
-    meta.groupSharedBytes = shader.groupSharedBytes;
-    meta.singleGroupDispatch = singleGroupFastPath ? 1 : 0;
+    std::unique_ptr<llvm::LLVMContext> outLlvmCtx;
+    std::unique_ptr<llvm::Module> linkedMod;
+    bool singleGroupFastPath = false;
+    uint32_t effectiveWidth = simdWidth;
+    {
+        auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+        DxilLoadedShader shader;
+        if (!loadAndUpgradeDXIL(desc.CS, *llvmCtx, shader, outError)) {
+            return false;
+        }
+        const auto tDxil = Clock::now();
+
+        const RootSignatureLayout& effectiveLayout =
+            (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
+                ? shader.embeddedRootSig
+                : rootLayout;
+
+        mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+        auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
+        if (!mlirMod) return false;
+        llvmCtx.reset();
+        const auto tLift = Clock::now();
+
+        effectiveWidth = (shader.waveSize > 0) ? shader.waveSize : simdWidth;
+        if (!packetizeComputeEntry(
+                *mlirMod, shader, effectiveLayout, effectiveWidth, symbolName,
+                outError, &singleGroupFastPath)) {
+            return false;
+        }
+        const auto tPacketize = Clock::now();
+
+        outLlvmCtx = std::make_unique<llvm::LLVMContext>();
+        linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
+        if (!linkedMod) return false;
+
+        meta.simdWidth = simdWidth;
+        meta.threadGroupSize[0] = shader.threadGroupSize[0];
+        meta.threadGroupSize[1] = shader.threadGroupSize[1];
+        meta.threadGroupSize[2] = shader.threadGroupSize[2];
+        meta.groupSharedBytes = shader.groupSharedBytes;
+        meta.singleGroupDispatch = singleGroupFastPath ? 1 : 0;
+
+        if (profileCompile) {
+            const auto tTranslateNow = Clock::now();
+            std::fprintf(
+                stderr,
+                "[NacelleCompile] W=%u dxil=%.2fms lift=%.2fms packetize=%.2fms mlir2llvm=%.2fms\n",
+                effectiveWidth,
+                msSince(tStart, tDxil),
+                msSince(tDxil, tLift),
+                msSince(tLift, tPacketize),
+                msSince(tPacketize, tTranslateNow));
+        }
+    }
+    const auto tTranslate = Clock::now();
 
     outPSO.threadGroupSize[0] = meta.threadGroupSize[0];
     outPSO.threadGroupSize[1] = meta.threadGroupSize[1];
@@ -2308,13 +2306,9 @@ bool compileComputePSO(
     if (profileCompile) {
         std::fprintf(
             stderr,
-            "[NacelleCompile] W=%u total=%.2fms (dxil=%.2fms lift=%.2fms packetize=%.2fms mlir2llvm=%.2fms tier1=%.2fms)\n",
+            "[NacelleCompile] W=%u total=%.2fms (tier1=%.2fms)\n",
             effectiveWidth,
             msSince(tStart, tTier1),
-            msSince(tStart, tDxil),
-            msSince(tDxil, tLift),
-            msSince(tLift, tPacketize),
-            msSince(tPacketize, tTranslate),
             msSince(tTranslate, tTier1));
     }
     return ok;
@@ -2441,38 +2435,97 @@ bool compileDxrShader(
     DxrShaderFn& outFn,
     std::string& outError) {
     outFn = nullptr;
-    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
-    DxilLoadedShader shader;
-    if (!loadAndUpgradeDXILLibraryExport(dxilLib, exportName, *llvmCtx, shader, outError)) {
-        return false;
-    }
-
-    const RootSignatureLayout& effectiveLayout =
-        (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
-            ? shader.embeddedRootSig
-            : rootLayout;
-
-    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
-    auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
-    if (!mlirMod) return false;
-
     const std::string symbolName = "nacelle_dxr_" + exportName;
-    if (!packetizeDxrEntry(*mlirMod, shader, effectiveLayout, simdWidth, symbolName, outError)) {
-        return false;
+
+    HashFeed feed;
+    feed.addStr("DXR");
+    feed.addStr(kCompilerBuildHash);
+    feed.addStr(getHostTargetTripleString().c_str());
+    feed.add(simdWidth);
+    feed.add(rootLayout.hashLo);
+    feed.add(rootLayout.hashHi);
+    feed.addStr(exportName.c_str());
+    uint64_t dxilLen = dxilLib.BytecodeLength;
+    feed.add(dxilLen);
+    feed.addBytes(dxilLib.pShaderBytecode, static_cast<size_t>(dxilLen));
+    XXH128_hash_t h = XXH3_128bits(feed.buf.data(), feed.buf.size());
+
+    std::filesystem::path cacheDir = getCacheDirectory();
+    std::string hex = hashToHex128(h.low64, h.high64);
+    std::string key = (cacheDir / hex).string();
+
+    auto& rt = getJitRuntime();
+    {
+        std::lock_guard<std::mutex> lock(rt.mu);
+        auto it = rt.memCache.find(key);
+        if (it != rt.memCache.end() && it->second.addr0 != 0 && it->second.meta.simdWidth == simdWidth) {
+            outFn = reinterpret_cast<DxrShaderFn>(it->second.addr0);
+            return true;
+        }
     }
 
-    auto outLlvmCtx = std::make_unique<llvm::LLVMContext>();
-    auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
-    if (!linkedMod) return false;
+    {
+        std::vector<uint8_t> cachedObj;
+        if (readFileBytes(cacheDir / (hex + ".o"), cachedObj) && !cachedObj.empty()) {
+            std::lock_guard<std::mutex> lock(rt.mu);
+            auto it = rt.memCache.find(key);
+            if (it != rt.memCache.end() && it->second.addr0 != 0 && it->second.meta.simdWidth == simdWidth) {
+                outFn = reinterpret_cast<DxrShaderFn>(it->second.addr0);
+                return true;
+            }
+            uint64_t addr0 = 0, addr1 = 0;
+            std::string err;
+            if (loadObjectIntoJitLocked(
+                    rt, cachedObj.data(), cachedObj.size(), key + ".o", symbolName, "", addr0, addr1, err) &&
+                addr0 != 0) {
+                CachedPSOMeta meta{};
+                meta.simdWidth = simdWidth;
+                rt.memCache[key] = InMemCacheEntry{meta, addr0, 0, 0, 0, 0, 0, 0, 0};
+                outFn = reinterpret_cast<DxrShaderFn>(addr0);
+                return true;
+            }
+        }
+    }
+
+    std::unique_ptr<llvm::LLVMContext> outLlvmCtx;
+    std::unique_ptr<llvm::Module> linkedMod;
+    {
+        auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+        DxilLoadedShader shader;
+        if (!loadAndUpgradeDXILLibraryExport(dxilLib, exportName, *llvmCtx, shader, outError)) {
+            return false;
+        }
+
+        const RootSignatureLayout& effectiveLayout =
+            (rootLayout.params.empty() && rootLayout.staticSamplers.empty() && shader.hasEmbeddedRootSig)
+                ? shader.embeddedRootSig
+                : rootLayout;
+
+        mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+        auto mlirMod = importAndLiftDXILToSCF(std::move(shader.module), shader.entryName, mlirCtx, outError);
+        if (!mlirMod) return false;
+        llvmCtx.reset();
+
+        if (!packetizeDxrEntry(*mlirMod, shader, effectiveLayout, simdWidth, symbolName, outError)) {
+            return false;
+        }
+
+        outLlvmCtx = std::make_unique<llvm::LLVMContext>();
+        linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
+        if (!linkedMod) return false;
+    }
 
     llvm::SmallVector<char, 0> objBytes;
     if (!emitObjectBytesO3(*linkedMod, objBytes, outError)) return false;
+    linkedMod.reset();
+    outLlvmCtx.reset();
 
-    auto& rt = getJitRuntime();
+    uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
+    writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
+
     std::lock_guard<std::mutex> lock(rt.mu);
     ensureLLJITLocked(rt, outError);
     if (!rt.jit) return false;
-    if (!ensureRuntimeBitcodeInMainJDLocked(rt, *linkedMod, outError)) return false;
 
     uint64_t addr0 = 0, addr1 = 0;
     const std::string objName = "dxr_" + exportName + "_" + std::to_string(rt.dylibSeq.fetch_add(1, std::memory_order_relaxed)) + ".o";
@@ -2481,6 +2534,9 @@ bool compileDxrShader(
             objName, symbolName, "", addr0, addr1, outError)) {
         return false;
     }
+    CachedPSOMeta meta{};
+    meta.simdWidth = simdWidth;
+    rt.memCache[key] = InMemCacheEntry{meta, addr0, 0, 0, 0, 0, 0, 0, 0};
     outFn = reinterpret_cast<DxrShaderFn>(addr0);
     return outFn != nullptr;
 }
