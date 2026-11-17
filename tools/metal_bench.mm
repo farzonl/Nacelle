@@ -1269,9 +1269,12 @@ MetalBenchResult runMetalRaytracingBench(
             samples.push_back(dispatchOnce(width, height));
         }
 
+        const size_t checksumCount = std::min<size_t>(
+            1024u * 1024u,
+            isInline ? static_cast<size_t>(width) * 4u : static_cast<size_t>(width));
         const auto* up = static_cast<const uint32_t*>([outBuf contents]);
         double sum = 0.0;
-        for (size_t i = 0; i < 1024; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+        for (size_t i = 0; i < checksumCount; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
         res.checksum = sum;
 
         res.shortJobMs = dispatchOnce(64, 64);

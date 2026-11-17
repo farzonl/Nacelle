@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
                    spec.kind == PipelineKind::RayTracingPipeline) {
             std::vector<uint8_t> rt;
             if (!readBinary(args.shaderDir + "/" + spec.rtDxil, rt)) return out;
-            out.push_back(runNacelleRaytracingBench(spec, rt, w, args.iters));
+            out.push_back(runNacelleRaytracingBench(spec, rt, w, args.width, args.height, args.iters));
         }
         return out;
     });
