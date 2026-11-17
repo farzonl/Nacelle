@@ -801,6 +801,98 @@ int main() {
                     W, H, msPerFrame, mTrisPerSec);
     }
 
+    // Regression test: packed multi-triangle batches must preserve per-triangle depth.
+    {
+        D3D12_INPUT_ELEMENT_DESC elems[2] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = rs.Get();
+        psoDesc.VS = {vsBytes.data(), vsBytes.size()};
+        psoDesc.PS = {psBytes.data(), psBytes.size()};
+        psoDesc.InputLayout = {elems, 2};
+        psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+        psoDesc.DepthStencilState.DepthEnable = TRUE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        psoDesc.SampleMask = UINT_MAX;
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        psoDesc.SampleDesc = {1, 0};
+
+        ComPtr<ID3D12PipelineState> pso;
+        testutil::checkHR(rt.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso)), "CreatePackedTriPSO");
+
+        constexpr UINT W = 16, H = 16;
+        D3D12_CLEAR_VALUE rtClear{};
+        rtClear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        auto rtvTex = createTex2D(rt.device.Get(), W, H, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, &rtClear);
+        D3D12_CLEAR_VALUE dsClear{};
+        dsClear.Format = DXGI_FORMAT_D32_FLOAT;
+        dsClear.DepthStencil.Depth = 1.0f;
+        auto dsvTex = createTex2D(rt.device.Get(), W, H, DXGI_FORMAT_D32_FLOAT,
+                                  D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, &dsClear);
+
+        auto rtvH = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        auto dsvH = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        rt.device->CreateRenderTargetView(rtvTex.Get(), nullptr, rtvH);
+        rt.device->CreateDepthStencilView(dsvTex.Get(), nullptr, dsvH);
+
+        // Two small triangles in the same 32x32 tile with different z:
+        // Tri 0 (red, closer z=0.25) covers top-left quadrant (0..7, 0..7)
+        // Tri 1 (green, farther z=0.75) covers (0..11, 0..11)
+        const VertexPosCol verts[] = {
+            {-1.0f,  1.0f, 0.25f, 1.0f, 0.0f, 0.0f, 1.0f},
+            { 0.0f,  1.0f, 0.25f, 1.0f, 0.0f, 0.0f, 1.0f},
+            {-1.0f,  0.0f, 0.25f, 1.0f, 0.0f, 0.0f, 1.0f},
+
+            {-1.0f,  1.0f, 0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
+            { 0.5f,  1.0f, 0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
+            {-1.0f, -0.5f, 0.75f, 0.0f, 1.0f, 0.0f, 1.0f},
+        };
+        auto vb = rt.createBuffer(sizeof(verts), D3D12_HEAP_TYPE_DEFAULT);
+        rt.uploadBuffer(vb.Get(), verts, sizeof(verts));
+        D3D12_VERTEX_BUFFER_VIEW vbv{vb->GetGPUVirtualAddress(), sizeof(verts), sizeof(VertexPosCol)};
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(W), static_cast<float>(H), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(W), static_cast<LONG>(H)};
+
+        rt.resetCmd();
+        rt.cmdList->SetGraphicsRootSignature(rs.Get());
+        rt.cmdList->SetPipelineState(pso.Get());
+        rt.cmdList->RSSetViewports(1, &vp);
+        rt.cmdList->RSSetScissorRects(1, &sc);
+        rt.cmdList->OMSetRenderTargets(1, &rtvH, FALSE, &dsvH);
+        const float bg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        rt.cmdList->ClearRenderTargetView(rtvH, bg, 0, nullptr);
+        rt.cmdList->ClearDepthStencilView(dsvH, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        rt.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        rt.cmdList->IASetVertexBuffers(0, 1, &vbv);
+        rt.cmdList->DrawInstanced(6, 1, 0, 0);
+        rt.executeAndWait();
+
+        auto bytes = readbackTex2D(rt, rtvTex.Get(), W, H, 4);
+        auto px0 = bytes.data() + (1 * W + 1) * 4;
+        if (px0[0] < 250 || px0[1] > 5) {
+            std::fprintf(stderr, "FAIL: Packed multi-tri overlap pixel got (%u,%u,%u,%u), expected red\n",
+                         px0[0], px0[1], px0[2], px0[3]);
+            return 1;
+        }
+        auto px1 = bytes.data() + (1 * W + 9) * 4;
+        if (px1[0] > 5 || px1[1] < 250) {
+            std::fprintf(stderr, "FAIL: Packed multi-tri non-overlap pixel got (%u,%u,%u,%u), expected green\n",
+                         px1[0], px1[1], px1[2], px1[3]);
+            return 1;
+        }
+        std::printf("  [PackedTri] Multi-triangle depth packing PASSED\n");
+    }
+
     std::printf("rasterizer_pipeline_test PASSED\n");
 
     return 0;
