@@ -1,4 +1,6 @@
 build/
+build-llvm/
+.toolchains/
 .DS_Store
 *.ppm
 *.dxil
