@@ -1,4 +1,5 @@
 #include "simt_to_simd_pass.h"
+#include "mlir_pipeline.h"
 
 #include <algorithm>
 #include <cmath>
@@ -4571,10 +4572,10 @@ private:
         mlir::Value inBounds,
         mlir::Value cOff) {
         auto loadIf = mlir::scf::IfOp::create(
-            b_, loc, inBounds,
+            b_, loc, emitExpectBool(b_, loc, inBounds, true),
             [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                 auto resIf = mlir::scf::IfOp::create(
-                    nb, nloc, isReserved,
+                    nb, nloc, emitExpectBool(nb, nloc, isReserved, false),
                     [&](mlir::OpBuilder& rb, mlir::Location rloc) {
                         mlir::Value ep = resolveReservedBufferElemPtr(rb, rloc, descP, basePtr, cOff, elemBytes);
                         mlir::Value nullP = mlir::LLVM::ZeroOp::create(rb, rloc, ptrTy());
@@ -4582,7 +4583,7 @@ private:
                             rb, rloc, mlir::LLVM::ICmpPredicate::ne, ep, nullP);
                         mlir::Value v =
                             mlir::scf::IfOp::create(
-                                rb, rloc, mapped,
+                                rb, rloc, emitExpectBool(rb, rloc, mapped, true),
                                 [&](mlir::OpBuilder& lb, mlir::Location lloc) {
                                     mlir::scf::YieldOp::create(
                                         lb, lloc, mlir::ValueRange{mlir::LLVM::LoadOp::create(lb, lloc, elemTy, ep)});
@@ -4624,15 +4625,15 @@ private:
         mlir::Value doStore,
         mlir::Value cOff,
         mlir::Value valScalar) {
-        mlir::scf::IfOp::create(b_, loc, doStore, [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+        mlir::scf::IfOp::create(b_, loc, emitExpectBool(b_, loc, doStore, true), [&](mlir::OpBuilder& nb, mlir::Location nloc) {
             mlir::scf::IfOp::create(
-                nb, nloc, isReserved,
+                nb, nloc, emitExpectBool(nb, nloc, isReserved, false),
                 [&](mlir::OpBuilder& rb, mlir::Location rloc) {
                     mlir::Value ep = resolveReservedBufferElemPtr(rb, rloc, descP, basePtr, cOff, elemBytes);
                     mlir::Value nullP = mlir::LLVM::ZeroOp::create(rb, rloc, ptrTy());
                     mlir::Value mapped = mlir::LLVM::ICmpOp::create(
                         rb, rloc, mlir::LLVM::ICmpPredicate::ne, ep, nullP);
-                    mlir::scf::IfOp::create(rb, rloc, mapped, [&](mlir::OpBuilder& sb, mlir::Location sloc) {
+                    mlir::scf::IfOp::create(rb, rloc, emitExpectBool(rb, rloc, mapped, true), [&](mlir::OpBuilder& sb, mlir::Location sloc) {
                         mlir::LLVM::StoreOp::create(sb, sloc, valScalar, ep);
                         mlir::scf::YieldOp::create(sb, sloc);
                     });
@@ -4906,7 +4907,7 @@ private:
         };
 
         auto ifRes = mlir::scf::IfOp::create(
-            b_, loc, info.isReserved,
+            b_, loc, emitExpectBool(b_, loc, info.isReserved, false),
             [&](mlir::OpBuilder& rb, mlir::Location rloc) {
                 if (activeComps.size() <= 1) {
                     mlir::scf::YieldOp::create(rb, rloc, emitPerCompReserved(rb, rloc));
@@ -4916,7 +4917,7 @@ private:
                 (void)lastOff;
                 uint32_t spanBytes = (activeComps.back() + 1u) * elemBytes;
                 auto fastIf = mlir::scf::IfOp::create(
-                    rb, rloc, fullOk,
+                    rb, rloc, emitExpectBool(rb, rloc, fullOk, true),
                     [&](mlir::OpBuilder& tb, mlir::Location tloc) {
                         mlir::Value spanPtr = resolveReservedBufferElemPtr(
                             tb, tloc, info.descP, info.basePtr, byteOff, spanBytes);
@@ -4924,7 +4925,7 @@ private:
                         mlir::Value samePageMapped = mlir::LLVM::ICmpOp::create(
                             tb, tloc, mlir::LLVM::ICmpPredicate::ne, spanPtr, nullP);
                         auto innerIf = mlir::scf::IfOp::create(
-                            tb, tloc, samePageMapped,
+                            tb, tloc, emitExpectBool(tb, tloc, samePageMapped, true),
                             [&](mlir::OpBuilder& lb, mlir::Location lloc) {
                                 llvm::SmallVector<mlir::Value, 17> vals;
                                 vals.reserve(activeComps.size() + 1);
@@ -5167,7 +5168,7 @@ private:
                 mlir::Value allOk = mlir::LLVM::vector_reduce_and::create(b_, loc, i1Ty(), inBoundsVec);
 
                 llvm::SmallVector<mlir::Type, 8> resTypes(activeComps.size(), vecTy(elemTy));
-                auto ifOk = mlir::scf::IfOp::create(b_, loc, resTypes, allOk, /*withElseRegion=*/true);
+                auto ifOk = mlir::scf::IfOp::create(b_, loc, resTypes, emitExpectBool(b_, loc, allOk, true), /*withElseRegion=*/true);
                 {
                     mlir::OpBuilder::InsertionGuard g(b_);
                     b_.setInsertionPointToStart(&ifOk.getThenRegion().front());
@@ -5275,7 +5276,7 @@ private:
                                           : mlir::Value();
 
             auto ifRes = mlir::scf::IfOp::create(
-                b_, loc, info.isReserved,
+                b_, loc, emitExpectBool(b_, loc, info.isReserved, false),
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
                     mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
@@ -5432,7 +5433,7 @@ private:
         }
         mlir::Value anyReserved = orReduce(loc, isReservedVec);
         auto ifRes = mlir::scf::IfOp::create(
-            b_, loc, anyReserved,
+            b_, loc, emitExpectBool(b_, loc, anyReserved, false),
             [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                 SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
                 llvm::SmallVector<mlir::Value, 17> activeVecs(
@@ -5550,7 +5551,7 @@ private:
                                           : mlir::Value();
 
             mlir::scf::IfOp::create(
-                b_, loc, info.isReserved,
+                b_, loc, emitExpectBool(b_, loc, info.isReserved, false),
                 [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                     mlir::Value c0 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(0));
                     mlir::Value c1 = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getI32IntegerAttr(1));
@@ -5691,7 +5692,7 @@ private:
         mlir::Value activeOkVec = mlir::LLVM::AndOp::create(b_, loc, realMask, okPtrVec);
 
         mlir::scf::IfOp::create(
-            b_, loc, anyReserved,
+            b_, loc, emitExpectBool(b_, loc, anyReserved, false),
             [&](mlir::OpBuilder& nb, mlir::Location nloc) {
                 SimdPacketizer tmp(nb, mod_, shader_, rootLayout_, W_, rootCtxPtr_, hooks_);
                 for (uint32_t l = 0; l < W_; ++l) {

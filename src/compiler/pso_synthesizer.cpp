@@ -961,7 +961,7 @@ bool emitVertexStageFunction(
                 }
             };
 
-            auto ifOp = mlir::scf::IfOp::create(b, loc, resTypes, allOk, /*withElseRegion=*/true);
+            auto ifOp = mlir::scf::IfOp::create(b, loc, resTypes, emitExpectBool(b, loc, allOk, true), /*withElseRegion=*/true);
             {
                 mlir::OpBuilder::InsertionGuard g(b);
                 b.setInsertionPointToStart(&ifOp.getThenRegion().front());

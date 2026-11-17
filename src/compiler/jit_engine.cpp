@@ -49,6 +49,7 @@
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/Scalar/LowerExpectIntrinsic.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
@@ -739,6 +740,7 @@ void runTier1Optimize(llvm::Module& mod) {
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
     llvm::FunctionPassManager fpm;
+    fpm.addPass(llvm::LowerExpectIntrinsicPass());
     fpm.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     fpm.addPass(llvm::SimplifyCFGPass());
 

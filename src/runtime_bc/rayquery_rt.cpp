@@ -181,7 +181,7 @@ inline bool resolveOpaque(uint32_t rayFlags, uint32_t instFlags, uint32_t geomFl
 inline void beginInstance(BC_RayQueryState& rq, const TlasInstance* inst) {
     rq.curInst = inst;
     rq.curBlas = reinterpret_cast<const BlasHeader*>(static_cast<uintptr_t>(inst->blasAddress));
-    if (!rq.curBlas || rq.curBlas->magic != kBlasMagic) {
+    if (!rq.curBlas || rq.curBlas->magic != kBlasMagic) [[unlikely]] {
         rq.curInst = nullptr;
         return;
     }
@@ -217,7 +217,7 @@ inline void beginInstance(BC_RayQueryState& rq, const TlasInstance* inst) {
 }
 
 inline float readMatrixElem(const float m[12], int32_t row, int32_t col) {
-    if (row < 0 || row >= 3 || col < 0 || col >= 4) return 0.0f;
+    if (row < 0 || row >= 3 || col < 0 || col >= 4) [[unlikely]] return 0.0f;
     return m[row * 4 + col];
 }
 
@@ -276,7 +276,7 @@ void nacelle_rqbc_trace_inline(
     rq->primEnd = 0;
 
     const auto* tlas = static_cast<const TlasHeader*>(tlasPtr);
-    if (!tlas || tlas->magic != kTlasMagic || tlas->rootNode == kInvalidNode || tMax < tMin) {
+    if (!tlas || tlas->magic != kTlasMagic || tlas->rootNode == kInvalidNode || tMax < tMin) [[unlikely]] {
         rq->finished = 1;
         return;
     }
