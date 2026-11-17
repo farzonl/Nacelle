@@ -1350,6 +1350,134 @@ bool initRasterSceneHeader(
     return true;
 }
 
+/// Reusable open-addressed uint32->uint32 map with O(1) generation-based reset.
+struct FlatUintMap {
+    struct Entry {
+        uint32_t key = 0;
+        uint32_t val = 0;
+        uint32_t stamp = 0;
+    };
+    std::vector<Entry> table;
+    uint32_t gen = 1;
+    uint32_t count = 0;
+
+    void reset(uint32_t expectedEntries = 0) {
+        if (table.empty()) {
+            uint32_t cap = 256;
+            while (cap < expectedEntries * 2u) cap <<= 1;
+            table.resize(cap);
+            gen = 1;
+            count = 0;
+            return;
+        }
+        if (expectedEntries * 2u >= table.size()) {
+            uint32_t cap = static_cast<uint32_t>(table.size());
+            while (cap < expectedEntries * 2u) cap <<= 1;
+            table.assign(cap, Entry{});
+            gen = 1;
+            count = 0;
+            return;
+        }
+        ++gen;
+        if (gen == 0) {
+            for (auto& e : table) e.stamp = 0;
+            gen = 1;
+        }
+        count = 0;
+    }
+
+    void rehash(uint32_t newCap) {
+        std::vector<Entry> old = std::move(table);
+        table.assign(newCap, Entry{});
+        uint32_t oldGen = gen;
+        gen = 1;
+        uint32_t mask = newCap - 1u;
+        for (const auto& e : old) {
+            if (e.stamp != oldGen) continue;
+            uint32_t idx = (e.key * 2654435761u) & mask;
+            while (table[idx].stamp == 1) {
+                idx = (idx + 1u) & mask;
+            }
+            table[idx] = {e.key, e.val, 1};
+        }
+    }
+
+    std::pair<uint32_t, bool> emplace(uint32_t key, uint32_t val) {
+        if ((count + 1u) * 2u >= table.size()) {
+            rehash(static_cast<uint32_t>(table.size()) * 2u);
+        }
+        uint32_t mask = static_cast<uint32_t>(table.size()) - 1u;
+        uint32_t idx = (key * 2654435761u) & mask;
+        while (table[idx].stamp == gen) {
+            if (table[idx].key == key) {
+                return {table[idx].val, false};
+            }
+            idx = (idx + 1u) & mask;
+        }
+        table[idx] = {key, val, gen};
+        ++count;
+        return {val, true};
+    }
+};
+
+struct FallbackGeoScratch {
+    std::vector<uint32_t> triVerts;
+    std::vector<uint32_t> uniqueVIds;
+    std::vector<uint32_t> stripRun;
+    FlatUintMap vIdToUnique;
+
+    std::vector<ShadedVertex> shadedVerts;
+    std::vector<float> outAttrs;
+    std::vector<ShadedVertex> polyA;
+    std::vector<ShadedVertex> polyB;
+    std::vector<ShadedVertex> batchPrims;
+
+    // Geometry Shader reusable buffers
+    std::vector<float> gsInPosSOA;
+    std::vector<float> gsInAttrsSOA;
+    std::vector<float> gsOutPos;
+    std::vector<float> gsOutAttrs;
+    std::vector<uint32_t> gsStripCounts;
+    std::vector<uint32_t> gsInstTotalVerts;
+    std::vector<uint32_t> gsInstNumStrips;
+
+    // Tessellation reusable buffers
+    std::vector<float> inCPAttrs;
+    std::vector<float> outCPAttrs;
+    std::vector<float> hsOutCPSOA;
+    std::vector<float> patchConsts;
+    std::vector<float> dsAttrsSOA;
+    std::vector<float> patchDomU;
+    std::vector<float> patchDomV;
+    std::vector<float> patchDomW;
+    std::vector<ShadedVertex> patchDSVerts;
+    std::vector<uint32_t> triRowOffsets;
+    std::vector<ShadedVertex> gsPrimBuf;
+    std::vector<uint32_t> gsPrimIdBuf;
+};
+
+struct PendingMeshDispatch {
+    uint32_t gx = 0;
+    uint32_t gy = 0;
+    uint32_t gz = 0;
+    size_t payloadOffset = 0;
+};
+
+struct MeshPipeScratch {
+    std::vector<PendingMeshDispatch> meshDispatches;
+    std::vector<uint8_t> payloadArena;
+    std::vector<uint8_t> asScratch;
+    std::vector<uint8_t> msScratch;
+    std::vector<float> outVertPosXYZW;
+    std::vector<float> outVertAttrs;
+    std::vector<uint32_t> outPrimIndices;
+    std::vector<float> outPrimAttrs;
+    std::vector<uint8_t> outPrimCull;
+    std::vector<uint32_t> outPrimId;
+    std::vector<ShadedVertex> polyA;
+    std::vector<ShadedVertex> polyB;
+};
+
 } // namespace
 
 bool buildRasterScene(
@@ -1735,14 +1863,18 @@ bool buildRasterScene(
         }
     }
 
-    std::vector<uint32_t> triVerts;
-    std::vector<uint32_t> uniqueVIds;
-    std::unordered_map<uint32_t, uint32_t> vIdToUnique;
+    thread_local FallbackGeoScratch tlGeo;
+    auto& triVerts = tlGeo.triVerts;
+    auto& uniqueVIds = tlGeo.uniqueVIds;
+    auto& vIdToUnique = tlGeo.vIdToUnique;
+    triVerts.clear();
+    uniqueVIds.clear();
+    vIdToUnique.reset(draw.countPerInstance);
 
     auto internVertex = [&](uint32_t vid) -> uint32_t {
-        auto [it, inserted] = vIdToUnique.emplace(vid, static_cast<uint32_t>(uniqueVIds.size()));
+        auto [idx, inserted] = vIdToUnique.emplace(vid, static_cast<uint32_t>(uniqueVIds.size()));
         if (inserted) uniqueVIds.push_back(vid);
-        return it->second;
+        return idx;
     };
 
     if (!draw.indexed) {
@@ -1781,7 +1913,8 @@ bool buildRasterScene(
                 }
             }
         } else {
-            std::vector<uint32_t> stripRun;
+            auto& stripRun = tlGeo.stripRun;
+            stripRun.clear();
             for (uint32_t i = 0; i < n; ++i) {
                 bool cut = false;
                 uint32_t r = readIndex(state.indexBuffer, draw.startIndexOrVertex + i, cut);
@@ -1816,30 +1949,35 @@ bool buildRasterScene(
     sceneTarget.attrFlatArena = &outScene.attrFlatArena;
     sceneTarget.origBaryArena = &outScene.origBaryArena;
 
-    std::vector<ShadedVertex> shadedVerts(uniqueVIds.size());
+    auto& shadedVerts = tlGeo.shadedVerts;
+    shadedVerts.resize(uniqueVIds.size());
     alignas(64) uint32_t batchVIds[kMaxSimdWidth]{};
     alignas(64) uint32_t batchIIds[kMaxSimdWidth]{};
     alignas(64) float outPosXYZW[4 * kMaxSimdWidth]{};
-    std::vector<float> outAttrs(std::max<uint32_t>(1, vsOutScalars) * W, 0.0f);
-    std::vector<ShadedVertex> polyA, polyB;
+    auto& outAttrs = tlGeo.outAttrs;
+    outAttrs.assign(std::max<uint32_t>(1, vsOutScalars) * W, 0.0f);
+    auto& polyA = tlGeo.polyA;
+    auto& polyB = tlGeo.polyB;
+    polyA.clear();
+    polyB.clear();
 
     // Reusable Geometry Shader batch buffers (hoisted outside primitive/patch loops)
     const uint32_t gsMaxVerts = std::max<uint32_t>(1, compiled->gsMaxVertexCount);
     const uint32_t gsInstCount = std::max<uint32_t>(1, compiled->gsInstanceCount);
     const uint32_t gsOutScalars = outScene.preRastScalarAttrs;
-    std::vector<float> gsInPosSOA;
-    std::vector<float> gsInAttrsSOA;
-    std::vector<float> gsOutPos;
-    std::vector<float> gsOutAttrs;
-    std::vector<uint32_t> gsStripCounts;
-    std::vector<uint32_t> gsInstTotalVerts;
-    std::vector<uint32_t> gsInstNumStrips;
+    auto& gsInPosSOA = tlGeo.gsInPosSOA;
+    auto& gsInAttrsSOA = tlGeo.gsInAttrsSOA;
+    auto& gsOutPos = tlGeo.gsOutPos;
+    auto& gsOutAttrs = tlGeo.gsOutAttrs;
+    auto& gsStripCounts = tlGeo.gsStripCounts;
+    auto& gsInstTotalVerts = tlGeo.gsInstTotalVerts;
+    auto& gsInstNumStrips = tlGeo.gsInstNumStrips;
     if (hasGS && gsFn) {
-        gsOutPos.resize(static_cast<size_t>(gsInstCount) * W * gsMaxVerts * 4, 0.0f);
-        gsOutAttrs.resize(std::max<size_t>(1, static_cast<size_t>(gsInstCount) * W * gsMaxVerts * gsOutScalars), 0.0f);
-        gsStripCounts.resize(static_cast<size_t>(gsInstCount) * W * gsMaxVerts, 0u);
-        gsInstTotalVerts.resize(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
-        gsInstNumStrips.resize(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
+        gsOutPos.assign(static_cast<size_t>(gsInstCount) * W * gsMaxVerts * 4, 0.0f);
+        gsOutAttrs.assign(std::max<size_t>(1, static_cast<size_t>(gsInstCount) * W * gsMaxVerts * gsOutScalars), 0.0f);
+        gsStripCounts.assign(static_cast<size_t>(gsInstCount) * W * gsMaxVerts, 0u);
+        gsInstTotalVerts.assign(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
+        gsInstNumStrips.assign(static_cast<size_t>(gsInstCount) * kMaxSimdWidth, 0u);
     }
 
     auto runGSBatch = [&](const ShadedVertex* batchPrims, uint32_t primVertCount,
@@ -1975,18 +2113,32 @@ bool buildRasterScene(
                 hasGS ? std::min<uint32_t>(compiled->numGSInputScalars, kMaxPSInputScalars)
                       : outScene.preRastScalarAttrs;
 
-            std::vector<float> inCPAttrs(inCPCount * inAttrScalars, 0.0f);
-            std::vector<float> outCPAttrs(outCPCount * outAttrScalars, 0.0f);
-            std::vector<float> hsOutCPSOA(outAttrScalars * W, 0.0f);
-            std::vector<float> patchConsts(pcScalars, 0.0f);
+            auto& inCPAttrs = tlGeo.inCPAttrs;
+            auto& outCPAttrs = tlGeo.outCPAttrs;
+            auto& hsOutCPSOA = tlGeo.hsOutCPSOA;
+            auto& patchConsts = tlGeo.patchConsts;
+            inCPAttrs.assign(inCPCount * inAttrScalars, 0.0f);
+            outCPAttrs.assign(outCPCount * outAttrScalars, 0.0f);
+            hsOutCPSOA.assign(outAttrScalars * W, 0.0f);
+            patchConsts.assign(pcScalars, 0.0f);
             float tessFactors[6]{};
             alignas(64) float dsPosSOA[4 * kMaxSimdWidth]{};
-            std::vector<float> dsAttrsSOA(std::max<uint32_t>(1, dsOutScalars) * W, 0.0f);
-            std::vector<float> patchDomU, patchDomV, patchDomW;
-            std::vector<ShadedVertex> patchDSVerts;
-            std::vector<uint32_t> triRowOffsets;
-            std::vector<ShadedVertex> gsPrimBuf;
-            std::vector<uint32_t> gsPrimIdBuf;
+            auto& dsAttrsSOA = tlGeo.dsAttrsSOA;
+            dsAttrsSOA.assign(std::max<uint32_t>(1, dsOutScalars) * W, 0.0f);
+            auto& patchDomU = tlGeo.patchDomU;
+            auto& patchDomV = tlGeo.patchDomV;
+            auto& patchDomW = tlGeo.patchDomW;
+            auto& patchDSVerts = tlGeo.patchDSVerts;
+            auto& triRowOffsets = tlGeo.triRowOffsets;
+            auto& gsPrimBuf = tlGeo.gsPrimBuf;
+            auto& gsPrimIdBuf = tlGeo.gsPrimIdBuf;
+            patchDomU.clear();
+            patchDomV.clear();
+            patchDomW.clear();
+            patchDSVerts.clear();
+            triRowOffsets.clear();
+            gsPrimBuf.clear();
+            gsPrimIdBuf.clear();
 
             auto partitionTF = [&](float tf) -> uint32_t {
                 float clamped = std::clamp(tf, 1.0f, std::max(1.0f, compiled->hsMaxTessFactor));
@@ -2226,7 +2378,8 @@ bool buildRasterScene(
             }
         } else if (hasGS && gsFn) {
             uint32_t numPrims = static_cast<uint32_t>(triVerts.size() / vertsPerPrim);
-            std::vector<ShadedVertex> batchPrims(static_cast<size_t>(W) * vertsPerPrim);
+            auto& batchPrims = tlGeo.batchPrims;
+            batchPrims.resize(static_cast<size_t>(W) * vertsPerPrim);
             uint32_t batchPrimIds[kMaxSimdWidth]{};
             for (uint32_t baseP = 0; baseP < numPrims; baseP += W) {
                 uint32_t activeP = std::min<uint32_t>(W, numPrims - baseP);
@@ -2284,17 +2437,16 @@ bool buildMeshRasterScene(
         return false;
     }
 
-    struct PendingMeshDispatch {
-        uint32_t gx = 0;
-        uint32_t gy = 0;
-        uint32_t gz = 0;
-        std::vector<uint8_t> payload;
-    };
-    std::vector<PendingMeshDispatch> meshDispatches;
+    thread_local MeshPipeScratch tlMesh;
+    auto& meshDispatches = tlMesh.meshDispatches;
+    auto& payloadArena = tlMesh.payloadArena;
+    meshDispatches.clear();
+    payloadArena.clear();
 
     const uint32_t payloadBytes = std::max<uint32_t>({64u, compiled->asPayloadBytes, compiled->msPayloadBytes});
     if (compiled->hasAS) {
-        std::vector<uint8_t> asScratch(std::max<uint32_t>(64u, compiled->asGroupSharedBytes), 0);
+        auto& asScratch = tlMesh.asScratch;
+        asScratch.assign(std::max<uint32_t>(64u, compiled->asGroupSharedBytes), 0);
         for (uint32_t az = 0; az < dispatch.groupCountZ; ++az) {
             for (uint32_t ay = 0; ay < dispatch.groupCountY; ++ay) {
                 for (uint32_t ax = 0; ax < dispatch.groupCountX; ++ax) {
@@ -2302,7 +2454,8 @@ bool buildMeshRasterScene(
                         std::memset(asScratch.data(), 0, compiled->asGroupSharedBytes);
                     }
                     uint32_t outDims[4]{0, 0, 0, 0};
-                    std::vector<uint8_t> payloadBuf(payloadBytes, 0);
+                    size_t payloadOff = payloadArena.size();
+                    payloadArena.resize(payloadOff + payloadBytes, 0);
 
                     AmplificationThreadGroupArgs asArgs{};
                     asArgs.rootCtx = &state.rootCtx;
@@ -2314,23 +2467,22 @@ bool buildMeshRasterScene(
                     asArgs.ngy = dispatch.groupCountY;
                     asArgs.ngz = dispatch.groupCountZ;
                     asArgs.outDispatchDims = outDims;
-                    asArgs.outPayload = payloadBuf.data();
+                    asArgs.outPayload = payloadArena.data() + payloadOff;
                     asFn(&asArgs);
 
                     if (outDims[3] != 0 && outDims[0] > 0 && outDims[1] > 0 && outDims[2] > 0) {
                         meshDispatches.push_back(PendingMeshDispatch{
-                            outDims[0], outDims[1], outDims[2], std::move(payloadBuf)});
+                            outDims[0], outDims[1], outDims[2], payloadOff});
+                    } else {
+                        payloadArena.resize(payloadOff);
                     }
                 }
             }
         }
     } else {
-        PendingMeshDispatch single{};
-        single.gx = dispatch.groupCountX;
-        single.gy = dispatch.groupCountY;
-        single.gz = dispatch.groupCountZ;
-        single.payload.assign(payloadBytes, 0);
-        meshDispatches.push_back(std::move(single));
+        payloadArena.assign(payloadBytes, 0);
+        meshDispatches.push_back(PendingMeshDispatch{
+            dispatch.groupCountX, dispatch.groupCountY, dispatch.groupCountZ, 0});
     }
 
     if (meshDispatches.empty()) return false;
@@ -2342,14 +2494,24 @@ bool buildMeshRasterScene(
     const uint32_t copyScalars = std::min<uint32_t>(attrStride, kMaxPSInputScalars);
     const uint64_t primAttrMask = compiled->msPrimAttrMask;
 
-    std::vector<uint8_t> msScratch(std::max<uint32_t>(64u, compiled->msGroupSharedBytes), 0);
-    std::vector<float> outVertPosXYZW(maxVerts * 4u, 0.0f);
-    std::vector<float> outVertAttrs(std::max<size_t>(1, static_cast<size_t>(maxVerts) * attrStride), 0.0f);
-    std::vector<uint32_t> outPrimIndices(maxPrims * 3u, 0u);
-    std::vector<float> outPrimAttrs(std::max<size_t>(1, static_cast<size_t>(maxPrims) * attrStride), 0.0f);
-    std::vector<uint8_t> outPrimCull(maxPrims, 0u);
-    std::vector<uint32_t> outPrimId(maxPrims, 0u);
-    std::vector<ShadedVertex> polyA, polyB;
+    auto& msScratch = tlMesh.msScratch;
+    auto& outVertPosXYZW = tlMesh.outVertPosXYZW;
+    auto& outVertAttrs = tlMesh.outVertAttrs;
+    auto& outPrimIndices = tlMesh.outPrimIndices;
+    auto& outPrimAttrs = tlMesh.outPrimAttrs;
+    auto& outPrimCull = tlMesh.outPrimCull;
+    auto& outPrimId = tlMesh.outPrimId;
+    auto& polyA = tlMesh.polyA;
+    auto& polyB = tlMesh.polyB;
+    msScratch.assign(std::max<uint32_t>(64u, compiled->msGroupSharedBytes), 0);
+    outVertPosXYZW.assign(maxVerts * 4u, 0.0f);
+    outVertAttrs.assign(std::max<size_t>(1, static_cast<size_t>(maxVerts) * attrStride), 0.0f);
+    outPrimIndices.assign(maxPrims * 3u, 0u);
+    outPrimAttrs.assign(std::max<size_t>(1, static_cast<size_t>(maxPrims) * attrStride), 0.0f);
+    outPrimCull.assign(maxPrims, 0u);
+    outPrimId.resize(maxPrims);
+    polyA.clear();
+    polyB.clear();
 
     auto makeMeshVertex = [&](uint32_t vIdx) -> ShadedVertex {
         ShadedVertex sv;
@@ -2399,7 +2561,7 @@ bool buildMeshRasterScene(
                     MeshThreadGroupArgs msArgs{};
                     msArgs.rootCtx = &state.rootCtx;
                     msArgs.groupSharedScratch = msScratch.data();
-                    msArgs.payloadPtr = md.payload.data();
+                    msArgs.payloadPtr = payloadArena.data() + md.payloadOffset;
                     msArgs.gx = gx;
                     msArgs.gy = gy;
                     msArgs.gz = gz;
