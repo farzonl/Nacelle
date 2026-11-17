@@ -899,11 +899,14 @@ inline BenchRunResult runWarpRaytracingBench(
     ctx.alloc->Reset();
     ctx.cmd->Reset(ctx.alloc, nullptr);
 
+    const size_t checksumCount = std::min<size_t>(
+        1024u * 1024u,
+        (spec.kind == PipelineKind::RayTracingInline) ? static_cast<size_t>(width) * 4u : static_cast<size_t>(width));
     const uint32_t* up = nullptr;
-    D3D12_RANGE rbRange{0, 1024 * sizeof(uint32_t)};
+    D3D12_RANGE rbRange{0, checksumCount * sizeof(uint32_t)};
     if (SUCCEEDED(rbBuf->Map(0, &rbRange, reinterpret_cast<void**>(const_cast<uint32_t**>(&up)))) && up) {
         double sum = 0.0;
-        for (size_t i = 0; i < 1024; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+        for (size_t i = 0; i < checksumCount; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
         rbBuf->Unmap(0, nullptr);
         res.checksum = sum;
     }

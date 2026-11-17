@@ -9,7 +9,7 @@
 
 #include "bench_common.h"
 #include "bench_memory.h"
-#include "bench_warp_runners.h"
+#include "bench_d3d12_runners.h"
 
 #include <algorithm>
 #include <chrono>

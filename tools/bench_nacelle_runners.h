@@ -641,6 +641,8 @@ inline BenchRunResult runNacelleRaytracingBench(
     const BenchmarkSpec& spec,
     const std::vector<uint8_t>& dxil,
     uint32_t simdWidth,
+    uint32_t width,
+    uint32_t height,
     uint32_t iters) {
     BenchRunResult res;
     res.benchId = spec.id;
@@ -881,25 +883,28 @@ inline BenchRunResult runNacelleRaytracingBench(
         return std::chrono::duration<double, std::milli>(s1 - s0).count();
     };
 
-    res.firstDispatchMs = runRT(64, 1);
+    res.firstDispatchMs = runRT(width, height);
     nacelle::waitForAllAsyncJITTasks();
-    runRT(64, 1);
+    runRT(width, height);
 
     std::vector<double> samples;
     samples.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i) {
-        samples.push_back(runRT(64, 1));
+        samples.push_back(runRT(width, height));
     }
 
+    const size_t checksumCount = std::min<size_t>(
+        1024u * 1024u,
+        (spec.kind == PipelineKind::RayTracingInline) ? static_cast<size_t>(width) * 4u : static_cast<size_t>(width));
     uint32_t* outPtr = nullptr;
     outBuf->Map(0, nullptr, reinterpret_cast<void**>(&outPtr));
     double sum = 0.0;
-    for (size_t i = 0; i < 64; ++i) sum += static_cast<double>(outPtr[i] & 0xFFFFu);
+    for (size_t i = 0; i < checksumCount; ++i) sum += static_cast<double>(outPtr[i] & 0xFFFFu);
     outBuf->Unmap(0, nullptr);
     res.checksum = sum;
 
-    res.shortJobMs = runRT(16, 1);
-    res.longJobMs = runRT(256, 1);
+    res.shortJobMs = runRT(64, 64);
+    res.longJobMs = runRT(width * 2, height * 2);
 
     finalizeTimingAndMemory(res, memBefore, memAfterCompile, samples);
 

@@ -1396,10 +1396,13 @@ inline std::vector<BenchRunResult> runVulkanRaytracingBench(
             samples.push_back(dispatchRT(width, height));
         }
 
-        vk.vkMapMemory(dev, outBuf.mem, 0, 4096, 0, &ptr);
+        const size_t checksumCount = std::min<size_t>(
+            1024u * 1024u,
+            isInline ? static_cast<size_t>(width) * 4u : static_cast<size_t>(width));
+        vk.vkMapMemory(dev, outBuf.mem, 0, checksumCount * sizeof(uint32_t), 0, &ptr);
         const uint32_t* up = static_cast<const uint32_t*>(ptr);
         double sum = 0.0;
-        for (size_t i = 0; i < 1024; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
+        for (size_t i = 0; i < checksumCount; ++i) sum += static_cast<double>(up[i] & 0xFFFFu);
         vk.vkUnmapMemory(dev, outBuf.mem);
         r.checksum = sum;
 
