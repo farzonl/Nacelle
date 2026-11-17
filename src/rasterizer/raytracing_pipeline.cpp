@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <vector>
 
@@ -30,15 +31,34 @@ struct DxrActiveTrace {
     bool reportEndSearch = false;
     uint32_t reportHitKind = 0;
     float reportT = 0.0f;
-    std::array<uint8_t, 64> reportAttr{};
+    std::array<uint8_t, 64> reportAttr;
+};
+
+struct DxrPacketView {
+    const PipelineHitResult* hits = nullptr;
+    const uint32_t* rayFlags = nullptr;
+    const float* ox = nullptr;
+    const float* oy = nullptr;
+    const float* oz = nullptr;
+    const float* tMin = nullptr;
+    const float* dx = nullptr;
+    const float* dy = nullptr;
+    const float* dz = nullptr;
+    const float* tMax = nullptr;
 };
 
 struct DxrThreadContext {
     const DriverRootContext* rootCtx = nullptr;
     const CompiledDxrStateObject* stateObj = nullptr;
     D3D12_DISPATCH_RAYS_DESC desc{};
+    bool hasAnyHitOrIntersection = false;
     uint32_t curRayIdx[3]{0, 0, 0};
+    const uint32_t* curPacketRx = nullptr;
+    const uint32_t* curPacketRy = nullptr;
+    const uint32_t* curPacketRz = nullptr;
     DxrActiveTrace* activeTrace = nullptr;
+    const DxrPacketView* activePacket = nullptr;
+    uint32_t activePacketMask = 0;
 };
 
 thread_local DxrThreadContext* t_dxrCtx = nullptr;
@@ -69,17 +89,23 @@ const CompiledDxrShader* lookupShader(const CompiledDxrStateObject* stateObj, ui
 }
 
 void invokeShaderSingleRay(
-    const DxrThreadContext& ctx,
+    DxrThreadContext& ctx,
     const CompiledDxrShader* shader,
     void* payloadPtr,
     void* attrPtr) {
     if (!shader || !shader->fn) return;
-    uint32_t rx[16]{};
-    uint32_t ry[16]{};
-    uint32_t rz[16]{};
+    uint32_t rx[16];
+    uint32_t ry[16];
+    uint32_t rz[16];
     rx[0] = ctx.curRayIdx[0];
     ry[0] = ctx.curRayIdx[1];
     rz[0] = ctx.curRayIdx[2];
+    void* pPtrs[16];
+    void* aPtrs[16];
+    pPtrs[0] = payloadPtr;
+    aPtrs[0] = attrPtr;
+    const DxrPacketView* savedPkt = ctx.activePacket;
+    ctx.activePacket = nullptr;
     shader->fn(
         ctx.rootCtx,
         1u,
@@ -89,8 +115,9 @@ void invokeShaderSingleRay(
         ctx.desc.Width,
         ctx.desc.Height,
         ctx.desc.Depth,
-        payloadPtr,
-        attrPtr);
+        pPtrs,
+        aPtrs);
+    ctx.activePacket = savedPkt;
 }
 
 int32_t anyHitCallback(void* userData, const PipelineHitResult& candidate) {
@@ -201,31 +228,55 @@ void executeDispatchRays(
     const uint32_t simdW = std::max<uint32_t>(1u, std::min<uint32_t>(16u, stateObj.simdWidth));
     const uint64_t numPackets = (totalRays + simdW - 1) / simdW;
 
+    bool hasAnyHitOrIntersection = false;
+    for (const auto& hg : stateObj.hitGroups) {
+        if (hg.anyHitIdx != UINT32_MAX || hg.intersectionIdx != UINT32_MAX) {
+            hasAnyHitOrIntersection = true;
+            break;
+        }
+    }
+
     auto runPacketRange = [&](uint64_t pktBegin, uint64_t pktEnd) {
         DxrThreadContext ctx{};
         ctx.rootCtx = &computeCtx;
         ctx.stateObj = &stateObj;
         ctx.desc = desc;
+        ctx.hasAnyHitOrIntersection = hasAnyHitOrIntersection;
         DxrThreadContext* prevCtx = t_dxrCtx;
         t_dxrCtx = &ctx;
 
         uint32_t rx[16]{};
         uint32_t ry[16]{};
         uint32_t rz[16]{};
+        ctx.curPacketRx = rx;
+        ctx.curPacketRy = ry;
+        ctx.curPacketRz = rz;
 
         for (uint64_t pkt = pktBegin; pkt < pktEnd; ++pkt) {
             uint64_t baseRay = pkt * simdW;
             uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(simdW, totalRays - baseRay));
             uint32_t activeMask = (count == 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
-            for (uint32_t l = 0; l < count; ++l) {
-                uint64_t linear = baseRay + l;
-                uint32_t x = static_cast<uint32_t>(linear % W);
-                uint64_t yz = linear / W;
-                uint32_t y = static_cast<uint32_t>(yz % H);
-                uint32_t z = static_cast<uint32_t>(yz / H);
-                rx[l] = x;
-                ry[l] = y;
-                rz[l] = z;
+            uint32_t x0 = static_cast<uint32_t>(baseRay % W);
+            uint64_t yz0 = baseRay / W;
+            uint32_t y0 = static_cast<uint32_t>(yz0 % H);
+            uint32_t z0 = static_cast<uint32_t>(yz0 / H);
+            if (x0 + count <= W) {
+                for (uint32_t l = 0; l < count; ++l) {
+                    rx[l] = x0 + l;
+                    ry[l] = y0;
+                    rz[l] = z0;
+                }
+            } else {
+                for (uint32_t l = 0; l < count; ++l) {
+                    uint64_t linear = baseRay + l;
+                    uint32_t x = static_cast<uint32_t>(linear % W);
+                    uint64_t yz = linear / W;
+                    uint32_t y = static_cast<uint32_t>(yz % H);
+                    uint32_t z = static_cast<uint32_t>(yz / H);
+                    rx[l] = x;
+                    ry[l] = y;
+                    rz[l] = z;
+                }
             }
             ctx.curRayIdx[0] = rx[0];
             ctx.curRayIdx[1] = ry[0];
@@ -267,7 +318,7 @@ void nacelle_dxr_trace_ray(
     auto* ctx = nacelle::t_dxrCtx;
     if (!ctx || !ctx->stateObj) return;
 
-    nacelle::DxrActiveTrace trace{};
+    nacelle::DxrActiveTrace trace;
     trace.rayFlags = static_cast<uint32_t>(rayFlags);
     trace.tMin = tMin;
     trace.tMax = tMax;
@@ -290,8 +341,8 @@ void nacelle_dxr_trace_ray(
         static_cast<uint32_t>(instanceMask),
         ox, oy, oz, tMin,
         dx, dy, dz, tMax,
-        &nacelle::anyHitCallback,
-        &nacelle::intersectionCallback,
+        ctx->hasAnyHitOrIntersection ? &nacelle::anyHitCallback : nullptr,
+        ctx->hasAnyHitOrIntersection ? &nacelle::intersectionCallback : nullptr,
         ctx);
 
     if (trace.hit.hit) {
@@ -327,52 +378,250 @@ void nacelle_dxr_trace_ray(
     ctx->activeTrace = savedTrace;
 }
 
-int32_t nacelle_dxr_state_i32(int32_t op) {
+void nacelle_dxr_trace_ray_packet(
+    uint32_t activeMask,
+    const void* tlasPtr,
+    const int32_t* rayFlags,
+    const int32_t* instanceMask,
+    const int32_t* rayContributionToHitGroupIndex,
+    const int32_t* multiplierForGeometryContribution,
+    const int32_t* missShaderIndex,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax,
+    void** payloadPtrs) {
     auto* ctx = nacelle::t_dxrCtx;
-    if (!ctx || !ctx->activeTrace) return 0;
-    const auto& tr = *ctx->activeTrace;
+    if (!ctx || !ctx->stateObj || activeMask == 0) return;
+
+    if (ctx->hasAnyHitOrIntersection) {
+        uint32_t m = activeMask;
+        while (m) {
+            const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+            m &= m - 1;
+            nacelle_dxr_trace_ray(
+                tlasPtr, rayFlags[l], instanceMask[l],
+                rayContributionToHitGroupIndex[l], multiplierForGeometryContribution[l],
+                missShaderIndex[l], ox[l], oy[l], oz[l], tMin[l],
+                dx[l], dy[l], dz[l], tMax[l], payloadPtrs[l]);
+        }
+        return;
+    }
+
+    nacelle::PipelineHitResult hits[16];
+    nacelle::traceRayPacketForPipeline(
+        activeMask,
+        tlasPtr,
+        reinterpret_cast<const uint32_t*>(rayFlags),
+        reinterpret_cast<const uint32_t*>(instanceMask),
+        ox, oy, oz, tMin, dx, dy, dz, tMax,
+        hits);
+
+    uint32_t targetShaderIdx[16];
+    float attrStorage[16][2];
+    void* attrPtrs[16];
+    uint32_t pendingMask = 0;
+
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        const auto& h = hits[l];
+        uint32_t sIdx = UINT32_MAX;
+        if (h.hit) {
+            if (!(static_cast<uint32_t>(rayFlags[l]) & nacelle::kRayFlagSkipClosestHitShader)) {
+                const uint64_t hgIdx = static_cast<uint64_t>(static_cast<uint32_t>(rayContributionToHitGroupIndex[l])) +
+                                       static_cast<uint64_t>(static_cast<uint32_t>(multiplierForGeometryContribution[l])) * h.geometryIndex +
+                                       h.instanceContributionToHitGroupIndex;
+                const auto* id = nacelle::readSbtRecord(
+                    ctx->desc.HitGroupTable.StartAddress,
+                    ctx->desc.HitGroupTable.SizeInBytes,
+                    ctx->desc.HitGroupTable.StrideInBytes,
+                    hgIdx);
+                const auto* hg = nacelle::lookupHitGroup(ctx->stateObj, id);
+                if (hg && hg->closestHitIdx != UINT32_MAX) {
+                    sIdx = hg->closestHitIdx;
+                    attrStorage[l][0] = h.baryU;
+                    attrStorage[l][1] = h.baryV;
+                    attrPtrs[l] = attrStorage[l];
+                }
+            }
+        } else {
+            const auto* id = nacelle::readSbtRecord(
+                ctx->desc.MissShaderTable.StartAddress,
+                ctx->desc.MissShaderTable.SizeInBytes,
+                ctx->desc.MissShaderTable.StrideInBytes,
+                static_cast<uint64_t>(missShaderIndex[l]));
+            if (id && !id->isHitGroup) {
+                sIdx = id->entryIndex;
+                attrPtrs[l] = nullptr;
+            }
+        }
+        if (sIdx != UINT32_MAX) {
+            targetShaderIdx[l] = sIdx;
+            pendingMask |= (1u << l);
+        }
+    }
+
+    if (pendingMask != 0) {
+        nacelle::DxrPacketView pktView{};
+        pktView.hits = hits;
+        pktView.rayFlags = reinterpret_cast<const uint32_t*>(rayFlags);
+        pktView.ox = ox; pktView.oy = oy; pktView.oz = oz; pktView.tMin = tMin;
+        pktView.dx = dx; pktView.dy = dy; pktView.dz = dz; pktView.tMax = tMax;
+
+        const nacelle::DxrPacketView* savedPkt = ctx->activePacket;
+        const uint32_t savedPktMask = ctx->activePacketMask;
+        ctx->activePacket = &pktView;
+        ctx->activePacketMask = activeMask;
+
+        while (pendingMask != 0) {
+            const uint32_t first = static_cast<uint32_t>(std::countr_zero(pendingMask));
+            const uint32_t sIdx = targetShaderIdx[first];
+            uint32_t batchMask = 0;
+            uint32_t scan = pendingMask;
+            while (scan) {
+                const uint32_t l = static_cast<uint32_t>(std::countr_zero(scan));
+                scan &= scan - 1;
+                if (targetShaderIdx[l] == sIdx) {
+                    batchMask |= (1u << l);
+                }
+            }
+            pendingMask &= ~batchMask;
+
+            const auto* shader = nacelle::lookupShader(ctx->stateObj, sIdx);
+            if (shader && shader->fn) {
+                shader->fn(
+                    ctx->rootCtx,
+                    batchMask,
+                    ctx->curPacketRx,
+                    ctx->curPacketRy,
+                    ctx->curPacketRz,
+                    ctx->desc.Width,
+                    ctx->desc.Height,
+                    ctx->desc.Depth,
+                    payloadPtrs,
+                    attrPtrs);
+            }
+        }
+
+        ctx->activePacket = savedPkt;
+        ctx->activePacketMask = savedPktMask;
+    }
+}
+
+int32_t nacelle_dxr_state_i32(int32_t op, int32_t lane) {
+    const auto* ctx = nacelle::t_dxrCtx;
+    if (!ctx) return 0;
+    if (ctx->activePacket && lane >= 0 && lane < 16) {
+        const auto& h = ctx->activePacket->hits[lane];
+        switch (op) {
+        case 141: return static_cast<int32_t>(h.instanceID);
+        case 142: return static_cast<int32_t>(h.instanceIndex);
+        case 143: return static_cast<int32_t>(h.hitKind);
+        case 144: return static_cast<int32_t>(ctx->activePacket->rayFlags[lane]);
+        case 161: return static_cast<int32_t>(h.primitiveIndex);
+        case 213: return static_cast<int32_t>(h.geometryIndex);
+        default: return 0;
+        }
+    }
+    if (!ctx->activeTrace) return 0;
+    const auto* tr = ctx->activeTrace;
     switch (op) {
-    case 141: return static_cast<int32_t>(tr.hit.instanceID);
-    case 142: return static_cast<int32_t>(tr.hit.instanceIndex);
-    case 143: return static_cast<int32_t>(tr.hit.hitKind);
-    case 144: return static_cast<int32_t>(tr.rayFlags);
-    case 161: return static_cast<int32_t>(tr.hit.primitiveIndex);
-    case 213: return static_cast<int32_t>(tr.hit.geometryIndex);
+    case 141: return static_cast<int32_t>(tr->hit.instanceID);
+    case 142: return static_cast<int32_t>(tr->hit.instanceIndex);
+    case 143: return static_cast<int32_t>(tr->hit.hitKind);
+    case 144: return static_cast<int32_t>(tr->rayFlags);
+    case 161: return static_cast<int32_t>(tr->hit.primitiveIndex);
+    case 213: return static_cast<int32_t>(tr->hit.geometryIndex);
     default: return 0;
     }
 }
 
-float nacelle_dxr_state_f32(int32_t op) {
-    auto* ctx = nacelle::t_dxrCtx;
-    if (!ctx || !ctx->activeTrace) return 0.0f;
-    const auto& tr = *ctx->activeTrace;
+float nacelle_dxr_state_f32(int32_t op, int32_t lane) {
+    const auto* ctx = nacelle::t_dxrCtx;
+    if (!ctx) return 0.0f;
+    if (ctx->activePacket && lane >= 0 && lane < 16) {
+        const auto& p = *ctx->activePacket;
+        switch (op) {
+        case 153: return p.tMin[lane];
+        case 154: return p.hits[lane].hit ? p.hits[lane].t : p.tMax[lane];
+        default: return 0.0f;
+        }
+    }
+    if (!ctx->activeTrace) return 0.0f;
+    const auto* tr = ctx->activeTrace;
     switch (op) {
-    case 153: return tr.tMin;
-    case 154: return tr.hit.hit ? tr.hit.t : tr.tMax;
+    case 153: return tr->tMin;
+    case 154: return tr->hit.hit ? tr->hit.t : tr->tMax;
     default: return 0.0f;
     }
 }
 
-float nacelle_dxr_state_vec(int32_t op, int32_t comp) {
-    auto* ctx = nacelle::t_dxrCtx;
-    if (!ctx || !ctx->activeTrace || comp < 0 || comp >= 3) return 0.0f;
-    const auto& tr = *ctx->activeTrace;
+float nacelle_dxr_state_vec(int32_t op, int32_t comp, int32_t lane) {
+    const auto* ctx = nacelle::t_dxrCtx;
+    if (!ctx || comp < 0 || comp >= 3) return 0.0f;
+    static constexpr float kIdentity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    if (ctx->activePacket && lane >= 0 && lane < 16) {
+        const auto& p = *ctx->activePacket;
+        const float ox = p.ox[lane], oy = p.oy[lane], oz = p.oz[lane];
+        const float dx = p.dx[lane], dy = p.dy[lane], dz = p.dz[lane];
+        switch (op) {
+        case 147: return comp == 0 ? ox : (comp == 1 ? oy : oz);
+        case 148: return comp == 0 ? dx : (comp == 1 ? dy : dz);
+        case 149: {
+            const float* m = p.hits[lane].worldToObjPtr ? p.hits[lane].worldToObjPtr : kIdentity;
+            const int r = comp * 4;
+            return m[r] * ox + m[r + 1] * oy + m[r + 2] * oz + m[r + 3];
+        }
+        case 150: {
+            const float* m = p.hits[lane].worldToObjPtr ? p.hits[lane].worldToObjPtr : kIdentity;
+            const int r = comp * 4;
+            return m[r] * dx + m[r + 1] * dy + m[r + 2] * dz;
+        }
+        default: return 0.0f;
+        }
+    }
+    if (!ctx->activeTrace) return 0.0f;
+    const auto* tr = ctx->activeTrace;
     switch (op) {
-    case 147: return tr.worldOrigin[comp];
-    case 148: return tr.worldDir[comp];
-    case 149: return tr.hit.objOrigin[comp];
-    case 150: return tr.hit.objDir[comp];
+    case 147: return tr->worldOrigin[comp];
+    case 148: return tr->worldDir[comp];
+    case 149: {
+        const float* m = tr->hit.worldToObjPtr ? tr->hit.worldToObjPtr : kIdentity;
+        const int r = comp * 4;
+        return m[r] * tr->worldOrigin[0] + m[r + 1] * tr->worldOrigin[1] + m[r + 2] * tr->worldOrigin[2] + m[r + 3];
+    }
+    case 150: {
+        const float* m = tr->hit.worldToObjPtr ? tr->hit.worldToObjPtr : kIdentity;
+        const int r = comp * 4;
+        return m[r] * tr->worldDir[0] + m[r + 1] * tr->worldDir[1] + m[r + 2] * tr->worldDir[2];
+    }
     default: return 0.0f;
     }
 }
 
-float nacelle_dxr_state_mat(int32_t op, int32_t row, int32_t col) {
-    auto* ctx = nacelle::t_dxrCtx;
-    if (!ctx || !ctx->activeTrace) return 0.0f;
-    const auto& tr = *ctx->activeTrace;
+float nacelle_dxr_state_mat(int32_t op, int32_t row, int32_t col, int32_t lane) {
+    const auto* ctx = nacelle::t_dxrCtx;
+    if (!ctx) return 0.0f;
+    static constexpr float kIdentity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    if (ctx->activePacket && lane >= 0 && lane < 16) {
+        const auto& h = ctx->activePacket->hits[lane];
+        switch (op) {
+        case 151: return nacelle::readMatrixElem(h.objToWorldPtr ? h.objToWorldPtr : kIdentity, row, col);
+        case 152: return nacelle::readMatrixElem(h.worldToObjPtr ? h.worldToObjPtr : kIdentity, row, col);
+        default: return 0.0f;
+        }
+    }
+    if (!ctx->activeTrace) return 0.0f;
+    const auto* tr = ctx->activeTrace;
     switch (op) {
-    case 151: return nacelle::readMatrixElem(tr.hit.objToWorld, row, col);
-    case 152: return nacelle::readMatrixElem(tr.hit.worldToObj, row, col);
+    case 151: return nacelle::readMatrixElem(tr->hit.objToWorldPtr ? tr->hit.objToWorldPtr : kIdentity, row, col);
+    case 152: return nacelle::readMatrixElem(tr->hit.worldToObjPtr ? tr->hit.worldToObjPtr : kIdentity, row, col);
     default: return 0.0f;
     }
 }

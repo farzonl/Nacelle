@@ -70,6 +70,7 @@
 #include "simt_to_simd_pass.h"
 #include "compiler_version.h"
 #include "math_simd_bc.h"
+#include "rayquery_rt_bc.h"
 #include "texture_sampler_bc.h"
 
 #if defined(__APPLE__)
@@ -419,6 +420,7 @@ struct JitRuntime {
     std::atomic<uint64_t> dylibSeq{1};
     std::atomic<uint64_t> tmpSeq{1};
     bool mathSimdLoaded = false;
+    bool rayQueryRtLoaded = false;
     bool texSamplerLoaded = false;
     std::unique_ptr<BS::thread_pool<>> tier2PoolOwned;
     std::atomic<BS::thread_pool<>*> activeTier2Pool{nullptr};
@@ -583,7 +585,14 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         addSym("nacelle_rayquery_state_f32", &nacelle_rayquery_state_f32);
         addSym("nacelle_rayquery_state_vec", &nacelle_rayquery_state_vec);
         addSym("nacelle_rayquery_state_mat", &nacelle_rayquery_state_mat);
+        addSym("nacelle_rayquery_alloc_pkt", &nacelle_rayquery_alloc_pkt);
+        addSym("nacelle_rayquery_trace_inline_pkt", &nacelle_rayquery_trace_inline_pkt);
+        addSym("nacelle_rayquery_proceed_pkt", &nacelle_rayquery_proceed_pkt);
+        addSym("nacelle_rayquery_state_i32_pkt", &nacelle_rayquery_state_i32_pkt);
+        addSym("nacelle_rayquery_state_f32_pkt", &nacelle_rayquery_state_f32_pkt);
+        addSym("nacelle_rayquery_state_vec_pkt", &nacelle_rayquery_state_vec_pkt);
         addSym("nacelle_dxr_trace_ray", &nacelle_dxr_trace_ray);
+        addSym("nacelle_dxr_trace_ray_packet", &nacelle_dxr_trace_ray_packet);
         addSym("nacelle_dxr_state_i32", &nacelle_dxr_state_i32);
         addSym("nacelle_dxr_state_f32", &nacelle_dxr_state_f32);
         addSym("nacelle_dxr_state_vec", &nacelle_dxr_state_vec);
@@ -1123,6 +1132,9 @@ bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
     if (!linkRuntimeBitcode(kMathSimdBitcode, kMathSimdBitcode_size, "math_simd.bc", "nacelle_math_")) {
         return false;
     }
+    if (!linkRuntimeBitcode(kRayQueryRtBitcode, kRayQueryRtBitcode_size, "rayquery_rt.bc", "nacelle_rqbc_")) {
+        return false;
+    }
 
     bool needsAlwaysInline = false;
     for (const llvm::Function& f : mod) {
@@ -1306,6 +1318,12 @@ bool ensureRuntimeBitcodeInMainJDLocked(
             return false;
         }
         rt.mathSimdLoaded = true;
+    }
+    if (!rt.rayQueryRtLoaded && hasPrefixDecl("nacelle_rqbc_")) {
+        if (!loadIntoMainJD(kRayQueryRtBitcode, kRayQueryRtBitcode_size, "rayquery_rt.bc", "nacelle_rqbc_")) {
+            return false;
+        }
+        rt.rayQueryRtLoaded = true;
     }
     return true;
 }
@@ -2447,28 +2465,23 @@ bool compileDxrShader(
     auto linkedMod = translateMLIRToLinkedLLVMIR(*mlirMod, *outLlvmCtx, outError, /*linkRuntime=*/false);
     if (!linkedMod) return false;
 
+    llvm::SmallVector<char, 0> objBytes;
+    if (!emitObjectBytesO3(*linkedMod, objBytes, outError)) return false;
+
     auto& rt = getJitRuntime();
     std::lock_guard<std::mutex> lock(rt.mu);
     ensureLLJITLocked(rt, outError);
     if (!rt.jit) return false;
     if (!ensureRuntimeBitcodeInMainJDLocked(rt, *linkedMod, outError)) return false;
 
-    auto jdOrErr = createIsolatedDylibLocked(rt);
-    if (!jdOrErr) {
-        outError = llvm::toString(jdOrErr.takeError());
+    uint64_t addr0 = 0, addr1 = 0;
+    const std::string objName = "dxr_" + exportName + "_" + std::to_string(rt.dylibSeq.fetch_add(1, std::memory_order_relaxed)) + ".o";
+    if (!loadObjectIntoJitLocked(
+            rt, reinterpret_cast<const uint8_t*>(objBytes.data()), objBytes.size(),
+            objName, symbolName, "", addr0, addr1, outError)) {
         return false;
     }
-    llvm::orc::JITDylib& jd = *jdOrErr;
-    if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(linkedMod), std::move(outLlvmCtx)))) {
-        outError = llvm::toString(std::move(err));
-        return false;
-    }
-    auto symOrErr = rt.jit->lookup(jd, symbolName);
-    if (!symOrErr) {
-        outError = llvm::toString(symOrErr.takeError());
-        return false;
-    }
-    outFn = reinterpret_cast<DxrShaderFn>(symOrErr->getValue());
+    outFn = reinterpret_cast<DxrShaderFn>(addr0);
     return outFn != nullptr;
 }
 

@@ -85,6 +85,8 @@ set(TEX_SAMPLER_BC "${CMAKE_CURRENT_BINARY_DIR}/generated/texture_sampler.bc")
 set(TEX_SAMPLER_BC_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/texture_sampler_bc.h")
 set(MATH_SIMD_BC "${CMAKE_CURRENT_BINARY_DIR}/generated/math_simd.bc")
 set(MATH_SIMD_BC_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/math_simd_bc.h")
+set(RAYQUERY_RT_BC "${CMAKE_CURRENT_BINARY_DIR}/generated/rayquery_rt.bc")
+set(RAYQUERY_RT_BC_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/rayquery_rt_bc.h")
 
 find_program(NACELLE_CLANGXX NAMES clang++ HINTS "${LLVM_TOOLS_BINARY_DIR}" REQUIRED)
 
@@ -132,6 +134,29 @@ add_custom_command(
     COMMENT "Embedding math_simd.bc into generated header"
 )
 
+add_custom_command(
+    OUTPUT "${RAYQUERY_RT_BC}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${NACELLE_CLANGXX}" -std=c++20 -O3 -emit-llvm -c
+            -fno-exceptions -fno-rtti -ffreestanding -fno-math-errno -ffp-contract=fast
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/rayquery_rt.cpp"
+            -o "${RAYQUERY_RT_BC}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_bc/rayquery_rt.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/rasterizer/raytracing_as_layout.h"
+    COMMENT "Compiling freestanding rayquery_rt.cpp to LLVM bitcode"
+)
+
+add_custom_command(
+    OUTPUT "${RAYQUERY_RT_BC_HDR}"
+    COMMAND ${CMAKE_COMMAND}
+            "-DINPUT_FILE=${RAYQUERY_RT_BC}"
+            "-DOUTPUT_FILE=${RAYQUERY_RT_BC_HDR}"
+            "-DSYMBOL_NAME=kRayQueryRtBitcode"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    DEPENDS "${RAYQUERY_RT_BC}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    COMMENT "Embedding rayquery_rt.bc into generated header"
+)
+
 # Compute deterministic build-time SHA-256 stamp across all compiler, ABI, and runtime bitcode inputs
 set(COMPILER_VERSION_HDR "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_version.h")
 set(COMPILER_HASH_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/generated/compiler_hash_inputs.txt")
@@ -152,6 +177,7 @@ set(NACELLE_COMPILER_HASH_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/simt_to_simd_pass.h"
     "${TEX_SAMPLER_BC}"
     "${MATH_SIMD_BC}"
+    "${RAYQUERY_RT_BC}"
 )
 string(JOIN "\n" COMPILER_HASH_MANIFEST_CONTENT
     "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}"
@@ -175,7 +201,7 @@ add_custom_command(
     COMMENT "Generating compiler build hash header"
 )
 
-add_custom_target(nacelle_embedded_bc DEPENDS "${TEX_SAMPLER_BC_HDR}" "${MATH_SIMD_BC_HDR}" "${COMPILER_VERSION_HDR}")
+add_custom_target(nacelle_embedded_bc DEPENDS "${TEX_SAMPLER_BC_HDR}" "${MATH_SIMD_BC_HDR}" "${RAYQUERY_RT_BC_HDR}" "${COMPILER_VERSION_HDR}")
 
 # 4. Core Nacelle Object Library (shared between static libnacelle and shared libnacelle_d3d12)
 set(NACELLE_SOURCES
