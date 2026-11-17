@@ -238,6 +238,7 @@ struct CompiledComputePSO {
     uint32_t threadGroupSize[3]{1, 1, 1};
     uint32_t groupSharedBytes = 0;
     uint32_t simdWidth = 4;
+    bool singleGroupDispatch = false;
     uint64_t cacheHashLo = 0;
     uint64_t cacheHashHi = 0;
     std::string symbolName;

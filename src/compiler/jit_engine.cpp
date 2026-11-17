@@ -793,6 +793,7 @@ void applyComputeMeta(const CachedPSOMeta& meta, const std::string& sym, uint64_
     outPSO.threadGroupSize[2] = meta.threadGroupSize[2];
     outPSO.groupSharedBytes = meta.groupSharedBytes;
     outPSO.simdWidth = meta.simdWidth;
+    outPSO.singleGroupDispatch = (meta.singleGroupDispatch != 0);
     outPSO.symbolName = sym;
     outPSO.fn.store(reinterpret_cast<CompiledComputeFn>(addr), std::memory_order_release);
 }
@@ -2250,10 +2251,11 @@ bool compileComputePSO(
     if (!mlirMod) return false;
     const auto tLift = Clock::now();
 
+    bool singleGroupFastPath = false;
     const uint32_t effectiveWidth = (shader.waveSize > 0) ? shader.waveSize : simdWidth;
     if (!packetizeComputeEntry(
             *mlirMod, shader, effectiveLayout, effectiveWidth, symbolName,
-            outError)) {
+            outError, &singleGroupFastPath)) {
         return false;
     }
     const auto tPacketize = Clock::now();
@@ -2269,12 +2271,14 @@ bool compileComputePSO(
     meta.threadGroupSize[1] = shader.threadGroupSize[1];
     meta.threadGroupSize[2] = shader.threadGroupSize[2];
     meta.groupSharedBytes = shader.groupSharedBytes;
+    meta.singleGroupDispatch = singleGroupFastPath ? 1 : 0;
 
     outPSO.threadGroupSize[0] = meta.threadGroupSize[0];
     outPSO.threadGroupSize[1] = meta.threadGroupSize[1];
     outPSO.threadGroupSize[2] = meta.threadGroupSize[2];
     outPSO.groupSharedBytes = meta.groupSharedBytes;
     outPSO.simdWidth = simdWidth;
+    outPSO.singleGroupDispatch = singleGroupFastPath;
 
     bool ok = jitCompileComputeTier1AndScheduleTier2(
         std::move(linkedMod), std::move(outLlvmCtx), symbolName, meta, outPSO, outError);

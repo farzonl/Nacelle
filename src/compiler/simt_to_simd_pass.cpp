@@ -9395,7 +9395,8 @@ bool packetizeComputeEntry(
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& symbolName,
-    std::string& outError) {
+    std::string& outError,
+    bool* outSingleGroupFastPath) {
     auto srcFunc = mod.lookupSymbol<mlir::func::FuncOp>(shader.entryName);
     if (!srcFunc || srcFunc.getBody().empty()) {
         outError = "Source compute func.func not found: " + shader.entryName;
@@ -9422,8 +9423,12 @@ bool packetizeComputeEntry(
     mlir::Value gy = entry->getArgument(3);
     mlir::Value gz = entry->getArgument(4);
 
-    if (!tryLowerGemmFastPath(
-            b, loc, mod, srcFunc, shader, rootLayout, simdWidth, rootCtx, gx, gy, gz, outError)) {
+    const bool usedGemmFastPath = tryLowerGemmFastPath(
+        b, loc, mod, srcFunc, shader, rootLayout, simdWidth, rootCtx, gx, gy, gz, outError);
+    if (outSingleGroupFastPath) {
+        *outSingleGroupFastPath = usedGemmFastPath;
+    }
+    if (!usedGemmFastPath) {
         if (!outError.empty()) return false;
         StageHooks baseHooks;
         if (!packetizeThreadGroupRegion(b, loc, mod, srcFunc.getBody(), shader, rootLayout,
