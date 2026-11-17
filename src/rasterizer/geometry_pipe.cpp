@@ -929,6 +929,9 @@ void executeVertexTriangleChunk(
     const bool cullBack = (rast.CullMode == D3D12_CULL_MODE_BACK);
     const bool cullFront = (rast.CullMode == D3D12_CULL_MODE_FRONT);
     const bool frontCCW = (rast.FrontCounterClockwise != FALSE);
+    const bool isSingleSample =
+        (!state.rtvs[0].resource || state.rtvs[0].resource->resourceDesc().SampleDesc.Count <= 1) &&
+        (!state.dsv.resource || state.dsv.resource->resourceDesc().SampleDesc.Count <= 1);
     const uint32_t defaultShadingRate =
         combineShadingRate(sceneCfg.drawShadingRate, 0u, sceneCfg.shadingRateCombiner);
     const uint32_t numPSScalars = sceneCfg.numPSInputScalars;
@@ -1015,6 +1018,12 @@ void executeVertexTriangleChunk(
                 tri.base[k] = dx * (128 - vyA[k]) - dy * (128 - vxA[k]);
                 bool isTopLeft = (dy < 0) || (dy == 0 && dx > 0);
                 tri.bias[k] = isTopLeft ? 0 : -1;
+            }
+            if (isSingleSample && maxX == minX + 1 && maxY == minY + 1) {
+                int64_t e0 = tri.base[0] + tri.stepX[0] * minX + tri.stepY[0] * minY + tri.bias[0];
+                int64_t e1 = tri.base[1] + tri.stepX[1] * minX + tri.stepY[1] * minY + tri.bias[1];
+                int64_t e2 = tri.base[2] + tri.stepX[2] * minX + tri.stepY[2] * minY + tri.bias[2];
+                if ((e0 | e1 | e2) < 0) continue;
             }
 
             float iw0 = scratch.invW[u0];
@@ -1776,9 +1785,10 @@ bool buildRasterScene(
 
         const char* forceSingleEnv = std::getenv("NACELLE_SINGLE_THREAD_GEOM");
         const bool allowParallel = !(forceSingleEnv && forceSingleEnv[0] == '1');
-
-        const uint32_t numChunks = static_cast<uint32_t>((totalPrims + kChunkPrims - 1u) / kChunkPrims);
-        if (!allowParallel || totalPrims < kParallelPrimThreshold || numChunks <= 1 || pool.get_thread_count() <= 1) {
+        const uint32_t numWorkers = static_cast<uint32_t>(std::max<size_t>(1, pool.get_thread_count()));
+        const uint32_t chunkPrims = kChunkPrims;
+        const uint32_t numChunks = static_cast<uint32_t>((totalPrims + chunkPrims - 1u) / chunkPrims);
+        if (!allowParallel || totalPrims < kParallelPrimThreshold || numChunks <= 1 || numWorkers <= 1) {
             TriangleEmitTarget directTarget;
             directTarget.triangles = &outScene.triangles;
             directTarget.attrBaseArena = &outScene.attrBaseArena;
@@ -1809,8 +1819,8 @@ bool buildRasterScene(
         }
 
         parallelForDynamic(pool, numChunks, [&](uint32_t c) {
-            uint64_t start = static_cast<uint64_t>(c) * kChunkPrims;
-            uint64_t end = std::min<uint64_t>(totalPrims, start + kChunkPrims);
+            uint64_t start = static_cast<uint64_t>(c) * chunkPrims;
+            uint64_t end = std::min<uint64_t>(totalPrims, start + chunkPrims);
             ChunkOutput& co = chunkOutputs[c];
             TriangleEmitTarget chunkTarget;
             chunkTarget.triangles = &co.triangles;
