@@ -570,7 +570,7 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         auto& es = rt.jit->getExecutionSession();
         llvm::orc::SymbolMap syms;
         auto addSym = [&](const char* name, auto* fn) {
-            syms[es.intern(name)] = llvm::orc::ExecutorSymbolDef(
+            syms[rt.jit->mangleAndIntern(name)] = llvm::orc::ExecutorSymbolDef(
                 llvm::orc::ExecutorAddr::fromPtr(fn), llvm::JITSymbolFlags::Exported);
         };
         addSym("nacelle_rayquery_alloc", &nacelle_rayquery_alloc);
