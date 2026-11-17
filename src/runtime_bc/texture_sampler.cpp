@@ -912,12 +912,94 @@ static inline __attribute__((always_inline)) uint32_t mask_to_u32(tex_vi32<W> ma
 }
 
 template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_load_vf(const float* p) {
+    tex_vf32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_load_vi(const int32_t* p) {
+    tex_vi32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vf(float* p, tex_vf32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vi(int32_t* p, tex_vi32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vu(uint32_t* p, tex_vu32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+struct alignas(16) SampleMip2DArgs {
+    float u[W];
+    float v[W];
+    int32_t slice[W];
+    int32_t offX[W];
+    int32_t offY[W];
+    float outR[W];
+    float outG[W];
+    float outB[W];
+    float outA[W];
+    uint32_t mip;
+    uint32_t reduction;
+    uint32_t addrU;
+    uint32_t addrV;
+    uint32_t borderKind;
+    uint32_t activeMask;
+    uint8_t uniformSlice;
+    uint8_t linearFilter;
+};
+
+template <int W>
+static inline __attribute__((always_inline)) void unpack_rgba8_v(
+    tex_vu32<W> p, bool isBgra, bool isSrgb,
+    tex_vf32<W>& r, tex_vf32<W>& g, tex_vf32<W>& b, tex_vf32<W>& a) {
+    const tex_vf32<W> inv255 = tex_splat_f<W>(1.0f / 255.0f);
+    const tex_vu32<W> m8 = tex_splat_u<W>(0xFFu);
+    tex_vf32<W> ch0 = __builtin_convertvector(p & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch1 = __builtin_convertvector((p >> 8) & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch2 = __builtin_convertvector((p >> 16) & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch3 = __builtin_convertvector(p >> 24, tex_vf32<W>) * inv255;
+    r = isBgra ? ch2 : ch0;
+    g = ch1;
+    b = isBgra ? ch0 : ch2;
+    a = ch3;
+    if (isSrgb) {
+        r = tex_srgb_to_lin<W>(r);
+        g = tex_srgb_to_lin<W>(g);
+        b = tex_srgb_to_lin<W>(b);
+    }
+}
+
+template <int W>
 static __attribute__((noinline)) void sample_mip_2d_fast_v(
-    const BC_Descriptor* tex, uint32_t mip,
-    tex_vf32<W> u, tex_vf32<W> v, tex_vi32<W> slice, bool uniformSlice,
-    bool linearFilter, uint32_t reduction, uint32_t addrU, uint32_t addrV, uint32_t borderKind,
-    tex_vi32<W> offX, tex_vi32<W> offY, uint32_t activeMask,
-    tex_vf32<W>& outR, tex_vf32<W>& outG, tex_vf32<W>& outB, tex_vf32<W>& outA) {
+    const BC_Descriptor* tex,
+    SampleMip2DArgs<W>* args) {
+    const uint32_t mip = args->mip;
+    const tex_vf32<W> u = tex_load_vf<W>(args->u);
+    const tex_vf32<W> v = tex_load_vf<W>(args->v);
+    const tex_vi32<W> slice = tex_load_vi<W>(args->slice);
+    const bool uniformSlice = (args->uniformSlice != 0u);
+    const bool linearFilter = (args->linearFilter != 0u);
+    const uint32_t reduction = args->reduction;
+    const uint32_t addrU = args->addrU;
+    const uint32_t addrV = args->addrV;
+    const uint32_t borderKind = args->borderKind;
+    const tex_vi32<W> offX = tex_load_vi<W>(args->offX);
+    const tex_vi32<W> offY = tex_load_vi<W>(args->offY);
+    const uint32_t activeMask = args->activeMask;
+    tex_vf32<W> outR, outG, outB, outA;
     const auto* meta = reinterpret_cast<const BC_TextureMetadata*>(tex->extra_ptr);
     uint32_t viewMip = ((tex->view_flags >> 8) & 0xFFu) + mip;
     if (meta && viewMip >= meta->mip_levels) viewMip = meta->mip_levels - 1;
@@ -995,6 +1077,10 @@ static __attribute__((noinline)) void sample_mip_2d_fast_v(
                 outR[l] = tmp[0]; outG[l] = tmp[1]; outB[l] = tmp[2]; outA[l] = tmp[3];
             }
         }
+        tex_store_vf<W>(args->outR, outR);
+        tex_store_vf<W>(args->outG, outG);
+        tex_store_vf<W>(args->outB, outB);
+        tex_store_vf<W>(args->outA, outA);
         return;
     }
 
@@ -1045,27 +1131,10 @@ static __attribute__((noinline)) void sample_mip_2d_fast_v(
             p00[l] = v00; p10[l] = v10; p01[l] = v01; p11[l] = v11;
         }
 
-        auto unpack = [&](tex_vu32<W> p, tex_vf32<W>& r, tex_vf32<W>& g, tex_vf32<W>& b, tex_vf32<W>& a) {
-            const tex_vf32<W> inv255 = tex_splat_f<W>(1.0f / 255.0f);
-            const tex_vu32<W> m8 = tex_splat_u<W>(0xFFu);
-            tex_vf32<W> ch0 = __builtin_convertvector(p & m8, tex_vf32<W>) * inv255;
-            tex_vf32<W> ch1 = __builtin_convertvector((p >> 8) & m8, tex_vf32<W>) * inv255;
-            tex_vf32<W> ch2 = __builtin_convertvector((p >> 16) & m8, tex_vf32<W>) * inv255;
-            tex_vf32<W> ch3 = __builtin_convertvector(p >> 24, tex_vf32<W>) * inv255;
-            r = isBgra ? ch2 : ch0;
-            g = ch1;
-            b = isBgra ? ch0 : ch2;
-            a = ch3;
-            if (isSrgb) {
-                r = tex_srgb_to_lin<W>(r);
-                g = tex_srgb_to_lin<W>(g);
-                b = tex_srgb_to_lin<W>(b);
-            }
-        };
-        unpack(p00, c00R, c00G, c00B, c00A);
-        unpack(p10, c10R, c10G, c10B, c10A);
-        unpack(p01, c01R, c01G, c01B, c01A);
-        unpack(p11, c11R, c11G, c11B, c11A);
+        unpack_rgba8_v<W>(p00, isBgra, isSrgb, c00R, c00G, c00B, c00A);
+        unpack_rgba8_v<W>(p10, isBgra, isSrgb, c10R, c10G, c10B, c10A);
+        unpack_rgba8_v<W>(p01, isBgra, isSrgb, c01R, c01G, c01B, c01A);
+        unpack_rgba8_v<W>(p11, isBgra, isSrgb, c11R, c11G, c11B, c11A);
         if (anyBorderBits) {
             c00R = tex_select_f<W>(bMask00, tex_splat_f<W>(bv), c00R);
             c00G = tex_select_f<W>(bMask00, tex_splat_f<W>(bv), c00G);
@@ -1140,6 +1209,10 @@ static __attribute__((noinline)) void sample_mip_2d_fast_v(
         outB = tex_lerp_f<W>(tex_lerp_f<W>(c00B, c10B, tx), tex_lerp_f<W>(c01B, c11B, tx), ty);
         outA = tex_lerp_f<W>(tex_lerp_f<W>(c00A, c10A, tx), tex_lerp_f<W>(c01A, c11A, tx), ty);
     }
+    tex_store_vf<W>(args->outR, outR);
+    tex_store_vf<W>(args->outG, outG);
+    tex_store_vf<W>(args->outB, outB);
+    tex_store_vf<W>(args->outA, outA);
 }
 
 template <int W>
@@ -1151,30 +1224,6 @@ struct alignas(16) BC_SampleVecArgs {
     float outR[W], outG[W], outB[W], outA[W];
     uint32_t outStatus[W];
 };
-
-template <int W>
-static inline __attribute__((always_inline)) tex_vf32<W> tex_load_vf(const float* p) {
-    tex_vf32<W> v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-
-template <int W>
-static inline __attribute__((always_inline)) tex_vi32<W> tex_load_vi(const int32_t* p) {
-    tex_vi32<W> v;
-    __builtin_memcpy(&v, p, sizeof(v));
-    return v;
-}
-
-template <int W>
-static inline __attribute__((always_inline)) void tex_store_vf(float* p, tex_vf32<W> v) {
-    __builtin_memcpy(p, &v, sizeof(v));
-}
-
-template <int W>
-static inline __attribute__((always_inline)) void tex_store_vu(uint32_t* p, tex_vu32<W> v) {
-    __builtin_memcpy(p, &v, sizeof(v));
-}
 
 template <int W>
 static inline __attribute__((always_inline)) void tex_sample_vec_impl(
@@ -1283,11 +1332,25 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
         if (sameM0 && sameFilter) {
             uint32_t m0 = static_cast<uint32_t>(refM0);
             uint32_t m1 = (m0 + 1u < tex->mip_levels) ? (m0 + 1u) : m0;
-            tex_vf32<W> r0, g0, b0, a0;
-            sample_mip_2d_fast_v<W>(
-                tex, m0, u, v, slice, (dim == 4u),
-                refLinear, reduction, addrU, addrV, borderKind, offX, offY, activeMask,
-                r0, g0, b0, a0);
+            SampleMip2DArgs<W> mipArgs;
+            tex_store_vf<W>(mipArgs.u, u);
+            tex_store_vf<W>(mipArgs.v, v);
+            tex_store_vi<W>(mipArgs.slice, slice);
+            tex_store_vi<W>(mipArgs.offX, offX);
+            tex_store_vi<W>(mipArgs.offY, offY);
+            mipArgs.mip = m0;
+            mipArgs.reduction = reduction;
+            mipArgs.addrU = addrU;
+            mipArgs.addrV = addrV;
+            mipArgs.borderKind = borderKind;
+            mipArgs.activeMask = activeMask;
+            mipArgs.uniformSlice = (dim == 4u) ? 1u : 0u;
+            mipArgs.linearFilter = refLinear ? 1u : 0u;
+            sample_mip_2d_fast_v<W>(tex, &mipArgs);
+            tex_vf32<W> r0 = tex_load_vf<W>(mipArgs.outR);
+            tex_vf32<W> g0 = tex_load_vf<W>(mipArgs.outG);
+            tex_vf32<W> b0 = tex_load_vf<W>(mipArgs.outB);
+            tex_vf32<W> a0 = tex_load_vf<W>(mipArgs.outA);
             if (singleMipMode || m1 == m0 || allSmallFrac) {
                 tex_store_vf<W>(args->outR, r0);
                 tex_store_vf<W>(args->outG, g0);
@@ -1296,11 +1359,12 @@ static inline __attribute__((always_inline)) void tex_sample_vec_impl(
                 tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
                 return;
             }
-            tex_vf32<W> r1, g1, b1, a1;
-            sample_mip_2d_fast_v<W>(
-                tex, m1, u, v, slice, (dim == 4u),
-                refLinear, reduction, addrU, addrV, borderKind, offX, offY, activeMask,
-                r1, g1, b1, a1);
+            mipArgs.mip = m1;
+            sample_mip_2d_fast_v<W>(tex, &mipArgs);
+            tex_vf32<W> r1 = tex_load_vf<W>(mipArgs.outR);
+            tex_vf32<W> g1 = tex_load_vf<W>(mipArgs.outG);
+            tex_vf32<W> b1 = tex_load_vf<W>(mipArgs.outB);
+            tex_vf32<W> a1 = tex_load_vf<W>(mipArgs.outA);
             tex_vf32<W> frac = lod - tex_splat_f<W>(float(m0));
             if (reduction == 2u) {
                 tex_store_vf<W>(args->outR, tex_min_f<W>(r0, r1));
