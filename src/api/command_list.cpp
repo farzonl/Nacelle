@@ -833,11 +833,62 @@ void execClearRTV(const CmdClearRTV& c) {
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
         y1 = std::min<LONG>(sub.height, y1);
+        if (x0 >= x1 || y0 >= y1) return;
         if (!reserved) {
-            for (LONG y = y0; y < y1; ++y) {
-                uint8_t* row = base + y * sub.row_pitch;
-                for (LONG x = x0; x < x1; ++x) {
-                    std::memcpy(row + x * fi.bytesPerBlock, encoded, fi.bytesPerBlock);
+            const size_t bpp = fi.bytesPerBlock;
+            const size_t w = static_cast<size_t>(x1 - x0);
+            const size_t rowBytes = w * bpp;
+            bool allSameByte = (bpp > 0);
+            for (size_t i = 1; i < bpp; ++i) {
+                if (encoded[i] != encoded[0]) {
+                    allSameByte = false;
+                    break;
+                }
+            }
+            if (allSameByte) {
+                if (x0 == 0 && x1 == sub.width && static_cast<size_t>(sub.row_pitch) == rowBytes) {
+                    std::memset(base + static_cast<size_t>(y0) * sub.row_pitch, encoded[0], static_cast<size_t>(y1 - y0) * rowBytes);
+                } else {
+                    for (LONG y = y0; y < y1; ++y) {
+                        std::memset(base + static_cast<size_t>(y) * sub.row_pitch + static_cast<size_t>(x0) * bpp, encoded[0], rowBytes);
+                    }
+                }
+                return;
+            }
+            if (bpp == 4) {
+                uint32_t val32 = 0;
+                std::memcpy(&val32, encoded, 4);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint32_t* dst = reinterpret_cast<uint32_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val32);
+                }
+            } else if (bpp == 8) {
+                uint64_t val64 = 0;
+                std::memcpy(&val64, encoded, 8);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint64_t* dst = reinterpret_cast<uint64_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val64);
+                }
+            } else if (bpp == 16) {
+                struct Block16 { uint64_t lo, hi; } val16{};
+                std::memcpy(&val16, encoded, 16);
+                for (LONG y = y0; y < y1; ++y) {
+                    Block16* dst = reinterpret_cast<Block16*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val16);
+                }
+            } else if (bpp == 2) {
+                uint16_t val16 = 0;
+                std::memcpy(&val16, encoded, 2);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint16_t* dst = reinterpret_cast<uint16_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val16);
+                }
+            } else {
+                for (LONG y = y0; y < y1; ++y) {
+                    uint8_t* row = base + static_cast<size_t>(y) * sub.row_pitch;
+                    for (LONG x = x0; x < x1; ++x) {
+                        std::memcpy(row + static_cast<size_t>(x) * bpp, encoded, bpp);
+                    }
                 }
             }
         } else {
@@ -901,11 +952,41 @@ void execClearDSV(const CmdClearDSV& c) {
         y0 = std::max<LONG>(0, y0);
         x1 = std::min<LONG>(sub.width, x1);
         y1 = std::min<LONG>(sub.height, y1);
+        if (x0 >= x1 || y0 >= y1) return;
         if (!reserved) {
+            const size_t w = static_cast<size_t>(x1 - x0);
+            if ((c.dsv.format == DXGI_FORMAT_D32_FLOAT || c.dsv.format == DXGI_FORMAT_R32_TYPELESS) &&
+                (c.flags & D3D12_CLEAR_FLAG_DEPTH)) {
+                uint32_t val32 = 0;
+                std::memcpy(&val32, &c.depth, 4);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint32_t* dst = reinterpret_cast<uint32_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val32);
+                }
+                return;
+            }
+            if (c.dsv.format == DXGI_FORMAT_D16_UNORM && (c.flags & D3D12_CLEAR_FLAG_DEPTH)) {
+                uint16_t d16 = static_cast<uint16_t>(std::clamp(c.depth, 0.0f, 1.0f) * 65535.0f + 0.5f);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint16_t* dst = reinterpret_cast<uint16_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, d16);
+                }
+                return;
+            }
+            if (c.dsv.format == DXGI_FORMAT_D24_UNORM_S8_UINT &&
+                (c.flags & D3D12_CLEAR_FLAG_DEPTH) && (c.flags & D3D12_CLEAR_FLAG_STENCIL)) {
+                uint32_t d24 = static_cast<uint32_t>(std::clamp(c.depth, 0.0f, 1.0f) * 16777215.0f + 0.5f);
+                uint32_t val32 = (uint32_t(c.stencil) << 24) | (d24 & 0x00FFFFFFu);
+                for (LONG y = y0; y < y1; ++y) {
+                    uint32_t* dst = reinterpret_cast<uint32_t*>(base + static_cast<size_t>(y) * sub.row_pitch) + x0;
+                    std::fill_n(dst, w, val32);
+                }
+                return;
+            }
             for (LONG y = y0; y < y1; ++y) {
-                uint8_t* row = base + y * sub.row_pitch;
+                uint8_t* row = base + static_cast<size_t>(y) * sub.row_pitch;
                 for (LONG x = x0; x < x1; ++x) {
-                    clearPixel(row + x * fi.bytesPerBlock);
+                    clearPixel(row + static_cast<size_t>(x) * fi.bytesPerBlock);
                 }
             }
         } else {

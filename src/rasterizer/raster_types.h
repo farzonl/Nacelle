@@ -2,12 +2,37 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "../compiler/shader_compiler.h"
 #include "rasterizer.h"
 
 namespace nacelle {
+
+/// Allocator that default-initializes instead of value-initializing elements on resize(),
+/// avoiding redundant zero-fill / memset before parallel memcpy overwrites the buffer.
+template <typename T>
+struct NoInitAllocator : std::allocator<T> {
+    using std::allocator<T>::allocator;
+    template <typename U>
+    struct rebind {
+        using other = NoInitAllocator<U>;
+    };
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
+template <typename T>
+using NoInitVec = std::vector<T, NoInitAllocator<T>>;
 
 constexpr uint32_t kTileSize = kRasterTileSize;
 constexpr uint32_t kTilePixels = kRasterTilePixels;
@@ -23,37 +48,37 @@ struct ShadedVertex {
 };
 
 struct SetupTriangle {
-    int32_t minX = 0; // inclusive pixel x
-    int32_t maxX = 0; // exclusive pixel x
-    int32_t minY = 0; // inclusive pixel y
-    int32_t maxY = 0; // exclusive pixel y
+    int32_t minX; // inclusive pixel x
+    int32_t maxX; // exclusive pixel x
+    int32_t minY; // inclusive pixel y
+    int32_t maxY; // exclusive pixel y
 
     // Edge equations in 24.8 fixed point for pixel center (px*256 + 128, py*256 + 128):
     // E_k(px, py) = stepX[k] * px + stepY[k] * py + base[k]
     // Inside test uses (E_k + bias[k]) >= 0.
     // Barycentrics at pixel center: baryI = float(E_1) * invArea, baryJ = float(E_2) * invArea.
-    int64_t stepX[3]{};
-    int64_t stepY[3]{};
-    int64_t base[3]{};
-    int64_t bias[3]{};
-    float invArea = 0.0f;
+    int64_t stepX[3];
+    int64_t stepY[3];
+    int64_t base[3];
+    int64_t bias[3];
+    float invArea;
 
-    uint32_t isFrontFace = 1;
-    uint32_t primitiveId = 0;
-    uint32_t viewportIndex = 0;
-    uint32_t shadingRate = 0;
-    float invW[3]{};   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
-    float depth[3]{};  // (z0, z1 - z0, z2 - z0)
+    uint32_t isFrontFace;
+    uint32_t primitiveId;
+    uint32_t viewportIndex;
+    uint32_t shadingRate;
+    float invW[3];   // (1/w0, 1/w1 - 1/w0, 1/w2 - 1/w0)
+    float depth[3];  // (z0, z1 - z0, z2 - z0)
 
-    bool isLine = false;
-    float lineX0 = 0.0f;
-    float lineY0 = 0.0f;
-    float lineX1 = 0.0f;
-    float lineY1 = 0.0f;
+    bool isLine;
+    float lineX0;
+    float lineY0;
+    float lineX1;
+    float lineY1;
 };
 
 struct TileBin {
-    std::vector<uint32_t> triIndices;
+    NoInitVec<uint32_t> triIndices;
 };
 
 struct RasterScene {
@@ -82,10 +107,10 @@ struct RasterScene {
     uint32_t numScissors = 1;
     std::array<int16_t, kMaxPSInputScalars> psInputFromPreRastSlot{};
 
-    std::vector<SetupTriangle> triangles;
-    std::vector<float> attrBaseArena;
-    std::vector<float> attrFlatArena;
-    std::vector<float> origBaryArena;
+    NoInitVec<SetupTriangle> triangles;
+    NoInitVec<float> attrBaseArena;
+    NoInitVec<float> attrFlatArena;
+    NoInitVec<float> origBaryArena;
 };
 
 bool buildRasterScene(
