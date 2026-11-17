@@ -1274,10 +1274,12 @@ void executeRasterMeshDispatch(
     const GraphicsExecutionState& state,
     const MeshDispatchParams& dispatch) {
     RasterScene scene;
-    if (!buildMeshRasterScene(pool, state, dispatch, scene)) return;
-
     std::vector<TileBin> bins;
-    binTrianglesToTiles(scene, bins);
+    if (!buildMeshRasterScene(pool, state, dispatch, scene, &bins)) return;
+
+    if (!scene.binsAlreadyPopulated) {
+        binTrianglesToTiles(scene, bins);
+    }
     rasterizeTiles(pool, state, scene, bins);
 }
 

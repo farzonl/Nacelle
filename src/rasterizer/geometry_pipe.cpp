@@ -122,6 +122,112 @@ struct ChunkOutput {
     }
 };
 
+/// Merges per-chunk geometry outputs and optional fused tile-binning counts into `outScene`.
+static bool mergeChunkOutputsToScene(
+    BS::thread_pool<>& pool,
+    uint32_t numChunks,
+    const std::vector<ChunkOutput>& chunkOutputs,
+    bool fuseBinning,
+    size_t numTiles,
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins) {
+    thread_local std::vector<size_t> tlChunkTriOffsets;
+    auto& chunkTriOffsets = tlChunkTriOffsets;
+    chunkTriOffsets.resize(numChunks + 1);
+    chunkTriOffsets[0] = 0;
+    for (uint32_t c = 0; c < numChunks; ++c) {
+        chunkTriOffsets[c + 1] = chunkTriOffsets[c] + chunkOutputs[c].triangles.size();
+    }
+    const size_t totalTris = chunkTriOffsets[numChunks];
+    if (totalTris == 0) {
+        if (fuseBinning) {
+            optOutBins->resize(numTiles);
+            for (auto& b : *optOutBins) b.triIndices.clear();
+            outScene.binsAlreadyPopulated = true;
+        }
+        return false;
+    }
+
+    const size_t psScalars = static_cast<size_t>(outScene.numPSInputScalars);
+    outScene.triangles.resize(totalTris);
+    if (psScalars > 0) {
+        outScene.attrBaseArena.resize(totalTris * psScalars * 3);
+        if (outScene.needsFlatAttrs) {
+            outScene.attrFlatArena.resize(totalTris * psScalars);
+        }
+    }
+    if (outScene.needsOrigBary) {
+        outScene.origBaryArena.resize(totalTris * 9);
+    }
+
+    thread_local std::vector<uint32_t> tlChunkTileCursors;
+    auto& chunkTileCursors = tlChunkTileCursors;
+    if (fuseBinning) {
+        optOutBins->resize(numTiles);
+        chunkTileCursors.resize(static_cast<size_t>(numChunks) * numTiles);
+        for (size_t t = 0; t < numTiles; ++t) {
+            uint32_t sum = 0;
+            for (uint32_t c = 0; c < numChunks; ++c) {
+                chunkTileCursors[static_cast<size_t>(c) * numTiles + t] = sum;
+                sum += chunkOutputs[c].tileCounts[t];
+            }
+            (*optOutBins)[t].triIndices.resize(sum);
+        }
+    }
+
+    auto scatterChunk = [&](uint32_t c) {
+        const ChunkOutput& co = chunkOutputs[c];
+        const size_t count = co.triangles.size();
+        if (count == 0) return;
+
+        const size_t triBase = chunkTriOffsets[c];
+        std::memcpy(
+            outScene.triangles.data() + triBase,
+            co.triangles.data(),
+            count * sizeof(SetupTriangle));
+
+        if (psScalars > 0) {
+            std::memcpy(
+                outScene.attrBaseArena.data() + triBase * psScalars * 3,
+                co.attrBase.data(),
+                count * psScalars * 3 * sizeof(float));
+            if (outScene.needsFlatAttrs) {
+                std::memcpy(
+                    outScene.attrFlatArena.data() + triBase * psScalars,
+                    co.attrFlat.data(),
+                    count * psScalars * sizeof(float));
+            }
+        }
+        if (outScene.needsOrigBary) {
+            std::memcpy(
+                outScene.origBaryArena.data() + triBase * 9,
+                co.origBary.data(),
+                count * 9 * sizeof(float));
+        }
+
+        if (fuseBinning && !co.binPairs.empty()) {
+            uint32_t* cursors = &chunkTileCursors[static_cast<size_t>(c) * numTiles];
+            const uint32_t baseIdx32 = static_cast<uint32_t>(triBase);
+            for (const ChunkBinPair& bp : co.binPairs) {
+                uint32_t dstPos = cursors[bp.tileIdx]++;
+                (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
+            }
+        }
+    };
+    if (totalTris < 2048 || numChunks <= 2) {
+        for (uint32_t c = 0; c < numChunks; ++c) {
+            scatterChunk(c);
+        }
+    } else {
+        parallelForDynamic(pool, numChunks, scatterChunk);
+    }
+
+    if (fuseBinning) {
+        outScene.binsAlreadyPopulated = true;
+    }
+    return true;
+}
+
 struct alignas(64) ChunkTransientScratch {
     uint32_t cacheVId[kVtxCacheSize]{};
     uint32_t cacheGen[kVtxCacheSize]{};
@@ -1478,6 +1584,11 @@ struct MeshPipeScratch {
     std::vector<ShadedVertex> polyB;
 };
 
+static MeshPipeScratch& getWorkerMeshScratch() {
+    thread_local MeshPipeScratch tlWorkerMesh;
+    return tlWorkerMesh;
+}
+
 } // namespace
 
 bool buildRasterScene(
@@ -1717,102 +1828,8 @@ bool buildRasterScene(
                 state, draw, vsFn, W, rast, outScene, chunkTarget);
         });
 
-        thread_local std::vector<size_t> tlChunkTriOffsets;
-        auto& chunkTriOffsets = tlChunkTriOffsets;
-        chunkTriOffsets.resize(numChunks + 1);
-        chunkTriOffsets[0] = 0;
-        for (uint32_t c = 0; c < numChunks; ++c) {
-            chunkTriOffsets[c + 1] = chunkTriOffsets[c] + chunkOutputs[c].triangles.size();
-        }
-        const size_t totalTris = chunkTriOffsets[numChunks];
-        if (totalTris == 0) {
-            if (fuseBinning) {
-                optOutBins->resize(numTiles);
-                for (auto& b : *optOutBins) b.triIndices.clear();
-                outScene.binsAlreadyPopulated = true;
-            }
-            return false;
-        }
-
-        const size_t psScalars = static_cast<size_t>(outScene.numPSInputScalars);
-        outScene.triangles.resize(totalTris);
-        if (psScalars > 0) {
-            outScene.attrBaseArena.resize(totalTris * psScalars * 3);
-            if (outScene.needsFlatAttrs) {
-                outScene.attrFlatArena.resize(totalTris * psScalars);
-            }
-        }
-        if (outScene.needsOrigBary) {
-            outScene.origBaryArena.resize(totalTris * 9);
-        }
-
-        thread_local std::vector<uint32_t> tlChunkTileCursors;
-        auto& chunkTileCursors = tlChunkTileCursors;
-        if (fuseBinning) {
-            optOutBins->resize(numTiles);
-            chunkTileCursors.resize(static_cast<size_t>(numChunks) * numTiles);
-            for (size_t t = 0; t < numTiles; ++t) {
-                uint32_t sum = 0;
-                for (uint32_t c = 0; c < numChunks; ++c) {
-                    chunkTileCursors[static_cast<size_t>(c) * numTiles + t] = sum;
-                    sum += chunkOutputs[c].tileCounts[t];
-                }
-                (*optOutBins)[t].triIndices.resize(sum);
-            }
-        }
-
-        // Scatter triangles, arenas, and ordered tile indices into disjoint slices
-        auto scatterChunk = [&](uint32_t c) {
-            const ChunkOutput& co = chunkOutputs[c];
-            const size_t count = co.triangles.size();
-            if (count == 0) return;
-
-            const size_t triBase = chunkTriOffsets[c];
-            std::memcpy(
-                outScene.triangles.data() + triBase,
-                co.triangles.data(),
-                count * sizeof(SetupTriangle));
-
-            if (psScalars > 0) {
-                std::memcpy(
-                    outScene.attrBaseArena.data() + triBase * psScalars * 3,
-                    co.attrBase.data(),
-                    count * psScalars * 3 * sizeof(float));
-                if (outScene.needsFlatAttrs) {
-                    std::memcpy(
-                        outScene.attrFlatArena.data() + triBase * psScalars,
-                        co.attrFlat.data(),
-                        count * psScalars * sizeof(float));
-                }
-            }
-            if (outScene.needsOrigBary) {
-                std::memcpy(
-                    outScene.origBaryArena.data() + triBase * 9,
-                    co.origBary.data(),
-                    count * 9 * sizeof(float));
-            }
-
-            if (fuseBinning && !co.binPairs.empty()) {
-                uint32_t* cursors = &chunkTileCursors[static_cast<size_t>(c) * numTiles];
-                const uint32_t baseIdx32 = static_cast<uint32_t>(triBase);
-                for (const ChunkBinPair& bp : co.binPairs) {
-                    uint32_t dstPos = cursors[bp.tileIdx]++;
-                    (*optOutBins)[bp.tileIdx].triIndices[dstPos] = baseIdx32 + bp.localTriIdx;
-                }
-            }
-        };
-        if (totalTris < 2048 || numChunks <= 2) {
-            for (uint32_t c = 0; c < numChunks; ++c) {
-                scatterChunk(c);
-            }
-        } else {
-            parallelForDynamic(pool, numChunks, scatterChunk);
-        }
-
-        if (fuseBinning) {
-            outScene.binsAlreadyPopulated = true;
-        }
-        return true;
+        return mergeChunkOutputsToScene(
+            pool, numChunks, chunkOutputs, fuseBinning, numTiles, outScene, optOutBins);
     }
 
     // =========================================================================
@@ -2414,10 +2431,11 @@ bool buildRasterScene(
 }
 
 bool buildMeshRasterScene(
-    BS::thread_pool<>& /*pool*/,
+    BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const MeshDispatchParams& dispatch,
-    RasterScene& outScene) {
+    RasterScene& outScene,
+    std::vector<TileBin>* optOutBins) {
     if (!state.pso || state.pso->isCompute()) return false;
     if (dispatch.groupCountX == 0 || dispatch.groupCountY == 0 || dispatch.groupCountZ == 0) {
         return false;
@@ -2450,36 +2468,89 @@ bool buildMeshRasterScene(
 
     const uint32_t payloadBytes = std::max<uint32_t>({64u, compiled->asPayloadBytes, compiled->msPayloadBytes});
     if (compiled->hasAS) {
-        auto& asScratch = tlMesh.asScratch;
-        asScratch.assign(std::max<uint32_t>(64u, compiled->asGroupSharedBytes), 0);
-        for (uint32_t az = 0; az < dispatch.groupCountZ; ++az) {
-            for (uint32_t ay = 0; ay < dispatch.groupCountY; ++ay) {
-                for (uint32_t ax = 0; ax < dispatch.groupCountX; ++ax) {
-                    if (compiled->asGroupSharedBytes > 0) {
-                        std::memset(asScratch.data(), 0, compiled->asGroupSharedBytes);
-                    }
-                    uint32_t outDims[4]{0, 0, 0, 0};
-                    size_t payloadOff = payloadArena.size();
-                    payloadArena.resize(payloadOff + payloadBytes, 0);
+        const uint64_t totalAS64 = static_cast<uint64_t>(dispatch.groupCountX) *
+                                   dispatch.groupCountY * dispatch.groupCountZ;
+        if (totalAS64 > 1 && pool.get_thread_count() > 1 && totalAS64 <= 0xFFFFFFFFull) {
+            const uint32_t totalAS = static_cast<uint32_t>(totalAS64);
+            payloadArena.resize(static_cast<size_t>(totalAS) * payloadBytes);
+            thread_local std::vector<PendingMeshDispatch> tlPendingAS;
+            auto& pendingAS = tlPendingAS;
+            pendingAS.assign(totalAS, PendingMeshDispatch{0, 0, 0, 0});
+            const uint32_t nx = dispatch.groupCountX;
+            const uint32_t nxy = nx * dispatch.groupCountY;
 
-                    AmplificationThreadGroupArgs asArgs{};
-                    asArgs.rootCtx = &state.rootCtx;
-                    asArgs.groupSharedScratch = asScratch.data();
-                    asArgs.gx = ax;
-                    asArgs.gy = ay;
-                    asArgs.gz = az;
-                    asArgs.ngx = dispatch.groupCountX;
-                    asArgs.ngy = dispatch.groupCountY;
-                    asArgs.ngz = dispatch.groupCountZ;
-                    asArgs.outDispatchDims = outDims;
-                    asArgs.outPayload = payloadArena.data() + payloadOff;
-                    asFn(&asArgs);
+            parallelForDynamic(pool, totalAS, [&](uint32_t flatIdx) {
+                auto& tlAsScratch = getWorkerMeshScratch().asScratch;
+                const uint32_t asScratchBytes = std::max<uint32_t>(64u, compiled->asGroupSharedBytes);
+                if (tlAsScratch.size() < asScratchBytes) {
+                    tlAsScratch.assign(asScratchBytes, 0);
+                } else if (compiled->asGroupSharedBytes > 0) {
+                    std::memset(tlAsScratch.data(), 0, compiled->asGroupSharedBytes);
+                }
+                const uint32_t az = flatIdx / nxy;
+                const uint32_t rem = flatIdx - az * nxy;
+                const uint32_t ay = rem / nx;
+                const uint32_t ax = rem - ay * nx;
+                const size_t payloadOff = static_cast<size_t>(flatIdx) * payloadBytes;
+                std::memset(payloadArena.data() + payloadOff, 0, payloadBytes);
 
-                    if (outDims[3] != 0 && outDims[0] > 0 && outDims[1] > 0 && outDims[2] > 0) {
-                        meshDispatches.push_back(PendingMeshDispatch{
-                            outDims[0], outDims[1], outDims[2], payloadOff});
-                    } else {
-                        payloadArena.resize(payloadOff);
+                uint32_t outDims[4]{0, 0, 0, 0};
+                AmplificationThreadGroupArgs asArgs{};
+                asArgs.rootCtx = &state.rootCtx;
+                asArgs.groupSharedScratch = tlAsScratch.data();
+                asArgs.gx = ax;
+                asArgs.gy = ay;
+                asArgs.gz = az;
+                asArgs.ngx = dispatch.groupCountX;
+                asArgs.ngy = dispatch.groupCountY;
+                asArgs.ngz = dispatch.groupCountZ;
+                asArgs.outDispatchDims = outDims;
+                asArgs.outPayload = payloadArena.data() + payloadOff;
+                asFn(&asArgs);
+
+                if (outDims[3] != 0 && outDims[0] > 0 && outDims[1] > 0 && outDims[2] > 0) {
+                    pendingAS[flatIdx] = PendingMeshDispatch{
+                        outDims[0], outDims[1], outDims[2], payloadOff};
+                }
+            });
+
+            for (const auto& pd : pendingAS) {
+                if (pd.gx > 0) {
+                    meshDispatches.push_back(pd);
+                }
+            }
+        } else {
+            auto& asScratch = tlMesh.asScratch;
+            asScratch.assign(std::max<uint32_t>(64u, compiled->asGroupSharedBytes), 0);
+            for (uint32_t az = 0; az < dispatch.groupCountZ; ++az) {
+                for (uint32_t ay = 0; ay < dispatch.groupCountY; ++ay) {
+                    for (uint32_t ax = 0; ax < dispatch.groupCountX; ++ax) {
+                        if (compiled->asGroupSharedBytes > 0) {
+                            std::memset(asScratch.data(), 0, compiled->asGroupSharedBytes);
+                        }
+                        uint32_t outDims[4]{0, 0, 0, 0};
+                        size_t payloadOff = payloadArena.size();
+                        payloadArena.resize(payloadOff + payloadBytes, 0);
+
+                        AmplificationThreadGroupArgs asArgs{};
+                        asArgs.rootCtx = &state.rootCtx;
+                        asArgs.groupSharedScratch = asScratch.data();
+                        asArgs.gx = ax;
+                        asArgs.gy = ay;
+                        asArgs.gz = az;
+                        asArgs.ngx = dispatch.groupCountX;
+                        asArgs.ngy = dispatch.groupCountY;
+                        asArgs.ngz = dispatch.groupCountZ;
+                        asArgs.outDispatchDims = outDims;
+                        asArgs.outPayload = payloadArena.data() + payloadOff;
+                        asFn(&asArgs);
+
+                        if (outDims[3] != 0 && outDims[0] > 0 && outDims[1] > 0 && outDims[2] > 0) {
+                            meshDispatches.push_back(PendingMeshDispatch{
+                                outDims[0], outDims[1], outDims[2], payloadOff});
+                        } else {
+                            payloadArena.resize(payloadOff);
+                        }
                     }
                 }
             }
@@ -2499,124 +2570,196 @@ bool buildMeshRasterScene(
     const uint32_t copyScalars = std::min<uint32_t>(attrStride, kMaxPSInputScalars);
     const uint64_t primAttrMask = compiled->msPrimAttrMask;
 
-    auto& msScratch = tlMesh.msScratch;
-    auto& outVertPosXYZW = tlMesh.outVertPosXYZW;
-    auto& outVertAttrs = tlMesh.outVertAttrs;
-    auto& outPrimIndices = tlMesh.outPrimIndices;
-    auto& outPrimAttrs = tlMesh.outPrimAttrs;
-    auto& outPrimCull = tlMesh.outPrimCull;
-    auto& outPrimId = tlMesh.outPrimId;
-    auto& polyA = tlMesh.polyA;
-    auto& polyB = tlMesh.polyB;
-    msScratch.assign(std::max<uint32_t>(64u, compiled->msGroupSharedBytes), 0);
-    outVertPosXYZW.assign(maxVerts * 4u, 0.0f);
-    outVertAttrs.assign(std::max<size_t>(1, static_cast<size_t>(maxVerts) * attrStride), 0.0f);
-    outPrimIndices.assign(maxPrims * 3u, 0u);
-    outPrimAttrs.assign(std::max<size_t>(1, static_cast<size_t>(maxPrims) * attrStride), 0.0f);
-    outPrimCull.assign(maxPrims, 0u);
-    outPrimId.resize(maxPrims);
-    polyA.clear();
-    polyB.clear();
+    uint64_t totalMSGroups64 = 0;
+    thread_local std::vector<uint64_t> tlDispatchGroupOffsets;
+    auto& dispatchGroupOffsets = tlDispatchGroupOffsets;
+    dispatchGroupOffsets.resize(meshDispatches.size() + 1);
+    dispatchGroupOffsets[0] = 0;
+    for (size_t i = 0; i < meshDispatches.size(); ++i) {
+        const auto& md = meshDispatches[i];
+        totalMSGroups64 += static_cast<uint64_t>(md.gx) * md.gy * md.gz;
+        dispatchGroupOffsets[i + 1] = totalMSGroups64;
+    }
 
-    auto makeMeshVertex = [&](uint32_t vIdx) -> ShadedVertex {
-        ShadedVertex sv;
-        sv.clipX = outVertPosXYZW[vIdx * 4u + 0];
-        sv.clipY = outVertPosXYZW[vIdx * 4u + 1];
-        sv.clipZ = outVertPosXYZW[vIdx * 4u + 2];
-        sv.clipW = outVertPosXYZW[vIdx * 4u + 3];
-        for (uint32_t s = 0; s < copyScalars; ++s) {
-            sv.attrs[s] = outVertAttrs[static_cast<size_t>(vIdx) * attrStride + s];
-        }
-        return sv;
-    };
+    auto executeMeshGroupRange = [&](uint64_t groupStart, uint64_t groupEnd, TriangleEmitTarget& target, MeshPipeScratch& tlWorkerMesh) {
+        auto& msScratch = tlWorkerMesh.msScratch;
+        auto& outVertPosXYZW = tlWorkerMesh.outVertPosXYZW;
+        auto& outVertAttrs = tlWorkerMesh.outVertAttrs;
+        auto& outPrimIndices = tlWorkerMesh.outPrimIndices;
+        auto& outPrimAttrs = tlWorkerMesh.outPrimAttrs;
+        auto& outPrimCull = tlWorkerMesh.outPrimCull;
+        auto& outPrimId = tlWorkerMesh.outPrimId;
+        auto& polyA = tlWorkerMesh.polyA;
+        auto& polyB = tlWorkerMesh.polyB;
 
-    auto applyPrimAttrs = [&](ShadedVertex& v0, uint32_t pIdx) {
-        if (primAttrMask == 0 || copyScalars == 0) return;
-        const uint32_t limit = std::min<uint32_t>(copyScalars, 64u);
-        for (uint32_t s = 0; s < limit; ++s) {
-            if ((primAttrMask & (1ull << s)) != 0) {
-                v0.attrs[s] = outPrimAttrs[static_cast<size_t>(pIdx) * attrStride + s];
+        const size_t msScratchNeed = std::max<uint32_t>(64u, compiled->msGroupSharedBytes);
+        if (msScratch.size() < msScratchNeed) msScratch.assign(msScratchNeed, 0);
+        if (outVertPosXYZW.size() < static_cast<size_t>(maxVerts) * 4u) outVertPosXYZW.assign(maxVerts * 4u, 0.0f);
+        const size_t vertAttrNeed = std::max<size_t>(1, static_cast<size_t>(maxVerts) * attrStride);
+        if (outVertAttrs.size() < vertAttrNeed) outVertAttrs.assign(vertAttrNeed, 0.0f);
+        if (outPrimIndices.size() < static_cast<size_t>(maxPrims) * 3u) outPrimIndices.assign(maxPrims * 3u, 0u);
+        const size_t primAttrNeed = std::max<size_t>(1, static_cast<size_t>(maxPrims) * attrStride);
+        if (outPrimAttrs.size() < primAttrNeed) outPrimAttrs.assign(primAttrNeed, 0.0f);
+        if (outPrimCull.size() < maxPrims) outPrimCull.assign(maxPrims, 0u);
+        if (outPrimId.size() < maxPrims) outPrimId.resize(maxPrims);
+        polyA.clear();
+        polyB.clear();
+
+        auto makeMeshVertex = [&](uint32_t vIdx) -> ShadedVertex {
+            ShadedVertex sv;
+            sv.clipX = outVertPosXYZW[vIdx * 4u + 0];
+            sv.clipY = outVertPosXYZW[vIdx * 4u + 1];
+            sv.clipZ = outVertPosXYZW[vIdx * 4u + 2];
+            sv.clipW = outVertPosXYZW[vIdx * 4u + 3];
+            for (uint32_t s = 0; s < copyScalars; ++s) {
+                sv.attrs[s] = outVertAttrs[static_cast<size_t>(vIdx) * attrStride + s];
             }
-        }
-    };
+            return sv;
+        };
 
-    TriangleEmitTarget meshTarget;
-    meshTarget.triangles = &outScene.triangles;
-    meshTarget.attrBaseArena = &outScene.attrBaseArena;
-    meshTarget.attrFlatArena = &outScene.attrFlatArena;
-    meshTarget.origBaryArena = &outScene.origBaryArena;
+        auto applyPrimAttrs = [&](ShadedVertex& v0, uint32_t pIdx) {
+            if (primAttrMask == 0 || copyScalars == 0) return;
+            const uint32_t limit = std::min<uint32_t>(copyScalars, 64u);
+            for (uint32_t s = 0; s < limit; ++s) {
+                if ((primAttrMask & (1ull << s)) != 0) {
+                    v0.attrs[s] = outPrimAttrs[static_cast<size_t>(pIdx) * attrStride + s];
+                }
+            }
+        };
 
-    for (const auto& md : meshDispatches) {
-        for (uint32_t gz = 0; gz < md.gz; ++gz) {
-            for (uint32_t gy = 0; gy < md.gy; ++gy) {
-                for (uint32_t gx = 0; gx < md.gx; ++gx) {
-                    if (compiled->msGroupSharedBytes > 0) {
-                        std::memset(msScratch.data(), 0, compiled->msGroupSharedBytes);
-                    }
-                    uint32_t outCounts[2]{0, 0};
-                    std::fill(outVertPosXYZW.begin(), outVertPosXYZW.end(), 0.0f);
-                    std::fill(outVertAttrs.begin(), outVertAttrs.end(), 0.0f);
-                    std::fill(outPrimIndices.begin(), outPrimIndices.end(), 0u);
-                    std::fill(outPrimAttrs.begin(), outPrimAttrs.end(), 0.0f);
-                    std::fill(outPrimCull.begin(), outPrimCull.end(), 0u);
-                    for (uint32_t p = 0; p < maxPrims; ++p) {
-                        outPrimId[p] = p;
-                    }
+        size_t mdIdx = static_cast<size_t>(
+            std::upper_bound(dispatchGroupOffsets.begin(), dispatchGroupOffsets.end(), groupStart) -
+            dispatchGroupOffsets.begin() - 1);
 
-                    MeshThreadGroupArgs msArgs{};
-                    msArgs.rootCtx = &state.rootCtx;
-                    msArgs.groupSharedScratch = msScratch.data();
-                    msArgs.payloadPtr = payloadArena.data() + md.payloadOffset;
-                    msArgs.gx = gx;
-                    msArgs.gy = gy;
-                    msArgs.gz = gz;
-                    msArgs.ngx = md.gx;
-                    msArgs.ngy = md.gy;
-                    msArgs.ngz = md.gz;
-                    msArgs.outCounts = outCounts;
-                    msArgs.outVertPosXYZW = outVertPosXYZW.data();
-                    msArgs.outVertAttrs = outVertAttrs.data();
-                    msArgs.outPrimIndices = outPrimIndices.data();
-                    msArgs.outPrimAttrs = outPrimAttrs.data();
-                    msArgs.outPrimCull = outPrimCull.data();
-                    msArgs.outPrimId = outPrimId.data();
-                    msFn(&msArgs);
+        for (uint64_t flatG = groupStart; flatG < groupEnd; ++flatG) {
+            while (flatG >= dispatchGroupOffsets[mdIdx + 1]) {
+                ++mdIdx;
+            }
+            const auto& md = meshDispatches[mdIdx];
+            const uint64_t localG = flatG - dispatchGroupOffsets[mdIdx];
+            const uint64_t nxy = static_cast<uint64_t>(md.gx) * md.gy;
+            const uint32_t gz = static_cast<uint32_t>(localG / nxy);
+            const uint64_t rem = localG - static_cast<uint64_t>(gz) * nxy;
+            const uint32_t gy = static_cast<uint32_t>(rem / md.gx);
+            const uint32_t gx = static_cast<uint32_t>(rem - static_cast<uint64_t>(gy) * md.gx);
 
-                    const uint32_t nv = std::min<uint32_t>(outCounts[0], compiled->msMaxVertexCount);
-                    const uint32_t np = std::min<uint32_t>(outCounts[1], compiled->msMaxPrimitiveCount);
-                    if (nv == 0 || np == 0) continue;
+            if (compiled->msGroupSharedBytes > 0) {
+                std::memset(msScratch.data(), 0, compiled->msGroupSharedBytes);
+            }
+            uint32_t outCounts[2]{0, 0};
+            std::fill_n(outVertPosXYZW.begin(), maxVerts * 4u, 0.0f);
+            std::fill_n(outVertAttrs.begin(), vertAttrNeed, 0.0f);
+            std::fill_n(outPrimIndices.begin(), maxPrims * 3u, 0u);
+            std::fill_n(outPrimAttrs.begin(), primAttrNeed, 0.0f);
+            std::fill_n(outPrimCull.begin(), maxPrims, 0u);
+            for (uint32_t p = 0; p < maxPrims; ++p) {
+                outPrimId[p] = p;
+            }
 
-                    if (compiled->msOutputTopology == 1) { // line
-                        for (uint32_t p = 0; p < np; ++p) {
-                            if (outPrimCull[p] != 0) continue;
-                            uint32_t i0 = outPrimIndices[p * 3u + 0];
-                            uint32_t i1 = outPrimIndices[p * 3u + 1];
-                            if (i0 >= nv || i1 >= nv) continue;
-                            ShadedVertex v0 = makeMeshVertex(i0);
-                            ShadedVertex v1 = makeMeshVertex(i1);
-                            applyPrimAttrs(v0, p);
-                            processLine(v0, v1, outPrimId[p], vp, rast, outScene);
-                        }
-                    } else { // triangle
-                        for (uint32_t p = 0; p < np; ++p) {
-                            if (outPrimCull[p] != 0) continue;
-                            uint32_t i0 = outPrimIndices[p * 3u + 0];
-                            uint32_t i1 = outPrimIndices[p * 3u + 1];
-                            uint32_t i2 = outPrimIndices[p * 3u + 2];
-                            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
-                            ShadedVertex v0 = makeMeshVertex(i0);
-                            ShadedVertex v1 = makeMeshVertex(i1);
-                            ShadedVertex v2 = makeMeshVertex(i2);
-                            applyPrimAttrs(v0, p);
-                            processTriangle(v0, v1, v2, outPrimId[p], rast, outScene, meshTarget, polyA, polyB);
-                        }
-                    }
+            MeshThreadGroupArgs msArgs{};
+            msArgs.rootCtx = &state.rootCtx;
+            msArgs.groupSharedScratch = msScratch.data();
+            msArgs.payloadPtr = payloadArena.data() + md.payloadOffset;
+            msArgs.gx = gx;
+            msArgs.gy = gy;
+            msArgs.gz = gz;
+            msArgs.ngx = md.gx;
+            msArgs.ngy = md.gy;
+            msArgs.ngz = md.gz;
+            msArgs.outCounts = outCounts;
+            msArgs.outVertPosXYZW = outVertPosXYZW.data();
+            msArgs.outVertAttrs = outVertAttrs.data();
+            msArgs.outPrimIndices = outPrimIndices.data();
+            msArgs.outPrimAttrs = outPrimAttrs.data();
+            msArgs.outPrimCull = outPrimCull.data();
+            msArgs.outPrimId = outPrimId.data();
+            msFn(&msArgs);
+
+            const uint32_t nv = std::min<uint32_t>(outCounts[0], compiled->msMaxVertexCount);
+            const uint32_t np = std::min<uint32_t>(outCounts[1], compiled->msMaxPrimitiveCount);
+            if (nv == 0 || np == 0) continue;
+
+            if (compiled->msOutputTopology == 1) { // line
+                for (uint32_t p = 0; p < np; ++p) {
+                    if (outPrimCull[p] != 0) continue;
+                    uint32_t i0 = outPrimIndices[p * 3u + 0];
+                    uint32_t i1 = outPrimIndices[p * 3u + 1];
+                    if (i0 >= nv || i1 >= nv) continue;
+                    ShadedVertex v0 = makeMeshVertex(i0);
+                    ShadedVertex v1 = makeMeshVertex(i1);
+                    applyPrimAttrs(v0, p);
+                    processLine(v0, v1, outPrimId[p], vp, rast, outScene);
+                }
+            } else { // triangle
+                for (uint32_t p = 0; p < np; ++p) {
+                    if (outPrimCull[p] != 0) continue;
+                    uint32_t i0 = outPrimIndices[p * 3u + 0];
+                    uint32_t i1 = outPrimIndices[p * 3u + 1];
+                    uint32_t i2 = outPrimIndices[p * 3u + 2];
+                    if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+                    ShadedVertex v0 = makeMeshVertex(i0);
+                    ShadedVertex v1 = makeMeshVertex(i1);
+                    ShadedVertex v2 = makeMeshVertex(i2);
+                    applyPrimAttrs(v0, p);
+                    processTriangle(v0, v1, v2, outPrimId[p], rast, outScene, target, polyA, polyB);
                 }
             }
         }
+    };
+
+    if (compiled->msOutputTopology == 1 || totalMSGroups64 <= 1 || pool.get_thread_count() <= 1) {
+        TriangleEmitTarget meshTarget;
+        meshTarget.triangles = &outScene.triangles;
+        meshTarget.attrBaseArena = &outScene.attrBaseArena;
+        meshTarget.attrFlatArena = &outScene.attrFlatArena;
+        meshTarget.origBaryArena = &outScene.origBaryArena;
+        executeMeshGroupRange(0, totalMSGroups64, meshTarget, tlMesh);
+        return !outScene.triangles.empty();
     }
 
-    return !outScene.triangles.empty();
+    const uint32_t numWorkers = static_cast<uint32_t>(std::max<size_t>(1, pool.get_thread_count()));
+    const uint64_t targetChunks = std::min<uint64_t>(totalMSGroups64, static_cast<uint64_t>(numWorkers) * 4u);
+    const uint64_t groupsPerChunk = std::max<uint64_t>(1u, (totalMSGroups64 + targetChunks - 1u) / targetChunks);
+    const uint32_t numChunks = static_cast<uint32_t>((totalMSGroups64 + groupsPerChunk - 1u) / groupsPerChunk);
+    const size_t numTiles = static_cast<size_t>(outScene.numTilesX) * outScene.numTilesY;
+    const bool fuseBinning = (optOutBins != nullptr) && (numTiles > 0) &&
+                             (static_cast<uint64_t>(numChunks) * numTiles <= kMaxFusedBinMatrixEntries);
+
+    thread_local std::vector<ChunkOutput> tlMeshChunkOutputs;
+    auto& chunkOutputs = tlMeshChunkOutputs;
+    if (chunkOutputs.size() < numChunks) {
+        chunkOutputs.resize(numChunks);
+    }
+    for (uint32_t c = 0; c < numChunks; ++c) {
+        chunkOutputs[c].reset(numTiles, fuseBinning);
+    }
+
+    thread_local std::vector<MeshPipeScratch> tlWorkerScratches;
+    auto& workerScratches = tlWorkerScratches;
+    if (workerScratches.size() < numChunks) {
+        workerScratches.resize(numChunks);
+    }
+
+    parallelForDynamic(pool, numChunks, [&](uint32_t c) {
+        uint64_t start = static_cast<uint64_t>(c) * groupsPerChunk;
+        uint64_t end = std::min<uint64_t>(totalMSGroups64, start + groupsPerChunk);
+        ChunkOutput& co = chunkOutputs[c];
+        TriangleEmitTarget chunkTarget;
+        chunkTarget.triangles = &co.triangles;
+        chunkTarget.attrBaseArena = &co.attrBase;
+        chunkTarget.attrFlatArena = &co.attrFlat;
+        chunkTarget.origBaryArena = &co.origBary;
+        if (fuseBinning) {
+            chunkTarget.tileCounts = &co.tileCounts;
+            chunkTarget.binPairs = &co.binPairs;
+            chunkTarget.numTilesX = outScene.numTilesX;
+            chunkTarget.numTilesY = outScene.numTilesY;
+        }
+        executeMeshGroupRange(start, end, chunkTarget, workerScratches[c]);
+    });
+
+    return mergeChunkOutputsToScene(
+        pool, numChunks, chunkOutputs, fuseBinning, numTiles, outScene, optOutBins);
 }
 
 } // namespace nacelle
