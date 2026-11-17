@@ -943,11 +943,13 @@ private:
         if (!entryBlk) {
             mlir::Block* curBlk = b_.getInsertionBlock();
             mlir::Operation* parentOp = curBlk ? curBlk->getParentOp() : nullptr;
-            while (parentOp && !llvm::isa<mlir::func::FuncOp>(parentOp)) {
+            while (parentOp && !llvm::isa<mlir::func::FuncOp, mlir::LLVM::LLVMFuncOp>(parentOp)) {
                 parentOp = parentOp->getParentOp();
             }
             if (auto fnOp = llvm::dyn_cast_or_null<mlir::func::FuncOp>(parentOp)) {
                 entryBlk = &fnOp.getBody().front();
+            } else if (auto llvmFnOp = llvm::dyn_cast_or_null<mlir::LLVM::LLVMFuncOp>(parentOp)) {
+                entryBlk = &llvmFnOp.getBody().front();
             }
         }
         if (entryBlk) {
