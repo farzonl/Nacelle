@@ -3203,89 +3203,120 @@ bool synthesizeGraphicsPSOMLIR(
         mlir::Value oneI64 = h.cInt(h.i64Ty(), 1);
         mlir::Value batchCountI64 = mlir::LLVM::ZExtOp::create(b, loc, h.i64Ty(), batchCount32);
 
-        auto emitBatchLoop = [&](mlir::OpBuilder& fb, mlir::Location floc, bool uniformTri) {
-            IRHelpers fh{fb, floc, simdWidth};
-            mlir::Value z0Uniform, dz1Uniform, dz2Uniform;
-            if (uniformTri) {
-                mlir::Value triDepthPtr = fh.loadScalar(ptrTy, fh.gepBytes(argsPtr, offsetof(PixelBatchArgs, triDepth)));
-                z0Uniform = llvmSplat(fb, floc, f32Ty, fh.loadScalar(f32Ty, triDepthPtr), simdWidth);
-                dz1Uniform = llvmSplat(fb, floc, f32Ty, fh.loadScalar(f32Ty, fh.gepBytes(triDepthPtr, 4)), simdWidth);
-                dz2Uniform = llvmSplat(fb, floc, f32Ty, fh.loadScalar(f32Ty, fh.gepBytes(triDepthPtr, 8)), simdWidth);
+        auto createScfIfResults = [&](mlir::OpBuilder& ib, mlir::Location iloc, mlir::TypeRange types, mlir::Value cond,
+                                      llvm::function_ref<void(mlir::OpBuilder&, mlir::Location)> thenFn,
+                                      llvm::function_ref<void(mlir::OpBuilder&, mlir::Location)> elseFn) {
+            auto ifOp = mlir::scf::IfOp::create(ib, iloc, types, cond, /*withElseRegion=*/true);
+            {
+                mlir::OpBuilder::InsertionGuard g(ib);
+                ib.setInsertionPointToStart(&ifOp.getThenRegion().front());
+                thenFn(ib, iloc);
+                ib.setInsertionPointToStart(&ifOp.getElseRegion().front());
+                elseFn(ib, iloc);
             }
+            return ifOp;
+        };
 
-            mlir::scf::ForOp::create(
-                fb, floc, zeroI64, batchCountI64, oneI64, mlir::ValueRange{},
-                [&](mlir::OpBuilder& b, mlir::Location loc, mlir::Value batchIdxI64, mlir::ValueRange) {
-                    IRHelpers h{b, loc, simdWidth};
-                    mlir::Value covByteOff = mlir::LLVM::MulOp::create(b, loc, batchIdxI64, h.cInt(h.i64Ty(), 4));
-                    mlir::Value covMask32 = h.loadScalar(i32Ty, h.gepBytesDyn(covMasksPtr, covByteOff));
+        mlir::scf::ForOp::create(
+            b, loc, zeroI64, batchCountI64, oneI64, mlir::ValueRange{},
+            [&](mlir::OpBuilder& b, mlir::Location loc, mlir::Value batchIdxI64, mlir::ValueRange) {
+                IRHelpers h{b, loc, simdWidth};
+                mlir::Value covByteOff = mlir::LLVM::MulOp::create(b, loc, batchIdxI64, h.cInt(h.i64Ty(), 4));
+                mlir::Value covMask32 = h.loadScalar(i32Ty, h.gepBytesDyn(covMasksPtr, covByteOff));
 
-                    mlir::Value covVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), covMask32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
-                    mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, covVec, h.laneIota());
-                    mlir::Value bitOne = mlir::LLVM::AndOp::create(b, loc, shifted, h.splatInt(i32Ty, 1));
-                    mlir::Value initRealMask = mlir::LLVM::ICmpOp::create(
-                        b, loc, mlir::LLVM::ICmpPredicate::ne, bitOne, h.splatInt(i32Ty, 0));
+                mlir::Value covVec = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getElementType(), covMask32, llvm::cast<mlir::VectorType>(h.vecTy(i32Ty)).getNumElements());
+                mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, covVec, h.laneIota());
+                mlir::Value bitOne = mlir::LLVM::AndOp::create(b, loc, shifted, h.splatInt(i32Ty, 1));
+                mlir::Value initRealMask = mlir::LLVM::ICmpOp::create(
+                    b, loc, mlir::LLVM::ICmpPredicate::ne, bitOne, h.splatInt(i32Ty, 0));
 
-                    mlir::Value laneVecByteOff = mlir::LLVM::MulOp::create(
-                        b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(simdWidth * 4)));
-                    auto loadBatchVec = [&](mlir::Value basePtr) -> mlir::Value {
-                        return mlir::LLVM::LoadOp::create(
-                            b, loc, h.vecTy(f32Ty), h.gepBytesDyn(basePtr, laneVecByteOff), /*alignment=*/4);
-                    };
-                    mlir::Value pixelX = loadBatchVec(pixelXPtr);
-                    mlir::Value pixelY = loadBatchVec(pixelYPtr);
-                    mlir::Value baryI = loadBatchVec(baryIPtr);
-                    mlir::Value baryJ = loadBatchVec(baryJPtr);
+                mlir::Value laneVecByteOff = mlir::LLVM::MulOp::create(
+                    b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(simdWidth * 4)));
+                auto loadBatchVec = [&](mlir::Value basePtr) -> mlir::Value {
+                    return mlir::LLVM::LoadOp::create(
+                        b, loc, h.vecTy(f32Ty), h.gepBytesDyn(basePtr, laneVecByteOff), /*alignment=*/4);
+                };
+                mlir::Value pixelX = loadBatchVec(pixelXPtr);
+                mlir::Value pixelY = loadBatchVec(pixelYPtr);
+                mlir::Value baryI = loadBatchVec(baryIPtr);
+                mlir::Value baryJ = loadBatchVec(baryJPtr);
 
-                    mlir::Value quadOffBatchByteOff = mlir::LLVM::MulOp::create(
-                        b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(numQuads * 4)));
-                    mlir::Value quadOffBatchPtr = h.gepBytesDyn(quadOffPtr, quadOffBatchByteOff);
-                    llvm::SmallVector<mlir::Value, 4> quadOffsets(numQuads);
+                mlir::Value quadOffBatchByteOff = mlir::LLVM::MulOp::create(
+                    b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(numQuads * 4)));
+                mlir::Value quadOffBatchPtr = h.gepBytesDyn(quadOffPtr, quadOffBatchByteOff);
+                llvm::SmallVector<mlir::Value, 4> quadOffsets(numQuads);
+                for (uint32_t q = 0; q < numQuads; ++q) {
+                    quadOffsets[q] = h.loadScalar(i32Ty, h.gepBytes(quadOffBatchPtr, static_cast<int64_t>(q * 4)));
+                }
+
+                auto loadQTriPtrs = [&](mlir::OpBuilder& qb, mlir::Location qloc) -> llvm::SmallVector<mlir::Value, 4> {
+                    IRHelpers qh{qb, qloc, simdWidth};
+                    mlir::Value qtBatchByteOff = mlir::LLVM::MulOp::create(
+                        qb, qloc, batchIdxI64, qh.cInt(qh.i64Ty(), static_cast<int64_t>(numQuads * 4)));
+                    mlir::Value qtBatchPtr = qh.gepBytesDyn(quadTriIdxPtr, qtBatchByteOff);
+                    llvm::SmallVector<mlir::Value, 4> ptrs(numQuads);
                     for (uint32_t q = 0; q < numQuads; ++q) {
-                        quadOffsets[q] = h.loadScalar(i32Ty, h.gepBytes(quadOffBatchPtr, static_cast<int64_t>(q * 4)));
+                        mlir::Value tIdx = qh.loadScalar(i32Ty, qh.gepBytes(qtBatchPtr, static_cast<int64_t>(q * 4)));
+                        mlir::Value tByteOff = mlir::LLVM::MulOp::create(
+                            qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), tIdx),
+                            qh.cInt(qh.i64Ty(), static_cast<int64_t>(sizeof(PixelTriData))));
+                        ptrs[q] = qh.gepBytesDyn(triDataPtr, tByteOff);
                     }
+                    return ptrs;
+                };
 
-                    llvm::SmallVector<mlir::Value, 4> qTriPtrs;
-                    mlir::Value z0 = z0Uniform;
-                    mlir::Value dz1 = dz1Uniform;
-                    mlir::Value dz2 = dz2Uniform;
-                    if (!uniformTri) {
-                        mlir::Value qtBatchByteOff = mlir::LLVM::MulOp::create(
-                            b, loc, batchIdxI64, h.cInt(h.i64Ty(), static_cast<int64_t>(numQuads * 4)));
-                        mlir::Value qtBatchPtr = h.gepBytesDyn(quadTriIdxPtr, qtBatchByteOff);
-                        qTriPtrs.resize(numQuads);
+                auto zIf = createScfIfResults(
+                    b, loc, mlir::TypeRange{h.vecTy(f32Ty), h.vecTy(f32Ty), h.vecTy(f32Ty)}, isUniformTri,
+                    [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                        IRHelpers th{tb, tloc, simdWidth};
+                        mlir::Value triDepthPtr = th.loadScalar(ptrTy, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triDepth)));
+                        mlir::Value z0U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, triDepthPtr), simdWidth);
+                        mlir::Value dz1U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triDepthPtr, 4)), simdWidth);
+                        mlir::Value dz2U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triDepthPtr, 8)), simdWidth);
+                        mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{z0U, dz1U, dz2U});
+                    },
+                    [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                        IRHelpers eh{eb, eloc, simdWidth};
+                        auto ptrs = loadQTriPtrs(eb, eloc);
                         llvm::SmallVector<mlir::Value, 4> z0s(numQuads), dz1s(numQuads), dz2s(numQuads);
                         for (uint32_t q = 0; q < numQuads; ++q) {
-                            mlir::Value tIdx = h.loadScalar(i32Ty, h.gepBytes(qtBatchPtr, static_cast<int64_t>(q * 4)));
-                            mlir::Value tByteOff = mlir::LLVM::MulOp::create(
-                                b, loc, mlir::LLVM::ZExtOp::create(b, loc, h.i64Ty(), tIdx),
-                                h.cInt(h.i64Ty(), static_cast<int64_t>(sizeof(PixelTriData))));
-                            qTriPtrs[q] = h.gepBytesDyn(triDataPtr, tByteOff);
-                            mlir::Value tdPtr = h.loadScalar(ptrTy, h.gepBytes(qTriPtrs[q], offsetof(PixelTriData, triDepth)));
-                            z0s[q] = h.loadScalar(f32Ty, tdPtr);
-                            dz1s[q] = h.loadScalar(f32Ty, h.gepBytes(tdPtr, 4));
-                            dz2s[q] = h.loadScalar(f32Ty, h.gepBytes(tdPtr, 8));
+                            mlir::Value tdPtr = eh.loadScalar(ptrTy, eh.gepBytes(ptrs[q], offsetof(PixelTriData, triDepth)));
+                            z0s[q] = eh.loadScalar(f32Ty, tdPtr);
+                            dz1s[q] = eh.loadScalar(f32Ty, eh.gepBytes(tdPtr, 4));
+                            dz2s[q] = eh.loadScalar(f32Ty, eh.gepBytes(tdPtr, 8));
                         }
-                        z0 = broadcastQuadScalars(b, loc, f32Ty, z0s);
-                        dz1 = broadcastQuadScalars(b, loc, f32Ty, dz1s);
-                        dz2 = broadcastQuadScalars(b, loc, f32Ty, dz2s);
-                    }
+                        mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{
+                            broadcastQuadScalars(eb, eloc, f32Ty, z0s),
+                            broadcastQuadScalars(eb, eloc, f32Ty, dz1s),
+                            broadcastQuadScalars(eb, eloc, f32Ty, dz2s)});
+                    });
+                mlir::Value z0 = zIf.getResult(0);
+                mlir::Value dz1 = zIf.getResult(1);
+                mlir::Value dz2 = zIf.getResult(2);
 
-                    auto getIsFrontBoolVec = [&](mlir::OpBuilder& gb, mlir::Location gloc) -> mlir::Value {
-                        IRHelpers gh{gb, gloc, simdWidth};
-                        if (uniformTri) {
+                auto getIsFrontBoolVec = [&](mlir::OpBuilder& gb, mlir::Location gloc) -> mlir::Value {
+                    IRHelpers gh{gb, gloc, simdWidth};
+                    auto ffIf = createScfIfResults(
+                        gb, gloc, mlir::TypeRange{gh.vecTy(gh.i1Ty())}, isUniformTri,
+                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                            IRHelpers th{tb, tloc, simdWidth};
                             mlir::Value isFrontBool = mlir::LLVM::ICmpOp::create(
-                                gb, gloc, mlir::LLVM::ICmpPredicate::ne, isFront32, gh.cInt(i32Ty, 0));
-                            return llvmSplat(gb, gloc, gh.i1Ty(), isFrontBool, simdWidth);
-                        }
-                        llvm::SmallVector<mlir::Value, 4> ffs(numQuads);
-                        for (uint32_t q = 0; q < numQuads; ++q) {
-                            mlir::Value ff32 = gh.loadScalar(i32Ty, gh.gepBytes(qTriPtrs[q], offsetof(PixelTriData, isFrontFace)));
-                            ffs[q] = mlir::LLVM::ICmpOp::create(
-                                gb, gloc, mlir::LLVM::ICmpPredicate::ne, ff32, gh.cInt(i32Ty, 0));
-                        }
-                        return broadcastQuadScalars(gb, gloc, gh.i1Ty(), ffs);
-                    };
+                                tb, tloc, mlir::LLVM::ICmpPredicate::ne, isFront32, th.cInt(i32Ty, 0));
+                            mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{llvmSplat(tb, tloc, th.i1Ty(), isFrontBool, simdWidth)});
+                        },
+                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                            IRHelpers eh{eb, eloc, simdWidth};
+                            auto ptrs = loadQTriPtrs(eb, eloc);
+                            llvm::SmallVector<mlir::Value, 4> ffs(numQuads);
+                            for (uint32_t q = 0; q < numQuads; ++q) {
+                                mlir::Value ff32 = eh.loadScalar(i32Ty, eh.gepBytes(ptrs[q], offsetof(PixelTriData, isFrontFace)));
+                                ffs[q] = mlir::LLVM::ICmpOp::create(
+                                    eb, eloc, mlir::LLVM::ICmpPredicate::ne, ff32, eh.cInt(i32Ty, 0));
+                            }
+                            mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{broadcastQuadScalars(eb, eloc, eh.i1Ty(), ffs)});
+                        });
+                    return ffIf.getResult(0);
+                };
 
                     mlir::Value interpZ = mlir::LLVM::FAddOp::create(
                     b, loc, z0,
@@ -3490,24 +3521,34 @@ bool synthesizeGraphicsPSOMLIR(
                     }
                 }
                 if (needInvW) {
-                    mlir::Value iw0, diw1, diw2;
-                    if (uniformTri) {
-                        mlir::Value triInvWPtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triInvW)));
-                        iw0 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, triInvWPtr), simdWidth);
-                        diw1 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 4)), simdWidth);
-                        diw2 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triInvWPtr, 8)), simdWidth);
-                    } else {
-                        llvm::SmallVector<mlir::Value, 4> iw0s(numQuads), diw1s(numQuads), diw2s(numQuads);
-                        for (uint32_t q = 0; q < numQuads; ++q) {
-                            mlir::Value p = ph.loadScalar(ptrTy, ph.gepBytes(qTriPtrs[q], offsetof(PixelTriData, triInvW)));
-                            iw0s[q] = ph.loadScalar(f32Ty, p);
-                            diw1s[q] = ph.loadScalar(f32Ty, ph.gepBytes(p, 4));
-                            diw2s[q] = ph.loadScalar(f32Ty, ph.gepBytes(p, 8));
-                        }
-                        iw0 = broadcastQuadScalars(pb, ploc, f32Ty, iw0s);
-                        diw1 = broadcastQuadScalars(pb, ploc, f32Ty, diw1s);
-                        diw2 = broadcastQuadScalars(pb, ploc, f32Ty, diw2s);
-                    }
+                    auto iwIf = createScfIfResults(
+                        pb, ploc, mlir::TypeRange{ph.vecTy(f32Ty), ph.vecTy(f32Ty), ph.vecTy(f32Ty)}, isUniformTri,
+                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                            IRHelpers th{tb, tloc, simdWidth};
+                            mlir::Value triInvWPtr = th.loadScalar(ptrTy, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triInvW)));
+                            mlir::Value iw0U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, triInvWPtr), simdWidth);
+                            mlir::Value diw1U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triInvWPtr, 4)), simdWidth);
+                            mlir::Value diw2U = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triInvWPtr, 8)), simdWidth);
+                            mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{iw0U, diw1U, diw2U});
+                        },
+                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                            IRHelpers eh{eb, eloc, simdWidth};
+                            auto ptrs = loadQTriPtrs(eb, eloc);
+                            llvm::SmallVector<mlir::Value, 4> iw0s(numQuads), diw1s(numQuads), diw2s(numQuads);
+                            for (uint32_t q = 0; q < numQuads; ++q) {
+                                mlir::Value p = eh.loadScalar(ptrTy, eh.gepBytes(ptrs[q], offsetof(PixelTriData, triInvW)));
+                                iw0s[q] = eh.loadScalar(f32Ty, p);
+                                diw1s[q] = eh.loadScalar(f32Ty, eh.gepBytes(p, 4));
+                                diw2s[q] = eh.loadScalar(f32Ty, eh.gepBytes(p, 8));
+                            }
+                            mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{
+                                broadcastQuadScalars(eb, eloc, f32Ty, iw0s),
+                                broadcastQuadScalars(eb, eloc, f32Ty, diw1s),
+                                broadcastQuadScalars(eb, eloc, f32Ty, diw2s)});
+                        });
+                    mlir::Value iw0 = iwIf.getResult(0);
+                    mlir::Value diw1 = iwIf.getResult(1);
+                    mlir::Value diw2 = iwIf.getResult(2);
                     invWVec = mlir::LLVM::FAddOp::create(
                         pb, ploc, iw0,
                         mlir::LLVM::FAddOp::create(
@@ -3542,71 +3583,87 @@ bool synthesizeGraphicsPSOMLIR(
 
                 std::array<mlir::Value, 128> interpScalars{};
                 if (!activeSlots.empty()) {
-                    if (uniformTri) {
-                        mlir::Value triAttrBasePtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrBase)));
-                        mlir::Value triAttrFlatPtr = ph.loadScalar(ptrTy, ph.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrFlat)));
-                        for (const auto& as : activeSlots) {
-                            if (as.isFlat) {
-                                mlir::Value fv = ph.loadScalar(f32Ty, ph.gepBytes(triAttrFlatPtr, static_cast<int64_t>(as.slot * 4)));
-                                interpScalars[as.slot] = llvmSplat(pb, ploc, f32Ty, fv, simdWidth);
-                            } else {
-                                int64_t baseOff = static_cast<int64_t>(as.slot * 3 * 4);
-                                mlir::Value a0 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff)), simdWidth);
-                                mlir::Value da1 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 4)), simdWidth);
-                                mlir::Value da2 = llvmSplat(pb, ploc, f32Ty, ph.loadScalar(f32Ty, ph.gepBytes(triAttrBasePtr, baseOff + 8)), simdWidth);
-                                mlir::Value lin = mlir::LLVM::FAddOp::create(
-                                    pb, ploc, a0,
-                                    mlir::LLVM::FAddOp::create(
-                                        pb, ploc, mlir::LLVM::FMulOp::create(pb, ploc, baryI, da1),
-                                        mlir::LLVM::FMulOp::create(pb, ploc, baryJ, da2)));
-                                interpScalars[as.slot] = (as.interpMode == 4)
-                                                             ? lin
-                                                             : mlir::LLVM::FMulOp::create(pb, ploc, lin, wVec).getResult();
-                            }
-                        }
-                    } else {
-                        llvm::SmallVector<mlir::Value, 4> qBasePtrs(numQuads), qFlatPtrs(numQuads);
-                        bool anyFlat = false, anyInterp = false;
-                        for (const auto& as : activeSlots) {
-                            if (as.isFlat) anyFlat = true;
-                            else anyInterp = true;
-                        }
-                        for (uint32_t q = 0; q < numQuads; ++q) {
-                            if (anyInterp) {
-                                qBasePtrs[q] = ph.loadScalar(ptrTy, ph.gepBytes(qTriPtrs[q], offsetof(PixelTriData, triAttrBase)));
-                            }
-                            if (anyFlat) {
-                                qFlatPtrs[q] = ph.loadScalar(ptrTy, ph.gepBytes(qTriPtrs[q], offsetof(PixelTriData, triAttrFlat)));
-                            }
-                        }
-                        for (const auto& as : activeSlots) {
-                            if (as.isFlat) {
-                                llvm::SmallVector<mlir::Value, 4> fvs(numQuads);
-                                for (uint32_t q = 0; q < numQuads; ++q) {
-                                    fvs[q] = ph.loadScalar(f32Ty, ph.gepBytes(qFlatPtrs[q], static_cast<int64_t>(as.slot * 4)));
+                    llvm::SmallVector<mlir::Type, 32> slotTypes(activeSlots.size(), ph.vecTy(f32Ty));
+                    auto slotsIf = createScfIfResults(
+                        pb, ploc, slotTypes, isUniformTri,
+                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                            IRHelpers th{tb, tloc, simdWidth};
+                            mlir::Value triAttrBasePtr = th.loadScalar(ptrTy, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrBase)));
+                            mlir::Value triAttrFlatPtr = th.loadScalar(ptrTy, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triAttrFlat)));
+                            llvm::SmallVector<mlir::Value, 32> vals;
+                            vals.reserve(activeSlots.size());
+                            for (const auto& as : activeSlots) {
+                                if (as.isFlat) {
+                                    mlir::Value fv = th.loadScalar(f32Ty, th.gepBytes(triAttrFlatPtr, static_cast<int64_t>(as.slot * 4)));
+                                    vals.push_back(llvmSplat(tb, tloc, f32Ty, fv, simdWidth));
+                                } else {
+                                    int64_t baseOff = static_cast<int64_t>(as.slot * 3 * 4);
+                                    mlir::Value a0 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triAttrBasePtr, baseOff)), simdWidth);
+                                    mlir::Value da1 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triAttrBasePtr, baseOff + 4)), simdWidth);
+                                    mlir::Value da2 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triAttrBasePtr, baseOff + 8)), simdWidth);
+                                    mlir::Value lin = mlir::LLVM::FAddOp::create(
+                                        tb, tloc, a0,
+                                        mlir::LLVM::FAddOp::create(
+                                            tb, tloc, mlir::LLVM::FMulOp::create(tb, tloc, baryI, da1),
+                                            mlir::LLVM::FMulOp::create(tb, tloc, baryJ, da2)));
+                                    vals.push_back((as.interpMode == 4)
+                                                       ? lin
+                                                       : mlir::LLVM::FMulOp::create(tb, tloc, lin, wVec).getResult());
                                 }
-                                interpScalars[as.slot] = broadcastQuadScalars(pb, ploc, f32Ty, fvs);
-                            } else {
-                                int64_t baseOff = static_cast<int64_t>(as.slot * 3 * 4);
-                                llvm::SmallVector<mlir::Value, 4> a0s(numQuads), da1s(numQuads), da2s(numQuads);
-                                for (uint32_t q = 0; q < numQuads; ++q) {
-                                    a0s[q] = ph.loadScalar(f32Ty, ph.gepBytes(qBasePtrs[q], baseOff));
-                                    da1s[q] = ph.loadScalar(f32Ty, ph.gepBytes(qBasePtrs[q], baseOff + 4));
-                                    da2s[q] = ph.loadScalar(f32Ty, ph.gepBytes(qBasePtrs[q], baseOff + 8));
-                                }
-                                mlir::Value a0 = broadcastQuadScalars(pb, ploc, f32Ty, a0s);
-                                mlir::Value da1 = broadcastQuadScalars(pb, ploc, f32Ty, da1s);
-                                mlir::Value da2 = broadcastQuadScalars(pb, ploc, f32Ty, da2s);
-                                mlir::Value lin = mlir::LLVM::FAddOp::create(
-                                    pb, ploc, a0,
-                                    mlir::LLVM::FAddOp::create(
-                                        pb, ploc, mlir::LLVM::FMulOp::create(pb, ploc, baryI, da1),
-                                        mlir::LLVM::FMulOp::create(pb, ploc, baryJ, da2)));
-                                interpScalars[as.slot] = (as.interpMode == 4)
-                                                             ? lin
-                                                             : mlir::LLVM::FMulOp::create(pb, ploc, lin, wVec).getResult();
                             }
-                        }
+                            mlir::scf::YieldOp::create(tb, tloc, vals);
+                        },
+                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                            IRHelpers eh{eb, eloc, simdWidth};
+                            auto ptrs = loadQTriPtrs(eb, eloc);
+                            llvm::SmallVector<mlir::Value, 4> qBasePtrs(numQuads), qFlatPtrs(numQuads);
+                            bool anyFlat = false, anyInterp = false;
+                            for (const auto& as : activeSlots) {
+                                if (as.isFlat) anyFlat = true;
+                                else anyInterp = true;
+                            }
+                            for (uint32_t q = 0; q < numQuads; ++q) {
+                                if (anyInterp) {
+                                    qBasePtrs[q] = eh.loadScalar(ptrTy, eh.gepBytes(ptrs[q], offsetof(PixelTriData, triAttrBase)));
+                                }
+                                if (anyFlat) {
+                                    qFlatPtrs[q] = eh.loadScalar(ptrTy, eh.gepBytes(ptrs[q], offsetof(PixelTriData, triAttrFlat)));
+                                }
+                            }
+                            llvm::SmallVector<mlir::Value, 32> vals;
+                            vals.reserve(activeSlots.size());
+                            for (const auto& as : activeSlots) {
+                                if (as.isFlat) {
+                                    llvm::SmallVector<mlir::Value, 4> fvs(numQuads);
+                                    for (uint32_t q = 0; q < numQuads; ++q) {
+                                        fvs[q] = eh.loadScalar(f32Ty, eh.gepBytes(qFlatPtrs[q], static_cast<int64_t>(as.slot * 4)));
+                                    }
+                                    vals.push_back(broadcastQuadScalars(eb, eloc, f32Ty, fvs));
+                                } else {
+                                    int64_t baseOff = static_cast<int64_t>(as.slot * 3 * 4);
+                                    llvm::SmallVector<mlir::Value, 4> a0s(numQuads), da1s(numQuads), da2s(numQuads);
+                                    for (uint32_t q = 0; q < numQuads; ++q) {
+                                        a0s[q] = eh.loadScalar(f32Ty, eh.gepBytes(qBasePtrs[q], baseOff));
+                                        da1s[q] = eh.loadScalar(f32Ty, eh.gepBytes(qBasePtrs[q], baseOff + 4));
+                                        da2s[q] = eh.loadScalar(f32Ty, eh.gepBytes(qBasePtrs[q], baseOff + 8));
+                                    }
+                                    mlir::Value a0 = broadcastQuadScalars(eb, eloc, f32Ty, a0s);
+                                    mlir::Value da1 = broadcastQuadScalars(eb, eloc, f32Ty, da1s);
+                                    mlir::Value da2 = broadcastQuadScalars(eb, eloc, f32Ty, da2s);
+                                    mlir::Value lin = mlir::LLVM::FAddOp::create(
+                                        eb, eloc, a0,
+                                        mlir::LLVM::FAddOp::create(
+                                            eb, eloc, mlir::LLVM::FMulOp::create(eb, eloc, baryI, da1),
+                                            mlir::LLVM::FMulOp::create(eb, eloc, baryJ, da2)));
+                                    vals.push_back((as.interpMode == 4)
+                                                       ? lin
+                                                       : mlir::LLVM::FMulOp::create(eb, eloc, lin, wVec).getResult());
+                                }
+                            }
+                            mlir::scf::YieldOp::create(eb, eloc, vals);
+                        });
+                    for (size_t i = 0; i < activeSlots.size(); ++i) {
+                        interpScalars[activeSlots[i].slot] = slotsIf.getResult(static_cast<unsigned>(i));
                     }
                 }
 
@@ -3647,18 +3704,24 @@ bool synthesizeGraphicsPSOMLIR(
                         return true;
                     }
                     if (sig->systemValueType == 5) { // SV_ViewportArrayIndex
-                        mlir::Value v;
-                        if (uniformTri) {
-                            mlir::Value vp32 = lh.loadScalar(
-                                i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, viewportArrayIndex)));
-                            v = llvmSplat(lb, lloc, i32Ty, vp32, simdWidth);
-                        } else {
-                            llvm::SmallVector<mlir::Value, 4> vps(numQuads);
-                            for (uint32_t q = 0; q < numQuads; ++q) {
-                                vps[q] = lh.loadScalar(i32Ty, lh.gepBytes(qTriPtrs[q], offsetof(PixelTriData, viewportArrayIndex)));
-                            }
-                            v = broadcastQuadScalars(lb, lloc, i32Ty, vps);
-                        }
+                        auto vpIf = createScfIfResults(
+                            lb, lloc, mlir::TypeRange{lh.vecTy(i32Ty)}, isUniformTri,
+                            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                IRHelpers th{tb, tloc, simdWidth};
+                                mlir::Value vp32 = th.loadScalar(
+                                    i32Ty, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, viewportArrayIndex)));
+                                mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{llvmSplat(tb, tloc, i32Ty, vp32, simdWidth)});
+                            },
+                            [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                IRHelpers eh{eb, eloc, simdWidth};
+                                auto ptrs = loadQTriPtrs(eb, eloc);
+                                llvm::SmallVector<mlir::Value, 4> vps(numQuads);
+                                for (uint32_t q = 0; q < numQuads; ++q) {
+                                    vps[q] = eh.loadScalar(i32Ty, eh.gepBytes(ptrs[q], offsetof(PixelTriData, viewportArrayIndex)));
+                                }
+                                mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{broadcastQuadScalars(eb, eloc, i32Ty, vps)});
+                            });
+                        mlir::Value v = vpIf.getResult(0);
                         if (scalarTy != i32Ty) {
                             v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
                         }
@@ -3666,16 +3729,21 @@ bool synthesizeGraphicsPSOMLIR(
                         return true;
                     }
                     if (sig->systemValueType == 10) { // SV_PrimitiveID
-                        mlir::Value v;
-                        if (uniformTri) {
-                            v = llvmSplat(lb, lloc, i32Ty, primId32, simdWidth);
-                        } else {
-                            llvm::SmallVector<mlir::Value, 4> pids(numQuads);
-                            for (uint32_t q = 0; q < numQuads; ++q) {
-                                pids[q] = lh.loadScalar(i32Ty, lh.gepBytes(qTriPtrs[q], offsetof(PixelTriData, primitiveId)));
-                            }
-                            v = broadcastQuadScalars(lb, lloc, i32Ty, pids);
-                        }
+                        auto pidIf = createScfIfResults(
+                            lb, lloc, mlir::TypeRange{lh.vecTy(i32Ty)}, isUniformTri,
+                            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{llvmSplat(tb, tloc, i32Ty, primId32, simdWidth)});
+                            },
+                            [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                IRHelpers eh{eb, eloc, simdWidth};
+                                auto ptrs = loadQTriPtrs(eb, eloc);
+                                llvm::SmallVector<mlir::Value, 4> pids(numQuads);
+                                for (uint32_t q = 0; q < numQuads; ++q) {
+                                    pids[q] = eh.loadScalar(i32Ty, eh.gepBytes(ptrs[q], offsetof(PixelTriData, primitiveId)));
+                                }
+                                mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{broadcastQuadScalars(eb, eloc, i32Ty, pids)});
+                            });
+                        mlir::Value v = pidIf.getResult(0);
                         if (scalarTy != i32Ty) {
                             v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
                         }
@@ -3693,30 +3761,37 @@ bool synthesizeGraphicsPSOMLIR(
                             else if (col == 2) v = baryJ;
                         } else if (col < 3) { // perspective (linear) using original-primitive barycentrics
                             int64_t baseOff = static_cast<int64_t>(col * 3 * 4);
-                            mlir::Value a0, da1, da2;
-                            if (uniformTri) {
-                                mlir::Value triOrigBaryPtr = lh.loadScalar(
-                                    ptrTy, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, triOrigBary)));
-                                a0 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff)), simdWidth);
-                                da1 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 4)), simdWidth);
-                                da2 = llvmSplat(lb, lloc, f32Ty, lh.loadScalar(f32Ty, lh.gepBytes(triOrigBaryPtr, baseOff + 8)), simdWidth);
-                            } else {
-                                llvm::SmallVector<mlir::Value, 4> a0s(numQuads), da1s(numQuads), da2s(numQuads);
-                                for (uint32_t q = 0; q < numQuads; ++q) {
-                                    mlir::Value p = lh.loadScalar(ptrTy, lh.gepBytes(qTriPtrs[q], offsetof(PixelTriData, triOrigBary)));
-                                    a0s[q] = lh.loadScalar(f32Ty, lh.gepBytes(p, baseOff));
-                                    da1s[q] = lh.loadScalar(f32Ty, lh.gepBytes(p, baseOff + 4));
-                                    da2s[q] = lh.loadScalar(f32Ty, lh.gepBytes(p, baseOff + 8));
-                                }
-                                a0 = broadcastQuadScalars(lb, lloc, f32Ty, a0s);
-                                da1 = broadcastQuadScalars(lb, lloc, f32Ty, da1s);
-                                da2 = broadcastQuadScalars(lb, lloc, f32Ty, da2s);
-                            }
+                            auto obIf = createScfIfResults(
+                                lb, lloc, mlir::TypeRange{lh.vecTy(f32Ty), lh.vecTy(f32Ty), lh.vecTy(f32Ty)}, isUniformTri,
+                                [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                    IRHelpers th{tb, tloc, simdWidth};
+                                    mlir::Value triOrigBaryPtr = th.loadScalar(
+                                        ptrTy, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triOrigBary)));
+                                    mlir::Value a0 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triOrigBaryPtr, baseOff)), simdWidth);
+                                    mlir::Value da1 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triOrigBaryPtr, baseOff + 4)), simdWidth);
+                                    mlir::Value da2 = llvmSplat(tb, tloc, f32Ty, th.loadScalar(f32Ty, th.gepBytes(triOrigBaryPtr, baseOff + 8)), simdWidth);
+                                    mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{a0, da1, da2});
+                                },
+                                [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                    IRHelpers eh{eb, eloc, simdWidth};
+                                    auto ptrs = loadQTriPtrs(eb, eloc);
+                                    llvm::SmallVector<mlir::Value, 4> a0s(numQuads), da1s(numQuads), da2s(numQuads);
+                                    for (uint32_t q = 0; q < numQuads; ++q) {
+                                        mlir::Value p = eh.loadScalar(ptrTy, eh.gepBytes(ptrs[q], offsetof(PixelTriData, triOrigBary)));
+                                        a0s[q] = eh.loadScalar(f32Ty, eh.gepBytes(p, baseOff));
+                                        da1s[q] = eh.loadScalar(f32Ty, eh.gepBytes(p, baseOff + 4));
+                                        da2s[q] = eh.loadScalar(f32Ty, eh.gepBytes(p, baseOff + 8));
+                                    }
+                                    mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{
+                                        broadcastQuadScalars(eb, eloc, f32Ty, a0s),
+                                        broadcastQuadScalars(eb, eloc, f32Ty, da1s),
+                                        broadcastQuadScalars(eb, eloc, f32Ty, da2s)});
+                                });
                             mlir::Value lin = mlir::LLVM::FAddOp::create(
-                                lb, lloc, a0,
+                                lb, lloc, obIf.getResult(0),
                                 mlir::LLVM::FAddOp::create(
-                                    lb, lloc, mlir::LLVM::FMulOp::create(lb, lloc, baryI, da1),
-                                    mlir::LLVM::FMulOp::create(lb, lloc, baryJ, da2)));
+                                    lb, lloc, mlir::LLVM::FMulOp::create(lb, lloc, baryI, obIf.getResult(1)),
+                                    mlir::LLVM::FMulOp::create(lb, lloc, baryJ, obIf.getResult(2))));
                             v = mlir::LLVM::FMulOp::create(lb, lloc, lin, wVec);
                         }
                         if (scalarTy != f32Ty) {
@@ -3726,18 +3801,24 @@ bool synthesizeGraphicsPSOMLIR(
                         return true;
                     }
                     if (sig->systemValueType == 29) { // SV_ShadingRate
-                        mlir::Value v;
-                        if (uniformTri) {
-                            mlir::Value sr32 = lh.loadScalar(
-                                i32Ty, lh.gepBytes(argsPtr, offsetof(PixelBatchArgs, shadingRate)));
-                            v = llvmSplat(lb, lloc, i32Ty, sr32, simdWidth);
-                        } else {
-                            llvm::SmallVector<mlir::Value, 4> srs(numQuads);
-                            for (uint32_t q = 0; q < numQuads; ++q) {
-                                srs[q] = lh.loadScalar(i32Ty, lh.gepBytes(qTriPtrs[q], offsetof(PixelTriData, shadingRate)));
-                            }
-                            v = broadcastQuadScalars(lb, lloc, i32Ty, srs);
-                        }
+                        auto srIf = createScfIfResults(
+                            lb, lloc, mlir::TypeRange{lh.vecTy(i32Ty)}, isUniformTri,
+                            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                IRHelpers th{tb, tloc, simdWidth};
+                                mlir::Value sr32 = th.loadScalar(
+                                    i32Ty, th.gepBytes(argsPtr, offsetof(PixelBatchArgs, shadingRate)));
+                                mlir::scf::YieldOp::create(tb, tloc, mlir::ValueRange{llvmSplat(tb, tloc, i32Ty, sr32, simdWidth)});
+                            },
+                            [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                IRHelpers eh{eb, eloc, simdWidth};
+                                auto ptrs = loadQTriPtrs(eb, eloc);
+                                llvm::SmallVector<mlir::Value, 4> srs(numQuads);
+                                for (uint32_t q = 0; q < numQuads; ++q) {
+                                    srs[q] = eh.loadScalar(i32Ty, eh.gepBytes(ptrs[q], offsetof(PixelTriData, shadingRate)));
+                                }
+                                mlir::scf::YieldOp::create(eb, eloc, mlir::ValueRange{broadcastQuadScalars(eb, eloc, i32Ty, srs)});
+                            });
+                        mlir::Value v = srIf.getResult(0);
                         if (scalarTy != i32Ty) {
                             v = mlir::LLVM::TruncOp::create(lb, lloc, lh.vecTy(scalarTy), v);
                         }
@@ -3979,21 +4060,9 @@ bool synthesizeGraphicsPSOMLIR(
                 emitPSBodyAndOM(b, loc, realMaskAfterEarly);
                 if (!outError.empty()) { batchEmitOk = false; }
             }
-                    }
-                    mlir::scf::YieldOp::create(b, loc);
-                });
-        };
-
-        mlir::scf::IfOp::create(
-            b, loc, isUniformTri,
-            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
-                emitBatchLoop(tb, tloc, /*uniformTri=*/true);
-                mlir::scf::YieldOp::create(tb, tloc);
-            },
-            [&](mlir::OpBuilder& eb, mlir::Location eloc) {
-                emitBatchLoop(eb, eloc, /*uniformTri=*/false);
-                mlir::scf::YieldOp::create(eb, eloc);
-            });
+        }
+        mlir::scf::YieldOp::create(b, loc);
+    });
         if (!batchEmitOk) return false;
 
         mlir::func::ReturnOp::create(b, loc);

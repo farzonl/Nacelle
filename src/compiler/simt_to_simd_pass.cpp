@@ -6517,42 +6517,77 @@ private:
              f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),
              f32Ty(), f32Ty(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), f32Ty(), ptrTy()});
         mlir::Value out4 = createEntryAlloca(loc, mlir::LLVM::LLVMArrayType::get(f32Ty(), 4), 1, 16);
-        llvm::SmallVector<mlir::Value, 4> rgba(4, splatFlt(loc, f32Ty(), 0.0));
-        mlir::Value statusVec = splatInt(loc, i32Ty(), 1);
-        for (uint32_t l = 0; l < W_; ++l) {
-            if (isLaneMaskConstFalse(execMask, l)) continue;
-            mlir::Value mL = llvmExtract(b_, loc, execMask, static_cast<uint32_t>(static_cast<int64_t>(l)));
-            mlir::Value tp = laneValue(loc, texH, l);
-            mlir::Value sp = laneValue(loc, sampH, l);
-            auto stIf = mlir::scf::IfOp::create(
-                b_, loc, mL,
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    auto ex = [&](mlir::Value vv) { return llvmExtract(nb, nloc, vv, static_cast<uint32_t>(static_cast<int64_t>(l))); };
-                    auto c = mlir::LLVM::CallOp::create(
-                        nb, nloc, fn,
-                        mlir::ValueRange{
-                            tp, sp, ex(u), ex(v), ex(w), ex(c3),
-                            ex(ddxU), ex(ddxV), ex(ddxW), ex(ddyU), ex(ddyV), ex(ddyW),
-                            ex(bias), ex(expLod),
-                            mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), lodMode)),
-                            ex(offX), ex(offY), ex(offZ), ex(clampLod), out4});
-                    mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{c.getResult()});
-                },
-                [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                    mlir::scf::YieldOp::create(
-                        nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), 1))});
-                });
-            statusVec = llvmInsert(b_, loc, statusVec, stIf.getResult(0), static_cast<uint32_t>(static_cast<int64_t>(l)));
-            for (unsigned c = 0; c < 4; ++c) {
-                mlir::Value ep = gepByteOffset(loc, out4, c * 4);
-                rgba[c] = llvmInsert(b_, loc, rgba[c], loadScalar(loc, f32Ty(), ep), static_cast<uint32_t>(static_cast<int64_t>(l)));
+        auto packHandlePtrs = [&](const SimdVal& h) -> std::pair<mlir::Value, mlir::Value> {
+            if (h.lanes.size() == 1) {
+                return {laneValue(loc, h, 0), mlir::Value()};
             }
-        }
+            mlir::Value arr = createEntryAlloca(loc, ptrTy(), W_, 8);
+            for (uint32_t l = 0; l < W_; ++l) {
+                mlir::Value ep = gepByteOffset(loc, arr, static_cast<int64_t>(l * 8));
+                mlir::LLVM::StoreOp::create(b_, loc, laneValue(loc, h, l), ep);
+            }
+            return {mlir::Value(), arr};
+        };
+        auto [texUniform, texArr] = packHandlePtrs(texH);
+        auto [sampUniform, sampArr] = packHandlePtrs(sampH);
+
+        mlir::Value c0 = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(0));
+        mlir::Value c1 = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(1));
+        mlir::Value cW = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getI32IntegerAttr(W_));
+        mlir::Value zeroF = splatFlt(loc, f32Ty(), 0.0);
+        llvm::SmallVector<mlir::Value, 5> initVals = {zeroF, zeroF, zeroF, zeroF, splatInt(loc, i32Ty(), 1)};
+        auto loop = mlir::scf::ForOp::create(
+            b_, loc, c0, cW, c1, initVals,
+            [&](mlir::OpBuilder& lb, mlir::Location lloc, mlir::Value lIdx, mlir::ValueRange iterArgs) {
+                mlir::Value mL = mlir::LLVM::ExtractElementOp::create(lb, lloc, execMask, lIdx);
+                mlir::Value tp = texUniform
+                                     ? texUniform
+                                     : mlir::LLVM::LoadOp::create(
+                                           lb, lloc, ptrTy(),
+                                           mlir::LLVM::GEPOp::create(lb, lloc, ptrTy(), ptrTy(), texArr, mlir::ValueRange{lIdx}))
+                                           .getResult();
+                mlir::Value sp = sampUniform
+                                     ? sampUniform
+                                     : mlir::LLVM::LoadOp::create(
+                                           lb, lloc, ptrTy(),
+                                           mlir::LLVM::GEPOp::create(lb, lloc, ptrTy(), ptrTy(), sampArr, mlir::ValueRange{lIdx}))
+                                           .getResult();
+                auto stIf = mlir::scf::IfOp::create(
+                    lb, lloc, mL,
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        auto ex = [&](mlir::Value vv) {
+                            return mlir::LLVM::ExtractElementOp::create(nb, nloc, vv, lIdx).getResult();
+                        };
+                        auto c = mlir::LLVM::CallOp::create(
+                            nb, nloc, fn,
+                            mlir::ValueRange{
+                                tp, sp, ex(u), ex(v), ex(w), ex(c3),
+                                ex(ddxU), ex(ddxV), ex(ddxW), ex(ddyU), ex(ddyV), ex(ddyW),
+                                ex(bias), ex(expLod),
+                                mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), lodMode)),
+                                ex(offX), ex(offY), ex(offZ), ex(clampLod), out4});
+                        llvm::SmallVector<mlir::Value, 5> nextArgs;
+                        nextArgs.reserve(5);
+                        for (unsigned ch = 0; ch < 4; ++ch) {
+                            mlir::Value ep = mlir::LLVM::GEPOp::create(
+                                nb, nloc, ptrTy(), i8Ty(), out4,
+                                mlir::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(ch * 4)});
+                            mlir::Value val = mlir::LLVM::LoadOp::create(nb, nloc, f32Ty(), ep);
+                            nextArgs.push_back(mlir::LLVM::InsertElementOp::create(nb, nloc, iterArgs[ch], val, lIdx));
+                        }
+                        nextArgs.push_back(mlir::LLVM::InsertElementOp::create(nb, nloc, iterArgs[4], c.getResult(), lIdx));
+                        mlir::scf::YieldOp::create(nb, nloc, nextArgs);
+                    },
+                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
+                        mlir::scf::YieldOp::create(nb, nloc, iterArgs);
+                    });
+                mlir::scf::YieldOp::create(lb, lloc, stIf.getResults());
+            });
         SimdVal st;
         st.kind = SimdVal::Kind::Struct;
         st.origType = call.getResult().getType();
-        for (unsigned c = 0; c < 4; ++c) st.fields.push_back({SimdVal::Kind::Vector, f32Ty(), rgba[c], {}, {}});
-        st.fields.push_back({SimdVal::Kind::Vector, i32Ty(), statusVec, {}, {}});
+        for (unsigned c = 0; c < 4; ++c) st.fields.push_back({SimdVal::Kind::Vector, f32Ty(), loop.getResult(c), {}, {}});
+        st.fields.push_back({SimdVal::Kind::Vector, i32Ty(), loop.getResult(4), {}, {}});
         setMapped(call.getResult(), st);
         return true;
     }
