@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
                 MemorySnapshot memBefore = queryProcessMemory();
                 auto mr = runMetalGraphicsBench(
                     spec.id, categoryName(spec.category), vsDxil, psDxil, args.width, args.height, args.iters,
-                    hsDxil, dsDxil, gsDxil);
+                    hsDxil, dsDxil, gsDxil, spec.hasTexture);
                 MemorySnapshot memAfter = queryProcessMemory();
                 recordMetal(mr, memBefore, memAfter);
             }

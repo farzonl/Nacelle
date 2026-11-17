@@ -41,6 +41,7 @@ using VkDescriptorSet = uint64_t;
 using VkFence = uint64_t;
 using VkImage = uint64_t;
 using VkImageView = uint64_t;
+using VkSampler = uint64_t;
 using VkRenderPass = uint64_t;
 using VkFramebuffer = uint64_t;
 using VkAccelerationStructureKHR = uint64_t;
@@ -62,6 +63,7 @@ constexpr uint32_t VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16;
 constexpr uint32_t VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO = 29;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO = 18;
 constexpr uint32_t VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30;
+constexpr uint32_t VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31;
 constexpr uint32_t VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO = 32;
 constexpr uint32_t VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO = 33;
 constexpr uint32_t VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO = 34;
@@ -87,6 +89,7 @@ constexpr uint32_t VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO = 43;
 
 constexpr VkFlags VK_QUEUE_GRAPHICS_BIT = 0x00000001;
 constexpr VkFlags VK_QUEUE_COMPUTE_BIT = 0x00000002;
+constexpr VkFlags VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001;
 constexpr VkFlags VK_BUFFER_USAGE_TRANSFER_DST_BIT = 0x00000002;
 constexpr VkFlags VK_BUFFER_USAGE_INDEX_BUFFER_BIT = 0x00000040;
 constexpr VkFlags VK_BUFFER_USAGE_VERTEX_BUFFER_BIT = 0x00000080;
@@ -113,13 +116,17 @@ constexpr uint32_t VK_FORMAT_D32_SFLOAT = 126;
 constexpr uint32_t VK_IMAGE_TYPE_2D = 1;
 constexpr uint32_t VK_IMAGE_TILING_OPTIMAL = 0;
 constexpr uint32_t VK_IMAGE_USAGE_TRANSFER_SRC_BIT = 0x00000001;
+constexpr uint32_t VK_IMAGE_USAGE_TRANSFER_DST_BIT = 0x00000002;
+constexpr uint32_t VK_IMAGE_USAGE_SAMPLED_BIT = 0x00000004;
 constexpr uint32_t VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = 0x00000010;
 constexpr uint32_t VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x00000020;
 constexpr uint32_t VK_IMAGE_LAYOUT_UNDEFINED = 0;
 constexpr uint32_t VK_IMAGE_LAYOUT_GENERAL = 1;
 constexpr uint32_t VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2;
 constexpr uint32_t VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL = 3;
+constexpr uint32_t VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL = 5;
 constexpr uint32_t VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL = 6;
+constexpr uint32_t VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = 7;
 constexpr uint32_t VK_IMAGE_VIEW_TYPE_2D = 1;
 constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT = 0x00000001;
 constexpr uint32_t VK_IMAGE_ASPECT_DEPTH_BIT = 0x00000002;
@@ -141,8 +148,20 @@ constexpr uint32_t VK_ATTACHMENT_STORE_OP_STORE = 0;
 constexpr uint32_t VK_ATTACHMENT_LOAD_OP_DONT_CARE = 2;
 constexpr uint32_t VK_ATTACHMENT_STORE_OP_DONT_CARE = 1;
 constexpr uint32_t VK_SUBPASS_CONTENTS_INLINE = 0;
+constexpr uint32_t VK_DESCRIPTOR_TYPE_SAMPLER = 0;
+constexpr uint32_t VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE = 2;
 constexpr uint32_t VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6;
 constexpr uint32_t VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
+constexpr uint32_t VK_FILTER_LINEAR = 1;
+constexpr uint32_t VK_SAMPLER_MIPMAP_MODE_LINEAR = 1;
+constexpr uint32_t VK_SAMPLER_ADDRESS_MODE_REPEAT = 0;
+constexpr uint32_t VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK = 0;
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER = 45;
+constexpr uint32_t VK_QUEUE_FAMILY_IGNORED = ~0U;
+constexpr VkFlags VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT = 0x00000001;
+constexpr VkFlags VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT = 0x00000080;
+constexpr VkFlags VK_PIPELINE_STAGE_TRANSFER_BIT = 0x00001000;
+constexpr VkFlags VK_ACCESS_TRANSFER_WRITE_BIT = 0x00001000;
 constexpr uint32_t VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
 constexpr uint32_t VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 0x00000001;
 constexpr uint32_t VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 0x00000002;
@@ -416,6 +435,33 @@ struct VkDescriptorBufferInfo {
     VkDeviceSize range;
 };
 
+struct VkDescriptorImageInfo {
+    VkSampler sampler;
+    VkImageView imageView;
+    uint32_t imageLayout;
+};
+
+struct VkSamplerCreateInfo {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t magFilter;
+    uint32_t minFilter;
+    uint32_t mipmapMode;
+    uint32_t addressModeU;
+    uint32_t addressModeV;
+    uint32_t addressModeW;
+    float mipLodBias;
+    VkBool32 anisotropyEnable;
+    float maxAnisotropy;
+    VkBool32 compareEnable;
+    uint32_t compareOp;
+    float minLod;
+    float maxLod;
+    uint32_t borderColor;
+    VkBool32 unnormalizedCoordinates;
+};
+
 struct VkWriteDescriptorSet {
     uint32_t sType;
     const void* pNext;
@@ -424,7 +470,7 @@ struct VkWriteDescriptorSet {
     uint32_t dstArrayElement;
     uint32_t descriptorCount;
     uint32_t descriptorType;
-    const void* pImageInfo;
+    const VkDescriptorImageInfo* pImageInfo;
     const VkDescriptorBufferInfo* pBufferInfo;
     const void* pTexelBufferView;
 };
@@ -529,6 +575,19 @@ struct VkImageSubresourceRange {
     uint32_t levelCount;
     uint32_t baseArrayLayer;
     uint32_t layerCount;
+};
+
+struct VkImageMemoryBarrier {
+    uint32_t sType;
+    const void* pNext;
+    VkFlags srcAccessMask;
+    VkFlags dstAccessMask;
+    uint32_t oldLayout;
+    uint32_t newLayout;
+    uint32_t srcQueueFamilyIndex;
+    uint32_t dstQueueFamilyIndex;
+    VkImage image;
+    VkImageSubresourceRange subresourceRange;
 };
 
 struct VkComponentMapping {
@@ -1089,7 +1148,7 @@ struct Loader {
     void (VK_PTR* vkGetPhysicalDeviceFeatures2)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*) = nullptr;
     VkResult (VK_PTR* vkEnumerateDeviceExtensionProperties)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*) = nullptr;
     void* (VK_PTR* vkGetDeviceProcAddr)(VkDevice, const char*) = nullptr;
-    void (VK_PTR* vkCmdPipelineBarrier)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const void*, uint32_t, const void*) = nullptr;
+    void (VK_PTR* vkCmdPipelineBarrier)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const void*, uint32_t, const VkImageMemoryBarrier*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceQueueFamilyProperties)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*) = nullptr;
     void (VK_PTR* vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*) = nullptr;
     VkResult (VK_PTR* vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*) = nullptr;
@@ -1132,6 +1191,8 @@ struct Loader {
     VkResult (VK_PTR* vkBindImageMemory)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) = nullptr;
     VkResult (VK_PTR* vkCreateImageView)(VkDevice, const VkImageViewCreateInfo*, const void*, VkImageView*) = nullptr;
     void (VK_PTR* vkDestroyImageView)(VkDevice, VkImageView, const void*) = nullptr;
+    VkResult (VK_PTR* vkCreateSampler)(VkDevice, const VkSamplerCreateInfo*, const void*, VkSampler*) = nullptr;
+    void (VK_PTR* vkDestroySampler)(VkDevice, VkSampler, const void*) = nullptr;
     VkResult (VK_PTR* vkCreateRenderPass)(VkDevice, const VkRenderPassCreateInfo*, const void*, VkRenderPass*) = nullptr;
     void (VK_PTR* vkDestroyRenderPass)(VkDevice, VkRenderPass, const void*) = nullptr;
     VkResult (VK_PTR* vkCreateFramebuffer)(VkDevice, const VkFramebufferCreateInfo*, const void*, VkFramebuffer*) = nullptr;
@@ -1145,6 +1206,7 @@ struct Loader {
     void (VK_PTR* vkCmdBindIndexBuffer)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t) = nullptr;
     void (VK_PTR* vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
     void (VK_PTR* vkCmdDrawIndexed)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) = nullptr;
+    void (VK_PTR* vkCmdCopyBufferToImage)(VkCommandBuffer, VkBuffer, VkImage, uint32_t, uint32_t, const VkBufferImageCopy*) = nullptr;
     void (VK_PTR* vkCmdCopyImageToBuffer)(VkCommandBuffer, VkImage, uint32_t, VkBuffer, uint32_t, const VkBufferImageCopy*) = nullptr;
 
     ~Loader() {
@@ -1245,6 +1307,8 @@ struct Loader {
         loadSym(inst, vkBindImageMemory, "vkBindImageMemory");
         loadSym(inst, vkCreateImageView, "vkCreateImageView");
         loadSym(inst, vkDestroyImageView, "vkDestroyImageView");
+        loadSym(inst, vkCreateSampler, "vkCreateSampler");
+        loadSym(inst, vkDestroySampler, "vkDestroySampler");
         loadSym(inst, vkCreateRenderPass, "vkCreateRenderPass");
         loadSym(inst, vkDestroyRenderPass, "vkDestroyRenderPass");
         loadSym(inst, vkCreateFramebuffer, "vkCreateFramebuffer");
@@ -1258,6 +1322,7 @@ struct Loader {
         loadSym(inst, vkCmdBindIndexBuffer, "vkCmdBindIndexBuffer");
         loadSym(inst, vkCmdDraw, "vkCmdDraw");
         loadSym(inst, vkCmdDrawIndexed, "vkCmdDrawIndexed");
+        loadSym(inst, vkCmdCopyBufferToImage, "vkCmdCopyBufferToImage");
         loadSym(inst, vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
         return vkEnumeratePhysicalDevices && vkCreateDevice && vkCreateComputePipelines && vkCmdDispatch;
     }

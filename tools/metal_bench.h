@@ -39,7 +39,8 @@ MetalBenchResult runMetalGraphicsBench(
     uint32_t iters,
     const std::vector<uint8_t>& hsDxil = {},
     const std::vector<uint8_t>& dsDxil = {},
-    const std::vector<uint8_t>& gsDxil = {});
+    const std::vector<uint8_t>& gsDxil = {},
+    bool hasTexture = false);
 
 MetalBenchResult runMetalMeshBench(
     const std::string& benchId,
