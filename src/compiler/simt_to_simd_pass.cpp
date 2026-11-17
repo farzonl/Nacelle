@@ -914,7 +914,7 @@ private:
         if (byteOff == 0) return basePtr;
         return mlir::LLVM::GEPOp::create(
             b_, loc, ptrTy(), i8Ty(), basePtr,
-            llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+            llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(byteOff)});
     }
 
     mlir::Value gepDynByteOffset(mlir::Location loc, mlir::Value basePtr, mlir::Value byteOff) {
@@ -2958,7 +2958,7 @@ private:
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), fallback))});
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                       mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+                       mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(byteOff)});
                        auto val = mlir::LLVM::LoadOp::create(nb, nloc, i32Ty(), fp);
                        val.setInvariant(true);
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});
@@ -2975,7 +2975,7 @@ private:
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{mlir::LLVM::ConstantOp::create(nb, nloc, i64Ty(), nb.getIntegerAttr(i64Ty(), 0))});
                    },
                    [&](mlir::OpBuilder& nb, mlir::Location nloc) {
-                       mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{byteOff});
+                       mlir::Value fp = mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), descPtr, llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(byteOff)});
                        auto val = mlir::LLVM::LoadOp::create(nb, nloc, i64Ty(), fp);
                        val.setInvariant(true);
                        mlir::scf::YieldOp::create(nb, nloc, mlir::ValueRange{val});

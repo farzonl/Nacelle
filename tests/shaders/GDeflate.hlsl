@@ -905,7 +905,10 @@ void CSMain(uint tid : SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
 #endif
 
-    [allow_uav_condition] while (numStreamsLeft > 0)
+#ifndef __spirv__
+    [allow_uav_condition]
+#endif
+    while (numStreamsLeft > 0)
     {
         // Read the input and output positions of the
         // current stream and construct a TileStream to
@@ -916,7 +919,10 @@ void CSMain(uint tid : SV_GroupThreadID)
         const TileStream tileStream = TileStream::construct(streamInPos);
 
         // Grab a tile and decompress it until no tiles remain
-        [allow_uav_condition] while (true)
+#ifndef __spirv__
+        [allow_uav_condition]
+#endif
+        while (true)
         {
             uint tileIdx = ~0;
 

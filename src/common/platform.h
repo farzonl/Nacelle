@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #if !defined(_WIN32)
@@ -106,28 +107,44 @@ inline void alignedFreeZeroed(void* ptr, size_t size) {
     alignedFree(ptr);
 }
 
+inline std::optional<std::string> getEnv(const char* name) {
+    if (!name) return std::nullopt;
+#if defined(_WIN32)
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
+        return std::nullopt;
+    }
+    std::string result(buf);
+    std::free(buf);
+    return result;
+#else
+    const char* val = std::getenv(name);
+    if (!val) return std::nullopt;
+    return std::string(val);
+#endif
+}
+
 inline std::filesystem::path getCacheDirectory() {
     auto tryUse = [](const std::filesystem::path& p) -> bool {
         std::error_code ec;
         std::filesystem::create_directories(p, ec);
         return !ec;
     };
-    if (const char* overrideDir = std::getenv("NACELLE_CACHE_DIR")) {
-        if (*overrideDir) {
-            std::filesystem::path p(overrideDir);
-            if (tryUse(p)) return p;
-        }
+    if (auto overrideDir = getEnv("NACELLE_CACHE_DIR"); overrideDir && !overrideDir->empty()) {
+        std::filesystem::path p(*overrideDir);
+        if (tryUse(p)) return p;
     }
     std::filesystem::path candidate;
 #if defined(_WIN32)
-    if (const char* localAppData = std::getenv("LOCALAPPDATA")) {
-        candidate = std::filesystem::path(localAppData) / "nacelle";
+    if (auto localAppData = getEnv("LOCALAPPDATA"); localAppData && !localAppData->empty()) {
+        candidate = std::filesystem::path(*localAppData) / "nacelle";
     }
 #else
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
-        if (*xdg) candidate = std::filesystem::path(xdg) / "nacelle";
-    } else if (const char* home = std::getenv("HOME")) {
-        candidate = std::filesystem::path(home) / ".cache" / "nacelle";
+    if (auto xdg = getEnv("XDG_CACHE_HOME"); xdg && !xdg->empty()) {
+        candidate = std::filesystem::path(*xdg) / "nacelle";
+    } else if (auto home = getEnv("HOME"); home && !home->empty()) {
+        candidate = std::filesystem::path(*home) / ".cache" / "nacelle";
     }
 #endif
     if (!candidate.empty() && tryUse(candidate)) {
@@ -166,7 +183,8 @@ inline void signalOsEvent(HANDLE hEvent) {
     int fd = static_cast<int>(reinterpret_cast<intptr_t>(hEvent));
     if (fd >= 0) {
         uint64_t one = 1;
-        (void)::write(fd, &one, sizeof(one));
+        ssize_t written = ::write(fd, &one, sizeof(one));
+        (void)written;
     }
 #endif
 }

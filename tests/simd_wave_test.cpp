@@ -68,8 +68,8 @@ void runWaveWidth(uint32_t width) {
 } // namespace
 
 int main() {
-    if (const char* envW = std::getenv("NACELLE_SIMD_WIDTH")) {
-        uint32_t w = static_cast<uint32_t>(std::stoul(envW));
+    if (auto envW = nacelle::getEnv("NACELLE_SIMD_WIDTH"); envW && !envW->empty()) {
+        uint32_t w = static_cast<uint32_t>(std::stoul(*envW));
         runWaveWidth(w);
     } else {
         runWaveWidth(4);
