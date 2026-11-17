@@ -99,7 +99,8 @@ struct CachedPSOMeta {
     uint8_t psWritesDepth = 0;
     uint8_t psUsesDiscard = 0;
     uint8_t psHasSideEffects = 0;
-    uint8_t reserved[3]{};
+    uint8_t psPixelFreqMSAA = 0;
+    uint8_t reserved[2]{};
     uint64_t vsHashLo = 0;
     uint64_t vsHashHi = 0;
 };

@@ -1453,21 +1453,31 @@ bool synthesizeGraphicsPSOMLIR(
     bool psUsesDiscard = hasPS && psLoaded.usesDiscard;
     bool psHasSideEffects = hasPS && psLoaded.hasSideEffects;
     bool psUsesPerspBarycentrics = false;
+    bool psUsesSampleFrequency = false;
     if (hasPS) {
         outPSInputs = convertSigElements(psLoaded.inputSigs);
         outPSOutputs = convertSigElements(psLoaded.outputSigs);
         for (const auto& po : psLoaded.outputSigs) {
             if (po.systemValueType >= 17 && po.systemValueType <= 19) psWritesDepth = true;
+            if (po.systemValueType == 14) psUsesSampleFrequency = true; // SV_Coverage output
         }
         for (const auto& pi : psLoaded.inputSigs) {
             if (pi.systemValueType == 28 && pi.interpMode != 4) {
                 psUsesPerspBarycentrics = true;
+            }
+            if (pi.systemValueType == 14 || pi.systemValueType == 15 || pi.systemValueType == 18 ||
+                pi.interpMode == 5 || pi.interpMode == 7) {
+                psUsesSampleFrequency = true;
             }
         }
     } else {
         outPSInputs.clear();
         outPSOutputs.clear();
     }
+    const uint32_t msaaSampleCount = std::max<uint32_t>(1u, desc.SampleDesc.Count);
+    const bool psPixelFreqMSAA =
+        hasPS && msaaSampleCount > 1u && msaaSampleCount <= 8u &&
+        !desc.BlendState.AlphaToCoverageEnable && !psUsesSampleFrequency;
     uint32_t numPSInputRegs = 0;
     uint32_t flatInterpMask = 0;
     if (hasPS) {
@@ -3145,6 +3155,9 @@ bool synthesizeGraphicsPSOMLIR(
             b, loc, mlir::LLVM::ICmpPredicate::eq, covMasksPtrRaw, nullPtrVal);
         mlir::Value covMasksPtr = mlir::LLVM::SelectOp::create(
             b, loc, covMasksIsNull, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, coverageMask)), covMasksPtrRaw);
+        mlir::Value sampleCovMasksPtr = psPixelFreqMSAA
+            ? h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, sampleCoverageMasks)))
+            : mlir::Value();
 
         mlir::Value pixelXPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, pixelX)));
         mlir::Value pixelYPtr = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(PixelBatchArgs, pixelY)));
@@ -3297,13 +3310,20 @@ bool synthesizeGraphicsPSOMLIR(
                 }
 
         // Helper lambdas for quad-swizzled depth & stencil SOA access (zero branches on loads, masked on writes)
-        auto loadDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc) -> mlir::Value {
+        auto addTileOffset = [&](mlir::OpBuilder& ab, mlir::Location aloc, mlir::Value qOff, uint32_t tileElemOffset) -> mlir::Value {
+            if (tileElemOffset == 0) return qOff;
+            IRHelpers ah{ab, aloc, simdWidth};
+            return mlir::LLVM::AddOp::create(ab, aloc, qOff, ah.cInt(i32Ty, static_cast<int64_t>(tileElemOffset)));
+        };
+
+        auto loadDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc, uint32_t tileElemOffset = 0) -> mlir::Value {
             IRHelpers dh{db, dloc, simdWidth};
             mlir::Value out = dh.splatFlt(1.0);
             auto v4f = mlir::VectorType::get({4}, f32Ty);
             for (uint32_t q = 0; q < numQuads; ++q) {
+                mlir::Value off = addTileOffset(db, dloc, quadOffsets[q], tileElemOffset);
                 mlir::Value qByte = mlir::LLVM::MulOp::create(
-                    db, dloc, mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), quadOffsets[q]), dh.cInt(dh.i64Ty(), 4));
+                    db, dloc, mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), off), dh.cInt(dh.i64Ty(), 4));
                 mlir::Value qp = dh.gepBytesDyn(tileDepthBase, qByte);
                 mlir::Value q4 = dh.loadScalar(v4f, qp);
                 for (uint32_t s = 0; s < 4; ++s) {
@@ -3314,7 +3334,7 @@ bool synthesizeGraphicsPSOMLIR(
             return out;
         };
 
-        auto storeDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newZ, mlir::Value oldZ) {
+        auto storeDepthVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newZ, mlir::Value oldZ, uint32_t tileElemOffset = 0) {
             IRHelpers dh{db, dloc, simdWidth};
             mlir::Value merged = mlir::LLVM::SelectOp::create(db, dloc, maskVec, newZ, oldZ);
             auto v4f = mlir::VectorType::get({4}, f32Ty);
@@ -3325,8 +3345,9 @@ bool synthesizeGraphicsPSOMLIR(
                 mlir::scf::IfOp::create(db, dloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
                     IRHelpers qh{qb, qloc, simdWidth};
                     mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
+                    mlir::Value off = addTileOffset(qb, qloc, quadOffsets[q], tileElemOffset);
                     mlir::Value qByte = mlir::LLVM::MulOp::create(
-                        qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), quadOffsets[q]), qh.cInt(qh.i64Ty(), 4));
+                        qb, qloc, mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), off), qh.cInt(qh.i64Ty(), 4));
                     mlir::Value qp = qh.gepBytesDyn(tileDepthBase, qByte);
                     mlir::LLVM::StoreOp::create(qb, qloc, q4, qp);
                     mlir::scf::YieldOp::create(qb, qloc);
@@ -3334,12 +3355,13 @@ bool synthesizeGraphicsPSOMLIR(
             }
         };
 
-        auto loadStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc) -> mlir::Value {
+        auto loadStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc, uint32_t tileElemOffset = 0) -> mlir::Value {
             IRHelpers dh{db, dloc, simdWidth};
             mlir::Value out = dh.splatInt(dh.i8Ty(), 0);
             auto v4i8 = mlir::VectorType::get({4}, dh.i8Ty());
             for (uint32_t q = 0; q < numQuads; ++q) {
-                mlir::Value q64 = mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), quadOffsets[q]);
+                mlir::Value off = addTileOffset(db, dloc, quadOffsets[q], tileElemOffset);
+                mlir::Value q64 = mlir::LLVM::ZExtOp::create(db, dloc, dh.i64Ty(), off);
                 mlir::Value qp = dh.gepBytesDyn(tileStencilBase, q64);
                 mlir::Value q4 = dh.loadScalar(v4i8, qp);
                 for (uint32_t s = 0; s < 4; ++s) {
@@ -3350,7 +3372,7 @@ bool synthesizeGraphicsPSOMLIR(
             return out;
         };
 
-        auto storeStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newS, mlir::Value oldS) {
+        auto storeStencilVec = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value maskVec, mlir::Value newS, mlir::Value oldS, uint32_t tileElemOffset = 0) {
             IRHelpers dh{db, dloc, simdWidth};
             mlir::Value merged = mlir::LLVM::SelectOp::create(db, dloc, maskVec, newS, oldS);
             for (uint32_t q = 0; q < numQuads; ++q) {
@@ -3360,7 +3382,8 @@ bool synthesizeGraphicsPSOMLIR(
                 mlir::scf::IfOp::create(db, dloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
                     IRHelpers qh{qb, qloc, simdWidth};
                     mlir::Value q4 = mlir::LLVM::ShuffleVectorOp::create(qb, qloc, merged, merged, qIdx);
-                    mlir::Value q64 = mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), quadOffsets[q]);
+                    mlir::Value off = addTileOffset(qb, qloc, quadOffsets[q], tileElemOffset);
+                    mlir::Value q64 = mlir::LLVM::ZExtOp::create(qb, qloc, qh.i64Ty(), off);
                     mlir::Value qp = qh.gepBytesDyn(tileStencilBase, q64);
                     mlir::LLVM::StoreOp::create(qb, qloc, q4, qp);
                     mlir::scf::YieldOp::create(qb, qloc);
@@ -3369,7 +3392,7 @@ bool synthesizeGraphicsPSOMLIR(
         };
 
         auto runDepthStencil = [&](mlir::OpBuilder& db, mlir::Location dloc, mlir::Value curRealMask, mlir::Value candZ,
-                                   mlir::Value candStencilRef8 = mlir::Value()) -> mlir::Value {
+                                   mlir::Value candStencilRef8 = mlir::Value(), uint32_t tileElemOffset = 0) -> mlir::Value {
             IRHelpers dh{db, dloc, simdWidth};
             const auto& ds = desc.DepthStencilState;
             bool depthOn = ds.DepthEnable && (desc.DSVFormat != DXGI_FORMAT_UNKNOWN);
@@ -3384,7 +3407,7 @@ bool synthesizeGraphicsPSOMLIR(
             D3D12_DEPTH_STENCILOP_DESC activeSOp = ds.FrontFace;
 
             if (stencilOn) {
-                oldStencil = loadStencilVec(db, dloc);
+                oldStencil = loadStencilVec(db, dloc, tileElemOffset);
                 if (candStencilRef8) {
                     ref8 = candStencilRef8;
                 } else {
@@ -3406,11 +3429,11 @@ bool synthesizeGraphicsPSOMLIR(
 
             mlir::Value zPassMask = dh.allTrueMask();
             if (depthOn) {
-                mlir::Value oldZ = loadDepthVec(db, dloc);
+                mlir::Value oldZ = loadDepthVec(db, dloc, tileElemOffset);
                 zPassMask = dh.evalDepthCmp(ds.DepthFunc, candZ, oldZ);
                 nextMask = mlir::LLVM::AndOp::create(db, dloc, nextMask, zPassMask);
                 if (ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL) {
-                    storeDepthVec(db, dloc, nextMask, candZ, oldZ);
+                    storeDepthVec(db, dloc, nextMask, candZ, oldZ, tileElemOffset);
                 }
             }
 
@@ -3437,7 +3460,7 @@ bool synthesizeGraphicsPSOMLIR(
                 mlir::Value maskedNewS = mlir::LLVM::OrOp::create(
                     db, dloc, mlir::LLVM::AndOp::create(db, dloc, oldStencil, keepBits),
                     mlir::LLVM::AndOp::create(db, dloc, sUpdated, writeMask8));
-                storeStencilVec(db, dloc, curRealMask, maskedNewS, oldStencil);
+                storeStencilVec(db, dloc, curRealMask, maskedNewS, oldStencil, tileElemOffset);
             }
             return nextMask;
         };
@@ -3456,9 +3479,51 @@ bool synthesizeGraphicsPSOMLIR(
         bool psHasSideEffects = hasPS && psLoaded.hasSideEffects;
         bool canEarlyZ = !psWritesDepth && !psWritesStencilRef && !psUsesDiscard && !psHasSideEffects;
 
+        llvm::SmallVector<mlir::Value, 8> msaaSampleMasks;
+        if (psPixelFreqMSAA) {
+            mlir::Value sampleCovNotNull = mlir::LLVM::ICmpOp::create(
+                b, loc, mlir::LLVM::ICmpPredicate::ne, sampleCovMasksPtr, nullPtrVal);
+            msaaSampleMasks.resize(msaaSampleCount);
+            for (uint32_t s = 0; s < msaaSampleCount; ++s) {
+                mlir::Value sMask = mlir::scf::IfOp::create(
+                    b, loc, sampleCovNotNull,
+                    [&](mlir::OpBuilder& sb, mlir::Location sloc) {
+                        IRHelpers sh{sb, sloc, simdWidth};
+                        mlir::Value sIdx = mlir::LLVM::AddOp::create(
+                            sb, sloc,
+                            mlir::LLVM::MulOp::create(sb, sloc, batchIdxI64, sh.cInt(h.i64Ty(), static_cast<int64_t>(msaaSampleCount))),
+                            sh.cInt(h.i64Ty(), static_cast<int64_t>(s)));
+                        mlir::Value sByteOff = mlir::LLVM::MulOp::create(sb, sloc, sIdx, sh.cInt(h.i64Ty(), 4));
+                        mlir::Value sMask32 = sh.loadScalar(i32Ty, sh.gepBytesDyn(sampleCovMasksPtr, sByteOff));
+                        mlir::Value sVec = llvmSplat(sb, sloc, llvm::cast<mlir::VectorType>(sh.vecTy(i32Ty)).getElementType(), sMask32, simdWidth);
+                        mlir::Value sShifted = mlir::LLVM::LShrOp::create(sb, sloc, sVec, sh.laneIota());
+                        mlir::Value sBitOne = mlir::LLVM::AndOp::create(sb, sloc, sShifted, sh.splatInt(i32Ty, 1));
+                        mlir::Value m = mlir::LLVM::ICmpOp::create(
+                            sb, sloc, mlir::LLVM::ICmpPredicate::ne, sBitOne, sh.splatInt(i32Ty, 0));
+                        mlir::scf::YieldOp::create(sb, sloc, mlir::ValueRange{m});
+                    },
+                    [&](mlir::OpBuilder& sb, mlir::Location sloc) {
+                        mlir::scf::YieldOp::create(sb, sloc, mlir::ValueRange{initRealMask});
+                    }).getResult(0);
+                msaaSampleMasks[s] = sMask;
+            }
+        }
+
         mlir::Value realMaskAfterEarly = initRealMask;
+        llvm::SmallVector<mlir::Value, 8> msaaEarlyDSMasks;
         if (canEarlyZ) {
-            realMaskAfterEarly = runDepthStencil(b, loc, initRealMask, interpZ);
+            if (psPixelFreqMSAA) {
+                msaaEarlyDSMasks.resize(msaaSampleCount);
+                for (uint32_t s = 0; s < msaaSampleCount; ++s) {
+                    msaaEarlyDSMasks[s] = runDepthStencil(
+                        b, loc, msaaSampleMasks[s], interpZ, mlir::Value(), s * kRasterTilePixels);
+                    realMaskAfterEarly = (s == 0)
+                        ? msaaEarlyDSMasks[0]
+                        : mlir::LLVM::OrOp::create(b, loc, realMaskAfterEarly, msaaEarlyDSMasks[s]);
+                }
+            } else {
+                realMaskAfterEarly = runDepthStencil(b, loc, initRealMask, interpZ);
+            }
         }
 
         if (hasPS) {
@@ -3830,142 +3895,170 @@ bool synthesizeGraphicsPSOMLIR(
                     return;
                 }
 
-                // Late-Z if Early-Z was skipped
-                if (!canEarlyZ) {
-                    mlir::Value finalZ = ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr);
-                    mlir::Value finalStencilRef = psWritesStencilRef
-                                                      ? ph.loadScalar(ph.vecTy(ph.i8Ty()), outStencilRefPtr)
-                                                      : mlir::Value();
-                    curRealMask = runDepthStencil(pb, ploc, curRealMask, finalZ, finalStencilRef);
-                }
-
-                // Fixed-function Output Merger Blending across active MRTs
-                mlir::Value anyWrite = ph.orReduce(curRealMask);
-                mlir::scf::IfOp::create(pb, ploc, anyWrite, [&](mlir::OpBuilder& ob, mlir::Location oloc) {
-                    IRHelpers oh{ob, oloc, simdWidth};
-                    mlir::Value blendFactors[4]{};
-                    bool loadedBlendFactor = false;
-                    auto ensureBlendFactor = [&]() {
-                        if (loadedBlendFactor) return;
-                        for (int c = 0; c < 4; ++c) {
-                            mlir::Value bf = oh.loadScalar(
-                                f32Ty, oh.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, blend_factor) + c * 4)));
-                            blendFactors[c] = llvmSplat(ob, oloc, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getElementType(), bf, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getNumElements());
-                        }
-                        loadedBlendFactor = true;
-                    };
-
-                    for (uint32_t rt = 0; rt < desc.NumRenderTargets && rt < 8; ++rt) {
-                        if (desc.RTVFormats[rt] == DXGI_FORMAT_UNKNOWN) continue;
-                        const auto& rtBlend = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? rt : 0];
-                        uint8_t writeMask = rtBlend.RenderTargetWriteMask;
-                        if (writeMask == 0) continue;
-
-                        mlir::Value src[4];
-                        for (int c = 0; c < 4; ++c) {
-                            src[c] = rtOutPtrs[rt][c] ? oh.loadScalar(oh.vecTy(f32Ty), rtOutPtrs[rt][c]) : oh.splatFlt(c == 3 ? 1.0 : 0.0);
-                            if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) {
-                                src[c] = oh.clamp01(src[c]);
-                            }
-                        }
-
-                        // Load current tile color only when blending is enabled; for opaque draws,
-                        // partial quads load destination pixels lazily inside the masked store branch.
-                        mlir::Value dst[4];
-                        auto v4f = mlir::VectorType::get({4}, f32Ty);
-                        if (rtBlend.BlendEnable) {
-                            for (int c = 0; c < 4; ++c) {
-                                dst[c] = oh.splatFlt(0.0);
-                                for (uint32_t q = 0; q < numQuads; ++q) {
-                                    mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                        ob, oloc, quadOffsets[q], oh.cInt(i32Ty, static_cast<int64_t>(c * kRasterTilePixels)));
-                                    mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                        ob, oloc, mlir::LLVM::ZExtOp::create(ob, oloc, oh.i64Ty(), pixIdx), oh.cInt(oh.i64Ty(), 4));
-                                    mlir::Value q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
-                                    for (uint32_t s = 0; s < 4; ++s) {
-                                        mlir::Value sc = llvmExtract(ob, oloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
-                                        dst[c] = llvmInsert(ob, oloc, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
-                                    }
-                                }
-                            }
-                        }
-
-                        mlir::Value outColor[4]{src[0], src[1], src[2], src[3]};
-                        if (rtBlend.BlendEnable) {
-                            if (rtBlend.SrcBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.SrcBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
-                                rtBlend.DestBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.DestBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
-                                rtBlend.SrcBlendAlpha == D3D12_BLEND_BLEND_FACTOR || rtBlend.SrcBlendAlpha == D3D12_BLEND_INV_BLEND_FACTOR ||
-                                rtBlend.DestBlendAlpha == D3D12_BLEND_BLEND_FACTOR || rtBlend.DestBlendAlpha == D3D12_BLEND_INV_BLEND_FACTOR) {
-                                ensureBlendFactor();
-                            }
-                            for (int c = 0; c < 3; ++c) {
-                                mlir::Value sf = oh.evalBlendFactorRGB(rtBlend.SrcBlend, src, dst, blendFactors, c);
-                                mlir::Value df = oh.evalBlendFactorRGB(rtBlend.DestBlend, src, dst, blendFactors, c);
-                                mlir::Value sTerm = mlir::LLVM::FMulOp::create(ob, oloc, src[c], sf);
-                                mlir::Value dTerm = mlir::LLVM::FMulOp::create(ob, oloc, dst[c], df);
-                                outColor[c] = oh.evalBlendOp(rtBlend.BlendOp, sTerm, dTerm);
-                                if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[c] = oh.clamp01(outColor[c]);
-                            }
-                            mlir::Value saf = oh.evalBlendFactorRGB(rtBlend.SrcBlendAlpha, src, dst, blendFactors, 3);
-                            mlir::Value daf = oh.evalBlendFactorRGB(rtBlend.DestBlendAlpha, src, dst, blendFactors, 3);
-                            outColor[3] = oh.evalBlendOp(
-                                rtBlend.BlendOpAlpha,
-                                mlir::LLVM::FMulOp::create(ob, oloc, src[3], saf),
-                                mlir::LLVM::FMulOp::create(ob, oloc, dst[3], daf));
-                            if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[3] = oh.clamp01(outColor[3]);
-                        }
-
-                        // Masked SOA quad write-back respecting RenderTargetWriteMask & curRealMask
-                        for (uint32_t q = 0; q < numQuads; ++q) {
-                            llvm::SmallVector<int32_t, 4> qIdx{static_cast<int32_t>(q * 4), static_cast<int32_t>(q * 4 + 1), static_cast<int32_t>(q * 4 + 2), static_cast<int32_t>(q * 4 + 3)};
-                            mlir::Value qMask = mlir::LLVM::ShuffleVectorOp::create(ob, oloc, curRealMask, curRealMask, qIdx);
-                            mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(ob, oloc, ob.getI1Type(), qMask);
-                            mlir::scf::IfOp::create(ob, oloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
-                                IRHelpers qh{qb, qloc, simdWidth};
-                                mlir::Value allQ = rtBlend.BlendEnable
-                                    ? mlir::Value{}
-                                    : mlir::LLVM::vector_reduce_and::create(qb, qloc, qb.getI1Type(), qMask);
-                                auto writeQuadChannels = [&](mlir::OpBuilder& wb, mlir::Location wloc, bool loadDstForPartial) {
-                                    IRHelpers wh{wb, wloc, simdWidth};
-                                    for (int c = 0; c < 4; ++c) {
-                                        if (!(writeMask & (1u << c))) continue;
-                                        mlir::Value outQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, outColor[c], outColor[c], qIdx);
-                                        mlir::Value pixIdx = mlir::LLVM::AddOp::create(
-                                            wb, wloc, quadOffsets[q], wh.cInt(i32Ty, static_cast<int64_t>(c * kRasterTilePixels)));
-                                        mlir::Value byteOff = mlir::LLVM::MulOp::create(
-                                            wb, wloc, mlir::LLVM::ZExtOp::create(wb, wloc, wh.i64Ty(), pixIdx), wh.cInt(wh.i64Ty(), 4));
-                                        mlir::Value dstPtr = wh.gepBytesDyn(tileColorBases[rt], byteOff);
-                                        mlir::Value storeQ4 = outQ4;
-                                        if (rtBlend.BlendEnable) {
-                                            mlir::Value dstQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, dst[c], dst[c], qIdx);
-                                            storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
-                                        } else if (loadDstForPartial) {
-                                            mlir::Value dstQ4 = wh.loadScalar(v4f, dstPtr);
-                                            storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
-                                        }
-                                        mlir::LLVM::StoreOp::create(wb, wloc, storeQ4, dstPtr);
-                                    }
-                                };
-                                if (rtBlend.BlendEnable) {
-                                    writeQuadChannels(qb, qloc, false);
-                                } else {
-                                    mlir::scf::IfOp::create(
-                                        qb, qloc, allQ,
-                                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
-                                            writeQuadChannels(tb, tloc, false);
-                                            mlir::scf::YieldOp::create(tb, tloc);
-                                        },
-                                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
-                                            writeQuadChannels(eb, eloc, true);
-                                            mlir::scf::YieldOp::create(eb, eloc);
-                                        });
-                                }
-                                mlir::scf::YieldOp::create(qb, qloc);
-                            });
+                // Preload and clamp PS color outputs once; reuse across all MSAA samples when psPixelFreqMSAA is active.
+                std::array<std::array<mlir::Value, 4>, 8> rtSrcColors{};
+                for (uint32_t rt = 0; rt < desc.NumRenderTargets && rt < 8; ++rt) {
+                    if (desc.RTVFormats[rt] == DXGI_FORMAT_UNKNOWN) continue;
+                    const auto& rtBlend = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? rt : 0];
+                    if (rtBlend.RenderTargetWriteMask == 0) continue;
+                    for (int c = 0; c < 4; ++c) {
+                        rtSrcColors[rt][c] = rtOutPtrs[rt][c]
+                                                 ? ph.loadScalar(ph.vecTy(f32Ty), rtOutPtrs[rt][c])
+                                                 : ph.splatFlt(c == 3 ? 1.0 : 0.0);
+                        if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) {
+                            rtSrcColors[rt][c] = ph.clamp01(rtSrcColors[rt][c]);
                         }
                     }
-                    mlir::scf::YieldOp::create(ob, oloc);
-                });
+                }
+
+                auto emitOutputMerger = [&](mlir::OpBuilder& mb, mlir::Location mloc, mlir::Value omMask, uint32_t tileColorElemOffset) {
+                    IRHelpers mh{mb, mloc, simdWidth};
+                    mlir::Value anyWrite = mh.orReduce(omMask);
+                    mlir::scf::IfOp::create(mb, mloc, anyWrite, [&](mlir::OpBuilder& ob, mlir::Location oloc) {
+                        IRHelpers oh{ob, oloc, simdWidth};
+                        mlir::Value blendFactors[4]{};
+                        bool loadedBlendFactor = false;
+                        auto ensureBlendFactor = [&]() {
+                            if (loadedBlendFactor) return;
+                            for (int c = 0; c < 4; ++c) {
+                                mlir::Value bf = oh.loadScalar(
+                                    f32Ty, oh.gepBytes(rootCtx, static_cast<int64_t>(offsetof(DriverRootContext, blend_factor) + c * 4)));
+                                blendFactors[c] = llvmSplat(ob, oloc, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getElementType(), bf, llvm::cast<mlir::VectorType>(oh.vecTy(f32Ty)).getNumElements());
+                            }
+                            loadedBlendFactor = true;
+                        };
+
+                        for (uint32_t rt = 0; rt < desc.NumRenderTargets && rt < 8; ++rt) {
+                            if (desc.RTVFormats[rt] == DXGI_FORMAT_UNKNOWN) continue;
+                            const auto& rtBlend = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? rt : 0];
+                            uint8_t writeMask = rtBlend.RenderTargetWriteMask;
+                            if (writeMask == 0) continue;
+
+                            mlir::Value src[4]{rtSrcColors[rt][0], rtSrcColors[rt][1], rtSrcColors[rt][2], rtSrcColors[rt][3]};
+
+                            // Load current tile color only when blending is enabled; for opaque draws,
+                            // partial quads load destination pixels lazily inside the masked store branch.
+                            mlir::Value dst[4];
+                            auto v4f = mlir::VectorType::get({4}, f32Ty);
+                            if (rtBlend.BlendEnable) {
+                                for (int c = 0; c < 4; ++c) {
+                                    dst[c] = oh.splatFlt(0.0);
+                                    for (uint32_t q = 0; q < numQuads; ++q) {
+                                        mlir::Value pixIdx = mlir::LLVM::AddOp::create(
+                                            ob, oloc, quadOffsets[q], oh.cInt(i32Ty, static_cast<int64_t>(tileColorElemOffset + c * kRasterTilePixels)));
+                                        mlir::Value byteOff = mlir::LLVM::MulOp::create(
+                                            ob, oloc, mlir::LLVM::ZExtOp::create(ob, oloc, oh.i64Ty(), pixIdx), oh.cInt(oh.i64Ty(), 4));
+                                        mlir::Value q4 = oh.loadScalar(v4f, oh.gepBytesDyn(tileColorBases[rt], byteOff));
+                                        for (uint32_t s = 0; s < 4; ++s) {
+                                            mlir::Value sc = llvmExtract(ob, oloc, q4, static_cast<uint32_t>(static_cast<int64_t>(s)));
+                                            dst[c] = llvmInsert(ob, oloc, dst[c], sc, static_cast<uint32_t>(static_cast<int64_t>(q * 4 + s)));
+                                        }
+                                    }
+                                }
+                            }
+
+                            mlir::Value outColor[4]{src[0], src[1], src[2], src[3]};
+                            if (rtBlend.BlendEnable) {
+                                if (rtBlend.SrcBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.SrcBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
+                                    rtBlend.DestBlend == D3D12_BLEND_BLEND_FACTOR || rtBlend.DestBlend == D3D12_BLEND_INV_BLEND_FACTOR ||
+                                    rtBlend.SrcBlendAlpha == D3D12_BLEND_BLEND_FACTOR || rtBlend.SrcBlendAlpha == D3D12_BLEND_INV_BLEND_FACTOR ||
+                                    rtBlend.DestBlendAlpha == D3D12_BLEND_BLEND_FACTOR || rtBlend.DestBlendAlpha == D3D12_BLEND_INV_BLEND_FACTOR) {
+                                    ensureBlendFactor();
+                                }
+                                for (int c = 0; c < 3; ++c) {
+                                    mlir::Value sf = oh.evalBlendFactorRGB(rtBlend.SrcBlend, src, dst, blendFactors, c);
+                                    mlir::Value df = oh.evalBlendFactorRGB(rtBlend.DestBlend, src, dst, blendFactors, c);
+                                    mlir::Value sTerm = mlir::LLVM::FMulOp::create(ob, oloc, src[c], sf);
+                                    mlir::Value dTerm = mlir::LLVM::FMulOp::create(ob, oloc, dst[c], df);
+                                    outColor[c] = oh.evalBlendOp(rtBlend.BlendOp, sTerm, dTerm);
+                                    if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[c] = oh.clamp01(outColor[c]);
+                                }
+                                mlir::Value saf = oh.evalBlendFactorRGB(rtBlend.SrcBlendAlpha, src, dst, blendFactors, 3);
+                                mlir::Value daf = oh.evalBlendFactorRGB(rtBlend.DestBlendAlpha, src, dst, blendFactors, 3);
+                                outColor[3] = oh.evalBlendOp(
+                                    rtBlend.BlendOpAlpha,
+                                    mlir::LLVM::FMulOp::create(ob, oloc, src[3], saf),
+                                    mlir::LLVM::FMulOp::create(ob, oloc, dst[3], daf));
+                                if (isUnormRenderTargetFormat(desc.RTVFormats[rt])) outColor[3] = oh.clamp01(outColor[3]);
+                            }
+
+                            // Masked SOA quad write-back respecting RenderTargetWriteMask & omMask
+                            for (uint32_t q = 0; q < numQuads; ++q) {
+                                llvm::SmallVector<int32_t, 4> qIdx{static_cast<int32_t>(q * 4), static_cast<int32_t>(q * 4 + 1), static_cast<int32_t>(q * 4 + 2), static_cast<int32_t>(q * 4 + 3)};
+                                mlir::Value qMask = mlir::LLVM::ShuffleVectorOp::create(ob, oloc, omMask, omMask, qIdx);
+                                mlir::Value anyQ = mlir::LLVM::vector_reduce_or::create(ob, oloc, ob.getI1Type(), qMask);
+                                mlir::scf::IfOp::create(ob, oloc, anyQ, [&](mlir::OpBuilder& qb, mlir::Location qloc) {
+                                    IRHelpers qh{qb, qloc, simdWidth};
+                                    mlir::Value allQ = rtBlend.BlendEnable
+                                        ? mlir::Value{}
+                                        : mlir::LLVM::vector_reduce_and::create(qb, qloc, qb.getI1Type(), qMask);
+                                    auto writeQuadChannels = [&](mlir::OpBuilder& wb, mlir::Location wloc, bool loadDstForPartial) {
+                                        IRHelpers wh{wb, wloc, simdWidth};
+                                        for (int c = 0; c < 4; ++c) {
+                                            if (!(writeMask & (1u << c))) continue;
+                                            mlir::Value outQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, outColor[c], outColor[c], qIdx);
+                                            mlir::Value pixIdx = mlir::LLVM::AddOp::create(
+                                                wb, wloc, quadOffsets[q], wh.cInt(i32Ty, static_cast<int64_t>(tileColorElemOffset + c * kRasterTilePixels)));
+                                            mlir::Value byteOff = mlir::LLVM::MulOp::create(
+                                                wb, wloc, mlir::LLVM::ZExtOp::create(wb, wloc, wh.i64Ty(), pixIdx), wh.cInt(wh.i64Ty(), 4));
+                                            mlir::Value dstPtr = wh.gepBytesDyn(tileColorBases[rt], byteOff);
+                                            mlir::Value storeQ4 = outQ4;
+                                            if (rtBlend.BlendEnable) {
+                                                mlir::Value dstQ4 = mlir::LLVM::ShuffleVectorOp::create(wb, wloc, dst[c], dst[c], qIdx);
+                                                storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
+                                            } else if (loadDstForPartial) {
+                                                mlir::Value dstQ4 = wh.loadScalar(v4f, dstPtr);
+                                                storeQ4 = mlir::LLVM::SelectOp::create(wb, wloc, qMask, outQ4, dstQ4);
+                                            }
+                                            mlir::LLVM::StoreOp::create(wb, wloc, storeQ4, dstPtr);
+                                        }
+                                    };
+                                    if (rtBlend.BlendEnable) {
+                                        writeQuadChannels(qb, qloc, false);
+                                    } else {
+                                        mlir::scf::IfOp::create(
+                                            qb, qloc, allQ,
+                                            [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                                                writeQuadChannels(tb, tloc, false);
+                                                mlir::scf::YieldOp::create(tb, tloc);
+                                            },
+                                            [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                                                writeQuadChannels(eb, eloc, true);
+                                                mlir::scf::YieldOp::create(eb, eloc);
+                                            });
+                                    }
+                                    mlir::scf::YieldOp::create(qb, qloc);
+                                });
+                            }
+                        }
+                        mlir::scf::YieldOp::create(ob, oloc);
+                    });
+                };
+
+                if (psPixelFreqMSAA) {
+                    mlir::Value finalZ = !canEarlyZ ? ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr) : mlir::Value();
+                    mlir::Value finalStencilRef = (!canEarlyZ && psWritesStencilRef)
+                                                      ? ph.loadScalar(ph.vecTy(ph.i8Ty()), outStencilRefPtr)
+                                                      : mlir::Value();
+                    for (uint32_t s = 0; s < msaaSampleCount; ++s) {
+                        mlir::Value sMask = canEarlyZ
+                            ? msaaEarlyDSMasks[s]
+                            : runDepthStencil(pb, ploc,
+                                              mlir::LLVM::AndOp::create(pb, ploc, msaaSampleMasks[s], curRealMask),
+                                              finalZ, finalStencilRef, s * kRasterTilePixels);
+                        emitOutputMerger(pb, ploc, sMask, s * 4u * kRasterTilePixels);
+                    }
+                } else {
+                    // Late-Z if Early-Z was skipped
+                    if (!canEarlyZ) {
+                        mlir::Value finalZ = ph.loadScalar(ph.vecTy(f32Ty), outDepthPtr);
+                        mlir::Value finalStencilRef = psWritesStencilRef
+                                                          ? ph.loadScalar(ph.vecTy(ph.i8Ty()), outStencilRefPtr)
+                                                          : mlir::Value();
+                        curRealMask = runDepthStencil(pb, ploc, curRealMask, finalZ, finalStencilRef);
+                    }
+                    emitOutputMerger(pb, ploc, curRealMask, 0);
+                }
             };
 
             if (canEarlyZ) {
@@ -4069,6 +4162,7 @@ bool synthesizeGraphicsPSOMLIR(
     outMeta.psWritesDepth = psWritesDepth ? 1 : 0;
     outMeta.psUsesDiscard = psUsesDiscard ? 1 : 0;
     outMeta.psHasSideEffects = psHasSideEffects ? 1 : 0;
+    outMeta.psPixelFreqMSAA = psPixelFreqMSAA ? 1 : 0;
     return true;
 }
 
@@ -4143,6 +4237,7 @@ bool compileGraphicsPSO(
         outPSO.psWritesDepth = meta.psWritesDepth != 0;
         outPSO.psUsesDiscard = meta.psUsesDiscard != 0;
         outPSO.psHasSideEffects = meta.psHasSideEffects != 0;
+        outPSO.psPixelFreqMSAA = meta.psPixelFreqMSAA != 0;
     };
 
     if (!hasMS && !hasTess && !hasGS) {

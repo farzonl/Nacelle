@@ -25,10 +25,28 @@ struct alignas(64) TileScratch {
     std::unique_ptr<float[], AlignedDeleter> extraColorSOA;
     uint32_t extraRTVsCap = 0;
 
+    std::unique_ptr<float[], AlignedDeleter> msaaColorBuf;
+    uint32_t msaaColorFloatsCap = 0;
+    std::unique_ptr<float[], AlignedDeleter> msaaDepthBuf;
+    uint32_t msaaDepthFloatsCap = 0;
+    struct ByteAlignedDeleter {
+        void operator()(uint8_t* p) const { alignedFree(p); }
+    };
+    std::unique_ptr<uint8_t[], ByteAlignedDeleter> msaaStencilBuf;
+    uint32_t msaaStencilBytesCap = 0;
+    uint32_t msaaSampleStride = 1;
+
     float* colorPlane(uint32_t rt) {
         if (rt == 0) return color0SOA;
         return extraColorSOA.get() + static_cast<size_t>(rt - 1) * (4 * kTilePixels);
     }
+
+    float* msaaColorPlane(uint32_t rt) {
+        return msaaColorBuf.get() + static_cast<size_t>(rt) * msaaSampleStride * (4 * kTilePixels);
+    }
+
+    float* msaaDepthPlane() { return msaaDepthBuf.get(); }
+    uint8_t* msaaStencilPlane() { return msaaStencilBuf.get(); }
 
     void ensureRTVs(uint32_t numRTVs) {
         if (numRTVs > 1) {
@@ -37,6 +55,29 @@ struct alignas(64) TileScratch {
                 const size_t bytes = static_cast<size_t>(neededRTVs) * (4 * kTilePixels) * sizeof(float);
                 extraColorSOA.reset(static_cast<float*>(alignedAlloc64(bytes)));
                 extraRTVsCap = neededRTVs;
+            }
+        }
+    }
+
+    void ensureMSAA(uint32_t numRTVs, uint32_t sampleCount, bool hasDSV) {
+        msaaSampleStride = sampleCount;
+        const uint32_t rtvCount = std::min<uint32_t>(numRTVs, 8u);
+        if (rtvCount > 0) {
+            const uint32_t neededFloats = rtvCount * sampleCount * (4 * kTilePixels);
+            if (msaaColorFloatsCap < neededFloats) {
+                msaaColorBuf.reset(static_cast<float*>(alignedAlloc64(static_cast<size_t>(neededFloats) * sizeof(float))));
+                msaaColorFloatsCap = neededFloats;
+            }
+        }
+        if (hasDSV) {
+            const uint32_t neededDepth = sampleCount * kTilePixels;
+            if (msaaDepthFloatsCap < neededDepth) {
+                msaaDepthBuf.reset(static_cast<float*>(alignedAlloc64(static_cast<size_t>(neededDepth) * sizeof(float))));
+                msaaDepthFloatsCap = neededDepth;
+            }
+            if (msaaStencilBytesCap < neededDepth) {
+                msaaStencilBuf.reset(static_cast<uint8_t*>(alignedAlloc64(neededDepth)));
+                msaaStencilBytesCap = neededDepth;
             }
         }
     }
@@ -435,7 +476,11 @@ struct QuadBatchEmitter {
     bool currentGroupHasPrevTri = false;
     float sampleOffsetX = 0.0f;
     float sampleOffsetY = 0.0f;
+    uint32_t sampleCount = 1;
+    int32_t sampleDx16[8]{};
+    int32_t sampleDy16[8]{};
     alignas(64) uint32_t coverageMasks[kMaxBatchGroups];
+    alignas(64) uint32_t sampleCoverageMasks[kMaxBatchGroups * 8];
     alignas(64) uint32_t quadOffsets[kMaxQuads];
     alignas(64) uint32_t quadTriIndices[kMaxQuads];
     alignas(64) PixelTriData triData[kMaxQuads];
@@ -446,6 +491,14 @@ struct QuadBatchEmitter {
 
     QuadBatchEmitter() {
         coverageMasks[0] = 0;
+    }
+
+    void clearBatchSampleMasks(uint32_t bIdx) {
+        if (sampleCount > 1) {
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                sampleCoverageMasks[bIdx * sampleCount + s] = 0;
+            }
+        }
     }
 
     void padRemainingQuadsInGroup() {
@@ -472,6 +525,7 @@ struct QuadBatchEmitter {
             flush();
         } else {
             coverageMasks[batchCount] = 0;
+            clearBatchSampleMasks(batchCount);
         }
     }
 
@@ -542,6 +596,7 @@ struct QuadBatchEmitter {
             args.triData = triData;
             args.quadTriIndices = quadTriIndices;
         }
+        args.sampleCoverageMasks = (sampleCount > 1) ? sampleCoverageMasks : nullptr;
         psFn(&args);
         batchCount = 0;
         qCount = 0;
@@ -549,6 +604,7 @@ struct QuadBatchEmitter {
         lastSceneTriIdx = UINT32_MAX;
         currentGroupHasPrevTri = false;
         coverageMasks[0] = 0;
+        clearBatchSampleMasks(0);
     }
 
     static bool pointInDiamond(float x, float y, int32_t px, int32_t py, bool isYMajor) {
@@ -588,6 +644,11 @@ struct QuadBatchEmitter {
                     baryI[lane] = t;
                     baryJ[lane] = 0.0f;
                     coverageMasks[batchCount] |= bit;
+                    if (sampleCount > 1) {
+                        for (uint32_t s = 0; s < sampleCount; ++s) {
+                            sampleCoverageMasks[batchCount * sampleCount + s] |= bit;
+                        }
+                    }
                     return;
                 }
                 flush();
@@ -620,6 +681,12 @@ struct QuadBatchEmitter {
             baryJ[lane] = 0.0f;
         }
         coverageMasks[batchCount] |= ((1u << subHit) << (qCount * 4u));
+        if (sampleCount > 1) {
+            uint32_t sbit = ((1u << subHit) << (qCount * 4u));
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                sampleCoverageMasks[batchCount * sampleCount + s] |= sbit;
+            }
+        }
         ++qCount;
         if (qCount == quadsPerBatch) {
             finishGroup();
@@ -698,7 +765,17 @@ struct QuadBatchEmitter {
         }
 
         uint32_t quadMask = 0;
+        uint32_t quadSampleMask[8]{};
         float qPixX[4], qPixY[4], qBaryI[4], qBaryJ[4];
+
+        int64_t sampleOff[8][3]{};
+        if (sampleCount > 1) {
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                for (int k = 0; k < 3; ++k) {
+                    sampleOff[s][k] = (tri.stepX[k] * sampleDx16[s] + tri.stepY[k] * sampleDy16[s]) / 16;
+                }
+            }
+        }
 
         for (uint32_t sub = 0; sub < 4; ++sub) {
             int32_t px = gx + static_cast<int32_t>(sub & 1u);
@@ -714,11 +791,23 @@ struct QuadBatchEmitter {
             qBaryJ[sub] = static_cast<float>(e2) * tri.invArea;
 
             if (px >= scissor.left && px < scissor.right &&
-                py >= scissor.top && py < scissor.bottom &&
-                (e0 + tri.bias[0]) >= 0 &&
-                (e1 + tri.bias[1]) >= 0 &&
-                (e2 + tri.bias[2]) >= 0) {
-                quadMask |= (1u << sub);
+                py >= scissor.top && py < scissor.bottom) {
+                if (sampleCount == 1) {
+                    if ((e0 + tri.bias[0]) >= 0 &&
+                        (e1 + tri.bias[1]) >= 0 &&
+                        (e2 + tri.bias[2]) >= 0) {
+                        quadMask |= (1u << sub);
+                    }
+                } else {
+                    for (uint32_t s = 0; s < sampleCount; ++s) {
+                        if ((e0 + sampleOff[s][0] + tri.bias[0]) >= 0 &&
+                            (e1 + sampleOff[s][1] + tri.bias[1]) >= 0 &&
+                            (e2 + sampleOff[s][2] + tri.bias[2]) >= 0) {
+                            quadSampleMask[s] |= (1u << sub);
+                            quadMask |= (1u << sub);
+                        }
+                    }
+                }
             }
         }
 
@@ -751,6 +840,11 @@ struct QuadBatchEmitter {
             baryJ[lane] = qBaryJ[sub];
         }
         coverageMasks[batchCount] |= (quadMask << (qCount * 4u));
+        if (sampleCount > 1) {
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                sampleCoverageMasks[batchCount * sampleCount + s] |= (quadSampleMask[s] << (qCount * 4u));
+            }
+        }
         ++qCount;
         if (qCount == quadsPerBatch) {
             finishGroup();
@@ -850,6 +944,157 @@ void rasterizeTiles(
                     break;
                 }
             }
+        }
+
+        const bool usePixelFreqMSAA = compiled->psPixelFreqMSAA && sampleCount > 1 && sampleCount <= 8;
+        if (usePixelFreqMSAA) {
+            scratch.ensureMSAA(state.numRTVs, sampleCount, state.hasDSV);
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                    uint32_t rtSample = (state.rtvs[rt].resource &&
+                                         state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
+                                            ? s
+                                            : 0u;
+                    loadTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH,
+                                scratch.msaaColorPlane(rt) + static_cast<size_t>(s) * (4 * kTilePixels));
+                }
+                if (state.hasDSV) {
+                    uint32_t dsSample = (state.dsv.resource &&
+                                         state.dsv.resource->resourceDesc().SampleDesc.Count > 1)
+                                            ? s
+                                            : 0u;
+                    loadTileDSV(state.dsv, dsSample, tileOriginX, tileOriginY, tileW, tileH,
+                                scratch.msaaDepthPlane() + static_cast<size_t>(s) * kTilePixels,
+                                scratch.msaaStencilPlane() + static_cast<size_t>(s) * kTilePixels);
+                }
+            }
+
+            QuadBatchEmitter emitter;
+            emitter.psFn = psFn;
+            emitter.quadsPerBatch = quadsPerBatch;
+            emitter.sampleCount = sampleCount;
+            emitter.clearBatchSampleMasks(0);
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                msaaSampleOffset16ths(sampleCount, s, emitter.sampleDx16[s], emitter.sampleDy16[s]);
+            }
+            emitter.args.rootCtx = &state.rootCtx;
+            emitter.args.coverageMasks = emitter.coverageMasks;
+            emitter.args.sampleCoverageMasks = emitter.sampleCoverageMasks;
+            emitter.args.quadOffsets = emitter.quadOffsets;
+            emitter.args.pixelX = emitter.pixelX;
+            emitter.args.pixelY = emitter.pixelY;
+            emitter.args.baryI = emitter.baryI;
+            emitter.args.baryJ = emitter.baryJ;
+            for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                emitter.args.tileColorSOA[rt] = scratch.msaaColorPlane(rt);
+            }
+            emitter.args.tileDepthSOA = state.hasDSV ? scratch.msaaDepthPlane() : nullptr;
+            emitter.args.tileStencilSOA = state.hasDSV ? scratch.msaaStencilPlane() : nullptr;
+
+            for (uint32_t triIdx : bins[tileIdx].triIndices) {
+                const SetupTriangle& sampleTri = scene.triangles[triIdx];
+                const uint32_t scIdx = (sampleTri.viewportIndex < scene.numScissors) ? sampleTri.viewportIndex : 0u;
+                const D3D12_RECT& vpScissor = scene.scissors[scIdx];
+                const D3D12_RECT tileScissor{
+                    std::max<LONG>(vpScissor.left, static_cast<LONG>(tileOriginX)),
+                    std::max<LONG>(vpScissor.top, static_cast<LONG>(tileOriginY)),
+                    std::min<LONG>(vpScissor.right, static_cast<LONG>(tileOriginX + tileW)),
+                    std::min<LONG>(vpScissor.bottom, static_cast<LONG>(tileOriginY + tileH)),
+                };
+                int32_t minX = std::max<int32_t>(sampleTri.minX, tileScissor.left);
+                int32_t maxX = std::min<int32_t>(sampleTri.maxX, tileScissor.right);
+                int32_t minY = std::max<int32_t>(sampleTri.minY, tileScissor.top);
+                int32_t maxY = std::min<int32_t>(sampleTri.maxY, tileScissor.bottom);
+                if (minX >= maxX || minY >= maxY) continue;
+
+                const size_t triIdxSz = static_cast<size_t>(triIdx);
+                const size_t psScalars = static_cast<size_t>(scene.numPSInputScalars);
+                PixelTriData td{};
+                td.triAttrBase = !scene.attrBaseArena.empty()
+                                     ? (scene.attrBaseArena.data() + triIdxSz * psScalars * 3)
+                                     : nullptr;
+                td.triAttrFlat = !scene.attrFlatArena.empty()
+                                     ? (scene.attrFlatArena.data() + triIdxSz * psScalars)
+                                     : nullptr;
+                td.triInvW = sampleTri.invW;
+                td.triOrigBary = !scene.origBaryArena.empty()
+                                     ? (scene.origBaryArena.data() + triIdxSz * 9)
+                                     : nullptr;
+                td.triDepth = sampleTri.depth;
+                td.isFrontFace = sampleTri.isFrontFace;
+                td.primitiveId = sampleTri.primitiveId;
+                td.viewportArrayIndex = sampleTri.viewportIndex;
+                td.shadingRate = sampleTri.shadingRate;
+
+                if (sampleTri.isLine) {
+                    emitter.flush();
+                    emitter.beginTriangle(triIdx, td);
+                    emitter.rasterizeLineInTile(sampleTri, tileScissor, tileOriginX, tileOriginY);
+                    emitter.flush();
+                    continue;
+                }
+
+                emitter.beginTriangle(triIdx, td);
+
+                int32_t qMinX = minX & ~1;
+                int32_t qMaxX = (maxX + 1) & ~1;
+                int32_t qMinY = minY & ~1;
+                int32_t qMaxY = (maxY + 1) & ~1;
+
+                if ((qMaxX - qMinX) <= 8 && (qMaxY - qMinY) <= 8) {
+                    for (int32_t gy = qMinY; gy < qMaxY; gy += 2) {
+                        for (int32_t gx = qMinX; gx < qMaxX; gx += 2) {
+                            emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, gx, gy);
+                        }
+                    }
+                } else {
+                    int32_t b16MinX = qMinX & ~15;
+                    int32_t b16MaxX = (qMaxX + 15) & ~15;
+                    int32_t b16MinY = qMinY & ~15;
+                    int32_t b16MaxY = (qMaxY + 15) & ~15;
+
+                    for (int32_t by16 = b16MinY; by16 < b16MaxY; by16 += 16) {
+                        for (int32_t bx16 = b16MinX; bx16 < b16MaxX; bx16 += 16) {
+                            if (!blockOverlapsTriangle(sampleTri, bx16, by16, 16)) continue;
+
+                            for (int32_t by4 = by16; by4 < by16 + 16; by4 += 4) {
+                                if (by4 + 4 <= qMinY || by4 >= qMaxY) continue;
+                                for (int32_t bx4 = bx16; bx4 < bx16 + 16; bx4 += 4) {
+                                    if (bx4 + 4 <= qMinX || bx4 >= qMaxX) continue;
+                                    if (!blockOverlapsTriangle(sampleTri, bx4, by4, 4)) continue;
+
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 0);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 0);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 0, by4 + 2);
+                                    emitter.testAndEmitQuad(sampleTri, tileScissor, tileOriginX, tileOriginY, bx4 + 2, by4 + 2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            emitter.flush();
+
+            for (uint32_t s = 0; s < sampleCount; ++s) {
+                for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
+                    uint32_t rtSample = (state.rtvs[rt].resource &&
+                                         state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
+                                            ? s
+                                            : 0u;
+                    storeTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH,
+                                 scratch.msaaColorPlane(rt) + static_cast<size_t>(s) * (4 * kTilePixels));
+                }
+                if (state.hasDSV) {
+                    uint32_t dsSample = (state.dsv.resource &&
+                                         state.dsv.resource->resourceDesc().SampleDesc.Count > 1)
+                                            ? s
+                                            : 0u;
+                    storeTileDSV(state.dsv, dsSample, tileOriginX, tileOriginY, tileW, tileH,
+                                 scratch.msaaDepthPlane() + static_cast<size_t>(s) * kTilePixels,
+                                 scratch.msaaStencilPlane() + static_cast<size_t>(s) * kTilePixels);
+                }
+            }
+            return;
         }
 
         for (uint32_t sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
