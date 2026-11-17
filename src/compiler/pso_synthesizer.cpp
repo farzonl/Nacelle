@@ -3951,7 +3951,7 @@ bool compileGraphicsPSO(
             return true;
         }
 
-        thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+        mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
         CachedVSMeta vsMeta{};
         CompiledVertexFn cachedVSFn = nullptr;
         std::vector<DxilSigRecord> vsOutputRecs;
@@ -4003,7 +4003,7 @@ bool compileGraphicsPSO(
         return true;
     }
 
-    thread_local mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
+    mlir::MLIRContext mlirCtx(mlir::MLIRContext::Threading::DISABLED);
     mlir::OwningOpRef<mlir::ModuleOp> combinedMod;
     CachedPSOMeta meta;
     if (!synthesizeGraphicsPSOMLIR(

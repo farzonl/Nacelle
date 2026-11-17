@@ -16,9 +16,24 @@ namespace {
 constexpr uint32_t kMaxSimdWidth = 16;
 
 struct alignas(64) TileScratch {
-    float colorSOA[8][4 * kTilePixels]{};
+    float color0SOA[4 * kTilePixels]{};
+    std::vector<float> extraColorSOA;
     float depthSOA[kTilePixels]{};
     uint8_t stencilSOA[kTilePixels]{};
+
+    float* colorPlane(uint32_t rt) {
+        if (rt == 0) return color0SOA;
+        return extraColorSOA.data() + static_cast<size_t>(rt - 1) * (4 * kTilePixels);
+    }
+
+    void ensureRTVs(uint32_t numRTVs) {
+        if (numRTVs > 1) {
+            const size_t needed = static_cast<size_t>(std::min<uint32_t>(numRTVs, 8u) - 1u) * (4 * kTilePixels);
+            if (extraColorSOA.size() < needed) {
+                extraColorSOA.resize(needed);
+            }
+        }
+    }
 };
 
 inline uint32_t quadSwizzlePixel(uint32_t tx, uint32_t ty) {
@@ -704,6 +719,7 @@ void rasterizeTiles(
     auto processTile = [&](size_t idx) {
         ScopedFlushDenormals flushDenorms;
         thread_local TileScratch scratch;
+        scratch.ensureRTVs(state.numRTVs);
         uint32_t tileIdx = activeTiles[idx];
         uint32_t txTile = tileIdx % scene.numTilesX;
         uint32_t tyTile = tileIdx / scene.numTilesX;
@@ -751,7 +767,7 @@ void rasterizeTiles(
                                      state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
                                         ? sampleIdx
                                         : 0u;
-                loadTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
+                loadTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorPlane(rt));
             }
             if (state.hasDSV) {
                 uint32_t dsSample = (state.dsv.resource &&
@@ -774,7 +790,7 @@ void rasterizeTiles(
             emitter.args.baryI = emitter.baryI;
             emitter.args.baryJ = emitter.baryJ;
             for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
-                emitter.args.tileColorSOA[rt] = scratch.colorSOA[rt];
+                emitter.args.tileColorSOA[rt] = scratch.colorPlane(rt);
             }
             emitter.args.tileDepthSOA = state.hasDSV ? scratch.depthSOA : nullptr;
             emitter.args.tileStencilSOA = state.hasDSV ? scratch.stencilSOA : nullptr;
@@ -869,7 +885,7 @@ void rasterizeTiles(
                                      state.rtvs[rt].resource->resourceDesc().SampleDesc.Count > 1)
                                         ? sampleIdx
                                         : 0u;
-                storeTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorSOA[rt]);
+                storeTileRTV(state.rtvs[rt], rtSample, tileOriginX, tileOriginY, tileW, tileH, scratch.colorPlane(rt));
             }
             if (state.hasDSV) {
                 uint32_t dsSample = (state.dsv.resource &&
@@ -899,6 +915,22 @@ void executeRasterDrawCall(
 
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
+
+    // Release oversized high-water-mark capacities after large draws.
+    auto shrinkIfOversized = [](auto& vec, size_t maxCap) {
+        if (vec.capacity() > maxCap) {
+            vec.clear();
+            vec.shrink_to_fit();
+        }
+    };
+    shrinkIfOversized(scene.triangles, 4096);
+    shrinkIfOversized(scene.attrBaseArena, 262144);
+    shrinkIfOversized(scene.attrFlatArena, 65536);
+    shrinkIfOversized(scene.origBaryArena, 32768);
+    if (bins.capacity() > 2048) {
+        bins.clear();
+        bins.shrink_to_fit();
+    }
 }
 
 void executeRasterMeshDispatch(
@@ -911,6 +943,22 @@ void executeRasterMeshDispatch(
     std::vector<TileBin> bins;
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
+
+    // Release oversized high-water-mark capacities after large draws.
+    auto shrinkIfOversized = [](auto& vec, size_t maxCap) {
+        if (vec.capacity() > maxCap) {
+            vec.clear();
+            vec.shrink_to_fit();
+        }
+    };
+    shrinkIfOversized(scene.triangles, 4096);
+    shrinkIfOversized(scene.attrBaseArena, 262144);
+    shrinkIfOversized(scene.attrFlatArena, 65536);
+    shrinkIfOversized(scene.origBaryArena, 32768);
+    if (bins.capacity() > 2048) {
+        bins.clear();
+        bins.shrink_to_fit();
+    }
 }
 
 void msaaSampleOffset16ths(uint32_t sampleCount, uint32_t sampleIdx, int32_t& dx16, int32_t& dy16) {
