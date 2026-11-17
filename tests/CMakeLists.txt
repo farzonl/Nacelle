@@ -299,6 +299,13 @@ function(add_nacelle_test name src)
     target_compile_definitions(${name} PRIVATE
         NACELLE_SHADER_BIN_DIR="${NACELLE_SHADER_BIN_DIR}"
     )
+    if(WIN32 AND NACELLE_OPENBLAS_DLL)
+        add_custom_command(TARGET ${name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${NACELLE_OPENBLAS_DLL}"
+                "$<TARGET_FILE_DIR:${name}>"
+        )
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 

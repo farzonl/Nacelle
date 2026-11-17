@@ -583,16 +583,6 @@ if(SDL3_FOUND OR TARGET SDL3::SDL3)
     message(STATUS "Found SDL3; enabling windowed mode in nacelle_viewer")
     target_compile_definitions(nacelle_viewer PRIVATE NACELLE_HAS_SDL3=1)
     target_link_libraries(nacelle_viewer PRIVATE SDL3::SDL3)
-    if(WIN32 AND NACELLE_OPENBLAS_DLL)
-    add_custom_command(TARGET nacelle_d3d12 POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${NACELLE_OPENBLAS_DLL}"
-            "$<TARGET_FILE_DIR:nacelle_d3d12>"
-    )
-    install(FILES "${NACELLE_OPENBLAS_DLL}"
-        DESTINATION "${CMAKE_INSTALL_BINDIR}"
-    )
-endif()
 if(WIN32 AND TARGET SDL3::SDL3-shared)
         add_custom_command(TARGET nacelle_viewer POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

@@ -323,5 +323,5 @@ jobs:
 
       - name: Run CTest
         run: |
-          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
+          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\openblas\bin;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
           ctest --test-dir build --output-on-failure
