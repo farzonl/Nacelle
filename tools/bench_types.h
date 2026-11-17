@@ -161,6 +161,22 @@ struct MatmulCB {
     uint32_t pad;
 };
 
+struct EthashCB {
+    uint32_t target[8];
+    uint32_t header[8];
+    uint32_t startNonce[2];
+    uint32_t numDatasetElements;
+    uint32_t init;
+};
+
+struct CoalescedUniformCB {
+    uint32_t count;
+    uint32_t passes;
+    float alpha;
+    float beta;
+    float weights[16];
+};
+
 struct ShadertoyCB {
     float resX, resY, resZ;
     float iTime;

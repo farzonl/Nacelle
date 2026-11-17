@@ -85,6 +85,9 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
     addCompute("prefix_sum_groupshared", "Prefix Sum (Groupshared)", "CSMain", "prefix_sum_groupshared.dxil", "prefix_sum_groupshared.spv");
     addCompute("divergent_cf_atomics", "Divergent CF + Atomics", "CSMain", "divergent_cf_atomics.dxil", "divergent_cf_atomics.spv");
     addCompute("wave_intrinsics", "Wave Intrinsics (Subgroup)", "CSMain", "wave_intrinsics.dxil", "wave_intrinsics.spv");
+    addCompute("gdeflate", "GDeflate Decompress (TileStream)", "CSMain", "gdeflate.dxil", "gdeflate.spv");
+    addCompute("ethash_mine", "Ethash Mining (Keccak+DAG)", "main", "ethash_mine.dxil", "ethash_mine.spv");
+    addCompute("coalesced_uniform_cs", "Coalesced UnitStride + Uniform", "CSMain", "bench_coalesced_uniform.dxil", "bench_coalesced_uniform.spv");
 
     {
         BenchmarkSpec s;
@@ -131,6 +134,20 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
     addPixel("sunflower_fields", "Sunflower Fields", "sunflower_fields.dxil", "sunflower_fields.spv");
     addPixel("mt_fuji_watercolor", "Mt Fuji Watercolor", "mt_fuji_watercolor.dxil", "mt_fuji_watercolor.spv");
     addPixel("disco_maze", "Disco Maze", "disco_maze.dxil", "disco_maze.spv");
+    addPixel("aetherial_cathedral", "Aetherial Cathedral", "aetherial_cathedral.dxil", "aetherial_cathedral.spv");
+
+    {
+        BenchmarkSpec s;
+        s.id = "state_heavy_ps";
+        s.name = "State-Heavy PS (BCn+Blend+DS+MSAA)";
+        s.category = BenchCategory::Pixel;
+        s.kind = PipelineKind::GraphicsVSPS;
+        s.vsDxil = "bench_state_heavy_ps_vs.dxil";
+        s.psDxil = "bench_state_heavy_ps_ps.dxil";
+        s.vsSpv = "bench_state_heavy_ps_vs.spv";
+        s.psSpv = "bench_state_heavy_ps_ps.spv";
+        cat.push_back(std::move(s));
+    }
 
     {
         BenchmarkSpec s;
@@ -161,6 +178,23 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.dsSpv = "bench_tess_tri_ds.spv";
         s.psDxil = "bench_tess_tri_ps.dxil";
         s.psSpv = "bench_tess_tri_ps.spv";
+        cat.push_back(std::move(s));
+    }
+
+    {
+        BenchmarkSpec s;
+        s.id = "tess_heavy";
+        s.name = "Tessellation Heavy (16x VS+HS+DS+PS)";
+        s.category = BenchCategory::Tessellation;
+        s.kind = PipelineKind::GraphicsTessGS;
+        s.vsDxil = "bench_tess_heavy_vs.dxil";
+        s.vsSpv = "bench_tess_heavy_vs.spv";
+        s.hsDxil = "bench_tess_heavy_hs.dxil";
+        s.hsSpv = "bench_tess_heavy_hs.spv";
+        s.dsDxil = "bench_tess_heavy_ds.dxil";
+        s.dsSpv = "bench_tess_heavy_ds.spv";
+        s.psDxil = "bench_tess_heavy_ps.dxil";
+        s.psSpv = "bench_tess_heavy_ps.spv";
         cat.push_back(std::move(s));
     }
 
@@ -202,6 +236,28 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.kind = PipelineKind::RayTracingPipeline;
         s.rtDxil = "raytracing_pipeline.dxil";
         s.csSpv = "raytracing_pipeline.spv";
+        cat.push_back(std::move(s));
+    }
+
+    {
+        BenchmarkSpec s;
+        s.id = "rt_inline_heavy";
+        s.name = "RayQuery Heavy (4-Bounce+Shadow 64x64BVH)";
+        s.category = BenchCategory::RayTracing;
+        s.kind = PipelineKind::RayTracingInline;
+        s.rtDxil = "bench_rt_inline_heavy_cs.dxil";
+        s.csSpv = "bench_rt_inline_heavy_cs.spv";
+        cat.push_back(std::move(s));
+    }
+
+    {
+        BenchmarkSpec s;
+        s.id = "rt_pipeline_heavy";
+        s.name = "DispatchRays Heavy (Recursive+Shadow 64x64BVH)";
+        s.category = BenchCategory::RayTracing;
+        s.kind = PipelineKind::RayTracingPipeline;
+        s.rtDxil = "bench_rt_pipeline_heavy.dxil";
+        s.csSpv = "bench_rt_pipeline_heavy.spv";
         cat.push_back(std::move(s));
     }
 
