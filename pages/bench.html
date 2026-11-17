@@ -249,6 +249,29 @@
       display: inline-flex;
       align-items: center;
       gap: 0.35rem;
+      background: none;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0.15rem 0.4rem;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      transition: opacity 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+
+    button.legend-item:hover {
+      border-color: var(--border);
+      color: var(--text);
+    }
+
+    button.legend-item:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    button.legend-item.is-hidden {
+      opacity: 0.4;
+      text-decoration: line-through;
     }
 
     .swatch {
@@ -776,6 +799,15 @@
     let benchHistory = [];
     let selectedIndex = 0;
     let hoveredIndex = -1;
+    const PENALTY_MULTIPLIER = 5.0;
+    const hiddenSeriesByLegend = {
+      "trend-legend": new Set(),
+      "mem-trend-legend": new Set(),
+    };
+    const LEGEND_FOR_CANVAS = {
+      "trend-canvas": "trend-legend",
+      "mem-trend-canvas": "mem-trend-legend",
+    };
 
     function getActiveTheme() {
       return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
@@ -857,57 +889,194 @@
       return fam ? (fam.cssVarName ? `var(${fam.cssVarName})` : fam.color) : "var(--accent)";
     }
 
-    function extractMetrics(entry, trendKey = "overall:all:medianMs") {
-      const suites = getEntrySuites(entry).filter(r => r.ran);
-      const pickGroup = (items, field, agg = "min") => {
-        if (!items.length) return null;
-        if (agg === "geomean") {
-          const vals = items.map(x => Number(x[field] || 0)).filter(v => v > 0);
-          if (!vals.length) return null;
-          return { val: geomean(vals), backend: items[0].backend, minMs: Math.min(...vals) };
-        }
-        const best = items.reduce((a, b) => (Number(a[field] || 0) <= Number(b[field] || 0) ? a : b));
-        return { val: Number(best[field] || 0), backend: best.backend, minMs: Number(best.minMs || best.medianMs || 0) };
-      };
+    function metricVal(r, field) {
+      if (field === "coldMs") return Number(r.coldMs || r.compileMs || 0);
+      return Number(r[field] || 0);
+    }
 
-      const buckets = {};
-      for (const f of BACKEND_FAMILIES) buckets[f.key] = [];
-      const [mode, param, field] = trendKey.split(":");
-
+    function computeMaxByBench(suites, field) {
+      const maxByBench = new Map();
       for (const r of suites) {
-        const b = (r.backend || "").toLowerCase();
-        const fam = BACKEND_FAMILIES.find(f => f.match(b));
-        if (!fam) continue;
-        if (mode === "shader" && (r.benchId || "bench_raymarch") !== param) continue;
-        if (mode === "cat" && r.category !== param) continue;
-        buckets[fam.key].push(r);
+        if (!r.ran) continue;
+        const v = metricVal(r, field);
+        if (v <= 0) continue;
+        const bid = r.benchId || "bench_raymarch";
+        if (!maxByBench.has(bid) || v > maxByBench.get(bid)) {
+          maxByBench.set(bid, v);
+        }
+      }
+      return maxByBench;
+    }
+
+    function computePenalizedBackendGeomeans(suites, field, { requireRanInScope = false, activeBackends = null } = {}) {
+      const maxByBench = computeMaxByBench(suites, field);
+      const out = new Map();
+      if (maxByBench.size === 0) return out;
+
+      const byBackend = new Map();
+      for (const r of suites) {
+        const b = r.backend || "";
+        if (!b) continue;
+        if (!byBackend.has(b)) byBackend.set(b, new Map());
+        if (r.ran) {
+          const v = metricVal(r, field);
+          if (v > 0) byBackend.get(b).set(r.benchId || "bench_raymarch", v);
+        }
       }
 
-      if (mode === "overall") {
-        const gms = entry.overallGeomeanMs || {};
-        const hasGms = Object.keys(gms).length > 0;
-        const out = { unit: "ms" };
-        for (const f of BACKEND_FAMILIES) {
-          if (hasGms) {
-            let bestB = null, bestMs = Infinity;
-            for (const [b, ms] of Object.entries(gms)) {
-              if (f.match(b.toLowerCase()) && ms > 0 && ms < bestMs) { bestMs = ms; bestB = b; }
-            }
-            out[f.key] = bestB ? { val: bestMs, backend: bestB, minMs: bestMs } : null;
-          } else {
-            out[f.key] = pickGroup(buckets[f.key], "medianMs", "geomean");
+      const backends = activeBackends || [...byBackend.keys()];
+      for (const b of backends) {
+        const ranMap = byBackend.get(b) || new Map();
+        if (requireRanInScope && ranMap.size === 0) continue;
+        const vals = [];
+        for (const [bid, maxV] of maxByBench.entries()) {
+          vals.push(ranMap.has(bid) ? ranMap.get(bid) : PENALTY_MULTIPLIER * maxV);
+        }
+        const gm = geomean(vals);
+        if (gm > 0) {
+          out.set(b, { val: gm, backend: b, ranCount: ranMap.size, totalBenches: maxByBench.size });
+        }
+      }
+      return out;
+    }
+
+    const BENCH_CATEGORIES = ["Compute", "Vertex", "Pixel", "Geometry", "Tessellation", "Ray Tracing", "Mesh"];
+
+    function computePenalizedSummary(entry) {
+      if (entry._penalizedSummary) return entry._penalizedSummary;
+      const suites = getEntrySuites(entry);
+      const activeBackends = new Set(suites.filter(r => r.ran && r.backend).map(r => r.backend));
+      const backendCatMs = new Map();
+      const categoryWinners = [];
+
+      for (const cat of BENCH_CATEGORIES) {
+        const catSuites = suites.filter(r => (r.category || "Compute") === cat);
+        const gms = computePenalizedBackendGeomeans(catSuites, "medianMs", {
+          requireRanInScope: false,
+          activeBackends,
+        });
+        let bestBackend = "N/A";
+        let bestMs = Infinity;
+        for (const [b, info] of gms.entries()) {
+          if (!backendCatMs.has(b)) backendCatMs.set(b, []);
+          backendCatMs.get(b).push(info.val);
+          if (info.ranCount > 0 && info.val < bestMs) {
+            bestMs = info.val;
+            bestBackend = b;
           }
+        }
+        if (gms.size > 0 || catSuites.length > 0) {
+          categoryWinners.push({
+            category: cat,
+            winner: bestBackend,
+            geomean_ms: bestBackend === "N/A" ? 0 : bestMs,
+          });
+        }
+      }
+
+      const overallGeomeanMs = {};
+      let overallWinner = "N/A";
+      let bestOverall = Infinity;
+      for (const [b, catVals] of backendCatMs.entries()) {
+        const ov = geomean(catVals);
+        if (ov > 0) {
+          overallGeomeanMs[b] = ov;
+          if (ov < bestOverall) {
+            bestOverall = ov;
+            overallWinner = b;
+          }
+        }
+      }
+
+      const regimeSpecs = [
+        { regime: "Cold JIT", field: "coldMs", unit: "ms" },
+        { regime: "Hot JIT", field: "medianMs", unit: "ms" },
+        { regime: "Short-Running Job", field: "shortJobMs", unit: "ms" },
+        { regime: "Long-Running Job", field: "longJobMs", unit: "ms" },
+        { regime: "Lowest Peak Memory", field: "peakRssMb", unit: "MB" },
+      ];
+      const regimeWinners = regimeSpecs.map(({ regime, field, unit }) => {
+        const gms = computePenalizedBackendGeomeans(suites, field, {
+          requireRanInScope: true,
+          activeBackends,
+        });
+        let winner = "N/A";
+        let value = 0;
+        let best = Infinity;
+        for (const [b, info] of gms.entries()) {
+          if (info.val < best) {
+            best = info.val;
+            winner = b;
+            value = info.val;
+          }
+        }
+        return { regime, winner, value, unit };
+      });
+
+      entry._penalizedSummary = { overallWinner, overallGeomeanMs, categoryWinners, regimeWinners };
+      return entry._penalizedSummary;
+    }
+
+    function extractMetrics(entry, trendKey = "overall:all:medianMs") {
+      const allSuites = getEntrySuites(entry);
+      const [mode, param, field] = trendKey.split(":");
+      const fName = field || "medianMs";
+      const unit = fName.toLowerCase().includes("mb") ? "MB" : "ms";
+      const out = { unit };
+
+      if (mode === "shader") {
+        const ran = allSuites.filter(r => r.ran && (r.benchId || "bench_raymarch") === param);
+        for (const f of BACKEND_FAMILIES) {
+          const items = ran.filter(r => f.match((r.backend || "").toLowerCase()));
+          if (!items.length) { out[f.key] = null; continue; }
+          const best = items.reduce((a, b) => (metricVal(a, fName) <= metricVal(b, fName) ? a : b));
+          out[f.key] = {
+            val: metricVal(best, fName),
+            backend: best.backend,
+            minMs: Number(best.minMs || best.medianMs || 0),
+          };
         }
         return out;
       }
 
-      const fName = field || "medianMs";
-      const agg = (mode === "regime" || mode === "cat") ? "geomean" : "min";
-      const unit = fName.toLowerCase().includes("mb") ? "MB" : "ms";
-      const out = { unit };
-      for (const fam of BACKEND_FAMILIES) {
-        out[fam.key] = pickGroup(buckets[fam.key], fName, agg);
+      const pickBestFromMap = (backendMap) => {
+        for (const f of BACKEND_FAMILIES) {
+          let bestInfo = null;
+          for (const [b, info] of backendMap.entries()) {
+            if (f.match(b.toLowerCase()) && info.val > 0 && (!bestInfo || info.val < bestInfo.val)) {
+              bestInfo = info;
+            }
+          }
+          out[f.key] = bestInfo ? { val: bestInfo.val, backend: bestInfo.backend, minMs: bestInfo.val } : null;
+        }
+      };
+
+      if (mode === "overall") {
+        const uniqueBenches = new Set(allSuites.map(r => r.benchId || "bench_raymarch"));
+        if (uniqueBenches.size > 1) {
+          const summary = computePenalizedSummary(entry);
+          const map = new Map(
+            Object.entries(summary.overallGeomeanMs).map(([b, val]) => [b, { val, backend: b }])
+          );
+          pickBestFromMap(map);
+          return out;
+        }
+        const gms = entry.overallGeomeanMs || {};
+        if (Object.keys(gms).length > 0) {
+          const map = new Map(
+            Object.entries(gms).map(([b, val]) => [b, { val: Number(val), backend: b }])
+          );
+          pickBestFromMap(map);
+          return out;
+        }
+        pickBestFromMap(computePenalizedBackendGeomeans(allSuites, "medianMs", { requireRanInScope: true }));
+        return out;
       }
+
+      const scopeSuites = mode === "cat"
+        ? allSuites.filter(r => (r.category || "Compute") === param)
+        : allSuites;
+      pickBestFromMap(computePenalizedBackendGeomeans(scopeSuites, fName, { requireRanInScope: true }));
       return out;
     }
 
@@ -967,9 +1136,11 @@
       for (const legendId of ["trend-legend", "mem-trend-legend"]) {
         const legend = document.getElementById(legendId);
         if (legend) {
+          const hidden = hiddenSeriesByLegend[legendId] || new Set();
           legend.innerHTML = families.map(f => {
             const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
-            return `<span class="legend-item"><span class="swatch" style="background: ${col}"></span>${escapeHtml(f.label)}</span>`;
+            const isHidden = hidden.has(f.key);
+            return `<button type="button" class="legend-item${isHidden ? " is-hidden" : ""}" data-family="${escapeHtml(f.key)}" aria-pressed="${String(!isHidden)}" title="Click to toggle ${escapeHtml(f.label)}"><span class="swatch" style="background: ${col}"></span>${escapeHtml(f.label)}</button>`;
           }).join("");
         }
       }
@@ -1024,13 +1195,16 @@
     function renderWinners(entry) {
       const grid = document.getElementById("winners-grid");
       const overallPill = document.getElementById("overall-winner-pill");
+      const suites = getEntrySuites(entry);
+      const isMultiShader = new Set(suites.map(r => r.benchId || "bench_raymarch")).size > 1;
+      const summary = isMultiShader ? computePenalizedSummary(entry) : entry;
       if (overallPill) {
-        const ow = entry.overallWinner || "—";
-        const gm = entry.overallGeomeanMs && entry.overallGeomeanMs[ow] ? ` (${Number(entry.overallGeomeanMs[ow]).toFixed(2)} ms geomean)` : "";
+        const ow = summary.overallWinner || "—";
+        const gm = summary.overallGeomeanMs && summary.overallGeomeanMs[ow] ? ` (${Number(summary.overallGeomeanMs[ow]).toFixed(2)} ms geomean)` : "";
         overallPill.textContent = `Overall Winner: ${ow}${gm}`;
       }
-      const cats = entry.categoryWinners || [];
-      const regs = entry.regimeWinners || [];
+      const cats = summary.categoryWinners || [];
+      const regs = summary.regimeWinners || [];
       const cards = [];
       for (const c of cats) {
         const val = c.geomean_ms || 0;
@@ -1064,48 +1238,74 @@
     let pageSize = 12;
 
     function aggregateByStage(suites, categoryFilter) {
-      const target = categoryFilter === "all" ? suites : suites.filter(r => r.category === categoryFilter);
-      const groups = new Map();
+      const target = categoryFilter === "all" ? suites : suites.filter(r => (r.category || "Compute") === categoryFilter);
+      const byCat = new Map();
       for (const r of target) {
         const cat = r.category || "Compute";
-        const key = `${cat}\0${r.backend}`;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(r);
+        if (!byCat.has(cat)) byCat.set(cat, []);
+        byCat.get(cat).push(r);
       }
+      const fields = ["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"];
       const out = [];
-      for (const group of groups.values()) {
-        const cat = group[0].category || "Compute";
-        const backend = group[0].backend;
-        const ranRows = group.filter(r => r.ran);
-        const testLabel = `${cat} Avg (${ranRows.length || group.length} test${(ranRows.length || group.length) === 1 ? "" : "s"})`;
-        if (ranRows.length > 0) {
-          out.push({
-            benchId: `stage:${cat}`,
-            benchName: testLabel,
-            category: cat,
-            backend,
-            coldMs: geomean(ranRows.map(r => Number(r.coldMs || r.compileMs || 0))),
-            medianMs: geomean(ranRows.map(r => Number(r.medianMs || 0))),
-            shortJobMs: geomean(ranRows.map(r => Number(r.shortJobMs || 0))),
-            longJobMs: geomean(ranRows.map(r => Number(r.longJobMs || 0))),
-            peakRssMb: geomean(ranRows.map(r => Number(r.peakRssMb || 0))),
-            ran: true,
-            status: `AVG (${ranRows.length}/${group.length})`,
-          });
-        } else {
-          out.push({
-            benchId: `stage:${cat}`,
-            benchName: testLabel,
-            category: cat,
-            backend,
-            coldMs: 0,
-            medianMs: 0,
-            shortJobMs: 0,
-            longJobMs: 0,
-            peakRssMb: 0,
-            ran: false,
-            status: group[0].status,
-          });
+      for (const [cat, catRows] of byCat.entries()) {
+        const maxByField = {};
+        for (const f of fields) maxByField[f] = computeMaxByBench(catRows, f);
+        const catBenchCount = maxByField.medianMs.size;
+
+        const byBackend = new Map();
+        for (const r of catRows) {
+          if (!byBackend.has(r.backend)) byBackend.set(r.backend, []);
+          byBackend.get(r.backend).push(r);
+        }
+
+        for (const [backend, group] of byBackend.entries()) {
+          const ranRows = group.filter(r => r.ran);
+          const totalTests = catBenchCount || group.length;
+          const testLabel = `${cat} Avg (${totalTests} test${totalTests === 1 ? "" : "s"})`;
+          if (ranRows.length > 0) {
+            const penalizedMean = (f) => {
+              const maxMap = maxByField[f];
+              if (!maxMap || maxMap.size === 0) return 0;
+              const ranByBench = new Map();
+              for (const r of ranRows) {
+                const v = metricVal(r, f);
+                if (v > 0) ranByBench.set(r.benchId || "bench_raymarch", v);
+              }
+              const vals = [];
+              for (const [bid, maxV] of maxMap.entries()) {
+                vals.push(ranByBench.has(bid) ? ranByBench.get(bid) : PENALTY_MULTIPLIER * maxV);
+              }
+              return geomean(vals);
+            };
+            const missingCount = Math.max(0, totalTests - ranRows.length);
+            out.push({
+              benchId: `stage:${cat}`,
+              benchName: testLabel,
+              category: cat,
+              backend,
+              coldMs: penalizedMean("coldMs"),
+              medianMs: penalizedMean("medianMs"),
+              shortJobMs: penalizedMean("shortJobMs"),
+              longJobMs: penalizedMean("longJobMs"),
+              peakRssMb: penalizedMean("peakRssMb"),
+              ran: true,
+              status: missingCount > 0 ? `AVG (${ranRows.length}/${totalTests} · penalized)` : `AVG (${ranRows.length}/${totalTests})`,
+            });
+          } else {
+            out.push({
+              benchId: `stage:${cat}`,
+              benchName: testLabel,
+              category: cat,
+              backend,
+              coldMs: 0,
+              medianMs: 0,
+              shortJobMs: 0,
+              longJobMs: 0,
+              peakRssMb: 0,
+              ran: false,
+              status: group[0].status,
+            });
+          }
         }
       }
       return out;
@@ -1295,11 +1495,29 @@
       const plotW = W - pad.left - pad.right;
       const plotH = H - pad.top - pad.bottom;
 
-      const seriesDefs = getActiveFamilies().map(f => ({
-        key: f.key,
-        color: familyColor(f),
-        label: f.label,
-      }));
+      const hiddenSet = hiddenSeriesByLegend[LEGEND_FOR_CANVAS[canvasId]] || new Set();
+      const seriesDefs = getActiveFamilies()
+        .filter(f => !hiddenSet.has(f.key))
+        .map(f => ({
+          key: f.key,
+          color: familyColor(f),
+          label: f.label,
+        }));
+
+      const borderCol = cssVar("--border");
+      const mutedCol = cssVar("--muted");
+      const surfaceCol = cssVar("--surface");
+      ctx.clearRect(0, 0, W, H);
+
+      if (!seriesDefs.length) {
+        ctx.font = "12px " + cssVar("--font-mono");
+        ctx.fillStyle = mutedCol;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("All series hidden — click a legend item to show.", W / 2, H / 2);
+        canvas._xs = [];
+        return;
+      }
 
       const winVal = document.getElementById("commit-window")?.value || "all";
       const winCount = winVal === "all" ? benchHistory.length : Math.max(1, Number(winVal));
@@ -1312,10 +1530,6 @@
       }
 
       const firstDataIdx = rawParsed.findIndex(p => seriesDefs.some(s => p.m[s.key]));
-      const borderCol = cssVar("--border");
-      const mutedCol = cssVar("--muted");
-      const surfaceCol = cssVar("--surface");
-      ctx.clearRect(0, 0, W, H);
 
       if (firstDataIdx === -1) {
         ctx.font = "12px " + cssVar("--font-mono");
@@ -1490,9 +1704,13 @@
         const m = nearest.p.m;
         const fmt = (it) => it ? `${it.val.toFixed(2)} ${m.unit}` : "—";
         const dot = (col) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${col};margin-right:4px;"></span>`;
-        const lines = getActiveFamilies().map(f =>
-          `<div>${dot(familyColor(f))}${escapeHtml(f.label)}: ${fmt(m[f.key])}</div>`
-        ).join("");
+        const hiddenSet = hiddenSeriesByLegend[LEGEND_FOR_CANVAS[canvasId]] || new Set();
+        const visibleFamilies = getActiveFamilies().filter(f => !hiddenSet.has(f.key));
+        const lines = visibleFamilies.length
+          ? visibleFamilies.map(f =>
+              `<div>${dot(familyColor(f))}${escapeHtml(f.label)}: ${fmt(m[f.key])}</div>`
+            ).join("")
+          : `<div>All series hidden</div>`;
         tooltip.innerHTML = `
           <div class="tt-sha">${escapeHtml(nearest.p.h.shortSha)}</div>
           <div class="tt-msg">${escapeHtml(nearest.p.h.message || "—")}</div>
@@ -1573,6 +1791,21 @@
 
       attachTrendInteraction("trend-canvas", "trend-tooltip");
       attachTrendInteraction("mem-trend-canvas", "mem-trend-tooltip");
+
+      for (const legendId of ["trend-legend", "mem-trend-legend"]) {
+        document.getElementById(legendId)?.addEventListener("click", (e) => {
+          const btn = e.target.closest("button.legend-item[data-family]");
+          if (!btn) return;
+          const famKey = btn.dataset.family;
+          const hidden = hiddenSeriesByLegend[legendId];
+          if (hidden.has(famKey)) hidden.delete(famKey);
+          else hidden.add(famKey);
+          const isHidden = hidden.has(famKey);
+          btn.classList.toggle("is-hidden", isHidden);
+          btn.setAttribute("aria-pressed", String(!isHidden));
+          drawTrendChart();
+        });
+      }
     }
 
     async function loadPlatformData(platform) {
