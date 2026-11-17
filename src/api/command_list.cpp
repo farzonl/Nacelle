@@ -1011,9 +1011,15 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     CompiledComputeFn fn = cpso->fn.load(std::memory_order_acquire);
     if (!fn || gx == 0 || gy == 0 || gz == 0) return;
 
+    const DriverRootContext ctxSnapshot = state.computeCtx;
+    if (cpso->singleGroupDispatch) {
+        ScopedFlushDenormals flushDenorms;
+        fn(&ctxSnapshot, nullptr, 0, 0, 0, gx, gy, gz);
+        return;
+    }
+
     const uint64_t totalGroups = uint64_t(gx) * gy * gz;
     const uint32_t scratchSize = std::max<uint32_t>(64, cpso->groupSharedBytes);
-    const DriverRootContext ctxSnapshot = state.computeCtx;
 
     auto runRange = [&](uint64_t begin, uint64_t end) {
         ScopedFlushDenormals flushDenorms;

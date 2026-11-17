@@ -142,7 +142,8 @@ bool packetizeComputeEntry(
     const RootSignatureLayout& rootLayout,
     uint32_t simdWidth,
     const std::string& symbolName,
-    std::string& outError);
+    std::string& outError,
+    bool* outSingleGroupFastPath = nullptr);
 
 /// Packetizes a barrier-free shader body (e.g. VS or PS) inside the caller's builder scope,
 /// initializing `rootCtxPtr`, `execMask` (`vector<Wxi1>`), and `realMask` (`vector<Wxi1>`).

@@ -47,11 +47,12 @@ struct CachedVSMeta {
 };
 
 struct CachedPSOMeta {
-    uint32_t magic = 0x4E434C35; // 'NCL5'
+    uint32_t magic = 0x4E434C36; // 'NCL6'
     uint32_t simdWidth = 4;
     // Compute
     uint32_t threadGroupSize[3]{1, 1, 1};
     uint32_t groupSharedBytes = 0;
+    uint8_t singleGroupDispatch = 0;
     // Graphics
     uint32_t numVSOutputRegs = 0;
     int32_t posOutputReg = 0;
