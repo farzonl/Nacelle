@@ -373,6 +373,11 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_CXX_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_LINKER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/lld-link.exe" `
+            -DCMAKE_C_FLAGS_RELEASE="/clang:-O3 /clang:-march=native /Ob2 /DNDEBUG" `
+            -DCMAKE_CXX_FLAGS_RELEASE="/clang:-O3 /clang:-march=native /Ob2 /DNDEBUG" `
             -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
             -DNACELLE_D3D12_SDK_VERSION="${{ steps.agility-release.outputs.sdk_version }}" `
             -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
