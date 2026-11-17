@@ -2208,6 +2208,17 @@ private:
             setMapped(op.getResult(0), {SimdVal::Kind::Vector, resElem, r, {}, {}});
             return true;
         }
+        if (llvm::isa<mlir::LLVM::FshlOp, mlir::LLVM::FshrOp>(&op)) {
+            mlir::Type resElem = op.getResult(0).getType();
+            mlir::Value a = asVec(loc, getMapped(loc, op.getOperand(0)));
+            mlir::Value b = asVec(loc, getMapped(loc, op.getOperand(1)));
+            mlir::Value c = asVec(loc, getMapped(loc, op.getOperand(2)));
+            mlir::Value r = llvm::isa<mlir::LLVM::FshlOp>(&op)
+                                ? mlir::Value(mlir::LLVM::FshlOp::create(b_, loc, vecTy(resElem), a, b, c))
+                                : mlir::Value(mlir::LLVM::FshrOp::create(b_, loc, vecTy(resElem), a, b, c));
+            setMapped(op.getResult(0), {SimdVal::Kind::Vector, resElem, r, {}, {}});
+            return true;
+        }
         if (auto ctlz = llvm::dyn_cast<mlir::LLVM::CountLeadingZerosOp>(&op)) {
             mlir::Type resElem = ctlz.getType();
             mlir::Value a = asVec(loc, getMapped(loc, ctlz.getIn()));
@@ -2559,15 +2570,16 @@ private:
         if (startVal >= boundVal) return false;
         if (isNe && ((boundVal - startVal) % stepVal) != 0) return false;
         uint64_t tripCount = (boundVal - startVal + stepVal - 1) / stepVal;
-        if (tripCount > 6) return false;
+        if (tripCount > 24) return false;
 
-        // Only unroll small leaf loops (no nested regions and bounded op count) so we
-        // expose cross-call CSE (e.g. repeated fbm calls) without blowing up compile time.
+        // Only unroll small leaf loops (no nested loops and bounded op count) so we
+        // expose constant-table folding and cross-call CSE without blowing up compile time.
         uint32_t bodyOps = 0;
         for (mlir::Operation& innerOp : srcBefore) {
-            if (innerOp.getNumRegions() > 0) return false;
+            if (llvm::isa<mlir::scf::WhileOp, mlir::scf::ForOp>(innerOp)) return false;
             if (++bodyOps > 120) return false;
         }
+        if (tripCount > 6 && tripCount * bodyOps > 1200) return false;
 
         mlir::Location loc = whileOp.getLoc();
         llvm::SmallVector<SimdVal, 8> curState;
@@ -2582,7 +2594,9 @@ private:
                 if (static_cast<int>(i) == ivIdx) {
                     int64_t ivVal = static_cast<int64_t>(startVal + iter * stepVal);
                     mlir::Value ivConst = mlir::LLVM::ConstantOp::create(b_, loc, ivTy, b_.getIntegerAttr(ivTy, ivVal));
-                    sub.setMapped(srcBefore.getArgument(i), {SimdVal::Kind::Vector, ivTy, llvmSplat(b_, loc, ivTy, ivConst), {}, {}});
+                    SimdVal ivSv{SimdVal::Kind::Vector, ivTy, llvmSplat(b_, loc, ivTy, ivConst), {}, {}};
+                    ivSv.pattern = SimdVal::LanePattern::Uniform;
+                    sub.setMapped(srcBefore.getArgument(i), std::move(ivSv));
                 } else {
                     sub.setMapped(srcBefore.getArgument(i), curState[i]);
                 }
