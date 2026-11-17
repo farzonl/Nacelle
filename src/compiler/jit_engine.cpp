@@ -136,6 +136,10 @@ static const AppleOpenBlasDispatch& getAppleOpenBlasDispatch() {
             auto s = reinterpret_cast<AppleOpenBlasDispatch::SgemmFn>(dlsym(h, "cblas_sgemm"));
             auto dg = reinterpret_cast<AppleOpenBlasDispatch::DgemmFn>(dlsym(h, "cblas_dgemm"));
             if (s && dg) {
+                using SetThreadsFn = void (*)(int);
+                if (auto setThreads = reinterpret_cast<SetThreadsFn>(dlsym(h, "openblas_set_num_threads"))) {
+                    setThreads(1);
+                }
                 out.handle = h;
                 out.sgemm = s;
                 out.dgemm = dg;
@@ -261,6 +265,28 @@ static void dispatchGemm(
         }
         break;
 #elif defined(NACELLE_HAS_CBLAS)
+        // OpenBLAS defaults to multi-threaded execution, which contends with Nacelle's
+        // BS::thread_pool workers when many small tile GEMMs are dispatched concurrently.
+        static std::once_flag openBlasThreadOnce;
+        std::call_once(openBlasThreadOnce, []() {
+            using SetThreadsFn = void (*)(int);
+            SetThreadsFn setThreads = nullptr;
+#if defined(_WIN32)
+            if (HMODULE h = GetModuleHandleA("libopenblas.dll")) {
+                setThreads = reinterpret_cast<SetThreadsFn>(GetProcAddress(h, "openblas_set_num_threads"));
+            }
+            if (!setThreads) {
+                if (HMODULE h = GetModuleHandleA("openblas.dll")) {
+                    setThreads = reinterpret_cast<SetThreadsFn>(GetProcAddress(h, "openblas_set_num_threads"));
+                }
+            }
+#else
+            setThreads = reinterpret_cast<SetThreadsFn>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads"));
+#endif
+            if (setThreads) {
+                setThreads(1);
+            }
+        });
         copyC();
         if constexpr (std::is_same_v<T, float>) {
             cblas_sgemm(
