@@ -430,6 +430,8 @@ struct QuadBatchEmitter {
     uint32_t triDataCount = 0;
     uint32_t currentTriDataIdx = 0;
     uint32_t lastSceneTriIdx = UINT32_MAX;
+    uint32_t currentSceneTriIdx = UINT32_MAX;
+    PixelTriData currentTriData{};
     bool currentGroupHasPrevTri = false;
     float sampleOffsetX = 0.0f;
     float sampleOffsetY = 0.0f;
@@ -481,6 +483,8 @@ struct QuadBatchEmitter {
     }
 
     void beginTriangle(uint32_t sceneTriIdx, const PixelTriData& td) {
+        currentTriData = td;
+        currentSceneTriIdx = sceneTriIdx;
         if (triDataCount > 0 && sceneTriIdx == lastSceneTriIdx) {
             return;
         }
@@ -497,6 +501,15 @@ struct QuadBatchEmitter {
         currentTriDataIdx = triDataCount++;
         triData[currentTriDataIdx] = td;
         lastSceneTriIdx = sceneTriIdx;
+    }
+
+    void ensureCurrentTriangle() {
+        if (triDataCount == 0 && currentSceneTriIdx != UINT32_MAX) {
+            currentTriDataIdx = 0;
+            triDataCount = 1;
+            triData[0] = currentTriData;
+            lastSceneTriIdx = currentSceneTriIdx;
+        }
     }
 
     void flush() {
@@ -587,6 +600,7 @@ struct QuadBatchEmitter {
         float dy = tri.lineY1 - tri.lineY0;
         float lenSq = dx * dx + dy * dy;
 
+        ensureCurrentTriangle();
         quadOffsets[baseQ + qCount] = quadOffset;
         quadTriIndices[baseQ + qCount] = currentTriDataIdx;
         for (uint32_t sub = 0; sub < 4; ++sub) {
@@ -725,6 +739,7 @@ struct QuadBatchEmitter {
             }
         }
 
+        ensureCurrentTriangle();
         quadOffsets[baseQ + qCount] = quadOffset;
         quadTriIndices[baseQ + qCount] = currentTriDataIdx;
         uint32_t baseLane = (baseQ + qCount) * 4u;
@@ -912,11 +927,11 @@ void rasterizeTiles(
                 td.triAttrFlat = !scene.attrFlatArena.empty()
                                      ? (scene.attrFlatArena.data() + triIdxSz * psScalars)
                                      : nullptr;
-                td.triInvW = sampleTri.invW;
+                td.triInvW = baseTri.invW;
                 td.triOrigBary = !scene.origBaryArena.empty()
                                      ? (scene.origBaryArena.data() + triIdxSz * 9)
                                      : nullptr;
-                td.triDepth = sampleTri.depth;
+                td.triDepth = baseTri.depth;
                 td.isFrontFace = sampleTri.isFrontFace;
                 td.primitiveId = sampleTri.primitiveId;
                 td.viewportArrayIndex = sampleTri.viewportIndex;
