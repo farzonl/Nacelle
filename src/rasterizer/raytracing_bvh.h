@@ -29,10 +29,8 @@ struct PipelineHitResult {
     uint32_t geometryIndex = 0;
     uint32_t primitiveIndex = 0;
     uint32_t instanceContributionToHitGroupIndex = 0;
-    float objOrigin[3]{};
-    float objDir[3]{};
-    float objToWorld[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-    float worldToObj[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    const float* objToWorldPtr = nullptr;
+    const float* worldToObjPtr = nullptr;
 };
 
 // Return values for DxrAnyHitFn: 0 = accept hit, 1 = ignore hit, 2 = accept and end search
@@ -63,6 +61,21 @@ PipelineHitResult traceRayForPipeline(
     DxrIntersectionFn onIntersection,
     void* userData);
 
+void traceRayPacketForPipeline(
+    uint32_t activeMask,
+    const void* tlasPtr,
+    const uint32_t* rayFlags,
+    const uint32_t* instanceMask,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax,
+    PipelineHitResult* outHits);
+
 } // namespace nacelle
 
 extern "C" {
@@ -88,4 +101,25 @@ int32_t nacelle_rayquery_state_i32(int32_t op, int32_t handle);
 float nacelle_rayquery_state_f32(int32_t op, int32_t handle);
 float nacelle_rayquery_state_vec(int32_t op, int32_t handle, int32_t comp);
 float nacelle_rayquery_state_mat(int32_t op, int32_t handle, int32_t row, int32_t col);
+
+void nacelle_rayquery_alloc_pkt(uint32_t activeMask, const int32_t* constRayFlags, int32_t* outHandles);
+void nacelle_rayquery_trace_inline_pkt(
+    uint32_t activeMask,
+    const int32_t* handles,
+    const void* tlasPtr,
+    const int32_t* rayFlags,
+    const int32_t* instanceMask,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax);
+uint32_t nacelle_rayquery_proceed_pkt(uint32_t activeMask, const int32_t* handles);
+void nacelle_rayquery_state_i32_pkt(int32_t op, uint32_t activeMask, const int32_t* handles, int32_t* outVals);
+void nacelle_rayquery_state_f32_pkt(int32_t op, uint32_t activeMask, const int32_t* handles, float* outVals);
+void nacelle_rayquery_state_vec_pkt(
+    int32_t op, uint32_t activeMask, const int32_t* handles, const int32_t* comps, float* outVals);
 }

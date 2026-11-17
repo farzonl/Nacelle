@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -27,6 +28,7 @@ constexpr uint32_t kRayFlagCullOpaque = 0x40u;
 constexpr uint32_t kRayFlagCullNonOpaque = 0x80u;
 constexpr uint32_t kRayFlagSkipTriangles = 0x100u;
 constexpr uint32_t kRayFlagSkipProceduralPrimitives = 0x200u;
+constexpr uint32_t kInstFlagIdentityTransform = 0x80000000u;
 
 // Committed / Candidate enums
 constexpr uint32_t kCommittedNothing = 0u;
@@ -511,11 +513,17 @@ void buildTlas(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
 
         TlasInstance inst{};
         std::memcpy(inst.objectToWorld, srcInst->Transform, sizeof(inst.objectToWorld));
-        invertTransform3x4(inst.objectToWorld, inst.worldToObject);
+        static constexpr float kIdent[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        const bool isIdent = std::memcmp(inst.objectToWorld, kIdent, sizeof(kIdent)) == 0;
+        if (isIdent) {
+            std::memcpy(inst.worldToObject, kIdent, sizeof(kIdent));
+        } else {
+            invertTransform3x4(inst.objectToWorld, inst.worldToObject);
+        }
         inst.instanceID = srcInst->InstanceID;
         inst.instanceMask = srcInst->InstanceMask;
         inst.instanceContributionToHitGroupIndex = srcInst->InstanceContributionToHitGroupIndex;
-        inst.flags = srcInst->Flags;
+        inst.flags = srcInst->Flags | (isIdent ? kInstFlagIdentityTransform : 0u);
         inst.instanceIndex = i;
         inst.blasAddress = srcInst->AccelerationStructure;
 
@@ -570,6 +578,32 @@ void buildTlas(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc) {
     }
 }
 
+inline void computeInvDir(const float dir[3], float invDir[3]) {
+    for (int a = 0; a < 3; ++a) {
+        const float d = std::fabs(dir[a]) >= 1e-20f ? dir[a] : std::copysign(1e-20f, dir[a]);
+        invDir[a] = 1.0f / d;
+    }
+}
+
+inline bool intersectRayAabbFast(
+    const float origin[3],
+    const float invDir[3],
+    float tMin,
+    float tMax,
+    const float bMin[3],
+    const float bMax[3]) {
+    for (int a = 0; a < 3; ++a) {
+        const float t0 = (bMin[a] - origin[a]) * invDir[a];
+        const float t1 = (bMax[a] - origin[a]) * invDir[a];
+        const float tNear = t0 < t1 ? t0 : t1;
+        const float tFar = t0 > t1 ? t0 : t1;
+        tMin = tNear > tMin ? tNear : tMin;
+        tMax = tFar < tMax ? tFar : tMax;
+        if (tMax < tMin) return false;
+    }
+    return true;
+}
+
 bool intersectRayAabb(
     const float origin[3],
     const float dir[3],
@@ -577,22 +611,9 @@ bool intersectRayAabb(
     float tMax,
     const float bMin[3],
     const float bMax[3]) {
-    for (int a = 0; a < 3; ++a) {
-        if (std::fabs(dir[a]) < 1e-30f) {
-            if (origin[a] < bMin[a] || origin[a] > bMax[a]) {
-                return false;
-            }
-            continue;
-        }
-        float invD = 1.0f / dir[a];
-        float t0 = (bMin[a] - origin[a]) * invD;
-        float t1 = (bMax[a] - origin[a]) * invD;
-        if (invD < 0.0f) std::swap(t0, t1);
-        tMin = std::max(tMin, t0);
-        tMax = std::min(tMax, t1);
-        if (tMax < tMin) return false;
-    }
-    return true;
+    float invDir[3];
+    computeInvDir(dir, invDir);
+    return intersectRayAabbFast(origin, invDir, tMin, tMax, bMin, bMax);
 }
 
 bool intersectRayTriangle(
@@ -644,17 +665,16 @@ struct HitInfo {
     float t = 0.0f;
     float baryU = 0.0f;
     float baryV = 0.0f;
-    bool frontFace = false;
     uint32_t instanceIndex = 0;
     uint32_t instanceID = 0;
     uint32_t geometryIndex = 0;
     uint32_t primitiveIndex = 0;
     uint32_t instanceContributionToHitGroupIndex = 0;
+    bool frontFace = false;
+    bool frontFaceValid = false;
     bool nonOpaque = false;
-    float objOrigin[3]{};
-    float objDir[3]{};
-    float objToWorld[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-    float worldToObj[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    const TlasInstance* inst = nullptr;
+    const BlasTriangle* tri = nullptr;
 };
 
 struct RayQueryState {
@@ -663,6 +683,7 @@ struct RayQueryState {
     uint32_t instanceMask = 0xFF;
     float worldOrigin[3]{};
     float worldDir[3]{};
+    float invWorldDir[3]{};
     float tMin = 0.0f;
     float tMax = 0.0f;
 
@@ -688,6 +709,7 @@ struct RayQueryState {
     const BlasAabb* blasAabbs = nullptr;
     float curObjOrigin[3]{};
     float curObjDir[3]{};
+    float curInvObjDir[3]{};
 
     uint32_t blasStack[32]{};
     int32_t blasSp = 0;
@@ -701,12 +723,32 @@ constexpr int32_t kMaxRayQueries = 256;
 thread_local std::array<RayQueryState, kMaxRayQueries> g_rayQueries{};
 thread_local uint32_t g_nextRayQuerySlot = 0;
 
-RayQueryState* getQuery(int32_t handle) {
+inline RayQueryState* getQuery(int32_t handle) {
     if (handle < 0 || handle >= kMaxRayQueries) return nullptr;
     return &g_rayQueries[static_cast<size_t>(handle)];
 }
 
-void beginInstance(RayQueryState& rq, const TlasInstance* inst) {
+inline bool computeTriFrontFace(const TlasInstance* inst, const BlasTriangle* tri, const float worldDir[3]) {
+    if (!inst || !tri) return true;
+    float e1[3] = {tri->v1[0] - tri->v0[0], tri->v1[1] - tri->v0[1], tri->v1[2] - tri->v0[2]};
+    float e2[3] = {tri->v2[0] - tri->v0[0], tri->v2[1] - tri->v0[1], tri->v2[2] - tri->v0[2]};
+    float we1[3], we2[3];
+    transformVec3x3(inst->objectToWorld, e1, we1);
+    transformVec3x3(inst->objectToWorld, e2, we2);
+    float wn[3] = {
+        we1[1] * we2[2] - we1[2] * we2[1],
+        we1[2] * we2[0] - we1[0] * we2[2],
+        we1[0] * we2[1] - we1[1] * we2[0],
+    };
+    float facingDot = worldDir[0] * wn[0] + worldDir[1] * wn[1] + worldDir[2] * wn[2];
+    bool frontFace = facingDot < 0.0f;
+    if (inst->flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE) {
+        frontFace = !frontFace;
+    }
+    return frontFace;
+}
+
+inline void beginInstance(RayQueryState& rq, const TlasInstance* inst) {
     rq.curInst = inst;
     rq.curBlas = reinterpret_cast<const BlasHeader*>(inst->blasAddress);
     if (!rq.curBlas || rq.curBlas->magic != kBlasMagic) {
@@ -719,6 +761,7 @@ void beginInstance(RayQueryState& rq, const TlasInstance* inst) {
     rq.blasAabbs = reinterpret_cast<const BlasAabb*>(base + rq.curBlas->aabbsOffset);
     transformPoint3x4(inst->worldToObject, rq.worldOrigin, rq.curObjOrigin);
     transformVec3x3(inst->worldToObject, rq.worldDir, rq.curObjDir);
+    computeInvDir(rq.curObjDir, rq.curInvObjDir);
 
     rq.blasSp = 0;
     rq.primCursor = 0;
@@ -737,19 +780,12 @@ void beginInstance(RayQueryState& rq, const TlasInstance* inst) {
     }
 }
 
-bool resolveOpaque(uint32_t rayFlags, uint32_t instFlags, uint32_t geomFlags) {
+inline bool resolveOpaque(uint32_t rayFlags, uint32_t instFlags, uint32_t geomFlags) {
     if (rayFlags & kRayFlagForceOpaque) return true;
     if (rayFlags & kRayFlagForceNonOpaque) return false;
     if (instFlags & D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE) return true;
     if (instFlags & D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE) return false;
     return (geomFlags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0;
-}
-
-void fillHitTransform(HitInfo& h, const TlasInstance& inst, const float objOrigin[3], const float objDir[3]) {
-    std::memcpy(h.objOrigin, objOrigin, sizeof(h.objOrigin));
-    std::memcpy(h.objDir, objDir, sizeof(h.objDir));
-    std::memcpy(h.objToWorld, inst.objectToWorld, sizeof(h.objToWorld));
-    std::memcpy(h.worldToObj, inst.worldToObject, sizeof(h.worldToObj));
 }
 
 float readMatrixElem(const float m[12], int32_t row, int32_t col) {
@@ -824,8 +860,11 @@ int32_t nacelle_rayquery_alloc(int32_t constRayFlags) {
     uint32_t slot = nacelle::g_nextRayQuerySlot % static_cast<uint32_t>(nacelle::kMaxRayQueries);
     ++nacelle::g_nextRayQuerySlot;
     auto& rq = nacelle::g_rayQueries[slot];
-    rq = nacelle::RayQueryState{};
     rq.constRayFlags = static_cast<uint32_t>(constRayFlags);
+    rq.finished = true;
+    rq.committed.status = nacelle::kCommittedNothing;
+    rq.committed.inst = nullptr;
+    rq.committed.tri = nullptr;
     return static_cast<int32_t>(slot);
 }
 
@@ -845,10 +884,7 @@ void nacelle_rayquery_trace_inline(
     auto* rq = nacelle::getQuery(handle);
     if (!rq) return;
 
-    const uint32_t savedConstFlags = rq->constRayFlags;
-    *rq = nacelle::RayQueryState{};
-    rq->constRayFlags = savedConstFlags;
-    rq->rayFlags = savedConstFlags | static_cast<uint32_t>(rayFlags);
+    rq->rayFlags = rq->constRayFlags | static_cast<uint32_t>(rayFlags);
     rq->instanceMask = static_cast<uint32_t>(instanceMask) & 0xFFu;
     rq->worldOrigin[0] = ox;
     rq->worldOrigin[1] = oy;
@@ -856,10 +892,24 @@ void nacelle_rayquery_trace_inline(
     rq->worldDir[0] = dx;
     rq->worldDir[1] = dy;
     rq->worldDir[2] = dz;
+    nacelle::computeInvDir(rq->worldDir, rq->invWorldDir);
     rq->tMin = tMin;
     rq->tMax = tMax;
     rq->committed.status = nacelle::kCommittedNothing;
     rq->committed.t = tMax;
+    rq->committed.inst = nullptr;
+    rq->committed.tri = nullptr;
+    rq->committed.frontFace = false;
+    rq->committed.frontFaceValid = false;
+    rq->tlasSp = 0;
+    rq->instCursor = 0;
+    rq->instEnd = 0;
+    rq->curInst = nullptr;
+    rq->blasSp = 0;
+    rq->traversingTris = false;
+    rq->traversingAabbs = false;
+    rq->primCursor = 0;
+    rq->primEnd = 0;
 
     const auto* tlas = static_cast<const nacelle::TlasHeader*>(tlasPtr);
     if (!tlas || tlas->magic != nacelle::kTlasMagic || tlas->rootNode == nacelle::kInvalidNode || tMax < tMin) {
@@ -879,6 +929,9 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
     auto* rq = nacelle::getQuery(handle);
     if (!rq || rq->finished) return 0;
 
+    const bool needCullCheck =
+        (rq->rayFlags & (nacelle::kRayFlagCullBackFacingTriangles | nacelle::kRayFlagCullFrontFacingTriangles)) != 0;
+
     while (true) {
         // 1. Inside an active BLAS instance
         if (rq->curInst) {
@@ -890,24 +943,11 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
                         continue;
                     }
 
-                    // Winding / front-face check in world space (or object space)
-                    float e1[3] = {tri.v1[0] - tri.v0[0], tri.v1[1] - tri.v0[1], tri.v1[2] - tri.v0[2]};
-                    float e2[3] = {tri.v2[0] - tri.v0[0], tri.v2[1] - tri.v0[1], tri.v2[2] - tri.v0[2]};
-                    float we1[3], we2[3];
-                    nacelle::transformVec3x3(rq->curInst->objectToWorld, e1, we1);
-                    nacelle::transformVec3x3(rq->curInst->objectToWorld, e2, we2);
-                    float wn[3] = {
-                        we1[1] * we2[2] - we1[2] * we2[1],
-                        we1[2] * we2[0] - we1[0] * we2[2],
-                        we1[0] * we2[1] - we1[1] * we2[0],
-                    };
-                    float facingDot = rq->worldDir[0] * wn[0] + rq->worldDir[1] * wn[1] + rq->worldDir[2] * wn[2];
-                    bool frontFace = facingDot < 0.0f;
-                    if (rq->curInst->flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE) {
-                        frontFace = !frontFace;
-                    }
-
-                    if (!(rq->curInst->flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)) {
+                    bool frontFace = false;
+                    bool frontFaceValid = false;
+                    if (needCullCheck && !(rq->curInst->flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)) {
+                        frontFace = nacelle::computeTriFrontFace(rq->curInst, &tri, rq->worldDir);
+                        frontFaceValid = true;
                         if ((rq->rayFlags & nacelle::kRayFlagCullBackFacingTriangles) && !frontFace) continue;
                         if ((rq->rayFlags & nacelle::kRayFlagCullFrontFacingTriangles) && frontFace) continue;
                     }
@@ -916,28 +956,28 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
                     if (isOpaque && (rq->rayFlags & nacelle::kRayFlagCullOpaque)) continue;
                     if (!isOpaque && (rq->rayFlags & nacelle::kRayFlagCullNonOpaque)) continue;
 
-                    nacelle::HitInfo hit{};
-                    hit.status = nacelle::kCommittedTriangleHit;
-                    hit.t = t;
-                    hit.baryU = u;
-                    hit.baryV = v;
-                    hit.frontFace = frontFace;
-                    hit.instanceIndex = rq->curInst->instanceIndex;
-                    hit.instanceID = rq->curInst->instanceID;
-                    hit.geometryIndex = tri.geometryIndex;
-                    hit.primitiveIndex = tri.primitiveIndex;
-                    hit.instanceContributionToHitGroupIndex = rq->curInst->instanceContributionToHitGroupIndex;
-                    hit.nonOpaque = !isOpaque;
-                    nacelle::fillHitTransform(hit, *rq->curInst, rq->curObjOrigin, rq->curObjDir);
+                    nacelle::HitInfo& dst = isOpaque ? rq->committed : rq->candidate;
+                    dst.status = nacelle::kCommittedTriangleHit;
+                    dst.t = t;
+                    dst.baryU = u;
+                    dst.baryV = v;
+                    dst.frontFace = frontFace;
+                    dst.frontFaceValid = frontFaceValid;
+                    dst.instanceIndex = rq->curInst->instanceIndex;
+                    dst.instanceID = rq->curInst->instanceID;
+                    dst.geometryIndex = tri.geometryIndex;
+                    dst.primitiveIndex = tri.primitiveIndex;
+                    dst.instanceContributionToHitGroupIndex = rq->curInst->instanceContributionToHitGroupIndex;
+                    dst.nonOpaque = !isOpaque;
+                    dst.inst = rq->curInst;
+                    dst.tri = &tri;
 
                     if (isOpaque) {
-                        rq->committed = hit;
                         if (rq->rayFlags & nacelle::kRayFlagAcceptFirstHitAndEndSearch) {
                             rq->finished = true;
                             return 0;
                         }
                     } else {
-                        rq->candidate = hit;
                         rq->candidateType = nacelle::kCandidateNonOpaqueTriangle;
                         return 1;
                     }
@@ -946,7 +986,7 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
                 if (rq->blasSp > 0) {
                     uint32_t nodeIdx = rq->blasStack[--rq->blasSp];
                     const auto& node = rq->blasNodes[nodeIdx];
-                    if (nacelle::intersectRayAabb(rq->curObjOrigin, rq->curObjDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
+                    if (nacelle::intersectRayAabbFast(rq->curObjOrigin, rq->curInvObjDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
                         if (node.count > 0) {
                             rq->primCursor = node.leftOrFirst;
                             rq->primEnd = node.leftOrFirst + node.count;
@@ -970,24 +1010,28 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
             if (rq->traversingAabbs) {
                 while (rq->primCursor < rq->primEnd) {
                     const auto& aabb = rq->blasAabbs[rq->primCursor++];
-                    if (!nacelle::intersectRayAabb(rq->curObjOrigin, rq->curObjDir, rq->tMin, rq->committed.t, aabb.minB, aabb.maxB)) {
+                    if (!nacelle::intersectRayAabbFast(rq->curObjOrigin, rq->curInvObjDir, rq->tMin, rq->committed.t, aabb.minB, aabb.maxB)) {
                         continue;
                     }
                     bool isOpaque = nacelle::resolveOpaque(rq->rayFlags, rq->curInst->flags, aabb.geomFlags);
                     if (isOpaque && (rq->rayFlags & nacelle::kRayFlagCullOpaque)) continue;
                     if (!isOpaque && (rq->rayFlags & nacelle::kRayFlagCullNonOpaque)) continue;
 
-                    nacelle::HitInfo cand{};
+                    nacelle::HitInfo& cand = rq->candidate;
                     cand.status = nacelle::kCommittedProceduralHit;
                     cand.t = rq->committed.t;
+                    cand.baryU = 0.0f;
+                    cand.baryV = 0.0f;
+                    cand.frontFace = false;
+                    cand.frontFaceValid = true;
                     cand.instanceIndex = rq->curInst->instanceIndex;
                     cand.instanceID = rq->curInst->instanceID;
                     cand.geometryIndex = aabb.geometryIndex;
                     cand.primitiveIndex = aabb.primitiveIndex;
                     cand.instanceContributionToHitGroupIndex = rq->curInst->instanceContributionToHitGroupIndex;
                     cand.nonOpaque = !isOpaque;
-                    nacelle::fillHitTransform(cand, *rq->curInst, rq->curObjOrigin, rq->curObjDir);
-                    rq->candidate = cand;
+                    cand.inst = rq->curInst;
+                    cand.tri = nullptr;
                     rq->candidateType = nacelle::kCandidateProceduralPrimitive;
                     return 1;
                 }
@@ -995,7 +1039,7 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
                 if (rq->blasSp > 0) {
                     uint32_t nodeIdx = rq->blasStack[--rq->blasSp];
                     const auto& node = rq->blasNodes[nodeIdx];
-                    if (nacelle::intersectRayAabb(rq->curObjOrigin, rq->curObjDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
+                    if (nacelle::intersectRayAabbFast(rq->curObjOrigin, rq->curInvObjDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
                         if (node.count > 0) {
                             rq->primCursor = node.leftOrFirst;
                             rq->primEnd = node.leftOrFirst + node.count;
@@ -1016,7 +1060,7 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
         if (rq->instCursor < rq->instEnd) {
             const auto& inst = rq->tlasInstances[rq->instCursor++];
             if ((inst.instanceMask & rq->instanceMask) != 0 &&
-                nacelle::intersectRayAabb(rq->worldOrigin, rq->worldDir, rq->tMin, rq->committed.t, inst.minB, inst.maxB)) {
+                nacelle::intersectRayAabbFast(rq->worldOrigin, rq->invWorldDir, rq->tMin, rq->committed.t, inst.minB, inst.maxB)) {
                 nacelle::beginInstance(*rq, &inst);
             }
             continue;
@@ -1026,7 +1070,7 @@ int32_t nacelle_rayquery_proceed(int32_t handle) {
         if (rq->tlasSp > 0) {
             uint32_t nodeIdx = rq->tlasStack[--rq->tlasSp];
             const auto& node = rq->tlasNodes[nodeIdx];
-            if (nacelle::intersectRayAabb(rq->worldOrigin, rq->worldDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
+            if (nacelle::intersectRayAabbFast(rq->worldOrigin, rq->invWorldDir, rq->tMin, rq->committed.t, node.minB, node.maxB)) {
                 if (node.count > 0) {
                     rq->instCursor = node.leftOrFirst;
                     rq->instEnd = node.leftOrFirst + node.count;
@@ -1080,8 +1124,18 @@ int32_t nacelle_rayquery_state_i32(int32_t op, int32_t handle) {
     case 184: return static_cast<int32_t>(rq->committed.status);
     case 185: return static_cast<int32_t>(rq->candidateType);
     case 190: return rq->candidate.nonOpaque ? 1 : 0;
-    case 191: return rq->candidate.frontFace ? 1 : 0;
-    case 192: return rq->committed.frontFace ? 1 : 0;
+    case 191:
+        return (rq->candidate.frontFaceValid
+                    ? rq->candidate.frontFace
+                    : nacelle::computeTriFrontFace(rq->candidate.inst, rq->candidate.tri, rq->worldDir))
+                   ? 1
+                   : 0;
+    case 192:
+        return (rq->committed.frontFaceValid
+                    ? rq->committed.frontFace
+                    : nacelle::computeTriFrontFace(rq->committed.inst, rq->committed.tri, rq->worldDir))
+                   ? 1
+                   : 0;
     case 195: return static_cast<int32_t>(rq->rayFlags);
     case 201: return static_cast<int32_t>(rq->candidate.instanceIndex);
     case 202: return static_cast<int32_t>(rq->candidate.instanceID);
@@ -1116,10 +1170,24 @@ float nacelle_rayquery_state_vec(int32_t op, int32_t handle, int32_t comp) {
     case 194: return comp == 0 ? rq->committed.baryU : (comp == 1 ? rq->committed.baryV : 0.0f);
     case 196: return comp < 3 ? rq->worldOrigin[comp] : 0.0f;
     case 197: return comp < 3 ? rq->worldDir[comp] : 0.0f;
-    case 205: return comp < 3 ? rq->candidate.objOrigin[comp] : 0.0f;
-    case 206: return comp < 3 ? rq->candidate.objDir[comp] : 0.0f;
-    case 211: return comp < 3 ? rq->committed.objOrigin[comp] : 0.0f;
-    case 212: return comp < 3 ? rq->committed.objDir[comp] : 0.0f;
+    case 205:
+    case 211: {
+        if (comp >= 3) return 0.0f;
+        const auto* inst = (op == 205) ? rq->candidate.inst : rq->committed.inst;
+        if (!inst) return 0.0f;
+        float out[3];
+        nacelle::transformPoint3x4(inst->worldToObject, rq->worldOrigin, out);
+        return out[comp];
+    }
+    case 206:
+    case 212: {
+        if (comp >= 3) return 0.0f;
+        const auto* inst = (op == 206) ? rq->candidate.inst : rq->committed.inst;
+        if (!inst) return 0.0f;
+        float out[3];
+        nacelle::transformVec3x3(inst->worldToObject, rq->worldDir, out);
+        return out[comp];
+    }
     default: return 0.0f;
     }
 }
@@ -1127,12 +1195,87 @@ float nacelle_rayquery_state_vec(int32_t op, int32_t handle, int32_t comp) {
 float nacelle_rayquery_state_mat(int32_t op, int32_t handle, int32_t row, int32_t col) {
     const auto* rq = nacelle::getQuery(handle);
     if (!rq) return 0.0f;
+    static constexpr float kIdentity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     switch (op) {
-    case 186: return nacelle::readMatrixElem(rq->candidate.objToWorld, row, col);
-    case 187: return nacelle::readMatrixElem(rq->candidate.worldToObj, row, col);
-    case 188: return nacelle::readMatrixElem(rq->committed.objToWorld, row, col);
-    case 189: return nacelle::readMatrixElem(rq->committed.worldToObj, row, col);
+    case 186: return nacelle::readMatrixElem(rq->candidate.inst ? rq->candidate.inst->objectToWorld : kIdentity, row, col);
+    case 187: return nacelle::readMatrixElem(rq->candidate.inst ? rq->candidate.inst->worldToObject : kIdentity, row, col);
+    case 188: return nacelle::readMatrixElem(rq->committed.inst ? rq->committed.inst->objectToWorld : kIdentity, row, col);
+    case 189: return nacelle::readMatrixElem(rq->committed.inst ? rq->committed.inst->worldToObject : kIdentity, row, col);
     default: return 0.0f;
+    }
+}
+
+void nacelle_rayquery_alloc_pkt(uint32_t activeMask, const int32_t* constRayFlags, int32_t* outHandles) {
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        outHandles[l] = nacelle_rayquery_alloc(constRayFlags[l]);
+    }
+}
+
+void nacelle_rayquery_trace_inline_pkt(
+    uint32_t activeMask,
+    const int32_t* handles,
+    const void* tlasPtr,
+    const int32_t* rayFlags,
+    const int32_t* instanceMask,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax) {
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        nacelle_rayquery_trace_inline(
+            handles[l], tlasPtr, rayFlags[l], instanceMask[l],
+            ox[l], oy[l], oz[l], tMin[l], dx[l], dy[l], dz[l], tMax[l]);
+    }
+}
+
+uint32_t nacelle_rayquery_proceed_pkt(uint32_t activeMask, const int32_t* handles) {
+    uint32_t retMask = 0;
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        if (nacelle_rayquery_proceed(handles[l]) != 0) {
+            retMask |= (1u << l);
+        }
+    }
+    return retMask;
+}
+
+void nacelle_rayquery_state_i32_pkt(int32_t op, uint32_t activeMask, const int32_t* handles, int32_t* outVals) {
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        outVals[l] = nacelle_rayquery_state_i32(op, handles[l]);
+    }
+}
+
+void nacelle_rayquery_state_f32_pkt(int32_t op, uint32_t activeMask, const int32_t* handles, float* outVals) {
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        outVals[l] = nacelle_rayquery_state_f32(op, handles[l]);
+    }
+}
+
+void nacelle_rayquery_state_vec_pkt(
+    int32_t op, uint32_t activeMask, const int32_t* handles, const int32_t* comps, float* outVals) {
+    uint32_t m = activeMask;
+    while (m) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+        m &= m - 1;
+        outVals[l] = nacelle_rayquery_state_vec(op, handles[l], comps[l]);
     }
 }
 
@@ -1142,23 +1285,36 @@ namespace nacelle {
 
 namespace {
 
-PipelineHitResult hitInfoToPipelineResult(const HitInfo& info, bool isHit, bool isProcedural, uint32_t customHitKind) {
+PipelineHitResult hitInfoToPipelineResult(
+    const HitInfo& info,
+    const float worldOrigin[3],
+    const float worldDir[3],
+    bool isHit,
+    bool isProcedural,
+    uint32_t customHitKind) {
     PipelineHitResult r{};
     r.hit = isHit;
     r.isProcedural = isProcedural;
     r.t = info.t;
     r.baryU = info.baryU;
     r.baryV = info.baryV;
-    r.hitKind = isProcedural ? customHitKind : (info.frontFace ? 254u : 255u);
+    if (isProcedural) {
+        r.hitKind = customHitKind;
+    } else if (isHit) {
+        bool ff = info.frontFaceValid ? info.frontFace : computeTriFrontFace(info.inst, info.tri, worldDir);
+        r.hitKind = ff ? 254u : 255u;
+    } else {
+        r.hitKind = 254u;
+    }
     r.instanceIndex = info.instanceIndex;
     r.instanceID = info.instanceID;
     r.geometryIndex = info.geometryIndex;
     r.primitiveIndex = info.primitiveIndex;
     r.instanceContributionToHitGroupIndex = info.instanceContributionToHitGroupIndex;
-    std::memcpy(r.objOrigin, info.objOrigin, sizeof(r.objOrigin));
-    std::memcpy(r.objDir, info.objDir, sizeof(r.objDir));
-    std::memcpy(r.objToWorld, info.objToWorld, sizeof(r.objToWorld));
-    std::memcpy(r.worldToObj, info.worldToObj, sizeof(r.worldToObj));
+    if (info.inst) {
+        r.objToWorldPtr = info.inst->objectToWorld;
+        r.worldToObjPtr = info.inst->worldToObject;
+    }
     return r;
 }
 
@@ -1179,6 +1335,137 @@ PipelineHitResult traceRayForPipeline(
     DxrAnyHitFn onAnyHit,
     DxrIntersectionFn onIntersection,
     void* userData) {
+    if (!onAnyHit && !onIntersection) {
+        PipelineHitResult best{};
+        best.hit = false;
+        best.t = tMax;
+
+        const auto* tlas = static_cast<const TlasHeader*>(tlasPtr);
+        if (!tlas || tlas->magic != kTlasMagic || tlas->rootNode == kInvalidNode || tMax < tMin) {
+            return best;
+        }
+
+        const float worldOrigin[3] = {ox, oy, oz};
+        const float worldDir[3] = {dx, dy, dz};
+        float invWorldDir[3];
+        computeInvDir(worldDir, invWorldDir);
+
+        const auto* tlasBase = static_cast<const uint8_t*>(tlasPtr);
+        const auto* tlasNodes = reinterpret_cast<const BvhNode*>(tlasBase + tlas->nodesOffset);
+        const auto* tlasInstances = reinterpret_cast<const TlasInstance*>(tlasBase + tlas->instancesOffset);
+
+        const uint32_t mask = instanceMask & 0xFFu;
+        const bool needCullCheck = (rayFlags & (kRayFlagCullBackFacingTriangles | kRayFlagCullFrontFacingTriangles)) != 0;
+        const bool acceptFirst = (rayFlags & kRayFlagAcceptFirstHitAndEndSearch) != 0;
+        const bool skipTris = (rayFlags & kRayFlagSkipTriangles) != 0;
+
+        uint32_t tlasStack[32];
+        int32_t tlasSp = 0;
+        tlasStack[tlasSp++] = tlas->rootNode;
+
+        const TlasInstance* bestInst = nullptr;
+        const BlasTriangle* bestTri = nullptr;
+
+        while (tlasSp > 0) {
+            const uint32_t tNodeIdx = tlasStack[--tlasSp];
+            const auto& tNode = tlasNodes[tNodeIdx];
+            if (!intersectRayAabbFast(worldOrigin, invWorldDir, tMin, best.t, tNode.minB, tNode.maxB)) {
+                continue;
+            }
+            if (tNode.count == 0) {
+                tlasStack[tlasSp++] = tNode.leftOrFirst + 1;
+                tlasStack[tlasSp++] = tNode.leftOrFirst;
+                continue;
+            }
+
+            for (uint32_t ii = 0; ii < tNode.count; ++ii) {
+                const auto& inst = tlasInstances[tNode.leftOrFirst + ii];
+                if ((inst.instanceMask & mask) == 0 ||
+                    !intersectRayAabbFast(worldOrigin, invWorldDir, tMin, best.t, inst.minB, inst.maxB)) {
+                    continue;
+                }
+                const auto* blas = reinterpret_cast<const BlasHeader*>(inst.blasAddress);
+                if (!blas || blas->magic != kBlasMagic || skipTris || blas->triRoot == kInvalidNode) {
+                    continue;
+                }
+
+                const auto* blasBase = reinterpret_cast<const uint8_t*>(blas);
+                const auto* blasNodes = reinterpret_cast<const BvhNode*>(blasBase + blas->nodesOffset);
+                const auto* blasTris = reinterpret_cast<const BlasTriangle*>(blasBase + blas->trisOffset);
+
+                float objOrigin[3], objDir[3], invObjDir[3];
+                if (inst.flags & kInstFlagIdentityTransform) {
+                    objOrigin[0] = worldOrigin[0]; objOrigin[1] = worldOrigin[1]; objOrigin[2] = worldOrigin[2];
+                    objDir[0] = worldDir[0]; objDir[1] = worldDir[1]; objDir[2] = worldDir[2];
+                    invObjDir[0] = invWorldDir[0]; invObjDir[1] = invWorldDir[1]; invObjDir[2] = invWorldDir[2];
+                } else {
+                    transformPoint3x4(inst.worldToObject, worldOrigin, objOrigin);
+                    transformVec3x3(inst.worldToObject, worldDir, objDir);
+                    computeInvDir(objDir, invObjDir);
+                }
+
+                uint32_t blasStack[32];
+                int32_t blasSp = 0;
+                blasStack[blasSp++] = blas->triRoot;
+
+                while (blasSp > 0) {
+                    const uint32_t bNodeIdx = blasStack[--blasSp];
+                    const auto& bNode = blasNodes[bNodeIdx];
+                    if (!intersectRayAabbFast(objOrigin, invObjDir, tMin, best.t, bNode.minB, bNode.maxB)) {
+                        continue;
+                    }
+                    if (bNode.count == 0) {
+                        blasStack[blasSp++] = bNode.leftOrFirst + 1;
+                        blasStack[blasSp++] = bNode.leftOrFirst;
+                        continue;
+                    }
+                    for (uint32_t ti = 0; ti < bNode.count; ++ti) {
+                        const auto& tri = blasTris[bNode.leftOrFirst + ti];
+                        float t = 0.0f, u = 0.0f, v = 0.0f;
+                        if (!intersectRayTriangle(objOrigin, objDir, tMin, best.t, tri, t, u, v)) {
+                            continue;
+                        }
+                        if (needCullCheck && !(inst.flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)) {
+                            const bool ff = computeTriFrontFace(&inst, &tri, worldDir);
+                            if ((rayFlags & kRayFlagCullBackFacingTriangles) && !ff) continue;
+                            if ((rayFlags & kRayFlagCullFrontFacingTriangles) && ff) continue;
+                        }
+                        const bool isOpaque = resolveOpaque(rayFlags, inst.flags, tri.geomFlags);
+                        if (isOpaque && (rayFlags & kRayFlagCullOpaque)) continue;
+                        if (!isOpaque && (rayFlags & kRayFlagCullNonOpaque)) continue;
+
+                        best.hit = true;
+                        best.isProcedural = false;
+                        best.t = t;
+                        best.baryU = u;
+                        best.baryV = v;
+                        best.instanceIndex = inst.instanceIndex;
+                        best.instanceID = inst.instanceID;
+                        best.geometryIndex = tri.geometryIndex;
+                        best.primitiveIndex = tri.primitiveIndex;
+                        best.instanceContributionToHitGroupIndex = inst.instanceContributionToHitGroupIndex;
+                        bestInst = &inst;
+                        bestTri = &tri;
+
+                        if (acceptFirst) {
+                            tlasSp = 0;
+                            blasSp = 0;
+                            break;
+                        }
+                    }
+                }
+                if (acceptFirst && best.hit) break;
+            }
+        }
+
+        if (best.hit && bestInst) {
+            best.hitKind = computeTriFrontFace(bestInst, bestTri, worldDir) ? 254u : 255u;
+            best.objToWorldPtr = bestInst->objectToWorld;
+            best.worldToObjPtr = bestInst->worldToObject;
+        }
+        return best;
+    }
+
     const int32_t h = nacelle_rayquery_alloc(0);
     nacelle_rayquery_trace_inline(
         h, tlasPtr, static_cast<int32_t>(rayFlags), static_cast<int32_t>(instanceMask),
@@ -1189,7 +1476,7 @@ PipelineHitResult traceRayForPipeline(
 
     while (nacelle_rayquery_proceed(h)) {
         if (rq->candidateType == kCandidateNonOpaqueTriangle) {
-            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, true, false, 0);
+            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, rq->worldOrigin, rq->worldDir, true, false, 0);
             int32_t act = onAnyHit ? onAnyHit(userData, cand) : 0;
             if (act == 0 || act == 2) {
                 nacelle_rayquery_commit_triangle(h);
@@ -1199,7 +1486,7 @@ PipelineHitResult traceRayForPipeline(
                 }
             }
         } else if (rq->candidateType == kCandidateProceduralPrimitive && onIntersection) {
-            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, true, true, 0);
+            PipelineHitResult cand = hitInfoToPipelineResult(rq->candidate, rq->worldOrigin, rq->worldDir, true, true, 0);
             float committedT = rq->committed.t;
             bool accepted = false;
             bool endSearch = false;
@@ -1222,7 +1509,221 @@ PipelineHitResult traceRayForPipeline(
 
     const bool hasHit = rq->committed.status != kCommittedNothing;
     const bool isProc = rq->committed.status == kCommittedProceduralHit;
-    return hitInfoToPipelineResult(rq->committed, hasHit, isProc, committedCustomHitKind);
+    return hitInfoToPipelineResult(rq->committed, rq->worldOrigin, rq->worldDir, hasHit, isProc, committedCustomHitKind);
+}
+
+void traceRayPacketForPipeline(
+    uint32_t activeMask,
+    const void* tlasPtr,
+    const uint32_t* rayFlags,
+    const uint32_t* instanceMask,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax,
+    PipelineHitResult* outHits) {
+    if (activeMask == 0) return;
+
+    const auto* tlas = static_cast<const TlasHeader*>(tlasPtr);
+    if (!tlas || tlas->magic != kTlasMagic || tlas->rootNode == kInvalidNode) {
+        uint32_t m = activeMask;
+        while (m) {
+            const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+            m &= m - 1;
+            outHits[l].hit = false;
+            outHits[l].t = tMax[l];
+        }
+        return;
+    }
+
+    float invDx[16], invDy[16], invDz[16];
+    uint32_t validMask = 0;
+    uint32_t mInit = activeMask;
+    while (mInit) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(mInit));
+        mInit &= mInit - 1;
+        outHits[l].hit = false;
+        outHits[l].t = tMax[l];
+        if (tMax[l] >= tMin[l]) {
+            validMask |= (1u << l);
+            const float ddx = std::fabs(dx[l]) >= 1e-20f ? dx[l] : std::copysign(1e-20f, dx[l]);
+            const float ddy = std::fabs(dy[l]) >= 1e-20f ? dy[l] : std::copysign(1e-20f, dy[l]);
+            const float ddz = std::fabs(dz[l]) >= 1e-20f ? dz[l] : std::copysign(1e-20f, dz[l]);
+            invDx[l] = 1.0f / ddx;
+            invDy[l] = 1.0f / ddy;
+            invDz[l] = 1.0f / ddz;
+        }
+    }
+    if (validMask == 0) return;
+
+    const auto* tlasBase = static_cast<const uint8_t*>(tlasPtr);
+    const auto* tlasNodes = reinterpret_cast<const BvhNode*>(tlasBase + tlas->nodesOffset);
+    const auto* tlasInstances = reinterpret_cast<const TlasInstance*>(tlasBase + tlas->instancesOffset);
+
+    const TlasInstance* bestInst[16]{};
+    const BlasTriangle* bestTri[16]{};
+
+    auto testAabbMask = [&](uint32_t mask, const float bMin[3], const float bMax[3],
+                            const float* ax, const float* ay, const float* az,
+                            const float* iax, const float* iay, const float* iaz) -> uint32_t {
+        uint32_t hitMask = 0;
+        uint32_t m = mask;
+        while (m) {
+            const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+            m &= m - 1;
+            const float orig[3] = {ax[l], ay[l], az[l]};
+            const float idir[3] = {iax[l], iay[l], iaz[l]};
+            if (intersectRayAabbFast(orig, idir, tMin[l], outHits[l].t, bMin, bMax)) {
+                hitMask |= (1u << l);
+            }
+        }
+        return hitMask;
+    };
+
+    uint32_t tlasStack[32];
+    int32_t tlasSp = 0;
+    tlasStack[tlasSp++] = tlas->rootNode;
+
+    while (tlasSp > 0) {
+        const uint32_t tNodeIdx = tlasStack[--tlasSp];
+        const auto& tNode = tlasNodes[tNodeIdx];
+        const uint32_t nodeHitMask = testAabbMask(validMask, tNode.minB, tNode.maxB, ox, oy, oz, invDx, invDy, invDz);
+        if (nodeHitMask == 0) continue;
+
+        if (tNode.count == 0) {
+            tlasStack[tlasSp++] = tNode.leftOrFirst + 1;
+            tlasStack[tlasSp++] = tNode.leftOrFirst;
+            continue;
+        }
+
+        for (uint32_t ii = 0; ii < tNode.count; ++ii) {
+            const auto& inst = tlasInstances[tNode.leftOrFirst + ii];
+            uint32_t instHitMask = 0;
+            uint32_t m = nodeHitMask;
+            while (m) {
+                const uint32_t l = static_cast<uint32_t>(std::countr_zero(m));
+                m &= m - 1;
+                if ((inst.instanceMask & (instanceMask[l] & 0xFFu)) != 0) {
+                    const float orig[3] = {ox[l], oy[l], oz[l]};
+                    const float idir[3] = {invDx[l], invDy[l], invDz[l]};
+                    if (intersectRayAabbFast(orig, idir, tMin[l], outHits[l].t, inst.minB, inst.maxB)) {
+                        instHitMask |= (1u << l);
+                    }
+                }
+            }
+            if (instHitMask == 0) continue;
+
+            const auto* blas = reinterpret_cast<const BlasHeader*>(inst.blasAddress);
+            if (!blas || blas->magic != kBlasMagic || blas->triRoot == kInvalidNode) continue;
+
+            const auto* blasBase = reinterpret_cast<const uint8_t*>(blas);
+            const auto* blasNodes = reinterpret_cast<const BvhNode*>(blasBase + blas->nodesOffset);
+            const auto* blasTris = reinterpret_cast<const BlasTriangle*>(blasBase + blas->trisOffset);
+
+            const bool isIdent = (inst.flags & kInstFlagIdentityTransform) != 0;
+            float objOx[16], objOy[16], objOz[16];
+            float objDx[16], objDy[16], objDz[16];
+            float invObjDx[16], invObjDy[16], invObjDz[16];
+
+            if (!isIdent) {
+                uint32_t lm = instHitMask;
+                while (lm) {
+                    const uint32_t l = static_cast<uint32_t>(std::countr_zero(lm));
+                    lm &= lm - 1;
+                    const float wo[3] = {ox[l], oy[l], oz[l]};
+                    const float wd[3] = {dx[l], dy[l], dz[l]};
+                    float oo[3], od[3], iod[3];
+                    transformPoint3x4(inst.worldToObject, wo, oo);
+                    transformVec3x3(inst.worldToObject, wd, od);
+                    computeInvDir(od, iod);
+                    objOx[l] = oo[0]; objOy[l] = oo[1]; objOz[l] = oo[2];
+                    objDx[l] = od[0]; objDy[l] = od[1]; objDz[l] = od[2];
+                    invObjDx[l] = iod[0]; invObjDy[l] = iod[1]; invObjDz[l] = iod[2];
+                }
+            }
+
+            const float* bx = isIdent ? ox : objOx;
+            const float* by = isIdent ? oy : objOy;
+            const float* bz = isIdent ? oz : objOz;
+            const float* bdx = isIdent ? dx : objDx;
+            const float* bdy = isIdent ? dy : objDy;
+            const float* bdz = isIdent ? dz : objDz;
+            const float* ibx = isIdent ? invDx : invObjDx;
+            const float* iby = isIdent ? invDy : invObjDy;
+            const float* ibz = isIdent ? invDz : invObjDz;
+
+            uint32_t blasStack[32];
+            int32_t blasSp = 0;
+            blasStack[blasSp++] = blas->triRoot;
+
+            while (blasSp > 0) {
+                const uint32_t bNodeIdx = blasStack[--blasSp];
+                const auto& bNode = blasNodes[bNodeIdx];
+                const uint32_t bHitMask = testAabbMask(instHitMask, bNode.minB, bNode.maxB, bx, by, bz, ibx, iby, ibz);
+                if (bHitMask == 0) continue;
+
+                if (bNode.count > 0) {
+                    for (uint32_t ti = 0; ti < bNode.count; ++ti) {
+                        const auto& tri = blasTris[bNode.leftOrFirst + ti];
+                        uint32_t tm = bHitMask;
+                        while (tm) {
+                            const uint32_t l = static_cast<uint32_t>(std::countr_zero(tm));
+                            tm &= tm - 1;
+                            const uint32_t rf = rayFlags[l];
+                            if (rf & kRayFlagSkipTriangles) continue;
+                            const float orig[3] = {bx[l], by[l], bz[l]};
+                            const float dir[3] = {bdx[l], bdy[l], bdz[l]};
+                            float t = 0.0f, u = 0.0f, v = 0.0f;
+                            if (!intersectRayTriangle(orig, dir, tMin[l], outHits[l].t, tri, t, u, v)) continue;
+
+                            if ((rf & (kRayFlagCullBackFacingTriangles | kRayFlagCullFrontFacingTriangles)) &&
+                                !(inst.flags & D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)) {
+                                const float wdir[3] = {dx[l], dy[l], dz[l]};
+                                const bool ff = computeTriFrontFace(&inst, &tri, wdir);
+                                if ((rf & kRayFlagCullBackFacingTriangles) && !ff) continue;
+                                if ((rf & kRayFlagCullFrontFacingTriangles) && ff) continue;
+                            }
+                            const bool isOpaque = resolveOpaque(rf, inst.flags, tri.geomFlags);
+                            if (isOpaque && (rf & kRayFlagCullOpaque)) continue;
+                            if (!isOpaque && (rf & kRayFlagCullNonOpaque)) continue;
+
+                            outHits[l].hit = true;
+                            outHits[l].isProcedural = false;
+                            outHits[l].t = t;
+                            outHits[l].baryU = u;
+                            outHits[l].baryV = v;
+                            outHits[l].instanceIndex = inst.instanceIndex;
+                            outHits[l].instanceID = inst.instanceID;
+                            outHits[l].geometryIndex = tri.geometryIndex;
+                            outHits[l].primitiveIndex = tri.primitiveIndex;
+                            outHits[l].instanceContributionToHitGroupIndex = inst.instanceContributionToHitGroupIndex;
+                            bestInst[l] = &inst;
+                            bestTri[l] = &tri;
+                        }
+                    }
+                } else {
+                    blasStack[blasSp++] = bNode.leftOrFirst + 1;
+                    blasStack[blasSp++] = bNode.leftOrFirst;
+                }
+            }
+        }
+    }
+
+    uint32_t fm = validMask;
+    while (fm) {
+        const uint32_t l = static_cast<uint32_t>(std::countr_zero(fm));
+        fm &= fm - 1;
+        if (outHits[l].hit && bestInst[l]) {
+            const float wdir[3] = {dx[l], dy[l], dz[l]};
+            outHits[l].hitKind = computeTriFrontFace(bestInst[l], bestTri[l], wdir) ? 254u : 255u;
+            outHits[l].objToWorldPtr = bestInst[l]->objectToWorld;
+            outHits[l].worldToObjPtr = bestInst[l]->worldToObject;
+        }
+    }
 }
 
 } // namespace nacelle

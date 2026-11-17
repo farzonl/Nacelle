@@ -83,10 +83,27 @@ void nacelle_dxr_trace_ray(
     float dz,
     float tMax,
     void* payloadPtr);
-int32_t nacelle_dxr_state_i32(int32_t op);
-float nacelle_dxr_state_f32(int32_t op);
-float nacelle_dxr_state_vec(int32_t op, int32_t comp);
-float nacelle_dxr_state_mat(int32_t op, int32_t row, int32_t col);
+void nacelle_dxr_trace_ray_packet(
+    uint32_t activeMask,
+    const void* tlasPtr,
+    const int32_t* rayFlags,
+    const int32_t* instanceMask,
+    const int32_t* rayContributionToHitGroupIndex,
+    const int32_t* multiplierForGeometryContribution,
+    const int32_t* missShaderIndex,
+    const float* ox,
+    const float* oy,
+    const float* oz,
+    const float* tMin,
+    const float* dx,
+    const float* dy,
+    const float* dz,
+    const float* tMax,
+    void** payloadPtrs);
+int32_t nacelle_dxr_state_i32(int32_t op, int32_t lane);
+float nacelle_dxr_state_f32(int32_t op, int32_t lane);
+float nacelle_dxr_state_vec(int32_t op, int32_t comp, int32_t lane);
+float nacelle_dxr_state_mat(int32_t op, int32_t row, int32_t col, int32_t lane);
 void nacelle_dxr_ignore_hit();
 void nacelle_dxr_accept_hit_and_end_search();
 int32_t nacelle_dxr_report_hit(float tHit, int32_t hitKind, const void* attrPtr, int32_t attrBytes);

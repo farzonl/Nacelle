@@ -7087,6 +7087,44 @@ private:
             mlir::Value tMaxVec = laneVec(arg(14));
             SimdVal payloadVal = getMapped(loc, arg(15));
 
+            if (uniformTlasPtr) {
+                mlir::Type iWTy = mlir::IntegerType::get(ctx_, W_);
+                mlir::Value bits = mlir::LLVM::BitcastOp::create(b_, loc, iWTy, execMask).getResult();
+                mlir::Value maskI32 = (W_ < 32) ? mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), bits).getResult() : bits;
+                auto spillVec = [&](mlir::Value vec) -> mlir::Value {
+                    mlir::Value buf = createEntryAlloca(loc, vec.getType(), 1, 16);
+                    mlir::LLVM::StoreOp::create(b_, loc, vec, buf);
+                    return buf;
+                };
+                mlir::Value payloadPtrArr = createEntryAlloca(loc, ptrTy(), W_, 16);
+                for (uint32_t l = 0; l < W_; ++l) {
+                    mlir::Value pPtr = l < payloadVal.lanes.size()
+                                           ? payloadVal.lanes[l]
+                                           : (!payloadVal.lanes.empty()
+                                                  ? payloadVal.lanes[0]
+                                                  : mlir::LLVM::ZeroOp::create(b_, loc, ptrTy()).getResult());
+                    mlir::Value slotPtr = mlir::LLVM::GEPOp::create(
+                        b_, loc, ptrTy(), ptrTy(), payloadPtrArr,
+                        mlir::ValueRange{cInt(loc, i32Ty(), static_cast<int64_t>(l))});
+                    mlir::LLVM::StoreOp::create(b_, loc, pPtr, slotPtr);
+                }
+                auto fn = getOrDeclareRuntimeFn(
+                    loc, "nacelle_dxr_trace_ray_packet", nullptr,
+                    {i32Ty(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy(),
+                     ptrTy(), ptrTy(), ptrTy(), ptrTy(),
+                     ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+                mlir::LLVM::CallOp::create(
+                    b_, loc, fn,
+                    mlir::ValueRange{
+                        maskI32, uniformTlasPtr,
+                        spillVec(flagsVec), spillVec(maskVec), spillVec(rayContribVec),
+                        spillVec(geomMultVec), spillVec(missIdxVec),
+                        spillVec(oxVec), spillVec(oyVec), spillVec(ozVec), spillVec(tMinVec),
+                        spillVec(dxVec), spillVec(dyVec), spillVec(dzVec), spillVec(tMaxVec),
+                        payloadPtrArr});
+                return true;
+            }
+
             auto fn = getOrDeclareRuntimeFn(
                 loc, "nacelle_dxr_trace_ray", nullptr,
                 {ptrTy(), i32Ty(), i32Ty(), i32Ty(), i32Ty(), i32Ty(),
@@ -7176,10 +7214,11 @@ private:
 
         // Scalar float state queries: RayTMin (153), RayTCurrent (154)
         if (op == 153 || op == 154) {
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_f32", f32Ty(), {i32Ty()});
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_f32", f32Ty(), {i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
-            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t) {
-                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst}).getResult();
+            runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value laneConst = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, laneConst}).getResult();
             });
             return true;
         }
@@ -7188,11 +7227,12 @@ private:
         // ObjectRayOrigin (149), ObjectRayDirection (150)
         if (op >= 147 && op <= 150) {
             mlir::Value compVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(1)));
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_vec", f32Ty(), {i32Ty(), i32Ty()});
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_vec", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value c = llvmExtract(nb, nloc, compVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, c}).getResult();
+                mlir::Value laneConst = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, c, laneConst}).getResult();
             });
             return true;
         }
@@ -7201,12 +7241,13 @@ private:
         if (op == 151 || op == 152) {
             mlir::Value rowVec = laneVec(arg(1));
             mlir::Value colVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value r = llvmExtract(nb, nloc, rowVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value c = llvmExtract(nb, nloc, colVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, r, c}).getResult();
+                mlir::Value laneConst = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, r, c, laneConst}).getResult();
             });
             return true;
         }
@@ -7214,10 +7255,11 @@ private:
         // Scalar i32 state queries: InstanceID (141), InstanceIndex (142), HitKind (143),
         // RayFlags (144), PrimitiveIndex (161), GeometryIndex (213)
         if (op == 141 || op == 142 || op == 143 || op == 144 || op == 161 || op == 213) {
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_i32", i32Ty(), {i32Ty()});
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_dxr_state_i32", i32Ty(), {i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
-            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t) {
-                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst}).getResult();
+            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                mlir::Value laneConst = mlir::LLVM::ConstantOp::create(nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), l));
+                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, laneConst}).getResult();
             });
             return true;
         }
@@ -7269,16 +7311,30 @@ private:
             setMapped(call.getResult(), {SimdVal::Kind::Vector, elemTy, outVec, {}, {}});
         };
 
+        constexpr int64_t kBcRayQueryStateSize = 640;
+        auto rqPtrAt = [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value slotBase, uint32_t l) -> mlir::Value {
+            if (l == 0) return slotBase;
+            mlir::Value off = mlir::LLVM::ConstantOp::create(
+                nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), static_cast<int64_t>(l) * kBcRayQueryStateSize));
+            return mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), slotBase, mlir::ValueRange{off}).getResult();
+        };
+
         // AllocateRayQuery (178, 258)
         if (op == 178 || op == 258) {
             mlir::Value flagsVec = laneVec(arg(1));
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_alloc", i32Ty(), {i32Ty()});
-            runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+            mlir::Value slotBase = createEntryAlloca(loc, i8Ty(), static_cast<int64_t>(W_) * kBcRayQueryStateSize, 16);
+            rayQuerySlotPtrs_[call.getResult()] = slotBase;
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_init", nullptr, {ptrTy(), i32Ty()});
+            runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value fl = llvmExtract(nb, nloc, flagsVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{fl}).getResult();
+                mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{rqPtr, fl});
             });
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
             return true;
         }
+
+        mlir::Value slotBase = arg(1) ? rayQuerySlotPtrs_.lookup(arg(1)) : mlir::Value();
 
         // RayQuery_TraceRayInline (179)
         if (op == 179) {
@@ -7298,6 +7354,33 @@ private:
             mlir::Value dyVec = laneVec(arg(10));
             mlir::Value dzVec = laneVec(arg(11));
             mlir::Value tMaxVec = laneVec(arg(12));
+
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(
+                    loc, "nacelle_rqbc_trace_inline", nullptr,
+                    {ptrTy(), ptrTy(), i32Ty(), i32Ty(),
+                     f32Ty(), f32Ty(), f32Ty(), f32Ty(),
+                     f32Ty(), f32Ty(), f32Ty(), f32Ty()});
+                runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value tlasPtr = uniformTlasPtr;
+                    if (!tlasPtr) {
+                        mlir::Value descPtr = l < tlasHandle.lanes.size()
+                                                  ? tlasHandle.lanes[l]
+                                                  : mlir::LLVM::ZeroOp::create(nb, nloc, ptrTy()).getResult();
+                        tlasPtr = mlir::LLVM::LoadOp::create(nb, nloc, ptrTy(), descPtr).getResult();
+                    }
+                    auto ext = [&](mlir::Value v) -> mlir::Value {
+                        return llvmExtract(nb, nloc, v, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    };
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::LLVM::CallOp::create(
+                        nb, nloc, fn,
+                        mlir::ValueRange{rqPtr, tlasPtr, ext(flagsVec), ext(maskVec),
+                                         ext(oxVec), ext(oyVec), ext(ozVec), ext(tMinVec),
+                                         ext(dxVec), ext(dyVec), ext(dzVec), ext(tMaxVec)});
+                });
+                return true;
+            }
 
             auto fn = getOrDeclareRuntimeFn(
                 loc, "nacelle_rayquery_trace_inline", nullptr,
@@ -7327,6 +7410,15 @@ private:
 
         // RayQuery_Proceed (180)
         if (op == 180) {
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_proceed", i32Ty(), {ptrTy()});
+                runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{rqPtr}).getResult();
+                    return mlir::LLVM::TruncOp::create(nb, nloc, i1Ty(), r).getResult();
+                });
+                return true;
+            }
             mlir::Value qVec = laneVec(arg(1));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_proceed", i32Ty(), {i32Ty()});
             runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
@@ -7339,6 +7431,15 @@ private:
 
         // RayQuery_Abort (181) & RayQuery_CommitNonOpaqueTriangleHit (182)
         if (op == 181 || op == 182) {
+            if (slotBase) {
+                const char* fnName = (op == 181) ? "nacelle_rqbc_abort" : "nacelle_rqbc_commit_triangle";
+                auto fn = getOrDeclareRuntimeFn(loc, fnName, nullptr, {ptrTy()});
+                runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{rqPtr});
+                });
+                return true;
+            }
             mlir::Value qVec = laneVec(arg(1));
             const char* fnName = (op == 181) ? "nacelle_rayquery_abort" : "nacelle_rayquery_commit_triangle";
             auto fn = getOrDeclareRuntimeFn(loc, fnName, nullptr, {i32Ty()});
@@ -7351,8 +7452,17 @@ private:
 
         // RayQuery_CommitProceduralPrimitiveHit (183)
         if (op == 183) {
-            mlir::Value qVec = laneVec(arg(1));
             mlir::Value tVec = laneVec(arg(2));
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_commit_procedural", nullptr, {ptrTy(), f32Ty()});
+                runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::Value t = llvmExtract(nb, nloc, tVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{rqPtr, t});
+                });
+                return true;
+            }
+            mlir::Value qVec = laneVec(arg(1));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_commit_procedural", nullptr, {i32Ty(), f32Ty()});
             runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
@@ -7364,9 +7474,17 @@ private:
 
         // Scalar float state queries: RayTMin (198), CandidateTriangleRayT (199), CommittedRayT (200)
         if (op == 198 || op == 199 || op == 200) {
+            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_state_f32", f32Ty(), {i32Ty(), ptrTy()});
+                runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, rqPtr}).getResult();
+                });
+                return true;
+            }
             mlir::Value qVec = laneVec(arg(1));
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_f32", f32Ty(), {i32Ty(), i32Ty()});
-            mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, q}).getResult();
@@ -7377,10 +7495,19 @@ private:
         // Vector float state queries: Barycentrics (193, 194), WorldRay* (196, 197), ObjectRay* (205, 206, 211, 212)
         if (op == 193 || op == 194 || op == 196 || op == 197 ||
             op == 205 || op == 206 || op == 211 || op == 212) {
-            mlir::Value qVec = laneVec(arg(1));
             mlir::Value compVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(2)));
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_vec", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_state_vec", f32Ty(), {i32Ty(), ptrTy(), i32Ty()});
+                runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::Value c = llvmExtract(nb, nloc, compVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, rqPtr, c}).getResult();
+                });
+                return true;
+            }
+            mlir::Value qVec = laneVec(arg(1));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_vec", f32Ty(), {i32Ty(), i32Ty(), i32Ty()});
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value c = llvmExtract(nb, nloc, compVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
@@ -7391,11 +7518,21 @@ private:
 
         // Matrix float state queries: ObjectToWorld3x4 / WorldToObject3x4 (186..189)
         if (op >= 186 && op <= 189) {
-            mlir::Value qVec = laneVec(arg(1));
             mlir::Value rowVec = laneVec(arg(2));
             mlir::Value colVec = mlir::LLVM::SExtOp::create(b_, loc, vecTy(i32Ty()), laneVec(arg(3)));
-            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty(), i32Ty()});
             mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
+            if (slotBase) {
+                auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_state_mat", f32Ty(), {i32Ty(), ptrTy(), i32Ty(), i32Ty()});
+                runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::Value r = llvmExtract(nb, nloc, rowVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    mlir::Value c = llvmExtract(nb, nloc, colVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
+                    return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, rqPtr, r, c}).getResult();
+                });
+                return true;
+            }
+            mlir::Value qVec = laneVec(arg(1));
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_mat", f32Ty(), {i32Ty(), i32Ty(), i32Ty(), i32Ty()});
             runPerActiveLaneScalar(f32Ty(), cFlt(loc, f32Ty(), 0.0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
                 mlir::Value r = llvmExtract(nb, nloc, rowVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
@@ -7406,10 +7543,26 @@ private:
         }
 
         // Scalar i32 / i1 state queries (184, 185, 190..192, 195, 201..204, 207..210, 214, 215)
-        mlir::Value qVec = laneVec(arg(1));
-        auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_i32", i32Ty(), {i32Ty(), i32Ty()});
         mlir::Value opConst = cInt(loc, i32Ty(), static_cast<int64_t>(op));
         const bool isBool = call.getResult().getType().isInteger(1);
+        if (slotBase) {
+            auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_state_i32", i32Ty(), {i32Ty(), ptrTy()});
+            if (isBool) {
+                runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    mlir::Value r = mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, rqPtr}).getResult();
+                    return mlir::LLVM::TruncOp::create(nb, nloc, i1Ty(), r).getResult();
+                });
+            } else {
+                runPerActiveLaneScalar(i32Ty(), cInt(loc, i32Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
+                    mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                    return mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{opConst, rqPtr}).getResult();
+                });
+            }
+            return true;
+        }
+        mlir::Value qVec = laneVec(arg(1));
+        auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rayquery_state_i32", i32Ty(), {i32Ty(), i32Ty()});
         if (isBool) {
             runPerActiveLaneScalar(i1Ty(), cInt(loc, i1Ty(), 0), [&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value q = llvmExtract(nb, nloc, qVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
@@ -7774,6 +7927,7 @@ private:
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
     mlir::Value scratchAlloca_;
+    llvm::DenseMap<mlir::Value, mlir::Value> rayQuerySlotPtrs_;
     bool strictFp_ = false;
     DescInfoCache ownedDescCache_;
     DescInfoCache* descCache_ = nullptr;
@@ -9155,8 +9309,9 @@ bool packetizeDxrEntry(
     mlir::Type ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
     mlir::Type i32Ty = b.getI32Type();
     mlir::Type i1Ty = b.getI1Type();
-    mlir::VectorType vecI32Ty = mlir::VectorType::get({simdWidth}, i32Ty);
-    mlir::VectorType vecI1Ty = mlir::VectorType::get({simdWidth}, i1Ty);
+    const uint32_t effW = simdWidth;
+    mlir::VectorType vecI32Ty = mlir::VectorType::get({effW}, i32Ty);
+    mlir::VectorType vecI1Ty = mlir::VectorType::get({effW}, i1Ty);
 
     // void fn(ptr rootCtx, i32 activeMask, ptr rxPtr, ptr ryPtr, ptr rzPtr,
     //         i32 dimX, i32 dimY, i32 dimZ, ptr payloadPtr, ptr attrPtr)
@@ -9180,7 +9335,7 @@ bool packetizeDxrEntry(
     mlir::Value c0 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, 0));
     mlir::Value c1 = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, 1));
     mlir::Value initExecMask = mlir::LLVM::ConstantOp::create(b, loc, llvm::cast<mlir::TypedAttr>(mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false))).getType(), mlir::DenseElementsAttr::get(vecI1Ty, b.getBoolAttr(false)));
-    for (uint32_t l = 0; l < simdWidth; ++l) {
+    for (uint32_t l = 0; l < effW; ++l) {
         mlir::Value shift = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, l));
         mlir::Value shifted = mlir::LLVM::LShrOp::create(b, loc, activeMaskArg, shift);
         mlir::Value bit = mlir::LLVM::AndOp::create(b, loc, shifted, c1);
@@ -9194,14 +9349,20 @@ bool packetizeDxrEntry(
     hooks.threadId[0] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rxPtr, 4u);
     hooks.threadId[1] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, ryPtr, 4u);
     hooks.threadId[2] = mlir::LLVM::LoadOp::create(b, loc, vecI32Ty, rzPtr, 4u);
-    hooks.dispatchRaysDim[0] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimX, simdWidth);
-    hooks.dispatchRaysDim[1] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimY, simdWidth);
-    hooks.dispatchRaysDim[2] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimZ, simdWidth);
+    hooks.dispatchRaysDim[0] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimX, effW);
+    hooks.dispatchRaysDim[1] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimY, effW);
+    hooks.dispatchRaysDim[2] = llvmSplat(b, loc, llvm::cast<mlir::VectorType>(vecI32Ty).getElementType(), dimZ, effW);
 
-    SimdPacketizer pkt(b, mod, shader, rootLayout, simdWidth, rootCtx, hooks);
+    SimdPacketizer pkt(b, mod, shader, rootLayout, effW, rootCtx, hooks);
     for (unsigned a = 0; a < srcFunc.getNumArguments() && a < 2; ++a) {
-        mlir::Value ptrArg = (a == 0) ? payloadPtr : attrPtr;
-        llvm::SmallVector<mlir::Value, 8> lanes(simdWidth, ptrArg);
+        mlir::Value ptrArrArg = (a == 0) ? payloadPtr : attrPtr;
+        llvm::SmallVector<mlir::Value, 8> lanes;
+        lanes.reserve(effW);
+        for (uint32_t l = 0; l < effW; ++l) {
+            mlir::Value idx = mlir::LLVM::ConstantOp::create(b, loc, i32Ty, b.getIntegerAttr(i32Ty, l));
+            mlir::Value slotPtr = mlir::LLVM::GEPOp::create(b, loc, ptrTy, ptrTy, ptrArrArg, mlir::ValueRange{idx});
+            lanes.push_back(mlir::LLVM::LoadOp::create(b, loc, ptrTy, slotPtr).getResult());
+        }
         pkt.setMapped(srcFunc.getArgument(a), {SimdVal::Kind::Lanes, ptrTy, mlir::Value(), std::move(lanes), {}});
     }
 
