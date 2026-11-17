@@ -478,10 +478,11 @@ int main(int argc, char** argv) {
             if (!spec.gsDxil.empty() && !readBinary(args.shaderDir + "/" + spec.gsDxil, gs)) return out;
             out.push_back(runWarpGraphicsBench(spec, vs, hs, ds, gs, ps, args.width, args.height, args.iters, devIdx, forceWarp));
         } else if (spec.kind == PipelineKind::GraphicsMSPS) {
-            std::vector<uint8_t> ms, ps;
+            std::vector<uint8_t> as, ms, ps;
+            if (!spec.asDxil.empty() && !readBinary(args.shaderDir + "/" + spec.asDxil, as)) return out;
             if (!readBinary(args.shaderDir + "/" + spec.msDxil, ms) ||
                 !readBinary(args.shaderDir + "/" + spec.psDxil, ps)) return out;
-            out.push_back(runWarpMeshBench(spec, ms, ps, args.iters, devIdx, forceWarp));
+            out.push_back(runWarpMeshBench(spec, ms, ps, args.iters, devIdx, forceWarp, as));
         } else if (spec.kind == PipelineKind::RayTracingInline ||
                    spec.kind == PipelineKind::RayTracingPipeline) {
             std::vector<uint8_t> rt;

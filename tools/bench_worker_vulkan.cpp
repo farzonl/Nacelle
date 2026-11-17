@@ -58,11 +58,14 @@ int main(int argc, char** argv) {
                 out.insert(out.end(), vkRes.begin(), vkRes.end());
             }
         } else if (spec.kind == PipelineKind::GraphicsMSPS && !spec.msSpv.empty() && !spec.psSpv.empty()) {
-            std::vector<uint8_t> msSpv, psSpv;
+            std::vector<uint8_t> asSpv, msSpv, psSpv;
             std::string err;
-            if (readBinary(args.shaderDir + "/" + spec.msSpv, msSpv) && validateSpirvBinary(msSpv, err) &&
+            bool asOk = spec.asSpv.empty() ||
+                        (readBinary(args.shaderDir + "/" + spec.asSpv, asSpv) && validateSpirvBinary(asSpv, err));
+            if (asOk &&
+                readBinary(args.shaderDir + "/" + spec.msSpv, msSpv) && validateSpirvBinary(msSpv, err) &&
                 readBinary(args.shaderDir + "/" + spec.psSpv, psSpv) && validateSpirvBinary(psSpv, err)) {
-                auto vkRes = runVulkanMeshBench(spec, msSpv, psSpv, args.iters, devIdx);
+                auto vkRes = runVulkanMeshBench(spec, msSpv, psSpv, args.iters, devIdx, asSpv);
                 out.insert(out.end(), vkRes.begin(), vkRes.end());
             }
         } else if ((spec.kind == PipelineKind::RayTracingInline || PipelineKind::RayTracingPipeline == spec.kind) &&

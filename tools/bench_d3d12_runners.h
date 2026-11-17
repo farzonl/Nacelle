@@ -1162,7 +1162,8 @@ inline BenchRunResult runWarpMeshBench(
     const std::vector<uint8_t>& psDxil,
     uint32_t iters,
     int32_t devIdx = -1,
-    bool forceWarp = true) {
+    bool forceWarp = true,
+    const std::vector<uint8_t>& asDxil = {}) {
     BenchRunResult res;
     res.benchId = spec.id;
     res.benchName = spec.name;
@@ -1218,6 +1219,9 @@ inline BenchRunResult runWarpMeshBench(
     }
     rsBlob->Release();
 
+    const bool hasAS = !asDxil.empty();
+    const bool isCullMesh = (spec.id == "bench_mesh_cull");
+
     struct alignas(void*) MeshPsoStream {
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v; } rs;
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v; } ms;
@@ -1228,19 +1232,61 @@ inline BenchRunResult runWarpMeshBench(
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; } sampleMask;
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; D3D12_PRIMITIVE_TOPOLOGY_TYPE v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; } topo;
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; } rtfs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; DXGI_FORMAT v = DXGI_FORMAT_UNKNOWN; } dsvFmt;
         struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; } sampleDesc;
     } stream;
 
-    stream.rs.v = rootSig;
-    stream.ms.v = {msDxil.data(), msDxil.size()};
-    stream.ps.v = {psDxil.data(), psDxil.size()};
-    stream.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
-    stream.rast.v.CullMode = D3D12_CULL_MODE_NONE;
-    stream.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    stream.rtfs.v.NumRenderTargets = 1;
-    stream.rtfs.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    struct alignas(void*) MeshASPsoStream {
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE; ID3D12RootSignature* v; } rs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS; D3D12_SHADER_BYTECODE v; } as;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS; D3D12_SHADER_BYTECODE v; } ms;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS; D3D12_SHADER_BYTECODE v; } ps;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER; D3D12_RASTERIZER_DESC v{}; } rast;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND; D3D12_BLEND_DESC v{}; } blend;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL; D3D12_DEPTH_STENCIL_DESC v{}; } dss;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK; UINT v = UINT_MAX; } sampleMask;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY; D3D12_PRIMITIVE_TOPOLOGY_TYPE v = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE; } topo;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS; D3D12_RT_FORMAT_ARRAY v{}; } rtfs;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT; DXGI_FORMAT v = DXGI_FORMAT_UNKNOWN; } dsvFmt;
+        struct alignas(void*) { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC; DXGI_SAMPLE_DESC v{1, 0}; } sampleDesc;
+    } streamAS;
 
-    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(stream), &stream};
+    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{};
+    if (hasAS) {
+        streamAS.rs.v = rootSig;
+        streamAS.as.v = {asDxil.data(), asDxil.size()};
+        streamAS.ms.v = {msDxil.data(), msDxil.size()};
+        streamAS.ps.v = {psDxil.data(), psDxil.size()};
+        streamAS.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+        streamAS.rast.v.CullMode = isCullMesh ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+        streamAS.rast.v.FrontCounterClockwise = isCullMesh ? TRUE : FALSE;
+        streamAS.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (isCullMesh) {
+            streamAS.dss.v.DepthEnable = TRUE;
+            streamAS.dss.v.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            streamAS.dss.v.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            streamAS.dsvFmt.v = DXGI_FORMAT_D32_FLOAT;
+        }
+        streamAS.rtfs.v.NumRenderTargets = 1;
+        streamAS.rtfs.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        streamDesc = {sizeof(streamAS), &streamAS};
+    } else {
+        stream.rs.v = rootSig;
+        stream.ms.v = {msDxil.data(), msDxil.size()};
+        stream.ps.v = {psDxil.data(), psDxil.size()};
+        stream.rast.v.FillMode = D3D12_FILL_MODE_SOLID;
+        stream.rast.v.CullMode = isCullMesh ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE;
+        stream.blend.v.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (isCullMesh) {
+            stream.dss.v.DepthEnable = TRUE;
+            stream.dss.v.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            stream.dss.v.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            stream.dsvFmt.v = DXGI_FORMAT_D32_FLOAT;
+        }
+        stream.rtfs.v.NumRenderTargets = 1;
+        stream.rtfs.v.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        streamDesc = {sizeof(stream), &stream};
+    }
     auto t0 = std::chrono::steady_clock::now();
     ID3D12PipelineState* pso = nullptr;
     HRESULT hr = dev2->CreatePipelineState(&streamDesc, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&pso));
@@ -1257,7 +1303,8 @@ inline BenchRunResult runWarpMeshBench(
         return res;
     }
 
-    const uint32_t rw = 128, rh = 128;
+    const uint32_t rw = isCullMesh ? 256u : 128u;
+    const uint32_t rh = isCullMesh ? 256u : 128u;
     D3D12_HEAP_PROPERTIES defHeap{};
     defHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rtDesc{};
@@ -1278,14 +1325,42 @@ inline BenchRunResult runWarpMeshBench(
     ctx.dev->CreateDescriptorHeap(&rtvHD, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&rtvHeap));
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     ctx.dev->CreateRenderTargetView(rtvTex, nullptr, rtvHandle);
+
+    ID3D12Resource* dsvTex = nullptr;
+    ID3D12DescriptorHeap* dsvHeap = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle{};
+    if (isCullMesh) {
+        D3D12_RESOURCE_DESC dsDesc{};
+        dsDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dsDesc.Width = rw;
+        dsDesc.Height = rh;
+        dsDesc.DepthOrArraySize = 1;
+        dsDesc.MipLevels = 1;
+        dsDesc.Format = DXGI_FORMAT_D32_FLOAT;
+        dsDesc.SampleDesc.Count = 1;
+        dsDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &dsDesc,
+                                         D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&dsvTex));
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHD{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        ctx.dev->CreateDescriptorHeap(&dsvHD, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&dsvHeap));
+        dsvHandle = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        ctx.dev->CreateDepthStencilView(dsvTex, nullptr, dsvHandle);
+    }
+
     ID3D12Resource* cbBuf = createWarpBuffer(ctx.dev, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     ID3D12Resource* rbBuf = createWarpBuffer(ctx.dev, static_cast<size_t>(rw) * rh * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    auto runMesh = [&](uint32_t groups) -> double {
+    auto runMesh = [&](uint32_t groups, uint32_t gridX = 32, uint32_t layers = 4) -> double {
         void* p = nullptr;
         if (SUCCEEDED(cbBuf->Map(0, nullptr, &p)) && p) {
-            struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
-            std::memcpy(p, &cb, sizeof(cb));
+            if (isCullMesh) {
+                struct { float scale; float time; uint32_t gridX; uint32_t layerCount; } cb{1.0f, 0.25f, gridX, layers};
+                std::memcpy(p, &cb, sizeof(cb));
+            } else {
+                struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
+                std::memcpy(p, &cb, sizeof(cb));
+            }
             cbBuf->Unmap(0, nullptr);
         }
 
@@ -1307,7 +1382,12 @@ inline BenchRunResult runWarpMeshBench(
         ctx.cmd->RSSetViewports(1, &vp);
         ctx.cmd->RSSetScissorRects(1, &sc);
         ctx.cmd->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-        ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        if (isCullMesh) {
+            ctx.cmd->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+        } else {
+            ctx.cmd->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        }
         cmd6->DispatchMesh(groups, 1, 1);
 
         D3D12_RESOURCE_BARRIER b1 = b0;
@@ -1325,13 +1405,17 @@ inline BenchRunResult runWarpMeshBench(
         return std::chrono::duration<double, std::milli>(s1 - s0).count();
     };
 
-    res.firstDispatchMs = runMesh(128);
-    runMesh(128);
+    const uint32_t steadyGroups = isCullMesh ? 64u : 128u;
+    const uint32_t shortGroups = isCullMesh ? 8u : 16u;
+    const uint32_t longGroups = isCullMesh ? 256u : 512u;
+
+    res.firstDispatchMs = runMesh(steadyGroups, 32, 4);
+    runMesh(steadyGroups, 32, 4);
 
     std::vector<double> samples;
     samples.reserve(iters);
     for (uint32_t i = 0; i < iters; ++i) {
-        samples.push_back(runMesh(128));
+        samples.push_back(runMesh(steadyGroups, 32, 4));
     }
 
     D3D12_RESOURCE_BARRIER rb0{};
@@ -1373,13 +1457,15 @@ inline BenchRunResult runWarpMeshBench(
         res.checksum = sum;
     }
 
-    res.shortJobMs = runMesh(16);
-    res.longJobMs = runMesh(512);
+    res.shortJobMs = runMesh(shortGroups, 16, 2);
+    res.longJobMs = runMesh(longGroups, 64, 4);
 
     finalizeTimingAndMemory(res, memBefore, memAfterCompile, samples);
 
     rbBuf->Release();
     cbBuf->Release();
+    if (dsvHeap) dsvHeap->Release();
+    if (dsvTex) dsvTex->Release();
     rtvHeap->Release();
     rtvTex->Release();
     pso->Release();

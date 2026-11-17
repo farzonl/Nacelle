@@ -1562,7 +1562,10 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
     const std::vector<uint8_t>& msSpv,
     const std::vector<uint8_t>& psSpv,
     uint32_t iters,
-    int32_t targetDeviceIdx = -1) {
+    int32_t targetDeviceIdx = -1,
+    const std::vector<uint8_t>& asSpv = {}) {
+    const bool hasAS = !asSpv.empty();
+    const bool isCullMesh = (spec.id == "bench_mesh_cull");
     std::vector<BenchRunResult> results;
     vkmin::Loader vk;
     vkmin::VkInstance inst = nullptr;
@@ -1630,7 +1633,7 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
             uint32_t multiviewMeshShader;
             uint32_t primitiveFragmentShadingRateMeshShader;
             uint32_t meshShaderQueries;
-        } meshFeat{1000328000u, nullptr, 0, 1, 0, 0, 0};
+        } meshFeat{1000328000u, nullptr, hasAS ? 1u : 0u, 1u, 0, 0, 0};
 
         const char* devExts[] = {"VK_EXT_mesh_shader"};
         float prio = 1.0f;
@@ -1665,25 +1668,38 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
             return 0;
         };
 
-        const uint32_t rw = 128, rh = 128;
-        vkmin::VkAttachmentDescription att{0, vkmin::VK_FORMAT_R8G8B8A8_UNORM, vkmin::VK_SAMPLE_COUNT_1_BIT,
-            vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR, vkmin::VK_ATTACHMENT_STORE_OP_STORE,
-            vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE, vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            vkmin::VK_IMAGE_LAYOUT_UNDEFINED, vkmin::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL};
+        const uint32_t rw = isCullMesh ? 256u : 128u;
+        const uint32_t rh = isCullMesh ? 256u : 128u;
+        vkmin::VkAttachmentDescription atts[2] = {
+            {0, vkmin::VK_FORMAT_R8G8B8A8_UNORM, vkmin::VK_SAMPLE_COUNT_1_BIT,
+             vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR, vkmin::VK_ATTACHMENT_STORE_OP_STORE,
+             vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE, vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE,
+             vkmin::VK_IMAGE_LAYOUT_UNDEFINED, vkmin::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+            {0, vkmin::VK_FORMAT_D32_SFLOAT, vkmin::VK_SAMPLE_COUNT_1_BIT,
+             vkmin::VK_ATTACHMENT_LOAD_OP_CLEAR, vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE,
+             vkmin::VK_ATTACHMENT_LOAD_OP_DONT_CARE, vkmin::VK_ATTACHMENT_STORE_OP_DONT_CARE,
+             vkmin::VK_IMAGE_LAYOUT_UNDEFINED, vkmin::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}
+        };
         vkmin::VkAttachmentReference colorRef{0, vkmin::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        vkmin::VkSubpassDescription subpass{0, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, 0, nullptr, 1, &colorRef, nullptr, nullptr, 0, nullptr};
-        vkmin::VkRenderPassCreateInfo rpci{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, 1, &att, 1, &subpass, 0, nullptr};
+        vkmin::VkAttachmentReference depthRef{1, vkmin::VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        vkmin::VkSubpassDescription subpass{0, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, 0, nullptr, 1, &colorRef, nullptr, isCullMesh ? &depthRef : nullptr, 0, nullptr};
+        vkmin::VkRenderPassCreateInfo rpci{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, isCullMesh ? 2u : 1u, atts, 1, &subpass, 0, nullptr};
         vkmin::VkRenderPass rp = 0;
         vk.vkCreateRenderPass(dev, &rpci, nullptr, &rp);
 
         auto t0 = std::chrono::steady_clock::now();
-        vkmin::VkShaderModule msMod = 0, psMod = 0;
+        vkmin::VkShaderModule asMod = 0, msMod = 0, psMod = 0;
+        if (hasAS) {
+            vkmin::VkShaderModuleCreateInfo asci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, asSpv.size(), reinterpret_cast<const uint32_t*>(asSpv.data())};
+            vk.vkCreateShaderModule(dev, &asci, nullptr, &asMod);
+        }
         vkmin::VkShaderModuleCreateInfo msci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, msSpv.size(), reinterpret_cast<const uint32_t*>(msSpv.data())};
         vkmin::VkShaderModuleCreateInfo psci{vkmin::VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0, psSpv.size(), reinterpret_cast<const uint32_t*>(psSpv.data())};
         vk.vkCreateShaderModule(dev, &msci, nullptr, &msMod);
         vk.vkCreateShaderModule(dev, &psci, nullptr, &psMod);
 
-        vkmin::VkDescriptorSetLayoutBinding dslb{16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0x00000080u | vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        uint32_t stageFlags = 0x00000080u | vkmin::VK_SHADER_STAGE_FRAGMENT_BIT | (hasAS ? 0x00000040u : 0u);
+        vkmin::VkDescriptorSetLayoutBinding dslb{16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stageFlags, nullptr};
         vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 1, &dslb};
         vkmin::VkDescriptorSetLayout dsl = 0;
         vk.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
@@ -1692,17 +1708,27 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
         vkmin::VkPipelineLayout pl = 0;
         vk.vkCreatePipelineLayout(dev, &plci, nullptr, &pl);
 
-        vkmin::VkPipelineShaderStageCreateInfo stages[2] = {
-            {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, 0x00000080u /*VK_SHADER_STAGE_MESH_BIT_EXT*/, msMod, "MSMain", nullptr},
-            {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, psMod, "PSMain", nullptr},
-        };
+        vkmin::VkPipelineShaderStageCreateInfo stages[3]{};
+        uint32_t stageCount = 0;
+        if (hasAS) {
+            stages[stageCount++] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, 0x00000040u /*VK_SHADER_STAGE_TASK_BIT_EXT*/, asMod, "ASMain", nullptr};
+        }
+        stages[stageCount++] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, 0x00000080u /*VK_SHADER_STAGE_MESH_BIT_EXT*/, msMod, "MSMain", nullptr};
+        stages[stageCount++] = {vkmin::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, psMod, "PSMain", nullptr};
         vkmin::VkViewport vp{0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh), 0.0f, 1.0f};
         vkmin::VkRect2D sc{{0, 0}, {rw, rh}};
         vkmin::VkPipelineViewportStateCreateInfo vps{vkmin::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, &vp, 1, &sc};
         vkmin::VkPipelineRasterizationStateCreateInfo rs{
             vkmin::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, nullptr, 0, 0, 0,
-            vkmin::VK_POLYGON_MODE_FILL, vkmin::VK_CULL_MODE_NONE, vkmin::VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            vkmin::VK_POLYGON_MODE_FILL,
+            isCullMesh ? vkmin::VK_CULL_MODE_BACK_BIT : vkmin::VK_CULL_MODE_NONE,
+            isCullMesh ? vkmin::VK_FRONT_FACE_CLOCKWISE : vkmin::VK_FRONT_FACE_COUNTER_CLOCKWISE,
             0, 0, 0, 0, 1.0f};
+        vkmin::VkPipelineDepthStencilStateCreateInfo dsState{};
+        dsState.sType = vkmin::VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        dsState.depthTestEnable = isCullMesh ? 1u : 0u;
+        dsState.depthWriteEnable = isCullMesh ? 1u : 0u;
+        dsState.depthCompareOp = vkmin::VK_COMPARE_OP_LESS;
         vkmin::VkPipelineMultisampleStateCreateInfo ms{vkmin::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr, 0, vkmin::VK_SAMPLE_COUNT_1_BIT, 0, 1.0f, nullptr, 0, 0};
         vkmin::VkPipelineColorBlendAttachmentState cba{};
         cba.colorWriteMask = 0xF;
@@ -1710,11 +1736,12 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
 
         vkmin::VkGraphicsPipelineCreateInfo gpci{};
         gpci.sType = vkmin::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        gpci.stageCount = 2;
+        gpci.stageCount = stageCount;
         gpci.pStages = stages;
         gpci.pViewportState = &vps;
         gpci.pRasterizationState = &rs;
         gpci.pMultisampleState = &ms;
+        gpci.pDepthStencilState = isCullMesh ? &dsState : nullptr;
         gpci.pColorBlendState = &cbState;
         gpci.layout = pl;
         gpci.renderPass = rp;
@@ -1732,6 +1759,7 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
             vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
             vk.vkDestroyShaderModule(dev, psMod, nullptr);
             vk.vkDestroyShaderModule(dev, msMod, nullptr);
+            if (asMod) vk.vkDestroyShaderModule(dev, asMod, nullptr);
             vk.vkDestroyRenderPass(dev, rp, nullptr);
             vk.vkDestroyDevice(dev, nullptr);
             results.push_back(r);
@@ -1752,7 +1780,23 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
         vkmin::VkImageView iv = 0;
         vk.vkCreateImageView(dev, &ivci, nullptr, &iv);
 
-        vkmin::VkFramebufferCreateInfo fbci{vkmin::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, rp, 1, &iv, rw, rh, 1};
+        vkmin::VkImage dImg = 0;
+        vkmin::VkDeviceMemory dImgMem = 0;
+        vkmin::VkImageView dIv = 0;
+        if (isCullMesh) {
+            vkmin::VkImageCreateInfo dici{vkmin::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr, 0, vkmin::VK_IMAGE_TYPE_2D, vkmin::VK_FORMAT_D32_SFLOAT, {rw, rh, 1}, 1, 1, vkmin::VK_SAMPLE_COUNT_1_BIT, vkmin::VK_IMAGE_TILING_OPTIMAL, vkmin::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, vkmin::VK_IMAGE_LAYOUT_UNDEFINED};
+            vk.vkCreateImage(dev, &dici, nullptr, &dImg);
+            vkmin::VkMemoryRequirements dmr{};
+            vk.vkGetImageMemoryRequirements(dev, dImg, &dmr);
+            vkmin::VkMemoryAllocateInfo dmai{vkmin::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, dmr.size, findMem(dmr.memoryTypeBits, vkmin::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            vk.vkAllocateMemory(dev, &dmai, nullptr, &dImgMem);
+            vk.vkBindImageMemory(dev, dImg, dImgMem, 0);
+            vkmin::VkImageViewCreateInfo divci{vkmin::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, dImg, vkmin::VK_IMAGE_VIEW_TYPE_2D, vkmin::VK_FORMAT_D32_SFLOAT, {0, 0, 0, 0}, {vkmin::VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+            vk.vkCreateImageView(dev, &divci, nullptr, &dIv);
+        }
+
+        vkmin::VkImageView fbViews[2] = {iv, dIv};
+        vkmin::VkFramebufferCreateInfo fbci{vkmin::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, rp, isCullMesh ? 2u : 1u, fbViews, rw, rh, 1};
         vkmin::VkFramebuffer fb = 0;
         vk.vkCreateFramebuffer(dev, &fbci, nullptr, &fb);
 
@@ -1791,20 +1835,26 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
 
         vkmin::VkCommandBufferBeginInfo cbbi{vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, 0, nullptr};
         vkmin::VkSubmitInfo si{vkmin::VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmdBuf, 0, nullptr};
-        vkmin::VkClearValue clearVal{};
-        clearVal.float32[3] = 1.0f;
+        vkmin::VkClearValue clearVals[2]{};
+        clearVals[0].float32[3] = 1.0f;
+        clearVals[1].float32[0] = 1.0f;
 
-        auto drawOnce = [&](uint32_t groups) -> double {
+        auto drawOnce = [&](uint32_t groups, uint32_t gridX = 32, uint32_t layers = 4) -> double {
             void* p = nullptr;
             vk.vkMapMemory(dev, uboMem, 0, 256, 0, &p);
-            struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
-            std::memcpy(p, &cb, sizeof(cb));
+            if (isCullMesh) {
+                struct { float scale; float time; uint32_t gridX; uint32_t layerCount; } cb{1.0f, 0.25f, gridX, layers};
+                std::memcpy(p, &cb, sizeof(cb));
+            } else {
+                struct { float scale; float time; uint32_t groupCount; float pad; } cb{0.05f, 0.25f, groups, 0.0f};
+                std::memcpy(p, &cb, sizeof(cb));
+            }
             vk.vkUnmapMemory(dev, uboMem);
 
             auto s0 = std::chrono::steady_clock::now();
             vk.vkResetCommandBuffer(cmdBuf, 0);
             vk.vkBeginCommandBuffer(cmdBuf, &cbbi);
-            vkmin::VkRenderPassBeginInfo rpbi{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, rp, fb, {{0, 0}, {rw, rh}}, 1, &clearVal};
+            vkmin::VkRenderPassBeginInfo rpbi{vkmin::VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, rp, fb, {{0, 0}, {rw, rh}}, isCullMesh ? 2u : 1u, clearVals};
             vk.vkCmdBeginRenderPass(cmdBuf, &rpbi, vkmin::VK_SUBPASS_CONTENTS_INLINE);
             vk.vkCmdBindPipeline(cmdBuf, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vk.vkCmdBindDescriptorSets(cmdBuf, vkmin::VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
@@ -1817,11 +1867,15 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
             return std::chrono::duration<double, std::milli>(s1 - s0).count();
         };
 
-        r.firstDispatchMs = drawOnce(128);
+        const uint32_t steadyGroups = isCullMesh ? 64u : 128u;
+        const uint32_t shortGroups = isCullMesh ? 8u : 16u;
+        const uint32_t longGroups = isCullMesh ? 256u : 512u;
+
+        r.firstDispatchMs = drawOnce(steadyGroups, 32, 4);
         std::vector<double> samples;
         samples.reserve(iters);
         for (uint32_t i = 0; i < iters; ++i) {
-            samples.push_back(drawOnce(128));
+            samples.push_back(drawOnce(steadyGroups, 32, 4));
         }
 
         vk.vkResetCommandBuffer(cmdBuf, 0);
@@ -1840,8 +1894,8 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
         vk.vkUnmapMemory(dev, rbMem);
         r.checksum = sum;
 
-        r.shortJobMs = drawOnce(16);
-        r.longJobMs = drawOnce(512);
+        r.shortJobMs = drawOnce(shortGroups, 16, 2);
+        r.longJobMs = drawOnce(longGroups, 64, 4);
 
         finalizeTimingAndMemory(r, memBefore, memAfterCompile, samples);
         results.push_back(r);
@@ -1853,6 +1907,9 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
         vk.vkDestroyBuffer(dev, uboBuf, nullptr);
         vk.vkFreeMemory(dev, uboMem, nullptr);
         vk.vkDestroyFramebuffer(dev, fb, nullptr);
+        if (dIv) vk.vkDestroyImageView(dev, dIv, nullptr);
+        if (dImg) vk.vkDestroyImage(dev, dImg, nullptr);
+        if (dImgMem) vk.vkFreeMemory(dev, dImgMem, nullptr);
         vk.vkDestroyImageView(dev, iv, nullptr);
         vk.vkDestroyImage(dev, img, nullptr);
         vk.vkFreeMemory(dev, imgMem, nullptr);
@@ -1861,6 +1918,7 @@ inline std::vector<BenchRunResult> runVulkanMeshBench(
         vk.vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
         vk.vkDestroyShaderModule(dev, psMod, nullptr);
         vk.vkDestroyShaderModule(dev, msMod, nullptr);
+        if (asMod) vk.vkDestroyShaderModule(dev, asMod, nullptr);
         vk.vkDestroyRenderPass(dev, rp, nullptr);
         vk.vkDestroyDevice(dev, nullptr);
     }
