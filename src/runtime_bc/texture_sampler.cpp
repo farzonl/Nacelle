@@ -912,7 +912,7 @@ static inline __attribute__((always_inline)) uint32_t mask_to_u32(tex_vi32<W> ma
 }
 
 template <int W>
-static inline __attribute__((always_inline)) void sample_mip_2d_fast_v(
+static __attribute__((noinline)) void sample_mip_2d_fast_v(
     const BC_Descriptor* tex, uint32_t mip,
     tex_vf32<W> u, tex_vf32<W> v, tex_vi32<W> slice, bool uniformSlice,
     bool linearFilter, uint32_t reduction, uint32_t addrU, uint32_t addrV, uint32_t borderKind,
