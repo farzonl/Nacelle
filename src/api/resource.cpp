@@ -89,14 +89,11 @@ D3D12_TILE_SHAPE NacelleResource::computeStandardTileShape(const D3D12_RESOURCE_
 
 NacelleHeap::NacelleHeap(ID3D12Device* device, const D3D12_HEAP_DESC& desc)
     : D3D12PageableBase(device), desc_(desc) {
-    memory_ = static_cast<uint8_t*>(alignedAlloc64(static_cast<size_t>(desc.SizeInBytes)));
-    if (memory_ && desc.SizeInBytes > 0) {
-        std::memset(memory_, 0, static_cast<size_t>(desc.SizeInBytes));
-    }
+    memory_ = static_cast<uint8_t*>(alignedAllocZeroed64(static_cast<size_t>(desc.SizeInBytes)));
 }
 
 NacelleHeap::~NacelleHeap() {
-    alignedFree(memory_);
+    alignedFreeZeroed(memory_, static_cast<size_t>(desc_.SizeInBytes));
 }
 
 HRESULT STDMETHODCALLTYPE NacelleHeap::QueryInterface(REFIID riid, void** ppvObject) {
@@ -298,10 +295,8 @@ NacelleResource::NacelleResource(ID3D12Device* device,
         data_ = placedHeap_->data() + heapOffset;
         ownsMemory_ = false;
     } else {
-        data_ = static_cast<uint8_t*>(alignedAlloc64(static_cast<size_t>(std::max<uint64_t>(64, totalBytes_))));
-        if (data_ && totalBytes_ > 0) {
-            std::memset(data_, 0, static_cast<size_t>(totalBytes_));
-        }
+        allocatedBytes_ = static_cast<size_t>(std::max<uint64_t>(64, totalBytes_));
+        data_ = static_cast<uint8_t*>(alignedAllocZeroed64(allocatedBytes_));
         ownsMemory_ = true;
     }
 
@@ -348,7 +343,7 @@ NacelleResource::~NacelleResource() {
         if (h) h->Release();
     }
     if (ownsMemory_) {
-        alignedFree(data_);
+        alignedFreeZeroed(data_, allocatedBytes_);
     }
     if (placedHeap_) {
         placedHeap_->Release();

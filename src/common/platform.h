@@ -11,8 +11,12 @@
 #include <string>
 
 #if !defined(_WIN32)
+#include <sys/mman.h>
 #include <unistd.h>
 #include <wsl/winadapter.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -58,6 +62,48 @@ inline void alignedFree(void* ptr) {
 #else
     std::free(ptr);
 #endif
+}
+
+inline constexpr size_t kDemandPagedThresholdBytes = 64 * 1024;
+
+/// Allocates 64-byte aligned zero-initialized memory. Large allocations use
+/// OS demand-zeroed virtual memory so untouched pages consume no physical RSS.
+inline void* alignedAllocZeroed64(size_t size) {
+    if (size == 0) size = 64;
+    const size_t aligned = (size + 63) & ~size_t(63);
+    if (aligned >= kDemandPagedThresholdBytes) {
+#if defined(_WIN32)
+        if (void* p = VirtualAlloc(nullptr, aligned, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
+            return p;
+        }
+#else
+        void* p = mmap(nullptr, aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED) {
+            return p;
+        }
+#endif
+    }
+    void* p = alignedAlloc64(aligned);
+    if (p) {
+        std::memset(p, 0, aligned);
+    }
+    return p;
+}
+
+inline void alignedFreeZeroed(void* ptr, size_t size) {
+    if (!ptr) return;
+    if (size == 0) size = 64;
+    const size_t aligned = (size + 63) & ~size_t(63);
+    if (aligned >= kDemandPagedThresholdBytes) {
+#if defined(_WIN32)
+        VirtualFree(ptr, 0, MEM_RELEASE);
+        return;
+#else
+        munmap(ptr, aligned);
+        return;
+#endif
+    }
+    alignedFree(ptr);
 }
 
 inline std::filesystem::path getCacheDirectory() {

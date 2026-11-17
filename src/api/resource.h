@@ -153,6 +153,7 @@ private:
     bool ownsMemory_ = false;
     bool isReserved_ = false;
     uint64_t totalBytes_ = 0;
+    size_t allocatedBytes_ = 0;
     std::vector<NacelleMipLayout> subresources_;
     NacelleTextureMetadata texMeta_{};
 
