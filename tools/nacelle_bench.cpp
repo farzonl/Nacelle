@@ -829,33 +829,70 @@ int main(int argc, char** argv) {
         recordResults(spec.id, bt, res);
     }
 
-    // Compute Category Winners (lowest geomean dispatch time in ms)
+    constexpr double kIncompletePenaltyMultiplier = 5.0;
+
+    auto computeMaxByBench = [&](double BenchRunResult::*field) {
+        std::map<std::string, double> maxByBench;
+        for (const auto& r : allResults) {
+            if (r.ran && r.*field > 0.0) {
+                auto& cur = maxByBench[r.benchId];
+                if (r.*field > cur) cur = r.*field;
+            }
+        }
+        return maxByBench;
+    };
+
+    std::set<std::string> activeBackends;
+    for (const auto& r : allResults) {
+        if (r.ran) activeBackends.insert(r.backend);
+    }
+
+    // Compute Category Winners (lowest geomean dispatch time in ms, with penalty for incomplete benchmarks)
     std::vector<BenchCategory> cats = {
         BenchCategory::Compute, BenchCategory::Vertex, BenchCategory::Pixel,
         BenchCategory::Geometry, BenchCategory::Tessellation, BenchCategory::RayTracing,
         BenchCategory::Mesh
     };
 
+    auto maxMedianByBench = computeMaxByBench(&BenchRunResult::medianMs);
     std::map<std::string, std::vector<double>> backendCategoryMs;
     std::vector<WinnerInfo> categoryWinners;
 
     for (auto c : cats) {
         std::string cname = categoryName(c);
-        std::map<std::string, std::vector<double>> msByBackend;
+        std::set<std::string> catBenchIds;
+        std::map<std::string, std::map<std::string, double>> ranByBackend;
         for (const auto& r : allResults) {
-            if (r.ran && r.category == cname && r.medianMs > 0.0) {
-                msByBackend[r.backend].push_back(r.medianMs);
+            if (r.category == cname && maxMedianByBench.count(r.benchId)) {
+                catBenchIds.insert(r.benchId);
+                if (r.ran && r.medianMs > 0.0) {
+                    ranByBackend[r.backend][r.benchId] = r.medianMs;
+                }
             }
         }
+
         std::string bestBackend = "N/A";
         double bestMs = 1e18;
-        for (const auto& [b, vals] : msByBackend) {
-            double gm = computeGeoMean(vals);
-            if (gm > 0.0) {
-                backendCategoryMs[b].push_back(gm);
-                if (gm < bestMs) {
-                    bestMs = gm;
-                    bestBackend = b;
+        if (!catBenchIds.empty()) {
+            for (const auto& b : activeBackends) {
+                const auto it = ranByBackend.find(b);
+                const size_t ranCount = (it != ranByBackend.end()) ? it->second.size() : 0;
+                std::vector<double> vals;
+                vals.reserve(catBenchIds.size());
+                for (const auto& bid : catBenchIds) {
+                    if (it != ranByBackend.end() && it->second.count(bid)) {
+                        vals.push_back(it->second.at(bid));
+                    } else {
+                        vals.push_back(kIncompletePenaltyMultiplier * maxMedianByBench.at(bid));
+                    }
+                }
+                double gm = computeGeoMean(vals);
+                if (gm > 0.0) {
+                    backendCategoryMs[b].push_back(gm);
+                    if (ranCount > 0 && gm < bestMs) {
+                        bestMs = gm;
+                        bestBackend = b;
+                    }
                 }
             }
         }
@@ -876,20 +913,31 @@ int main(int argc, char** argv) {
     }
 
     // Regime Winners: Cold JIT, Hot JIT, Short Job, Long Job, Lowest Peak Memory
-    std::map<std::string, std::vector<double>> coldByB, hotByB, shortByB, longByB, memByB;
-    for (const auto& r : allResults) {
-        if (!r.ran) continue;
-        if (r.coldMs > 0.0) coldByB[r.backend].push_back(r.coldMs);
-        if (r.medianMs > 0.0) hotByB[r.backend].push_back(r.medianMs);
-        if (r.shortJobMs > 0.0) shortByB[r.backend].push_back(r.shortJobMs);
-        if (r.longJobMs > 0.0) longByB[r.backend].push_back(r.longJobMs);
-        if (r.peakRssMb > 0.0) memByB[r.backend].push_back(r.peakRssMb);
-    }
+    auto pickLowestPenalizedGeomean = [&](double BenchRunResult::*field, const std::string& label, const std::string& unit) -> WinnerInfo {
+        auto maxByBench = computeMaxByBench(field);
+        if (maxByBench.empty()) return {label, "N/A", 0.0, unit};
 
-    auto pickLowestGeomean = [](const std::map<std::string, std::vector<double>>& m, const std::string& label, const std::string& unit) -> WinnerInfo {
+        std::map<std::string, std::map<std::string, double>> ranByBackend;
+        for (const auto& r : allResults) {
+            if (r.ran && r.*field > 0.0) {
+                ranByBackend[r.backend][r.benchId] = r.*field;
+            }
+        }
+
         std::string best = "N/A";
         double bestVal = 1e18;
-        for (const auto& [b, vals] : m) {
+        for (const auto& b : activeBackends) {
+            const auto it = ranByBackend.find(b);
+            if (it == ranByBackend.end() || it->second.empty()) continue;
+            std::vector<double> vals;
+            vals.reserve(maxByBench.size());
+            for (const auto& [bid, maxV] : maxByBench) {
+                if (it->second.count(bid)) {
+                    vals.push_back(it->second.at(bid));
+                } else {
+                    vals.push_back(kIncompletePenaltyMultiplier * maxV);
+                }
+            }
             double gm = computeGeoMean(vals);
             if (gm > 0.0 && gm < bestVal) {
                 bestVal = gm;
@@ -900,11 +948,11 @@ int main(int argc, char** argv) {
     };
 
     std::vector<WinnerInfo> regimeWinners = {
-        pickLowestGeomean(coldByB, "Cold JIT", "ms"),
-        pickLowestGeomean(hotByB, "Hot JIT", "ms"),
-        pickLowestGeomean(shortByB, "Short-Running Job", "ms"),
-        pickLowestGeomean(longByB, "Long-Running Job", "ms"),
-        pickLowestGeomean(memByB, "Lowest Peak Memory", "MB"),
+        pickLowestPenalizedGeomean(&BenchRunResult::coldMs, "Cold JIT", "ms"),
+        pickLowestPenalizedGeomean(&BenchRunResult::medianMs, "Hot JIT", "ms"),
+        pickLowestPenalizedGeomean(&BenchRunResult::shortJobMs, "Short-Running Job", "ms"),
+        pickLowestPenalizedGeomean(&BenchRunResult::longJobMs, "Long-Running Job", "ms"),
+        pickLowestPenalizedGeomean(&BenchRunResult::peakRssMb, "Lowest Peak Memory", "MB"),
     };
 
     // Print Console Report
