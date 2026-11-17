@@ -91,6 +91,19 @@ using CompiledVertexFn = void (*)(
 inline constexpr uint32_t kRasterTileSize = 32;
 inline constexpr uint32_t kRasterTilePixels = kRasterTileSize * kRasterTileSize;
 
+/// Per-triangle data for packed multi-triangle pixel batches.
+struct PixelTriData {
+    const float* triAttrBase = nullptr; // [numPSInputRegs * 4 * 3]
+    const float* triAttrFlat = nullptr; // [numPSInputRegs * 4]
+    const float* triInvW = nullptr;     // [3]
+    const float* triOrigBary = nullptr; // [9]
+    const float* triDepth = nullptr;    // [3]
+    uint32_t isFrontFace = 1;
+    uint32_t primitiveId = 0;
+    uint32_t viewportArrayIndex = 0;
+    uint32_t shadingRate = 0;
+};
+
 /// Pixel Uber-PSO quad batch kernel arguments.
 struct PixelBatchArgs {
     const DriverRootContext* rootCtx = nullptr;
@@ -114,6 +127,8 @@ struct PixelBatchArgs {
     float* tileColorSOA[8]{};           // Each points to 4 * kRasterTilePixels floats: plane c * kRasterTilePixels + pixIdx
     float* tileDepthSOA = nullptr;      // kRasterTilePixels floats
     uint8_t* tileStencilSOA = nullptr;  // kRasterTilePixels uint8_t
+    const PixelTriData* triData = nullptr;    // [numTris]: optional per-triangle descriptors for packed batches
+    const uint32_t* quadTriIndices = nullptr; // [batchCount * (W/4)]: optional per-quad index into triData (null = uniform triangle)
 };
 
 using CompiledPixelQuadFn = void (*)(const PixelBatchArgs* args);
