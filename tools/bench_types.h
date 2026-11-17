@@ -73,6 +73,8 @@ struct BenchmarkSpec {
     std::string dsSpv;
     std::string gsDxil;
     std::string gsSpv;
+    std::string asDxil;
+    std::string asSpv;
     std::string msDxil;
     std::string msSpv;
     std::string psDxil;
