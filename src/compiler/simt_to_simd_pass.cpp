@@ -6511,6 +6511,63 @@ private:
             clampLod = vecOrZero(16, f32Ty(), -1.0);
         }
 
+        auto isSingleHandle = [](const SimdVal& sv) -> bool {
+            return (sv.kind == SimdVal::Kind::Handle || sv.kind == SimdVal::Kind::Lanes) && sv.lanes.size() == 1;
+        };
+        if ((W_ == 4 || W_ == 8 || W_ == 16) && isSingleHandle(texH) && isSingleHandle(sampH)) {
+            std::string vecFnName = "nacelle_tex_sample_v" + std::to_string(W_);
+            auto vecFn = getOrDeclareRuntimeFn(
+                loc, vecFnName, nullptr, {ptrTy(), ptrTy(), i32Ty(), i32Ty(), ptrTy()});
+            const uint32_t vecBytes = W_ * 4u;
+            mlir::Value argsBuf = createEntryAlloca(
+                loc, mlir::LLVM::LLVMArrayType::get(vecTy(f32Ty()), 21), 1, std::max<uint32_t>(16u, vecBytes));
+            auto storeVecSlot = [&](uint32_t slot, mlir::Value val) {
+                mlir::Value p = gepByteOffset(loc, argsBuf, static_cast<int64_t>(slot) * static_cast<int64_t>(vecBytes));
+                mlir::LLVM::StoreOp::create(b_, loc, val, p);
+            };
+            storeVecSlot(0, u);
+            storeVecSlot(1, v);
+            storeVecSlot(2, w);
+            storeVecSlot(3, c3);
+            if (lodMode != 2u) {
+                storeVecSlot(4, ddxU);
+                storeVecSlot(5, ddxV);
+                storeVecSlot(6, ddxW);
+                storeVecSlot(7, ddyU);
+                storeVecSlot(8, ddyV);
+                storeVecSlot(9, ddyW);
+            }
+            if (lodMode == 1u) storeVecSlot(10, bias);
+            if (lodMode == 2u) storeVecSlot(11, expLod);
+            storeVecSlot(12, clampLod);
+            storeVecSlot(13, offX);
+            storeVecSlot(14, offY);
+            storeVecSlot(15, offZ);
+
+            mlir::Type maskIntTy = mlir::IntegerType::get(ctx_, W_);
+            mlir::Value maskBits = mlir::LLVM::BitcastOp::create(b_, loc, maskIntTy, execMask);
+            mlir::Value activeMask32 = mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), maskBits);
+            mlir::Value lodModeVal = mlir::LLVM::ConstantOp::create(b_, loc, i32Ty(), b_.getIntegerAttr(i32Ty(), lodMode));
+
+            mlir::LLVM::CallOp::create(
+                b_, loc, vecFn,
+                mlir::ValueRange{laneValue(loc, texH, 0), laneValue(loc, sampH, 0), lodModeVal, activeMask32, argsBuf});
+
+            SimdVal st;
+            st.kind = SimdVal::Kind::Struct;
+            st.origType = call.getResult().getType();
+            for (unsigned c = 0; c < 4; ++c) {
+                mlir::Value p = gepByteOffset(loc, argsBuf, static_cast<int64_t>(16 + c) * static_cast<int64_t>(vecBytes));
+                mlir::Value ch = mlir::LLVM::LoadOp::create(b_, loc, vecTy(f32Ty()), p);
+                st.fields.push_back({SimdVal::Kind::Vector, f32Ty(), ch, {}, {}});
+            }
+            mlir::Value stPtr = gepByteOffset(loc, argsBuf, static_cast<int64_t>(20) * static_cast<int64_t>(vecBytes));
+            mlir::Value statusVec = mlir::LLVM::LoadOp::create(b_, loc, vecTy(i32Ty()), stPtr);
+            st.fields.push_back({SimdVal::Kind::Vector, i32Ty(), statusVec, {}, {}});
+            setMapped(call.getResult(), st);
+            return true;
+        }
+
         auto fn = getOrDeclareRuntimeFn(
             loc, "nacelle_tex_sample", i32Ty(),
             {ptrTy(), ptrTy(), f32Ty(), f32Ty(), f32Ty(), f32Ty(),

@@ -222,6 +222,8 @@ add_hlsl_spirv(aurora_paint.hlsl ps_6_0 PSMain aurora_paint.spv)
 add_hlsl_spirv(sunflower_fields.hlsl ps_6_0 PSMain sunflower_fields.spv)
 add_hlsl_spirv(mt_fuji_watercolor.hlsl ps_6_0 PSMain mt_fuji_watercolor.spv)
 add_hlsl_spirv(disco_maze.hlsl ps_6_0 PSMain disco_maze.spv)
+add_hlsl_spirv(textured_filter.hlsl ps_6_0 PSMain textured_filter.spv)
+add_hlsl_spirv(textured_pbr_quad.hlsl ps_6_0 PSMain textured_pbr_quad.spv)
 
 # Graphics shaders (DXIL)
 add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSMain raster_basic_vs.dxil)
@@ -308,6 +310,8 @@ add_hlsl_dxil(van_gogh_sunset.hlsl ps_6_0 PSMain van_gogh_sunset.dxil)
 add_hlsl_dxil(rainbow_particle_hills.hlsl ps_6_0 PSMain rainbow_particle_hills.dxil)
 add_hlsl_dxil(goldeen.hlsl ps_6_0 PSMain goldeen.dxil)
 add_hlsl_dxil(disco_maze.hlsl ps_6_0 PSMain disco_maze.dxil)
+add_hlsl_dxil(textured_filter.hlsl ps_6_0 PSMain textured_filter.dxil)
+add_hlsl_dxil(textured_pbr_quad.hlsl ps_6_0 PSMain textured_pbr_quad.dxil)
 
 add_custom_target(nacelle_test_shaders DEPENDS ${NACELLE_SHADER_OUTPUTS})
 
