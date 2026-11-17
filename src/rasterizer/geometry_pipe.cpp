@@ -71,10 +71,10 @@ struct ChunkBinPair {
 };
 
 struct TriangleEmitTarget {
-    std::vector<SetupTriangle>* triangles = nullptr;
-    std::vector<float>* attrBaseArena = nullptr;
-    std::vector<float>* attrFlatArena = nullptr;
-    std::vector<float>* origBaryArena = nullptr;
+    NoInitVec<SetupTriangle>* triangles = nullptr;
+    NoInitVec<float>* attrBaseArena = nullptr;
+    NoInitVec<float>* attrFlatArena = nullptr;
+    NoInitVec<float>* origBaryArena = nullptr;
     std::vector<uint32_t>* tileCounts = nullptr;
     std::vector<ChunkBinPair>* binPairs = nullptr;
     uint32_t numTilesX = 0;
@@ -101,10 +101,10 @@ struct TriangleEmitTarget {
 };
 
 struct ChunkOutput {
-    std::vector<SetupTriangle> triangles;
-    std::vector<float> attrBase;
-    std::vector<float> attrFlat;
-    std::vector<float> origBary;
+    NoInitVec<SetupTriangle> triangles;
+    NoInitVec<float> attrBase;
+    NoInitVec<float> attrFlat;
+    NoInitVec<float> origBary;
     std::vector<uint32_t> tileCounts;
     std::vector<ChunkBinPair> binPairs;
 
@@ -326,7 +326,7 @@ void setupClippedBaryTriangle(
     int64_t vxB[3] = {fx2, fx0, fx1};
     int64_t vyB[3] = {fy2, fy0, fy1};
 
-    SetupTriangle tri;
+    SetupTriangle tri{};
     tri.minX = minX;
     tri.maxX = maxX;
     tri.minY = minY;
@@ -883,7 +883,7 @@ void executeVertexTriangleChunk(
             int32_t maxY = std::min<int32_t>(scissor0.bottom, static_cast<int32_t>((maxFy - 128) >> 8) + 1);
             if (minX >= maxX || minY >= maxY) continue;
 
-            SetupTriangle tri;
+            SetupTriangle tri{};
             tri.minX = minX;
             tri.maxX = maxX;
             tri.minY = minY;
@@ -1079,7 +1079,7 @@ void setupClippedLine(
         }
     }
 
-    SetupTriangle tri;
+    SetupTriangle tri{};
     tri.isLine = true;
     tri.lineX0 = lx0;
     tri.lineY0 = ly0;
