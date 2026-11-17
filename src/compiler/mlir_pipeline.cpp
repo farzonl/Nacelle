@@ -178,6 +178,8 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
     mlir::PassManager pm(&mlirCtx);
     pm.addPass(mlir::createLiftControlFlowToSCFPass());
     pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+    pm.addPass(mlir::createCanonicalizerPass());
     if (mlir::failed(pm.run(*mlirMod))) {
         outError = "MLIR ControlFlowToSCF pass failed";
         return nullptr;
