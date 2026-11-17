@@ -143,6 +143,11 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             results.push_back(r);
             continue;
         }
+        if (spec.hasTexture) {
+            r.status = "SKIPPED (textured PS)";
+            results.push_back(std::move(r));
+            continue;
+        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 
@@ -554,6 +559,11 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         if (spec.id == "state_heavy_ps") {
             r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
             results.push_back(r);
+            continue;
+        }
+        if (spec.hasTexture) {
+            r.status = "SKIPPED (textured PS)";
+            results.push_back(std::move(r));
             continue;
         }
 
@@ -1108,6 +1118,11 @@ inline std::vector<BenchRunResult> runVulkanRaytracingBench(
         if (spec.id == "state_heavy_ps") {
             r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
             results.push_back(r);
+            continue;
+        }
+        if (spec.hasTexture) {
+            r.status = "SKIPPED (textured PS)";
+            results.push_back(std::move(r));
             continue;
         }
 

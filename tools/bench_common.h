@@ -161,6 +161,32 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
         s.psSpv = "bench_state_heavy_ps_ps.spv";
         cat.push_back(std::move(s));
     }
+    {
+        BenchmarkSpec s;
+        s.id = "textured_filter";
+        s.name = "Textured Filter (8-tap)";
+        s.category = BenchCategory::Pixel;
+        s.kind = PipelineKind::GraphicsVSPS;
+        s.vsDxil = "fullscreen_quad_vs.dxil";
+        s.psDxil = "textured_filter.dxil";
+        s.vsSpv = "fullscreen_quad_vs.spv";
+        s.psSpv = "textured_filter.spv";
+        s.hasTexture = true;
+        cat.push_back(std::move(s));
+    }
+    {
+        BenchmarkSpec s;
+        s.id = "textured_pbr_quad";
+        s.name = "Textured PBR Quad";
+        s.category = BenchCategory::Pixel;
+        s.kind = PipelineKind::GraphicsVSPS;
+        s.vsDxil = "fullscreen_quad_vs.dxil";
+        s.psDxil = "textured_pbr_quad.dxil";
+        s.vsSpv = "fullscreen_quad_vs.spv";
+        s.psSpv = "textured_pbr_quad.spv";
+        s.hasTexture = true;
+        cat.push_back(std::move(s));
+    }
 
     {
         BenchmarkSpec s;

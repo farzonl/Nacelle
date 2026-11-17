@@ -436,11 +436,14 @@ inline BenchRunResult runNacelleGraphicsBench(
     dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
 
     const bool isStateHeavyPS = (spec.id == "state_heavy_ps");
+    const bool useSrvAndSampler = isStateHeavyPS || spec.hasTexture;
 
     D3D12_DESCRIPTOR_RANGE srvRange{};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = 2;
+    srvRange.NumDescriptors = isStateHeavyPS ? 2u : 1u;
     srvRange.BaseShaderRegister = 0;
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = 0;
 
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -450,20 +453,22 @@ inline BenchRunResult runNacelleGraphicsBench(
     params[1].DescriptorTable.pDescriptorRanges = &srvRange;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_STATIC_SAMPLER_DESC staticSamp{};
-    staticSamp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    staticSamp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSamp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSamp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    staticSamp.MaxLOD = D3D12_FLOAT32_MAX;
-    staticSamp.ShaderRegister = 0;
-    staticSamp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC staticSampler{};
+    staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    staticSampler.MaxAnisotropy = 1;
+    staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    staticSampler.ShaderRegister = 0;
+    staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = isStateHeavyPS ? 2u : 1u;
+    rsDesc.NumParameters = useSrvAndSampler ? 2u : 1u;
     rsDesc.pParameters = params;
-    rsDesc.NumStaticSamplers = isStateHeavyPS ? 1u : 0u;
-    rsDesc.pStaticSamplers = isStateHeavyPS ? &staticSamp : nullptr;
+    rsDesc.NumStaticSamplers = useSrvAndSampler ? 1u : 0u;
+    rsDesc.pStaticSamplers = useSrvAndSampler ? &staticSampler : nullptr;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ID3DBlob* rsBlob = nullptr;
     NacelleSerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
@@ -736,6 +741,45 @@ inline BenchRunResult runNacelleGraphicsBench(
         vbBuf->Unmap(0, nullptr);
     }
 
+    ID3D12Resource* texRes = nullptr;
+    if (spec.hasTexture && !isStateHeavyPS) {
+        D3D12_HEAP_PROPERTIES texHp{};
+        texHp.Type = D3D12_HEAP_TYPE_CUSTOM;
+        texHp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        texHp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        D3D12_RESOURCE_DESC texDesc{};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = 256;
+        texDesc.Height = 256;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 9;
+        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.SampleDesc.Count = 1;
+        dev->CreateCommittedResource(&texHp, D3D12_HEAP_FLAG_NONE, &texDesc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&texRes));
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+            uint32_t mw = std::max(1u, 256u >> mip);
+            uint32_t mh = std::max(1u, 256u >> mip);
+            std::vector<uint32_t> pixels(static_cast<size_t>(mw) * mh);
+            for (uint32_t y = 0; y < mh; ++y) {
+                for (uint32_t x = 0; x < mw; ++x) {
+                    uint32_t r = ((x * 255u) / mw) ^ (((x >> 4) ^ (y >> 4)) & 1u ? 0x40u : 0u);
+                    uint32_t g = ((y * 255u) / mh);
+                    uint32_t b = (((x + y) * 127u) / std::max(1u, mw + mh));
+                    pixels[static_cast<size_t>(y) * mw + x] = (r & 0xFFu) | ((g & 0xFFu) << 8) | ((b & 0xFFu) << 16) | 0xFF000000u;
+                }
+            }
+            texRes->WriteToSubresource(mip, nullptr, pixels.data(), mw * 4u, mw * mh * 4u);
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC srvHD{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        dev->CreateDescriptorHeap(&srvHD, IID_PPV_ARGS(&srvHeap));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 9;
+        dev->CreateShaderResourceView(texRes, &srvDesc, srvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
     uint64_t fenceVal = isStateHeavyPS ? 2 : 1;
     auto runDraw = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vertCount) -> double {
         uint32_t layerCount = (mode == 0) ? 8u : (mode == 1 ? 16u : 32u);
@@ -765,7 +809,7 @@ inline BenchRunResult runNacelleGraphicsBench(
         cmd->SetGraphicsRootSignature(rootSig);
         cmd->SetPipelineState(pso);
         cmd->SetGraphicsRootConstantBufferView(0, cbBuf->GetGPUVirtualAddress());
-        if (isStateHeavyPS) {
+        if (useSrvAndSampler && srvHeap) {
             ID3D12DescriptorHeap* heaps[] = {srvHeap};
             cmd->SetDescriptorHeaps(1, heaps);
             cmd->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
@@ -899,6 +943,7 @@ inline BenchRunResult runNacelleGraphicsBench(
     if (texBC7) texBC7->Release();
     if (texBC1) texBC1->Release();
     if (resolveTex) resolveTex->Release();
+    if (texRes) texRes->Release();
     if (dsvHeap) dsvHeap->Release();
     if (dsvTex) dsvTex->Release();
     vbBuf->Release();

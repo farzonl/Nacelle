@@ -287,6 +287,10 @@ inline BenchRunResult runWarpGraphicsBench(
     res.category = categoryName(spec.category);
     res.backend = "Microsoft WARP";
     res.shaderFormat = "DXIL";
+    if (spec.hasTexture) {
+        res.status = "SKIPPED (textured PS)";
+        return res;
+    }
 
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;
@@ -825,6 +829,10 @@ inline BenchRunResult runWarpRaytracingBench(
     res.category = categoryName(spec.category);
     res.backend = "Microsoft WARP";
     res.shaderFormat = "DXIL";
+    if (spec.hasTexture) {
+        res.status = "SKIPPED (textured PS)";
+        return res;
+    }
 
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;

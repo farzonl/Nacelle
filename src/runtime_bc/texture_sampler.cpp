@@ -734,6 +734,696 @@ uint32_t nacelle_tex_sample(
     return mapped;
 }
 
+} // extern "C"
+
+template <int W>
+using tex_vf32 = float __attribute__((ext_vector_type(W)));
+
+template <int W>
+using tex_vi32 = int32_t __attribute__((ext_vector_type(W)));
+
+template <int W>
+using tex_vu32 = uint32_t __attribute__((ext_vector_type(W)));
+
+template <typename Dst, typename Src>
+static inline __attribute__((always_inline)) Dst tex_bit_cast(Src s) {
+    Dst d;
+    __builtin_memcpy(&d, &s, sizeof(d));
+    return d;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_splat_f(float v) {
+    return (tex_vf32<W>)(v);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_splat_i(int32_t v) {
+    return (tex_vi32<W>)(v);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vu32<W> tex_splat_u(uint32_t v) {
+    return (tex_vu32<W>)(v);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_select_f(tex_vi32<W> mask, tex_vf32<W> t, tex_vf32<W> f) {
+    return mask ? t : f;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_select_i(tex_vi32<W> mask, tex_vi32<W> t, tex_vi32<W> f) {
+    return mask ? t : f;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_min_f(tex_vf32<W> a, tex_vf32<W> b) {
+    return (a < b) ? a : b;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_max_f(tex_vf32<W> a, tex_vf32<W> b) {
+    return (a > b) ? a : b;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_clamp_f(tex_vf32<W> x, float lo, float hi) {
+    return tex_min_f<W>(tex_max_f<W>(x, tex_splat_f<W>(lo)), tex_splat_f<W>(hi));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_min_i(tex_vi32<W> a, tex_vi32<W> b) {
+    return (a < b) ? a : b;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_max_i(tex_vi32<W> a, tex_vi32<W> b) {
+    return (a > b) ? a : b;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_lerp_f(tex_vf32<W> a, tex_vf32<W> b, tex_vf32<W> t) {
+    return a + t * (b - a);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_floor_i(tex_vf32<W> x) {
+    tex_vf32<W> cx = tex_select_f<W>(x == x, x, tex_splat_f<W>(0.0f));
+    cx = tex_clamp_f<W>(cx, -8388608.0f, 8388608.0f);
+    tex_vi32<W> i = __builtin_convertvector(cx, tex_vi32<W>);
+    tex_vf32<W> fi = __builtin_convertvector(i, tex_vf32<W>);
+    return tex_select_i<W>(fi > cx, i - tex_splat_i<W>(1), i);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_log2_pos(tex_vf32<W> x) {
+    tex_vi32<W> ix = tex_bit_cast<tex_vi32<W>>(x);
+    tex_vi32<W> e = (ix >> 23) - tex_splat_i<W>(127);
+    tex_vf32<W> m = tex_bit_cast<tex_vf32<W>>((ix & tex_splat_i<W>(0x007FFFFF)) | tex_splat_i<W>(0x3F800000));
+    tex_vi32<W> gt_sqrt2 = (m > tex_splat_f<W>(1.4142135624f));
+    m = tex_select_f<W>(gt_sqrt2, m * tex_splat_f<W>(0.5f), m);
+    e = tex_select_i<W>(gt_sqrt2, e + tex_splat_i<W>(1), e);
+
+    tex_vf32<W> u = (m - tex_splat_f<W>(1.0f)) / (m + tex_splat_f<W>(1.0f));
+    tex_vf32<W> u2 = u * u;
+    constexpr float kTwoOverLn2Hi = 2.885390043258667f;
+    constexpr float kTwoOverLn2Lo = 3.85192598e-8f;
+    tex_vf32<W> p = tex_splat_f<W>(0.32185382f);
+    p = p * u2 + tex_splat_f<W>(0.41219705f);
+    p = p * u2 + tex_splat_f<W>(0.57707802f);
+    p = p * u2 + tex_splat_f<W>(0.96179669f);
+    tex_vf32<W> tail = (u * u2 * p) + (u * tex_splat_f<W>(kTwoOverLn2Lo));
+    return (__builtin_convertvector(e, tex_vf32<W>) + u * tex_splat_f<W>(kTwoOverLn2Hi)) + tail;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_exp2_pos(tex_vf32<W> x) {
+    tex_vf32<W> cx = tex_clamp_f<W>(x, -126.0f, 127.0f);
+    tex_vi32<W> k = tex_floor_i<W>(cx);
+    tex_vf32<W> f = cx - __builtin_convertvector(k, tex_vf32<W>);
+    tex_vf32<W> p = tex_splat_f<W>(0.0018775767f);
+    p = p * f + tex_splat_f<W>(0.0089893397f);
+    p = p * f + tex_splat_f<W>(0.055826318f);
+    p = p * f + tex_splat_f<W>(0.24015362f);
+    p = p * f + tex_splat_f<W>(0.69315308f);
+    p = p * f + tex_splat_f<W>(1.0f);
+    tex_vi32<W> pow2k = (k + tex_splat_i<W>(127)) << 23;
+    return p * tex_bit_cast<tex_vf32<W>>(pow2k);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_srgb_to_lin(tex_vf32<W> c) {
+    tex_vi32<W> low = (c <= tex_splat_f<W>(0.04045f));
+    tex_vf32<W> lin = c * tex_splat_f<W>(1.0f / 12.92f);
+    tex_vf32<W> base = tex_max_f<W>((c + tex_splat_f<W>(0.055f)) * tex_splat_f<W>(1.0f / 1.055f), tex_splat_f<W>(1e-12f));
+    tex_vf32<W> hi = tex_exp2_pos<W>(tex_splat_f<W>(2.4f) * tex_log2_pos<W>(base));
+    return tex_select_f<W>(low, lin, hi);
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> apply_address_mode_v(
+    tex_vi32<W> coord, uint32_t dim, uint32_t mode, tex_vi32<W>& outBorder) {
+    int32_t idim = static_cast<int32_t>(dim);
+    if (idim <= 0) {
+        outBorder = tex_splat_i<W>(-1);
+        return tex_splat_i<W>(0);
+    }
+    switch (mode) {
+    case 0: { // WRAP
+        if ((dim & (dim - 1u)) == 0u) {
+            return coord & tex_splat_i<W>(idim - 1);
+        }
+        tex_vi32<W> d = tex_splat_i<W>(idim);
+        tex_vi32<W> m = coord % d;
+        return tex_select_i<W>(m < tex_splat_i<W>(0), m + d, m);
+    }
+    case 1: { // MIRROR
+        int32_t period = idim * 2;
+        tex_vi32<W> p = tex_splat_i<W>(period);
+        tex_vi32<W> d = tex_splat_i<W>(idim);
+        tex_vi32<W> m = coord % p;
+        m = tex_select_i<W>(m < tex_splat_i<W>(0), m + p, m);
+        return tex_select_i<W>(m >= d, tex_splat_i<W>(period - 1) - m, m);
+    }
+    case 2: // CLAMP
+        return tex_min_i<W>(tex_max_i<W>(coord, tex_splat_i<W>(0)), tex_splat_i<W>(idim - 1));
+    case 3: { // BORDER
+        tex_vi32<W> b = (coord < tex_splat_i<W>(0)) | (coord >= tex_splat_i<W>(idim));
+        outBorder |= b;
+        return tex_select_i<W>(b, tex_splat_i<W>(0), coord);
+    }
+    case 4: { // MIRROR_ONCE
+        tex_vi32<W> a = tex_select_i<W>(coord < tex_splat_i<W>(0), -coord - tex_splat_i<W>(1), coord);
+        return tex_min_i<W>(a, tex_splat_i<W>(idim - 1));
+    }
+    default:
+        return tex_min_i<W>(tex_max_i<W>(coord, tex_splat_i<W>(0)), tex_splat_i<W>(idim - 1));
+    }
+}
+
+template <int W>
+static inline __attribute__((always_inline)) uint32_t mask_to_u32(tex_vi32<W> mask) {
+    uint32_t bits = 0;
+    for (int l = 0; l < W; ++l) {
+        if (mask[l] != 0) bits |= (1u << l);
+    }
+    return bits;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vf32<W> tex_load_vf(const float* p) {
+    tex_vf32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) tex_vi32<W> tex_load_vi(const int32_t* p) {
+    tex_vi32<W> v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vf(float* p, tex_vf32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vi(int32_t* p, tex_vi32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_store_vu(uint32_t* p, tex_vu32<W> v) {
+    __builtin_memcpy(p, &v, sizeof(v));
+}
+
+template <int W>
+struct alignas(16) SampleMip2DArgs {
+    float u[W];
+    float v[W];
+    int32_t slice[W];
+    int32_t offX[W];
+    int32_t offY[W];
+    float outR[W];
+    float outG[W];
+    float outB[W];
+    float outA[W];
+    uint32_t mip;
+    uint32_t reduction;
+    uint32_t addrU;
+    uint32_t addrV;
+    uint32_t borderKind;
+    uint32_t activeMask;
+    uint8_t uniformSlice;
+    uint8_t linearFilter;
+};
+
+template <int W>
+static inline __attribute__((always_inline)) void unpack_rgba8_v(
+    tex_vu32<W> p, bool isBgra, bool isSrgb,
+    tex_vf32<W>& r, tex_vf32<W>& g, tex_vf32<W>& b, tex_vf32<W>& a) {
+    const tex_vf32<W> inv255 = tex_splat_f<W>(1.0f / 255.0f);
+    const tex_vu32<W> m8 = tex_splat_u<W>(0xFFu);
+    tex_vf32<W> ch0 = __builtin_convertvector(p & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch1 = __builtin_convertvector((p >> 8) & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch2 = __builtin_convertvector((p >> 16) & m8, tex_vf32<W>) * inv255;
+    tex_vf32<W> ch3 = __builtin_convertvector(p >> 24, tex_vf32<W>) * inv255;
+    r = isBgra ? ch2 : ch0;
+    g = ch1;
+    b = isBgra ? ch0 : ch2;
+    a = ch3;
+    if (isSrgb) {
+        r = tex_srgb_to_lin<W>(r);
+        g = tex_srgb_to_lin<W>(g);
+        b = tex_srgb_to_lin<W>(b);
+    }
+}
+
+template <int W>
+static __attribute__((noinline)) void sample_mip_2d_fast_v(
+    const BC_Descriptor* tex,
+    SampleMip2DArgs<W>* args) {
+    const uint32_t mip = args->mip;
+    const tex_vf32<W> u = tex_load_vf<W>(args->u);
+    const tex_vf32<W> v = tex_load_vf<W>(args->v);
+    const tex_vi32<W> slice = tex_load_vi<W>(args->slice);
+    const bool uniformSlice = (args->uniformSlice != 0u);
+    const bool linearFilter = (args->linearFilter != 0u);
+    const uint32_t reduction = args->reduction;
+    const uint32_t addrU = args->addrU;
+    const uint32_t addrV = args->addrV;
+    const uint32_t borderKind = args->borderKind;
+    const tex_vi32<W> offX = tex_load_vi<W>(args->offX);
+    const tex_vi32<W> offY = tex_load_vi<W>(args->offY);
+    const uint32_t activeMask = args->activeMask;
+    tex_vf32<W> outR, outG, outB, outA;
+    const auto* meta = reinterpret_cast<const BC_TextureMetadata*>(tex->extra_ptr);
+    uint32_t viewMip = ((tex->view_flags >> 8) & 0xFFu) + mip;
+    if (meta && viewMip >= meta->mip_levels) viewMip = meta->mip_levels - 1;
+
+    const bool isDecoded = (meta && meta->is_compressed && meta->decoded_rgba32f);
+    uint32_t w = 1, h = 1, rowPitch = tex->row_pitch;
+    uint64_t offset = 0;
+    if (isDecoded) {
+        const auto& dm = meta->decoded_mips[viewMip];
+        w = dm.width;
+        h = dm.height;
+    } else if (meta) {
+        const auto& m = meta->mips[viewMip];
+        w = m.width;
+        h = m.height;
+        rowPitch = m.row_pitch;
+        offset = m.offset;
+    } else {
+        w = tex->width >> mip;
+        h = tex->height >> mip;
+    }
+    if (w == 0) w = 1;
+    if (h == 0) h = 1;
+
+    const uint32_t arraySize = (meta && meta->array_size > 1) ? meta->array_size : 1u;
+    tex_vi32<W> sz = tex_splat_i<W>(0);
+    if (arraySize > 1u) {
+        sz = tex_min_i<W>(tex_max_i<W>(slice, tex_splat_i<W>(0)), tex_splat_i<W>(int32_t(arraySize - 1u)));
+    }
+
+    const uint32_t fmt = tex->format;
+    const bool isRgba8 = (!isDecoded && (fmt == 28u || fmt == 29u || fmt == 87u || fmt == 91u));
+    const bool isBgra = (fmt == 87u || fmt == 91u);
+    const bool isSrgb = (fmt == 29u || fmt == 91u);
+
+    const float bv = (borderKind == 2u) ? 1.0f : 0.0f;
+    const float ba = (borderKind >= 1u) ? 1.0f : 0.0f;
+
+    if (!linearFilter) {
+        tex_vi32<W> ix = tex_floor_i<W>(u * tex_splat_f<W>(float(w))) + offX;
+        tex_vi32<W> iy = tex_floor_i<W>(v * tex_splat_f<W>(float(h))) + offY;
+        tex_vi32<W> border = tex_splat_i<W>(0);
+        tex_vi32<W> sx = apply_address_mode_v<W>(ix, w, addrU, border);
+        tex_vi32<W> sy = apply_address_mode_v<W>(iy, h, addrV, border);
+        uint32_t loadMask = activeMask & ~mask_to_u32<W>(border);
+
+        outR = tex_splat_f<W>(bv);
+        outG = tex_splat_f<W>(bv);
+        outB = tex_splat_f<W>(bv);
+        outA = tex_splat_f<W>(ba);
+
+        if (isDecoded) {
+            const float* base = meta->decoded_rgba32f + (meta->decoded_mips[viewMip].offset / sizeof(float));
+            const size_t sliceFloats = size_t(w) * size_t(h) * 4u;
+            if (uniformSlice) base += size_t(sz[0]) * sliceFloats;
+            while (loadMask) {
+                uint32_t l = static_cast<uint32_t>(__builtin_ctz(loadMask));
+                loadMask &= (loadMask - 1u);
+                const float* sbase = uniformSlice ? base : (base + size_t(sz[l]) * sliceFloats);
+                const float* p = sbase + (size_t(sy[l]) * size_t(w) + size_t(sx[l])) * 4u;
+                outR[l] = p[0]; outG[l] = p[1]; outB[l] = p[2]; outA[l] = p[3];
+            }
+        } else {
+            const uint8_t* base = static_cast<const uint8_t*>(tex->base_ptr) + offset;
+            const uint64_t sliceStride = (arraySize > 1u) ? meta->array_slice_stride : 0ull;
+            if (uniformSlice && arraySize > 1u) base += uint64_t(sz[0]) * sliceStride;
+            const uint32_t stride = tex->elem_stride;
+            while (loadMask) {
+                uint32_t l = static_cast<uint32_t>(__builtin_ctz(loadMask));
+                loadMask &= (loadMask - 1u);
+                const uint8_t* sbase = (uniformSlice || arraySize <= 1u) ? base : (base + uint64_t(sz[l]) * sliceStride);
+                const uint8_t* p = sbase + uint64_t(sy[l]) * rowPitch + uint64_t(sx[l]) * stride;
+                float tmp[4];
+                read_texel_ptr(p, fmt, tmp);
+                outR[l] = tmp[0]; outG[l] = tmp[1]; outB[l] = tmp[2]; outA[l] = tmp[3];
+            }
+        }
+        tex_store_vf<W>(args->outR, outR);
+        tex_store_vf<W>(args->outG, outG);
+        tex_store_vf<W>(args->outB, outB);
+        tex_store_vf<W>(args->outA, outA);
+        return;
+    }
+
+    tex_vf32<W> fx = u * tex_splat_f<W>(float(w)) - tex_splat_f<W>(0.5f) + __builtin_convertvector(offX, tex_vf32<W>);
+    tex_vf32<W> fy = v * tex_splat_f<W>(float(h)) - tex_splat_f<W>(0.5f) + __builtin_convertvector(offY, tex_vf32<W>);
+    tex_vi32<W> x0 = tex_floor_i<W>(fx);
+    tex_vi32<W> y0 = tex_floor_i<W>(fy);
+    tex_vf32<W> tx = fx - __builtin_convertvector(x0, tex_vf32<W>);
+    tex_vf32<W> ty = fy - __builtin_convertvector(y0, tex_vf32<W>);
+
+    tex_vi32<W> b00 = tex_splat_i<W>(0), b10 = tex_splat_i<W>(0), b01 = tex_splat_i<W>(0), b11 = tex_splat_i<W>(0);
+    tex_vi32<W> sx0 = apply_address_mode_v<W>(x0, w, addrU, b00);
+    tex_vi32<W> sx1 = apply_address_mode_v<W>(x0 + tex_splat_i<W>(1), w, addrU, b10);
+    tex_vi32<W> sy0 = apply_address_mode_v<W>(y0, h, addrV, b01);
+    tex_vi32<W> sy1 = apply_address_mode_v<W>(y0 + tex_splat_i<W>(1), h, addrV, b11);
+
+    tex_vi32<W> bMask00 = b00 | b01;
+    tex_vi32<W> bMask10 = b10 | b01;
+    tex_vi32<W> bMask01 = b00 | b11;
+    tex_vi32<W> bMask11 = b10 | b11;
+    uint32_t anyBorderBits = mask_to_u32<W>(bMask00 | bMask10 | bMask01 | bMask11);
+
+    tex_vf32<W> c00R = tex_splat_f<W>(bv), c00G = tex_splat_f<W>(bv), c00B = tex_splat_f<W>(bv), c00A = tex_splat_f<W>(ba);
+    tex_vf32<W> c10R = tex_splat_f<W>(bv), c10G = tex_splat_f<W>(bv), c10B = tex_splat_f<W>(bv), c10A = tex_splat_f<W>(ba);
+    tex_vf32<W> c01R = tex_splat_f<W>(bv), c01G = tex_splat_f<W>(bv), c01B = tex_splat_f<W>(bv), c01A = tex_splat_f<W>(ba);
+    tex_vf32<W> c11R = tex_splat_f<W>(bv), c11G = tex_splat_f<W>(bv), c11B = tex_splat_f<W>(bv), c11A = tex_splat_f<W>(ba);
+
+    if (isRgba8) {
+        const uint8_t* base = static_cast<const uint8_t*>(tex->base_ptr) + offset;
+        const uint64_t sliceStride = (arraySize > 1u) ? meta->array_slice_stride : 0ull;
+        if (uniformSlice && arraySize > 1u) base += uint64_t(sz[0]) * sliceStride;
+
+        tex_vu32<W> p00 = tex_splat_u<W>(0), p10 = tex_splat_u<W>(0), p01 = tex_splat_u<W>(0), p11 = tex_splat_u<W>(0);
+        uint32_t loadMask = activeMask;
+        while (loadMask) {
+            uint32_t l = static_cast<uint32_t>(__builtin_ctz(loadMask));
+            loadMask &= (loadMask - 1u);
+            const uint8_t* sbase = (uniformSlice || arraySize <= 1u) ? base : (base + uint64_t(sz[l]) * sliceStride);
+            const uint8_t* row0 = sbase + uint64_t(sy0[l]) * rowPitch;
+            const uint8_t* row1 = sbase + uint64_t(sy1[l]) * rowPitch;
+            uint64_t xOff0 = uint64_t(sx0[l]) * 4u;
+            uint64_t xOff1 = uint64_t(sx1[l]) * 4u;
+            uint32_t v00 = 0, v10 = 0, v01 = 0, v11 = 0;
+            if (!bMask00[l]) __builtin_memcpy(&v00, row0 + xOff0, 4);
+            if (!bMask10[l]) __builtin_memcpy(&v10, row0 + xOff1, 4);
+            if (!bMask01[l]) __builtin_memcpy(&v01, row1 + xOff0, 4);
+            if (!bMask11[l]) __builtin_memcpy(&v11, row1 + xOff1, 4);
+            p00[l] = v00; p10[l] = v10; p01[l] = v01; p11[l] = v11;
+        }
+
+        unpack_rgba8_v<W>(p00, isBgra, isSrgb, c00R, c00G, c00B, c00A);
+        unpack_rgba8_v<W>(p10, isBgra, isSrgb, c10R, c10G, c10B, c10A);
+        unpack_rgba8_v<W>(p01, isBgra, isSrgb, c01R, c01G, c01B, c01A);
+        unpack_rgba8_v<W>(p11, isBgra, isSrgb, c11R, c11G, c11B, c11A);
+        if (anyBorderBits) {
+            c00R = tex_select_f<W>(bMask00, tex_splat_f<W>(bv), c00R);
+            c00G = tex_select_f<W>(bMask00, tex_splat_f<W>(bv), c00G);
+            c00B = tex_select_f<W>(bMask00, tex_splat_f<W>(bv), c00B);
+            c00A = tex_select_f<W>(bMask00, tex_splat_f<W>(ba), c00A);
+            c10R = tex_select_f<W>(bMask10, tex_splat_f<W>(bv), c10R);
+            c10G = tex_select_f<W>(bMask10, tex_splat_f<W>(bv), c10G);
+            c10B = tex_select_f<W>(bMask10, tex_splat_f<W>(bv), c10B);
+            c10A = tex_select_f<W>(bMask10, tex_splat_f<W>(ba), c10A);
+            c01R = tex_select_f<W>(bMask01, tex_splat_f<W>(bv), c01R);
+            c01G = tex_select_f<W>(bMask01, tex_splat_f<W>(bv), c01G);
+            c01B = tex_select_f<W>(bMask01, tex_splat_f<W>(bv), c01B);
+            c01A = tex_select_f<W>(bMask01, tex_splat_f<W>(ba), c01A);
+            c11R = tex_select_f<W>(bMask11, tex_splat_f<W>(bv), c11R);
+            c11G = tex_select_f<W>(bMask11, tex_splat_f<W>(bv), c11G);
+            c11B = tex_select_f<W>(bMask11, tex_splat_f<W>(bv), c11B);
+            c11A = tex_select_f<W>(bMask11, tex_splat_f<W>(ba), c11A);
+        }
+    } else if (isDecoded) {
+        const float* base = meta->decoded_rgba32f + (meta->decoded_mips[viewMip].offset / sizeof(float));
+        const size_t sliceFloats = size_t(w) * size_t(h) * 4u;
+        if (uniformSlice) base += size_t(sz[0]) * sliceFloats;
+        uint32_t loadMask = activeMask;
+        while (loadMask) {
+            uint32_t l = static_cast<uint32_t>(__builtin_ctz(loadMask));
+            loadMask &= (loadMask - 1u);
+            const float* sbase = uniformSlice ? base : (base + size_t(sz[l]) * sliceFloats);
+            const float* r0 = sbase + size_t(sy0[l]) * size_t(w) * 4u;
+            const float* r1 = sbase + size_t(sy1[l]) * size_t(w) * 4u;
+            size_t x0f = size_t(sx0[l]) * 4u;
+            size_t x1f = size_t(sx1[l]) * 4u;
+            if (!bMask00[l]) { c00R[l] = r0[x0f + 0]; c00G[l] = r0[x0f + 1]; c00B[l] = r0[x0f + 2]; c00A[l] = r0[x0f + 3]; }
+            if (!bMask10[l]) { c10R[l] = r0[x1f + 0]; c10G[l] = r0[x1f + 1]; c10B[l] = r0[x1f + 2]; c10A[l] = r0[x1f + 3]; }
+            if (!bMask01[l]) { c01R[l] = r1[x0f + 0]; c01G[l] = r1[x0f + 1]; c01B[l] = r1[x0f + 2]; c01A[l] = r1[x0f + 3]; }
+            if (!bMask11[l]) { c11R[l] = r1[x1f + 0]; c11G[l] = r1[x1f + 1]; c11B[l] = r1[x1f + 2]; c11A[l] = r1[x1f + 3]; }
+        }
+    } else {
+        const uint8_t* base = static_cast<const uint8_t*>(tex->base_ptr) + offset;
+        const uint64_t sliceStride = (arraySize > 1u) ? meta->array_slice_stride : 0ull;
+        if (uniformSlice && arraySize > 1u) base += uint64_t(sz[0]) * sliceStride;
+        const uint32_t stride = tex->elem_stride;
+        uint32_t loadMask = activeMask;
+        while (loadMask) {
+            uint32_t l = static_cast<uint32_t>(__builtin_ctz(loadMask));
+            loadMask &= (loadMask - 1u);
+            const uint8_t* sbase = (uniformSlice || arraySize <= 1u) ? base : (base + uint64_t(sz[l]) * sliceStride);
+            const uint8_t* r0 = sbase + uint64_t(sy0[l]) * rowPitch;
+            const uint8_t* r1 = sbase + uint64_t(sy1[l]) * rowPitch;
+            uint64_t xOff0 = uint64_t(sx0[l]) * stride;
+            uint64_t xOff1 = uint64_t(sx1[l]) * stride;
+            float t0[4];
+            if (!bMask00[l]) { read_texel_ptr(r0 + xOff0, fmt, t0); c00R[l] = t0[0]; c00G[l] = t0[1]; c00B[l] = t0[2]; c00A[l] = t0[3]; }
+            if (!bMask10[l]) { read_texel_ptr(r0 + xOff1, fmt, t0); c10R[l] = t0[0]; c10G[l] = t0[1]; c10B[l] = t0[2]; c10A[l] = t0[3]; }
+            if (!bMask01[l]) { read_texel_ptr(r1 + xOff0, fmt, t0); c01R[l] = t0[0]; c01G[l] = t0[1]; c01B[l] = t0[2]; c01A[l] = t0[3]; }
+            if (!bMask11[l]) { read_texel_ptr(r1 + xOff1, fmt, t0); c11R[l] = t0[0]; c11G[l] = t0[1]; c11B[l] = t0[2]; c11A[l] = t0[3]; }
+        }
+    }
+
+    if (reduction == 2u) {
+        outR = tex_min_f<W>(tex_min_f<W>(c00R, c10R), tex_min_f<W>(c01R, c11R));
+        outG = tex_min_f<W>(tex_min_f<W>(c00G, c10G), tex_min_f<W>(c01G, c11G));
+        outB = tex_min_f<W>(tex_min_f<W>(c00B, c10B), tex_min_f<W>(c01B, c11B));
+        outA = tex_min_f<W>(tex_min_f<W>(c00A, c10A), tex_min_f<W>(c01A, c11A));
+    } else if (reduction == 3u) {
+        outR = tex_max_f<W>(tex_max_f<W>(c00R, c10R), tex_max_f<W>(c01R, c11R));
+        outG = tex_max_f<W>(tex_max_f<W>(c00G, c10G), tex_max_f<W>(c01G, c11G));
+        outB = tex_max_f<W>(tex_max_f<W>(c00B, c10B), tex_max_f<W>(c01B, c11B));
+        outA = tex_max_f<W>(tex_max_f<W>(c00A, c10A), tex_max_f<W>(c01A, c11A));
+    } else {
+        outR = tex_lerp_f<W>(tex_lerp_f<W>(c00R, c10R, tx), tex_lerp_f<W>(c01R, c11R, tx), ty);
+        outG = tex_lerp_f<W>(tex_lerp_f<W>(c00G, c10G, tx), tex_lerp_f<W>(c01G, c11G, tx), ty);
+        outB = tex_lerp_f<W>(tex_lerp_f<W>(c00B, c10B, tx), tex_lerp_f<W>(c01B, c11B, tx), ty);
+        outA = tex_lerp_f<W>(tex_lerp_f<W>(c00A, c10A, tx), tex_lerp_f<W>(c01A, c11A, tx), ty);
+    }
+    tex_store_vf<W>(args->outR, outR);
+    tex_store_vf<W>(args->outG, outG);
+    tex_store_vf<W>(args->outB, outB);
+    tex_store_vf<W>(args->outA, outA);
+}
+
+template <int W>
+struct alignas(16) BC_SampleVecArgs {
+    float u[W], v[W], w[W], c3[W];
+    float ddxU[W], ddxV[W], ddxW[W], ddyU[W], ddyV[W], ddyW[W];
+    float bias[W], expLod[W], clampLod[W];
+    int32_t offX[W], offY[W], offZ[W];
+    float outR[W], outG[W], outB[W], outA[W];
+    uint32_t outStatus[W];
+};
+
+template <int W>
+static inline __attribute__((always_inline)) void tex_sample_vec_impl(
+    const BC_Descriptor* tex,
+    const BC_Descriptor* samp,
+    uint32_t lodMode,
+    uint32_t activeMask,
+    BC_SampleVecArgs<W>* args) {
+    if (activeMask == 0u || !tex || !tex->base_ptr) {
+        tex_store_vf<W>(args->outR, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outG, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outB, tex_splat_f<W>(0.0f));
+        tex_store_vf<W>(args->outA, tex_splat_f<W>(1.0f));
+        tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
+        return;
+    }
+
+    const uint32_t dim = tex->view_flags & 0xFFu;
+    const auto* meta = reinterpret_cast<const BC_TextureMetadata*>(tex->extra_ptr);
+    const bool isTiled = (meta && meta->is_tiled);
+    const uint32_t sflags = samp ? samp->sampler_flags : 0x15u;
+    const uint32_t filter = sflags & 0xFFu;
+    const bool linearMag = (filter & 0x04u) != 0;
+    const bool linearMin = (filter & 0x10u) != 0;
+    const bool linearMip = (filter & 0x01u) != 0;
+    const bool isAniso = (filter == 0x55u || filter == 0xD5u);
+
+    const tex_vf32<W> u = tex_load_vf<W>(args->u);
+    const tex_vf32<W> v = tex_load_vf<W>(args->v);
+    const tex_vf32<W> w = tex_load_vf<W>(args->w);
+    const tex_vf32<W> c3 = tex_load_vf<W>(args->c3);
+    const tex_vf32<W> ddxU = tex_load_vf<W>(args->ddxU);
+    const tex_vf32<W> ddxV = tex_load_vf<W>(args->ddxV);
+    const tex_vf32<W> ddxW = tex_load_vf<W>(args->ddxW);
+    const tex_vf32<W> ddyU = tex_load_vf<W>(args->ddyU);
+    const tex_vf32<W> ddyV = tex_load_vf<W>(args->ddyV);
+    const tex_vf32<W> ddyW = tex_load_vf<W>(args->ddyW);
+    const tex_vf32<W> bias = tex_load_vf<W>(args->bias);
+    const tex_vf32<W> expLod = tex_load_vf<W>(args->expLod);
+    const tex_vf32<W> clampLod = tex_load_vf<W>(args->clampLod);
+    const tex_vi32<W> offX = tex_load_vi<W>(args->offX);
+    const tex_vi32<W> offY = tex_load_vi<W>(args->offY);
+    const tex_vi32<W> offZ = tex_load_vi<W>(args->offZ);
+
+    if (!isTiled && (dim == 4u || dim == 5u)) {
+        const uint32_t addrU = (sflags >> 8) & 0x7u;
+        const uint32_t addrV = (sflags >> 11) & 0x7u;
+        const uint32_t borderKind = (sflags >> 26) & 0x3u;
+        const uint32_t reduction = (sflags >> 28) & 0x3u;
+        const float sampBias = samp ? samp->mip_lod_bias : 0.0f;
+        const float minLod = samp ? float(samp->view_flags & 0xFFFFu) / 256.0f : 0.0f;
+        const float maxLod = samp ? float((samp->view_flags >> 16) & 0xFFFFu) / 256.0f : 16.0f;
+        const float maxMipF = float(tex->mip_levels > 0 ? tex->mip_levels - 1u : 0u);
+        const float lodHi = f_min(maxLod, maxMipF);
+        const uint32_t firstArraySlice = (tex->view_flags >> 16) & 0xFFFFu;
+        const tex_vi32<W> slice = (dim == 5u)
+                                      ? (tex_splat_i<W>(int32_t(firstArraySlice)) + tex_floor_i<W>(w + tex_splat_f<W>(0.5f)))
+                                      : tex_splat_i<W>(int32_t(firstArraySlice));
+
+        tex_vf32<W> lod;
+        if (lodMode == 2u) {
+            lod = expLod;
+        } else {
+            tex_vf32<W> fw = tex_splat_f<W>(float(tex->width));
+            tex_vf32<W> fh = tex_splat_f<W>(float(tex->height));
+            tex_vf32<W> dx2 = ddxU * ddxU * fw * fw + ddxV * ddxV * fh * fh;
+            tex_vf32<W> dy2 = ddyU * ddyU * fw * fw + ddyV * ddyV * fh * fh;
+            tex_vf32<W> rho2 = tex_max_f<W>(dx2, dy2);
+            if (isAniso) {
+                tex_vf32<W> min2 = tex_min_f<W>(dx2, dy2);
+                float maxAniso = samp ? float((sflags >> 21) & 0x1Fu) : 1.0f;
+                tex_vf32<W> ratio = __builtin_elementwise_sqrt(rho2 / tex_max_f<W>(min2, tex_splat_f<W>(1e-12f)));
+                ratio = tex_min_f<W>(ratio, tex_splat_f<W>(f_max(1.0f, maxAniso)));
+                rho2 = rho2 / (ratio * ratio);
+            }
+            lod = tex_splat_f<W>(0.5f) * tex_log2_pos<W>(tex_max_f<W>(rho2, tex_splat_f<W>(1e-12f))) +
+                  tex_splat_f<W>(sampBias);
+            if (lodMode == 1u) lod = lod + bias;
+        }
+        lod = tex_select_f<W>(clampLod >= tex_splat_f<W>(0.0f), tex_max_f<W>(lod, clampLod), lod);
+        lod = tex_clamp_f<W>(lod, minLod, lodHi);
+
+        const bool singleMipMode = (!linearMip || tex->mip_levels <= 1u);
+        tex_vi32<W> m0Vec = singleMipMode
+                                ? tex_floor_i<W>(tex_clamp_f<W>(lod + tex_splat_f<W>(0.5f), 0.0f, maxMipF))
+                                : tex_floor_i<W>(tex_clamp_f<W>(lod, 0.0f, maxMipF));
+
+        const uint32_t firstLane = static_cast<uint32_t>(__builtin_ctz(activeMask));
+        const int32_t refM0 = m0Vec[firstLane];
+        bool sameM0 = true;
+        bool sameFilter = true;
+        bool allSmallFrac = true;
+        const bool refLinear = (lod[firstLane] <= 0.0f) ? linearMag : linearMin;
+        uint32_t checkMask = activeMask;
+        while (checkMask) {
+            uint32_t l = static_cast<uint32_t>(__builtin_ctz(checkMask));
+            checkMask &= (checkMask - 1u);
+            if (m0Vec[l] != refM0) { sameM0 = false; break; }
+            bool linL = (lod[l] <= 0.0f) ? linearMag : linearMin;
+            if (linL != refLinear) { sameFilter = false; break; }
+            if (!singleMipMode && (lod[l] - float(refM0)) > 0.001f) {
+                allSmallFrac = false;
+            }
+        }
+
+        if (sameM0 && sameFilter) {
+            uint32_t m0 = static_cast<uint32_t>(refM0);
+            uint32_t m1 = (m0 + 1u < tex->mip_levels) ? (m0 + 1u) : m0;
+            SampleMip2DArgs<W> mipArgs;
+            tex_store_vf<W>(mipArgs.u, u);
+            tex_store_vf<W>(mipArgs.v, v);
+            tex_store_vi<W>(mipArgs.slice, slice);
+            tex_store_vi<W>(mipArgs.offX, offX);
+            tex_store_vi<W>(mipArgs.offY, offY);
+            mipArgs.mip = m0;
+            mipArgs.reduction = reduction;
+            mipArgs.addrU = addrU;
+            mipArgs.addrV = addrV;
+            mipArgs.borderKind = borderKind;
+            mipArgs.activeMask = activeMask;
+            mipArgs.uniformSlice = (dim == 4u) ? 1u : 0u;
+            mipArgs.linearFilter = refLinear ? 1u : 0u;
+            sample_mip_2d_fast_v<W>(tex, &mipArgs);
+            tex_vf32<W> r0 = tex_load_vf<W>(mipArgs.outR);
+            tex_vf32<W> g0 = tex_load_vf<W>(mipArgs.outG);
+            tex_vf32<W> b0 = tex_load_vf<W>(mipArgs.outB);
+            tex_vf32<W> a0 = tex_load_vf<W>(mipArgs.outA);
+            if (singleMipMode || m1 == m0 || allSmallFrac) {
+                tex_store_vf<W>(args->outR, r0);
+                tex_store_vf<W>(args->outG, g0);
+                tex_store_vf<W>(args->outB, b0);
+                tex_store_vf<W>(args->outA, a0);
+                tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
+                return;
+            }
+            mipArgs.mip = m1;
+            sample_mip_2d_fast_v<W>(tex, &mipArgs);
+            tex_vf32<W> r1 = tex_load_vf<W>(mipArgs.outR);
+            tex_vf32<W> g1 = tex_load_vf<W>(mipArgs.outG);
+            tex_vf32<W> b1 = tex_load_vf<W>(mipArgs.outB);
+            tex_vf32<W> a1 = tex_load_vf<W>(mipArgs.outA);
+            tex_vf32<W> frac = lod - tex_splat_f<W>(float(m0));
+            if (reduction == 2u) {
+                tex_store_vf<W>(args->outR, tex_min_f<W>(r0, r1));
+                tex_store_vf<W>(args->outG, tex_min_f<W>(g0, g1));
+                tex_store_vf<W>(args->outB, tex_min_f<W>(b0, b1));
+                tex_store_vf<W>(args->outA, tex_min_f<W>(a0, a1));
+            } else if (reduction == 3u) {
+                tex_store_vf<W>(args->outR, tex_max_f<W>(r0, r1));
+                tex_store_vf<W>(args->outG, tex_max_f<W>(g0, g1));
+                tex_store_vf<W>(args->outB, tex_max_f<W>(b0, b1));
+                tex_store_vf<W>(args->outA, tex_max_f<W>(a0, a1));
+            } else {
+                tex_store_vf<W>(args->outR, tex_lerp_f<W>(r0, r1, frac));
+                tex_store_vf<W>(args->outG, tex_lerp_f<W>(g0, g1, frac));
+                tex_store_vf<W>(args->outB, tex_lerp_f<W>(b0, b1, frac));
+                tex_store_vf<W>(args->outA, tex_lerp_f<W>(a0, a1, frac));
+            }
+            tex_store_vu<W>(args->outStatus, tex_splat_u<W>(1u));
+            return;
+        }
+    }
+
+    tex_vf32<W> r = tex_splat_f<W>(0.0f);
+    tex_vf32<W> g = tex_splat_f<W>(0.0f);
+    tex_vf32<W> b = tex_splat_f<W>(0.0f);
+    tex_vf32<W> a = tex_splat_f<W>(1.0f);
+    tex_vu32<W> st = tex_splat_u<W>(1u);
+    uint32_t m = activeMask;
+    while (m) {
+        uint32_t l = static_cast<uint32_t>(__builtin_ctz(m));
+        m &= (m - 1u);
+        float tmp[4];
+        st[l] = nacelle_tex_sample(
+            tex, samp, u[l], v[l], w[l], c3[l],
+            ddxU[l], ddxV[l], ddxW[l], ddyU[l], ddyV[l], ddyW[l],
+            bias[l], expLod[l], lodMode, offX[l], offY[l], offZ[l], clampLod[l], tmp);
+        r[l] = tmp[0]; g[l] = tmp[1]; b[l] = tmp[2]; a[l] = tmp[3];
+    }
+    tex_store_vf<W>(args->outR, r);
+    tex_store_vf<W>(args->outG, g);
+    tex_store_vf<W>(args->outB, b);
+    tex_store_vf<W>(args->outA, a);
+    tex_store_vu<W>(args->outStatus, st);
+}
+
+#define NACELLE_DEFINE_TEX_SAMPLE_V(W)                                                                     \
+    extern "C" __attribute__((noinline)) void nacelle_tex_sample_v##W(                                     \
+        const BC_Descriptor* tex, const BC_Descriptor* samp,                                               \
+        uint32_t lodMode, uint32_t activeMask, BC_SampleVecArgs<W>* args) {                                \
+        tex_sample_vec_impl<W>(tex, samp, lodMode, activeMask, args);                                      \
+    }
+
+NACELLE_DEFINE_TEX_SAMPLE_V(4)
+NACELLE_DEFINE_TEX_SAMPLE_V(8)
+NACELLE_DEFINE_TEX_SAMPLE_V(16)
+#undef NACELLE_DEFINE_TEX_SAMPLE_V
+
+extern "C" {
+
 static inline __attribute__((always_inline)) float eval_cmp(uint32_t func, float ref, float val) {
     switch (func) {
     case 1: return 0.0f; // NEVER

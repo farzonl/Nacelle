@@ -78,6 +78,7 @@ struct BenchmarkSpec {
     std::string psDxil;
     std::string psSpv;
     std::string rtDxil;
+    bool hasTexture = false;
 };
 
 struct BenchRunResult {

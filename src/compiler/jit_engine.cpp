@@ -540,9 +540,10 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-#if defined(__APPLE__)
-    // macOS secondary threads (std::thread) default to a 512 KB stack; RegAllocFast at
-    // CodeGenOptLevel::None does not reuse stack slots and can overflow 512 KB on large W=16 shaders.
+#if defined(__APPLE__) || defined(_WIN32)
+    // Secondary threads (std::thread / BS::thread_pool) have limited stacks (512 KB on macOS,
+    // 1 MB on Windows); RegAllocFast at CodeGenOptLevel::None does not reuse stack slots and
+    // can overflow or mis-handle large W=8/W=16 vector frames.
     auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
 #else
     auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::None);
@@ -1283,7 +1284,7 @@ bool ensureRuntimeBitcodeInMainJDLocked(
         bcMod->setTargetTriple(rt.jit->getTargetTriple());
         bcMod->setDataLayout(rt.jit->getDataLayout());
         for (llvm::Function& f : *bcMod) {
-            if (!f.isDeclaration() && f.getName().starts_with(fnPrefix)) {
+            if (!f.isDeclaration()) {
                 f.removeFnAttr("target-cpu");
                 f.removeFnAttr("target-features");
                 f.removeFnAttr("tune-cpu");
