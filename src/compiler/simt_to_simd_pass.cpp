@@ -7312,29 +7312,39 @@ private:
         };
 
         constexpr int64_t kBcRayQueryStateSize = 640;
-        auto rqPtrAt = [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value slotBase, uint32_t l) -> mlir::Value {
-            if (l == 0) return slotBase;
+        auto rqPtrAt = [&](mlir::OpBuilder& nb, mlir::Location nloc, mlir::Value sBase, uint32_t l) -> mlir::Value {
+            if (l == 0) return sBase;
             mlir::Value off = mlir::LLVM::ConstantOp::create(
                 nb, nloc, i32Ty(), nb.getIntegerAttr(i32Ty(), static_cast<int64_t>(l) * kBcRayQueryStateSize));
-            return mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), slotBase, mlir::ValueRange{off}).getResult();
+            return mlir::LLVM::GEPOp::create(nb, nloc, ptrTy(), i8Ty(), sBase, mlir::ValueRange{off}).getResult();
         };
 
         // AllocateRayQuery (178, 258)
         if (op == 178 || op == 258) {
             mlir::Value flagsVec = laneVec(arg(1));
-            mlir::Value slotBase = createEntryAlloca(loc, i8Ty(), static_cast<int64_t>(W_) * kBcRayQueryStateSize, 16);
-            rayQuerySlotPtrs_[call.getResult()] = slotBase;
+            mlir::Value sBase = createEntryAlloca(loc, i8Ty(), static_cast<int64_t>(W_) * kBcRayQueryStateSize, 16);
+            const uint32_t slotId = static_cast<uint32_t>(hooks_.rayQuerySlots.size());
+            hooks_.rayQuerySlots.push_back(sBase);
             auto fn = getOrDeclareRuntimeFn(loc, "nacelle_rqbc_init", nullptr, {ptrTy(), i32Ty()});
             runPerActiveLaneVoid([&](mlir::OpBuilder& nb, mlir::Location nloc, uint32_t l) {
                 mlir::Value fl = llvmExtract(nb, nloc, flagsVec, static_cast<uint32_t>(static_cast<int64_t>(l)));
-                mlir::Value rqPtr = rqPtrAt(nb, nloc, slotBase, l);
+                mlir::Value rqPtr = rqPtrAt(nb, nloc, sBase, l);
                 mlir::LLVM::CallOp::create(nb, nloc, fn, mlir::ValueRange{rqPtr, fl});
             });
-            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), 0), {}, {}});
+            setMapped(call.getResult(), {SimdVal::Kind::Vector, i32Ty(), splatInt(loc, i32Ty(), slotId), {}, {}});
             return true;
         }
 
-        mlir::Value slotBase = arg(1) ? rayQuerySlotPtrs_.lookup(arg(1)) : mlir::Value();
+        mlir::Value slotBase;
+        if (hooks_.rayQuerySlots.size() == 1) {
+            slotBase = hooks_.rayQuerySlots[0];
+        } else if (!hooks_.rayQuerySlots.empty() && arg(1)) {
+            mlir::Value qVec = laneVec(arg(1));
+            if (auto cst = getConstIntValue(qVec); cst && *cst >= 0 &&
+                static_cast<size_t>(*cst) < hooks_.rayQuerySlots.size()) {
+                slotBase = hooks_.rayQuerySlots[static_cast<size_t>(*cst)];
+            }
+        }
 
         // RayQuery_TraceRayInline (179)
         if (op == 179) {
@@ -7927,7 +7937,6 @@ private:
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
     mlir::Value scratchAlloca_;
-    llvm::DenseMap<mlir::Value, mlir::Value> rayQuerySlotPtrs_;
     bool strictFp_ = false;
     DescInfoCache ownedDescCache_;
     DescInfoCache* descCache_ = nullptr;

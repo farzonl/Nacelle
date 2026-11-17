@@ -112,6 +112,7 @@ struct StageHooks {
                        const SimdVal& val, const SimdVal& vertIdx, mlir::Value realMask)> storeVertexOutput;
     std::function<bool(mlir::OpBuilder&, mlir::Location, uint32_t sigId, const SimdVal& row, uint32_t col,
                        const SimdVal& val, const SimdVal& primIdx, mlir::Value realMask)> storePrimitiveOutput;
+    llvm::SmallVector<mlir::Value, 4> rayQuerySlots;
 };
 
 /// Packetizes a threadgroup-based shader body (Compute, Amplification, or Mesh) across all waves in
