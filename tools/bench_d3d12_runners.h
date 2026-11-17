@@ -287,10 +287,6 @@ inline BenchRunResult runWarpGraphicsBench(
     res.category = categoryName(spec.category);
     res.backend = "Microsoft WARP";
     res.shaderFormat = "DXIL";
-    if (spec.hasTexture) {
-        res.status = "SKIPPED (textured PS)";
-        return res;
-    }
 
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;
@@ -302,10 +298,11 @@ inline BenchRunResult runWarpGraphicsBench(
     res.backend = ctx.backendName;
 
     const bool isStateHeavyPS = (spec.id == "state_heavy_ps");
+    const bool useSrvAndSampler = isStateHeavyPS || spec.hasTexture;
 
     D3D12_DESCRIPTOR_RANGE srvRange{};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = 2;
+    srvRange.NumDescriptors = isStateHeavyPS ? 2u : 1u;
     srvRange.BaseShaderRegister = 0;
 
     D3D12_ROOT_PARAMETER params[2]{};
@@ -327,10 +324,10 @@ inline BenchRunResult runWarpGraphicsBench(
     staticSamp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = isStateHeavyPS ? 2u : 1u;
+    rsDesc.NumParameters = useSrvAndSampler ? 2u : 1u;
     rsDesc.pParameters = params;
-    rsDesc.NumStaticSamplers = isStateHeavyPS ? 1u : 0u;
-    rsDesc.pStaticSamplers = isStateHeavyPS ? &staticSamp : nullptr;
+    rsDesc.NumStaticSamplers = useSrvAndSampler ? 1u : 0u;
+    rsDesc.pStaticSamplers = useSrvAndSampler ? &staticSamp : nullptr;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ID3DBlob* rsBlob = nullptr;
     ctx.pSerializeRS(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, nullptr);
@@ -555,6 +552,79 @@ inline BenchRunResult runWarpGraphicsBench(
         ctx.dev->CreateShaderResourceView(texBC7, &srvDesc, h0);
     }
 
+    ID3D12Resource* texColor = nullptr;
+    if (spec.hasTexture && !isStateHeavyPS) {
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = 256;
+        td.Height = 256;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 9;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        ctx.dev->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &td,
+                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                         __uuidof(ID3D12Resource), reinterpret_cast<void**>(&texColor));
+
+        UINT64 mipOffsets[9]{};
+        UINT mipPitches[9]{};
+        UINT64 totalUploadBytes = 0;
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+            uint32_t mw = std::max(1u, 256u >> mip);
+            uint32_t mh = std::max(1u, 256u >> mip);
+            UINT rowPitch = ((mw * 4u) + 255u) & ~255u;
+            totalUploadBytes = (totalUploadBytes + 511ull) & ~511ull;
+            mipOffsets[mip] = totalUploadBytes;
+            mipPitches[mip] = rowPitch;
+            totalUploadBytes += static_cast<UINT64>(rowPitch) * mh;
+        }
+        texUpload = createWarpBuffer(ctx.dev, totalUploadBytes, D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        void* up = nullptr;
+        texUpload->Map(0, nullptr, &up);
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+            uint32_t mw = std::max(1u, 256u >> mip);
+            uint32_t mh = std::max(1u, 256u >> mip);
+            auto pixels = buildProceduralTexture256Mip(mip);
+            auto* dstBase = static_cast<uint8_t*>(up) + mipOffsets[mip];
+            for (uint32_t y = 0; y < mh; ++y) {
+                std::memcpy(dstBase + static_cast<size_t>(y) * mipPitches[mip],
+                            pixels.data() + static_cast<size_t>(y) * mw, mw * 4u);
+            }
+        }
+        texUpload->Unmap(0, nullptr);
+
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+            uint32_t mw = std::max(1u, 256u >> mip);
+            uint32_t mh = std::max(1u, 256u >> mip);
+            D3D12_TEXTURE_COPY_LOCATION dstLoc{texColor, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {mip}};
+            D3D12_TEXTURE_COPY_LOCATION srcLoc{texUpload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+            srcLoc.PlacedFootprint.Offset = mipOffsets[mip];
+            srcLoc.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, mw, mh, 1, mipPitches[mip]};
+            ctx.cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition = {texColor, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        ctx.cmd->ResourceBarrier(1, &b);
+        ctx.cmd->Close();
+        ID3D12CommandList* initLists[] = {ctx.cmd};
+        ctx.queue->ExecuteCommandLists(1, initLists);
+        ctx.waitFence();
+        ctx.alloc->Reset();
+        ctx.cmd->Reset(ctx.alloc, nullptr);
+
+        D3D12_DESCRIPTOR_HEAP_DESC srvHD{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        ctx.dev->CreateDescriptorHeap(&srvHD, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void**>(&srvHeap));
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 9;
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ctx.dev->CreateShaderResourceView(texColor, &srvDesc, srvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
     if (isVertexMesh) {
 
         for (int m = 0; m < 3; ++m) {
@@ -643,7 +713,7 @@ inline BenchRunResult runWarpGraphicsBench(
         ctx.cmd->SetGraphicsRootSignature(rootSig);
         ctx.cmd->SetPipelineState(pso);
         ctx.cmd->SetGraphicsRootConstantBufferView(0, cbBuf->GetGPUVirtualAddress());
-        if (isStateHeavyPS) {
+        if (useSrvAndSampler && srvHeap) {
             ID3D12DescriptorHeap* heaps[] = {srvHeap};
             ctx.cmd->SetDescriptorHeaps(1, heaps);
             ctx.cmd->SetGraphicsRootDescriptorTable(1, srvHeap->GetGPUDescriptorHandleForHeapStart());
@@ -799,6 +869,7 @@ inline BenchRunResult runWarpGraphicsBench(
     }
     if (srvHeap) srvHeap->Release();
     if (texUpload) texUpload->Release();
+    if (texColor) texColor->Release();
     if (texBC7) texBC7->Release();
     if (texBC1) texBC1->Release();
     if (resolveTex) resolveTex->Release();
@@ -829,10 +900,6 @@ inline BenchRunResult runWarpRaytracingBench(
     res.category = categoryName(spec.category);
     res.backend = "Microsoft WARP";
     res.shaderFormat = "DXIL";
-    if (spec.hasTexture) {
-        res.status = "SKIPPED (textured PS)";
-        return res;
-    }
 
     MemorySnapshot memBefore = queryProcessMemory();
     WarpDeviceContext ctx;

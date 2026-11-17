@@ -1,4 +1,5 @@
 #include "metal_bench.h"
+#include "bench_common.h"
 #include "bench_types.h"
 
 #import <Foundation/Foundation.h>
@@ -426,7 +427,8 @@ MetalBenchResult runMetalGraphicsBench(
     uint32_t iters,
     const std::vector<uint8_t>& hsDxil,
     const std::vector<uint8_t>& dsDxil,
-    const std::vector<uint8_t>& gsDxil) {
+    const std::vector<uint8_t>& gsDxil,
+    bool hasTexture) {
     MetalBenchResult res;
     res.backend = "Metal (IRConverter)";
     res.shaderFormat = "DXIL->MTL";
@@ -466,16 +468,39 @@ MetalBenchResult runMetalGraphicsBench(
 
         auto t0 = std::chrono::steady_clock::now();
 
-        IRRootParameter1 param{};
-        param.ParameterType = IRRootParameterTypeCBV;
-        param.Descriptor.ShaderRegister = 0;
-        param.Descriptor.RegisterSpace = 0;
-        param.ShaderVisibility = IRShaderVisibilityAll;
+        IRDescriptorRange1 srvRange{};
+        srvRange.RangeType = IRDescriptorRangeTypeSRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+        IRRootParameter1 params[2]{};
+        params[0].ParameterType = IRRootParameterTypeCBV;
+        params[0].Descriptor.ShaderRegister = 0;
+        params[0].Descriptor.RegisterSpace = 0;
+        params[0].ShaderVisibility = IRShaderVisibilityAll;
+        params[1].ParameterType = IRRootParameterTypeDescriptorTable;
+        params[1].DescriptorTable.NumDescriptorRanges = 1;
+        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[1].ShaderVisibility = IRShaderVisibilityPixel;
+
+        IRStaticSamplerDescriptor staticSamp{};
+        staticSamp.Filter = IRFilterMinMagMipLinear;
+        staticSamp.AddressU = IRTextureAddressModeWrap;
+        staticSamp.AddressV = IRTextureAddressModeWrap;
+        staticSamp.AddressW = IRTextureAddressModeWrap;
+        staticSamp.MaxAnisotropy = 1;
+        staticSamp.MaxLOD = 1e30f;
+        staticSamp.ShaderRegister = 0;
+        staticSamp.ShaderVisibility = IRShaderVisibilityPixel;
 
         IRVersionedRootSignatureDescriptor rsDesc{};
         rsDesc.version = IRRootSignatureVersion_1_1;
-        rsDesc.desc_1_1.NumParameters = 1;
-        rsDesc.desc_1_1.pParameters = &param;
+        rsDesc.desc_1_1.NumParameters = hasTexture ? 2u : 1u;
+        rsDesc.desc_1_1.pParameters = params;
+        rsDesc.desc_1_1.NumStaticSamplers = hasTexture ? 1u : 0u;
+        rsDesc.desc_1_1.pStaticSamplers = hasTexture ? &staticSamp : nullptr;
         rsDesc.desc_1_1.Flags = IRRootSignatureFlagAllowInputAssemblerInputLayout;
 
         IRError* irErr = nullptr;
@@ -675,6 +700,30 @@ MetalBenchResult runMetalGraphicsBench(
         id<MTLBuffer> emptyVBs = [device newBufferWithLength:sizeof(IRRuntimeVertexBuffers) options:MTLResourceStorageModeShared];
         std::memset([emptyVBs contents], 0, sizeof(IRRuntimeVertexBuffers));
 
+        id<MTLTexture> colorTex = nil;
+        id<MTLBuffer> srvTableBuf = nil;
+        if (hasTexture) {
+            MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                          width:256
+                                                                                         height:256
+                                                                                      mipmapped:YES];
+            td.mipmapLevelCount = 9;
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModeShared;
+            colorTex = [device newTextureWithDescriptor:td];
+            for (uint32_t mip = 0; mip < 9; ++mip) {
+                uint32_t mw = std::max(1u, 256u >> mip);
+                uint32_t mh = std::max(1u, 256u >> mip);
+                auto pixels = buildProceduralTexture256Mip(mip);
+                [colorTex replaceRegion:MTLRegionMake2D(0, 0, mw, mh)
+                            mipmapLevel:mip
+                              withBytes:pixels.data()
+                            bytesPerRow:mw * 4u];
+            }
+            srvTableBuf = [device newBufferWithLength:sizeof(IRDescriptorTableEntry) options:MTLResourceStorageModeShared];
+            IRDescriptorTableSetTexture(static_cast<IRDescriptorTableEntry*>([srvTableBuf contents]), colorTex, 0.0f, 0);
+        }
+
         auto makeAB = [&](const std::vector<IRResourceLocation>& locs) {
             uint32_t sz = 256;
             for (const auto& loc : locs) {
@@ -690,6 +739,9 @@ MetalBenchResult runMetalGraphicsBench(
                     auto* entry = reinterpret_cast<IRDescriptorTableEntry*>(bytes + loc.topLevelOffset);
                     IRBufferView view{cbBuf, 0, cbBytes, nil, 0, false};
                     IRDescriptorTableSetBufferView(entry, &view);
+                } else if (loc.resourceType == IRResourceTypeTable && srvTableBuf != nil) {
+                    uint64_t tableAddr = [srvTableBuf gpuAddress];
+                    std::memcpy(bytes + loc.topLevelOffset, &tableAddr, sizeof(uint64_t));
                 }
             }
             return ab;
@@ -760,6 +812,10 @@ MetalBenchResult runMetalGraphicsBench(
             [enc setScissorRect:(MTLScissorRect){0, 0, rw, rh}];
             if (!useEmulation) {
                 [enc useResource:cbBuf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+                if (hasTexture && colorTex && srvTableBuf) {
+                    [enc useResource:colorTex usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                    [enc useResource:srvTableBuf usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                }
                 [enc setVertexBuffer:vsAB offset:0 atIndex:kIRArgumentBufferBindPoint];
                 [enc setFragmentBuffer:psAB offset:0 atIndex:kIRArgumentBufferBindPoint];
                 if (isVertexMesh) {

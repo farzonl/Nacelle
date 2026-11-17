@@ -759,15 +759,7 @@ inline BenchRunResult runNacelleGraphicsBench(
         for (uint32_t mip = 0; mip < 9; ++mip) {
             uint32_t mw = std::max(1u, 256u >> mip);
             uint32_t mh = std::max(1u, 256u >> mip);
-            std::vector<uint32_t> pixels(static_cast<size_t>(mw) * mh);
-            for (uint32_t y = 0; y < mh; ++y) {
-                for (uint32_t x = 0; x < mw; ++x) {
-                    uint32_t r = ((x * 255u) / mw) ^ (((x >> 4) ^ (y >> 4)) & 1u ? 0x40u : 0u);
-                    uint32_t g = ((y * 255u) / mh);
-                    uint32_t b = (((x + y) * 127u) / std::max(1u, mw + mh));
-                    pixels[static_cast<size_t>(y) * mw + x] = (r & 0xFFu) | ((g & 0xFFu) << 8) | ((b & 0xFFu) << 16) | 0xFF000000u;
-                }
-            }
+            auto pixels = buildProceduralTexture256Mip(mip);
             texRes->WriteToSubresource(mip, nullptr, pixels.data(), mw * 4u, mw * mh * 4u);
         }
         D3D12_DESCRIPTOR_HEAP_DESC srvHD{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};

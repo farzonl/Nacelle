@@ -143,11 +143,6 @@ inline std::vector<BenchRunResult> runVulkanComputeBench(
             results.push_back(r);
             continue;
         }
-        if (spec.hasTexture) {
-            r.status = "SKIPPED (textured PS)";
-            results.push_back(std::move(r));
-            continue;
-        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 
@@ -561,11 +556,6 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             results.push_back(r);
             continue;
         }
-        if (spec.hasTexture) {
-            r.status = "SKIPPED (textured PS)";
-            results.push_back(std::move(r));
-            continue;
-        }
 
         MemorySnapshot memBefore = queryProcessMemory();
 
@@ -689,8 +679,14 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         uint32_t uboStages = vkmin::VK_SHADER_STAGE_VERTEX_BIT | vkmin::VK_SHADER_STAGE_FRAGMENT_BIT;
         if (needGS) uboStages |= vkmin::VK_SHADER_STAGE_GEOMETRY_BIT;
         if (needTess) uboStages |= vkmin::VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | vkmin::VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-        vkmin::VkDescriptorSetLayoutBinding uboBind{16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, uboStages, nullptr};
-        vkmin::VkDescriptorSetLayoutCreateInfo dslci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 1, &uboBind};
+        vkmin::VkDescriptorSetLayoutBinding dslBinds[3]{
+            {16, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, uboStages, nullptr},
+            {0, vkmin::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {24, vkmin::VK_DESCRIPTOR_TYPE_SAMPLER, 1, vkmin::VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        };
+        vkmin::VkDescriptorSetLayoutCreateInfo dslci{
+            vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
+            spec.hasTexture ? 3u : 1u, dslBinds};
         vkmin::VkDescriptorSetLayout dsl = 0;
         vk.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsl);
 
@@ -908,23 +904,121 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
         std::memcpy(ptr, quadVerts, sizeof(quadVerts));
         vk.vkUnmapMemory(dev, vb.mem);
 
-        vkmin::VkDescriptorPoolSize psz{vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
-        vkmin::VkDescriptorPoolCreateInfo dpci{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1, 1, &psz};
-        vkmin::VkDescriptorPool dp = 0;
-        vk.vkCreateDescriptorPool(dev, &dpci, nullptr, &dp);
-        vkmin::VkDescriptorSetAllocateInfo dsai{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, dp, 1, &dsl};
-        vkmin::VkDescriptorSet ds = 0;
-        vk.vkAllocateDescriptorSets(dev, &dsai, &ds);
-        vkmin::VkDescriptorBufferInfo bi{cb.buf, 0, cbBytes};
-        vkmin::VkWriteDescriptorSet wds{vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 16, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bi, nullptr};
-        vk.vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
-
         vkmin::VkCommandPoolCreateInfo cpci2{vkmin::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, vkmin::VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, gfxQF};
         vkmin::VkCommandPool cpool = nullptr;
         vk.vkCreateCommandPool(dev, &cpci2, nullptr, &cpool);
         vkmin::VkCommandBufferAllocateInfo cbai{vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cpool, vkmin::VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         vkmin::VkCommandBuffer cmdBuf = nullptr;
         vk.vkAllocateCommandBuffers(dev, &cbai, &cmdBuf);
+
+        vkmin::VkImage texImg = 0;
+        vkmin::VkDeviceMemory texMem = 0;
+        vkmin::VkImageView texIv = 0;
+        vkmin::VkSampler texSampler = 0;
+        if (spec.hasTexture) {
+            vkmin::VkImageCreateInfo tici{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr, 0,
+                vkmin::VK_IMAGE_TYPE_2D, vkmin::VK_FORMAT_R8G8B8A8_UNORM, {256, 256, 1}, 9, 1,
+                vkmin::VK_SAMPLE_COUNT_1_BIT, vkmin::VK_IMAGE_TILING_OPTIMAL,
+                vkmin::VK_IMAGE_USAGE_TRANSFER_DST_BIT | vkmin::VK_IMAGE_USAGE_SAMPLED_BIT,
+                vkmin::VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, vkmin::VK_IMAGE_LAYOUT_UNDEFINED};
+            vk.vkCreateImage(dev, &tici, nullptr, &texImg);
+            vkmin::VkMemoryRequirements tmr{};
+            vk.vkGetImageMemoryRequirements(dev, texImg, &tmr);
+            vkmin::VkMemoryAllocateInfo tmai{
+                vkmin::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, tmr.size,
+                findMem(tmr.memoryTypeBits, vkmin::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            vk.vkAllocateMemory(dev, &tmai, nullptr, &texMem);
+            vk.vkBindImageMemory(dev, texImg, texMem, 0);
+
+            vkmin::VkImageViewCreateInfo tivci{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, texImg,
+                vkmin::VK_IMAGE_VIEW_TYPE_2D, vkmin::VK_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0},
+                {vkmin::VK_IMAGE_ASPECT_COLOR_BIT, 0, 9, 0, 1}};
+            vk.vkCreateImageView(dev, &tivci, nullptr, &texIv);
+
+            vkmin::VkSamplerCreateInfo sci{
+                vkmin::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, nullptr, 0,
+                vkmin::VK_FILTER_LINEAR, vkmin::VK_FILTER_LINEAR, vkmin::VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                vkmin::VK_SAMPLER_ADDRESS_MODE_REPEAT, vkmin::VK_SAMPLER_ADDRESS_MODE_REPEAT, vkmin::VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                0.0f, 0, 1.0f, 0, 0, 0.0f, 9.0f, vkmin::VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, 0};
+            vk.vkCreateSampler(dev, &sci, nullptr, &texSampler);
+
+            size_t totalTexBytes = 0;
+            size_t mipOffs[9]{};
+            for (uint32_t mip = 0; mip < 9; ++mip) {
+                uint32_t mw = std::max(1u, 256u >> mip);
+                uint32_t mh = std::max(1u, 256u >> mip);
+                mipOffs[mip] = totalTexBytes;
+                totalTexBytes += static_cast<size_t>(mw) * mh * 4u;
+            }
+            auto texStage = mkBuf(totalTexBytes, vkmin::VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            vk.vkMapMemory(dev, texStage.mem, 0, totalTexBytes, 0, &ptr);
+            for (uint32_t mip = 0; mip < 9; ++mip) {
+                auto pixels = buildProceduralTexture256Mip(mip);
+                std::memcpy(static_cast<uint8_t*>(ptr) + mipOffs[mip], pixels.data(), pixels.size() * 4u);
+            }
+            vk.vkUnmapMemory(dev, texStage.mem);
+
+            vkmin::VkCommandBufferBeginInfo cbbi{
+                vkmin::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                vkmin::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+            vk.vkBeginCommandBuffer(cmdBuf, &cbbi);
+            vkmin::VkImageMemoryBarrier toDst{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                0, vkmin::VK_ACCESS_TRANSFER_WRITE_BIT,
+                vkmin::VK_IMAGE_LAYOUT_UNDEFINED, vkmin::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                vkmin::VK_QUEUE_FAMILY_IGNORED, vkmin::VK_QUEUE_FAMILY_IGNORED,
+                texImg, {vkmin::VK_IMAGE_ASPECT_COLOR_BIT, 0, 9, 0, 1}};
+            vk.vkCmdPipelineBarrier(cmdBuf, vkmin::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vkmin::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0, 0, nullptr, 0, nullptr, 1, &toDst);
+            vkmin::VkBufferImageCopy regions[9]{};
+            for (uint32_t mip = 0; mip < 9; ++mip) {
+                uint32_t mw = std::max(1u, 256u >> mip);
+                uint32_t mh = std::max(1u, 256u >> mip);
+                regions[mip].bufferOffset = mipOffs[mip];
+                regions[mip].imageSubresource = {vkmin::VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+                regions[mip].imageExtent = {mw, mh, 1};
+            }
+            vk.vkCmdCopyBufferToImage(cmdBuf, texStage.buf, texImg, vkmin::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 9, regions);
+            vkmin::VkImageMemoryBarrier toRead{
+                vkmin::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                vkmin::VK_ACCESS_TRANSFER_WRITE_BIT, vkmin::VK_ACCESS_SHADER_READ_BIT,
+                vkmin::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vkmin::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                vkmin::VK_QUEUE_FAMILY_IGNORED, vkmin::VK_QUEUE_FAMILY_IGNORED,
+                texImg, {vkmin::VK_IMAGE_ASPECT_COLOR_BIT, 0, 9, 0, 1}};
+            vk.vkCmdPipelineBarrier(cmdBuf, vkmin::VK_PIPELINE_STAGE_TRANSFER_BIT, vkmin::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                    0, 0, nullptr, 0, nullptr, 1, &toRead);
+            vk.vkEndCommandBuffer(cmdBuf);
+            vkmin::VkSubmitInfo si{vkmin::VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmdBuf, 0, nullptr};
+            vk.vkQueueSubmit(queue, 1, &si, 0);
+            vk.vkQueueWaitIdle(queue);
+            vk.vkDestroyBuffer(dev, texStage.buf, nullptr);
+            vk.vkFreeMemory(dev, texStage.mem, nullptr);
+        }
+
+        vkmin::VkDescriptorPoolSize pszs[3]{
+            {vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+            {vkmin::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1},
+            {vkmin::VK_DESCRIPTOR_TYPE_SAMPLER, 1},
+        };
+        vkmin::VkDescriptorPoolCreateInfo dpci{
+            vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 1,
+            spec.hasTexture ? 3u : 1u, pszs};
+        vkmin::VkDescriptorPool dp = 0;
+        vk.vkCreateDescriptorPool(dev, &dpci, nullptr, &dp);
+        vkmin::VkDescriptorSetAllocateInfo dsai{vkmin::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, dp, 1, &dsl};
+        vkmin::VkDescriptorSet ds = 0;
+        vk.vkAllocateDescriptorSets(dev, &dsai, &ds);
+        vkmin::VkDescriptorBufferInfo bi{cb.buf, 0, cbBytes};
+        vkmin::VkDescriptorImageInfo imgInfo{0, texIv, vkmin::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        vkmin::VkDescriptorImageInfo sampInfo{texSampler, 0, vkmin::VK_IMAGE_LAYOUT_UNDEFINED};
+        vkmin::VkWriteDescriptorSet wds[3]{
+            {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 16, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &bi, nullptr},
+            {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &imgInfo, nullptr, nullptr},
+            {vkmin::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 24, 0, 1, vkmin::VK_DESCRIPTOR_TYPE_SAMPLER, &sampInfo, nullptr, nullptr},
+        };
+        vk.vkUpdateDescriptorSets(dev, spec.hasTexture ? 3u : 1u, wds, 0, nullptr);
 
         auto drawVK = [&](int mode, uint32_t rw, uint32_t rh, uint32_t vc) -> double {
             vk.vkMapMemory(dev, cb.mem, 0, cbBytes, 0, &ptr);
@@ -1056,6 +1150,12 @@ inline std::vector<BenchRunResult> runVulkanGraphicsBench(
             vk.vkFreeMemory(dev, b.mem, nullptr);
         }
         vk.vkDestroyFramebuffer(dev, fb, nullptr);
+        if (texSampler) vk.vkDestroySampler(dev, texSampler, nullptr);
+        if (texIv) vk.vkDestroyImageView(dev, texIv, nullptr);
+        if (texImg) {
+            vk.vkDestroyImage(dev, texImg, nullptr);
+            vk.vkFreeMemory(dev, texMem, nullptr);
+        }
         if (depthIv) vk.vkDestroyImageView(dev, depthIv, nullptr);
         if (depthImg) {
             vk.vkDestroyImage(dev, depthImg, nullptr);
@@ -1118,11 +1218,6 @@ inline std::vector<BenchRunResult> runVulkanRaytracingBench(
         if (spec.id == "state_heavy_ps") {
             r.status = "SKIPPED (MSAA+BCn state-heavy PS is DX12-only)";
             results.push_back(r);
-            continue;
-        }
-        if (spec.hasTexture) {
-            r.status = "SKIPPED (textured PS)";
-            results.push_back(std::move(r));
             continue;
         }
 
