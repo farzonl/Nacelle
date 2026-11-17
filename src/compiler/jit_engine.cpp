@@ -1137,6 +1137,27 @@ bool linkRuntimeBitcodeAndInline(llvm::Module& mod, std::string& outError) {
         return false;
     }
 
+    // If a module has many nacelle_math_v<W>_* callsites, keep them out-of-line (promoted
+    // to fastcc vector-return below) to avoid O(W^2) IR/compile-time/RSS explosion and
+    // register spilling in large shaders.
+    {
+        size_t totalMathCalls = 0;
+        for (const llvm::Function& f : mod) {
+            if (!f.isDeclaration() && f.getName().starts_with("nacelle_math_v")) {
+                totalMathCalls += f.getNumUses();
+            }
+        }
+        if (totalMathCalls > 8) {
+            for (llvm::Function& f : mod) {
+                if (!f.isDeclaration() && f.getName().starts_with("nacelle_math_v") && f.getNumUses() > 1) {
+                    f.removeFnAttr(llvm::Attribute::AlwaysInline);
+                    f.removeFnAttr(llvm::Attribute::InlineHint);
+                    f.addFnAttr(llvm::Attribute::NoInline);
+                }
+            }
+        }
+    }
+
     bool needsAlwaysInline = false;
     for (const llvm::Function& f : mod) {
         if (!f.isDeclaration() && f.hasFnAttribute(llvm::Attribute::AlwaysInline)) {
