@@ -101,6 +101,19 @@ inline std::vector<BenchmarkSpec> buildBenchmarkCatalog() {
 
     {
         BenchmarkSpec s;
+        s.id = "bench_small_tri_ps";
+        s.name = "Small Triangle PS Stress";
+        s.category = BenchCategory::Vertex;
+        s.kind = PipelineKind::GraphicsVSPS;
+        s.vsDxil = "bench_small_tri_ps_vs.dxil";
+        s.psDxil = "bench_small_tri_ps_ps.dxil";
+        s.vsSpv = "bench_small_tri_ps_vs.spv";
+        s.psSpv = "bench_small_tri_ps_ps.spv";
+        cat.push_back(std::move(s));
+    }
+
+    {
+        BenchmarkSpec s;
         s.id = "bench_vertex_mesh";
         s.name = "Skinned Mesh (VB+IB+Cull)";
         s.category = BenchCategory::Vertex;

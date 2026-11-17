@@ -421,23 +421,51 @@ inline bool triangleCoversRect(const SetupTriangle& tri, int32_t bx, int32_t by,
 
 struct QuadBatchEmitter {
     static constexpr uint32_t kMaxBatchGroups = 64;
+    static constexpr uint32_t kMaxQuads = kMaxBatchGroups * (kMaxSimdWidth / 4);
     CompiledPixelQuadFn psFn = nullptr;
     PixelBatchArgs args{};
     uint32_t quadsPerBatch = 1;
     uint32_t qCount = 0;
     uint32_t batchCount = 0;
+    uint32_t triDataCount = 0;
+    uint32_t currentTriDataIdx = 0;
+    uint32_t lastSceneTriIdx = UINT32_MAX;
+    bool currentGroupHasPrevTri = false;
     float sampleOffsetX = 0.0f;
     float sampleOffsetY = 0.0f;
-    alignas(64) uint32_t coverageMasks[kMaxBatchGroups]{};
-    alignas(64) uint32_t quadOffsets[kMaxBatchGroups * (kMaxSimdWidth / 4)]{};
-    alignas(64) float pixelX[kMaxBatchGroups * kMaxSimdWidth]{};
-    alignas(64) float pixelY[kMaxBatchGroups * kMaxSimdWidth]{};
-    alignas(64) float baryI[kMaxBatchGroups * kMaxSimdWidth]{};
-    alignas(64) float baryJ[kMaxBatchGroups * kMaxSimdWidth]{};
+    alignas(64) uint32_t coverageMasks[kMaxBatchGroups];
+    alignas(64) uint32_t quadOffsets[kMaxQuads];
+    alignas(64) uint32_t quadTriIndices[kMaxQuads];
+    alignas(64) PixelTriData triData[kMaxQuads];
+    alignas(64) float pixelX[kMaxBatchGroups * kMaxSimdWidth];
+    alignas(64) float pixelY[kMaxBatchGroups * kMaxSimdWidth];
+    alignas(64) float baryI[kMaxBatchGroups * kMaxSimdWidth];
+    alignas(64) float baryJ[kMaxBatchGroups * kMaxSimdWidth];
+
+    QuadBatchEmitter() {
+        coverageMasks[0] = 0;
+    }
+
+    void padRemainingQuadsInGroup() {
+        uint32_t baseQ = batchCount * quadsPerBatch;
+        for (uint32_t q = qCount; q < quadsPerBatch; ++q) {
+            quadOffsets[baseQ + q] = 0;
+            quadTriIndices[baseQ + q] = 0;
+            uint32_t baseLane = (baseQ + q) * 4u;
+            for (uint32_t s = 0; s < 4; ++s) {
+                uint32_t lane = baseLane + s;
+                pixelX[lane] = 0.0f;
+                pixelY[lane] = 0.0f;
+                baryI[lane] = 0.0f;
+                baryJ[lane] = 0.0f;
+            }
+        }
+    }
 
     void finishGroup() {
         ++batchCount;
         qCount = 0;
+        currentGroupHasPrevTri = false;
         if (batchCount == kMaxBatchGroups) {
             flush();
         } else {
@@ -445,28 +473,68 @@ struct QuadBatchEmitter {
         }
     }
 
+    void padAndFinishGroup() {
+        if (qCount > 0 && qCount < quadsPerBatch) {
+            padRemainingQuadsInGroup();
+        }
+        finishGroup();
+    }
+
+    void beginTriangle(uint32_t sceneTriIdx, const PixelTriData& td) {
+        if (triDataCount > 0 && sceneTriIdx == lastSceneTriIdx) {
+            return;
+        }
+        // Keep large single-triangle runs on the uniform-triangle fast path.
+        if (triDataCount == 1 && qCount == 0 && batchCount >= 4) {
+            flush();
+        }
+        if (triDataCount >= kMaxQuads) {
+            flush();
+        }
+        if (triDataCount > 0 && qCount > 0) {
+            currentGroupHasPrevTri = true;
+        }
+        currentTriDataIdx = triDataCount++;
+        triData[currentTriDataIdx] = td;
+        lastSceneTriIdx = sceneTriIdx;
+    }
+
     void flush() {
         if (qCount > 0) {
-            uint32_t baseQ = batchCount * quadsPerBatch;
-            for (uint32_t q = qCount; q < quadsPerBatch; ++q) {
-                quadOffsets[baseQ + q] = 0;
-                uint32_t baseLane = (baseQ + q) * 4u;
-                for (uint32_t s = 0; s < 4; ++s) {
-                    uint32_t lane = baseLane + s;
-                    pixelX[lane] = 0.0f;
-                    pixelY[lane] = 0.0f;
-                    baryI[lane] = 0.0f;
-                    baryJ[lane] = 0.0f;
-                }
-            }
+            padRemainingQuadsInGroup();
             ++batchCount;
             qCount = 0;
         }
-        if (batchCount == 0) return;
+        if (batchCount == 0) {
+            triDataCount = 0;
+            lastSceneTriIdx = UINT32_MAX;
+            currentGroupHasPrevTri = false;
+            return;
+        }
         args.batchCount = batchCount;
+        if (triDataCount <= 1) {
+            const PixelTriData& td = triData[0];
+            args.triAttrBase = td.triAttrBase;
+            args.triAttrFlat = td.triAttrFlat;
+            args.triInvW = td.triInvW;
+            args.triOrigBary = td.triOrigBary;
+            args.triDepth = td.triDepth;
+            args.isFrontFace = td.isFrontFace;
+            args.primitiveId = td.primitiveId;
+            args.viewportArrayIndex = td.viewportArrayIndex;
+            args.shadingRate = td.shadingRate;
+            args.triData = nullptr;
+            args.quadTriIndices = nullptr;
+        } else {
+            args.triData = triData;
+            args.quadTriIndices = quadTriIndices;
+        }
         psFn(&args);
         batchCount = 0;
         qCount = 0;
+        triDataCount = 0;
+        lastSceneTriIdx = UINT32_MAX;
+        currentGroupHasPrevTri = false;
         coverageMasks[0] = 0;
     }
 
@@ -520,6 +588,7 @@ struct QuadBatchEmitter {
         float lenSq = dx * dx + dy * dy;
 
         quadOffsets[baseQ + qCount] = quadOffset;
+        quadTriIndices[baseQ + qCount] = currentTriDataIdx;
         for (uint32_t sub = 0; sub < 4; ++sub) {
             int32_t spx = gx + static_cast<int32_t>(sub & 1u);
             int32_t spy = gy + static_cast<int32_t>(sub >> 1);
@@ -643,10 +712,21 @@ struct QuadBatchEmitter {
 
         uint32_t tx = static_cast<uint32_t>(gx - static_cast<int32_t>(tileOriginX));
         uint32_t ty = static_cast<uint32_t>(gy - static_cast<int32_t>(tileOriginY));
-        uint32_t quadIdx = (ty >> 1) * (kTileSize / 2u) + (tx >> 1);
+        uint32_t quadOffset = ((ty >> 1) * (kTileSize / 2u) + (tx >> 1)) * 4u;
 
         uint32_t baseQ = batchCount * quadsPerBatch;
-        quadOffsets[baseQ + qCount] = quadIdx * 4u;
+        if (currentGroupHasPrevTri) {
+            for (uint32_t q = 0; q < qCount; ++q) {
+                if (quadOffsets[baseQ + q] == quadOffset) {
+                    padAndFinishGroup();
+                    baseQ = batchCount * quadsPerBatch;
+                    break;
+                }
+            }
+        }
+
+        quadOffsets[baseQ + qCount] = quadOffset;
+        quadTriIndices[baseQ + qCount] = currentTriDataIdx;
         uint32_t baseLane = (baseQ + qCount) * 4u;
         for (uint32_t sub = 0; sub < 4; ++sub) {
             uint32_t lane = baseLane + sub;
@@ -825,27 +905,32 @@ void rasterizeTiles(
 
                 const size_t triIdxSz = static_cast<size_t>(triIdx);
                 const size_t psScalars = static_cast<size_t>(scene.numPSInputScalars);
-                emitter.args.triAttrBase = !scene.attrBaseArena.empty()
-                                               ? (scene.attrBaseArena.data() + triIdxSz * psScalars * 3)
-                                               : nullptr;
-                emitter.args.triAttrFlat = !scene.attrFlatArena.empty()
-                                               ? (scene.attrFlatArena.data() + triIdxSz * psScalars)
-                                               : nullptr;
-                emitter.args.triInvW = sampleTri.invW;
-                emitter.args.triOrigBary = !scene.origBaryArena.empty()
-                                               ? (scene.origBaryArena.data() + triIdxSz * 9)
-                                               : nullptr;
-                emitter.args.triDepth = sampleTri.depth;
-                emitter.args.isFrontFace = sampleTri.isFrontFace;
-                emitter.args.primitiveId = sampleTri.primitiveId;
-                emitter.args.viewportArrayIndex = sampleTri.viewportIndex;
-                emitter.args.shadingRate = sampleTri.shadingRate;
+                PixelTriData td{};
+                td.triAttrBase = !scene.attrBaseArena.empty()
+                                     ? (scene.attrBaseArena.data() + triIdxSz * psScalars * 3)
+                                     : nullptr;
+                td.triAttrFlat = !scene.attrFlatArena.empty()
+                                     ? (scene.attrFlatArena.data() + triIdxSz * psScalars)
+                                     : nullptr;
+                td.triInvW = sampleTri.invW;
+                td.triOrigBary = !scene.origBaryArena.empty()
+                                     ? (scene.origBaryArena.data() + triIdxSz * 9)
+                                     : nullptr;
+                td.triDepth = sampleTri.depth;
+                td.isFrontFace = sampleTri.isFrontFace;
+                td.primitiveId = sampleTri.primitiveId;
+                td.viewportArrayIndex = sampleTri.viewportIndex;
+                td.shadingRate = sampleTri.shadingRate;
 
                 if (sampleTri.isLine) {
+                    emitter.flush();
+                    emitter.beginTriangle(triIdx, td);
                     emitter.rasterizeLineInTile(sampleTri, tileScissor, tileOriginX, tileOriginY);
                     emitter.flush();
                     continue;
                 }
+
+                emitter.beginTriangle(triIdx, td);
 
                 int32_t qMinX = minX & ~1;
                 int32_t qMaxX = (maxX + 1) & ~1;
@@ -883,8 +968,8 @@ void rasterizeTiles(
                         }
                     }
                 }
-                emitter.flush();
             }
+            emitter.flush();
 
             for (uint32_t rt = 0; rt < state.numRTVs && rt < 8; ++rt) {
                 uint32_t rtSample = (state.rtvs[rt].resource &&
