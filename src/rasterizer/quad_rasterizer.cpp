@@ -17,20 +17,26 @@ constexpr uint32_t kMaxSimdWidth = 16;
 
 struct alignas(64) TileScratch {
     float color0SOA[4 * kTilePixels]{};
-    std::vector<float> extraColorSOA;
-    float depthSOA[kTilePixels]{};
-    uint8_t stencilSOA[kTilePixels]{};
+    alignas(64) float depthSOA[kTilePixels]{};
+    alignas(64) uint8_t stencilSOA[kTilePixels]{};
+    struct AlignedDeleter {
+        void operator()(float* p) const { alignedFree(p); }
+    };
+    std::unique_ptr<float[], AlignedDeleter> extraColorSOA;
+    uint32_t extraRTVsCap = 0;
 
     float* colorPlane(uint32_t rt) {
         if (rt == 0) return color0SOA;
-        return extraColorSOA.data() + static_cast<size_t>(rt - 1) * (4 * kTilePixels);
+        return extraColorSOA.get() + static_cast<size_t>(rt - 1) * (4 * kTilePixels);
     }
 
     void ensureRTVs(uint32_t numRTVs) {
         if (numRTVs > 1) {
-            const size_t needed = static_cast<size_t>(std::min<uint32_t>(numRTVs, 8u) - 1u) * (4 * kTilePixels);
-            if (extraColorSOA.size() < needed) {
-                extraColorSOA.resize(needed);
+            const uint32_t neededRTVs = std::min<uint32_t>(numRTVs, 8u) - 1u;
+            if (extraRTVsCap < neededRTVs) {
+                const size_t bytes = static_cast<size_t>(neededRTVs) * (4 * kTilePixels) * sizeof(float);
+                extraColorSOA.reset(static_cast<float*>(alignedAlloc64(bytes)));
+                extraRTVsCap = neededRTVs;
             }
         }
     }
