@@ -203,6 +203,51 @@ add_custom_command(
 
 add_custom_target(nacelle_embedded_bc DEPENDS "${TEX_SAMPLER_BC_HDR}" "${MATH_SIMD_BC_HDR}" "${RAYQUERY_RT_BC_HDR}" "${COMPILER_VERSION_HDR}")
 
+# Optional ThinLTO + Profile-Guided Optimization (Clang / AppleClang)
+option(NACELLE_ENABLE_THIN_LTO "Enable ThinLTO (-flto=thin)" OFF)
+set(NACELLE_PGO_MODE "OFF" CACHE STRING "PGO mode: OFF, GENERATE, USE")
+set_property(CACHE NACELLE_PGO_MODE PROPERTY STRINGS OFF GENERATE USE)
+set(NACELLE_PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-profiles" CACHE PATH "Directory for raw PGO profiles (GENERATE)")
+set(NACELLE_PGO_PROFILE_FILE "" CACHE FILEPATH "Merged .profdata file for PGO USE")
+
+function(nacelle_apply_lto_pgo target)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(NACELLE_ENABLE_THIN_LTO OR NOT NACELLE_PGO_MODE STREQUAL "OFF")
+            message(WARNING "ThinLTO/PGO options currently support Clang/AppleClang; skipping for ${target}")
+        endif()
+        return()
+    endif()
+
+    set(_flags "")
+    if(NACELLE_ENABLE_THIN_LTO)
+        list(APPEND _flags "-flto=thin")
+    endif()
+
+    if(NACELLE_PGO_MODE STREQUAL "GENERATE")
+        list(APPEND _flags "-fprofile-generate=${NACELLE_PGO_PROFILE_DIR}")
+    elseif(NACELLE_PGO_MODE STREQUAL "USE")
+        if(NOT NACELLE_PGO_PROFILE_FILE)
+            message(FATAL_ERROR "NACELLE_PGO_MODE=USE requires NACELLE_PGO_PROFILE_FILE to be set")
+        endif()
+        list(APPEND _flags "-fprofile-use=${NACELLE_PGO_PROFILE_FILE}" "-Wno-profile-instr-unprofiled")
+    elseif(NOT NACELLE_PGO_MODE STREQUAL "OFF")
+        message(FATAL_ERROR "Invalid NACELLE_PGO_MODE='${NACELLE_PGO_MODE}' (expected OFF, GENERATE, or USE)")
+    endif()
+
+    if(_flags)
+        get_target_property(_target_type ${target} TYPE)
+        if(_target_type STREQUAL "STATIC_LIBRARY")
+            target_compile_options(${target} PRIVATE ${_flags})
+            target_link_options(${target} INTERFACE ${_flags})
+        elseif(_target_type STREQUAL "OBJECT_LIBRARY")
+            target_compile_options(${target} PRIVATE ${_flags})
+        else()
+            target_compile_options(${target} PRIVATE ${_flags})
+            target_link_options(${target} PRIVATE ${_flags})
+        endif()
+    endif()
+endfunction()
+
 # 4. Core Nacelle Object Library (shared between static libnacelle and shared libnacelle_d3d12)
 set(NACELLE_SOURCES
     src/common/format_utils.cpp
@@ -227,6 +272,7 @@ set(NACELLE_SOURCES
 separate_arguments(LLVM_DEFS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 
 add_library(nacelle_objs OBJECT ${NACELLE_SOURCES})
+nacelle_apply_lto_pgo(nacelle_objs)
 add_dependencies(nacelle_objs nacelle_embedded_bc)
 set_target_properties(nacelle_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -337,6 +383,7 @@ endif()
 
 # Static library: libnacelle
 add_library(nacelle STATIC $<TARGET_OBJECTS:nacelle_objs>)
+nacelle_apply_lto_pgo(nacelle)
 target_include_directories(nacelle PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
@@ -364,6 +411,7 @@ endif()
 
 # Shared D3D12/DXCore drop-in library: libnacelle_d3d12
 add_library(nacelle_d3d12 SHARED ${NACELLE_SOURCES})
+nacelle_apply_lto_pgo(nacelle_d3d12)
 if(WIN32)
     target_sources(nacelle_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/api/nacelle_d3d12.def")
 endif()
@@ -415,6 +463,7 @@ endif()
 
 # 5. CLI Tools
 add_executable(nacelle-compile tools/nacelle_compile.cpp)
+nacelle_apply_lto_pgo(nacelle-compile)
 target_include_directories(nacelle-compile PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
@@ -431,6 +480,7 @@ set(NACELLE_D3D12_SDK_VERSION "0" CACHE STRING "DirectX 12 Agility SDK version n
 
 # Worker: Nacelle (links libnacelle / LLVM)
 add_executable(bench-worker-nacelle tools/bench_worker_nacelle.cpp)
+nacelle_apply_lto_pgo(bench-worker-nacelle)
 target_include_directories(bench-worker-nacelle PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectX-Headers/include"
@@ -586,6 +636,7 @@ elseif(UNIX AND NOT APPLE AND NOT SDL3_FOUND AND NACELLE_FETCH_SDL3)
     endif()
 endif()
 add_executable(nacelle_viewer apps/nacelle_viewer.cpp)
+nacelle_apply_lto_pgo(nacelle_viewer)
 add_dependencies(nacelle_viewer nacelle_test_shaders)
 target_include_directories(nacelle_viewer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

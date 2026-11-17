@@ -156,10 +156,35 @@ jobs:
           fi
           fail-on-cache-miss: true
 
-      - name: Configure and build nacelle-bench
+      - name: Configure and build PGO-instrumented nacelle worker
+        run: |
+          cmake -S . -B build-pgo-gen -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNACELLE_ENABLE_THIN_LTO=ON \
+            -DNACELLE_PGO_MODE=GENERATE \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
+            -DLLVM_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="$GITHUB_WORKSPACE/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file"
+          cmake --build build-pgo-gen --target bench-worker-nacelle nacelle_test_shaders --parallel
+
+      - name: Collect and merge PGO profiles
+        run: |
+          for w in nacelle-w16 nacelle-w8 nacelle-w4; do
+            "$GITHUB_WORKSPACE/build-pgo-gen/bench-worker-nacelle" --single-backend "$w" --iters 3 > /dev/null
+          done
+          xcrun llvm-profdata merge -output="$GITHUB_WORKSPACE/nacelle.profdata" "$GITHUB_WORKSPACE/build-pgo-gen/pgo-profiles/"*.profraw
+          rm -rf "$GITHUB_WORKSPACE/build-pgo-gen"
+
+      - name: Configure and build nacelle-bench (PGO + ThinLTO)
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DNACELLE_ENABLE_THIN_LTO=ON \
+            -DNACELLE_PGO_MODE=USE \
+            -DNACELLE_PGO_PROFILE_FILE="$GITHUB_WORKSPACE/nacelle.profdata" \
             -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
             -DLLVM_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" \
