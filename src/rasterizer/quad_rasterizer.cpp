@@ -921,22 +921,6 @@ void executeRasterDrawCall(
 
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
-
-    // Release oversized high-water-mark capacities after large draws.
-    auto shrinkIfOversized = [](auto& vec, size_t maxCap) {
-        if (vec.capacity() > maxCap) {
-            vec.clear();
-            vec.shrink_to_fit();
-        }
-    };
-    shrinkIfOversized(scene.triangles, 4096);
-    shrinkIfOversized(scene.attrBaseArena, 262144);
-    shrinkIfOversized(scene.attrFlatArena, 65536);
-    shrinkIfOversized(scene.origBaryArena, 32768);
-    if (bins.capacity() > 2048) {
-        bins.clear();
-        bins.shrink_to_fit();
-    }
 }
 
 void executeRasterMeshDispatch(
@@ -949,22 +933,6 @@ void executeRasterMeshDispatch(
     std::vector<TileBin> bins;
     binTrianglesToTiles(scene, bins);
     rasterizeTiles(pool, state, scene, bins);
-
-    // Release oversized high-water-mark capacities after large draws.
-    auto shrinkIfOversized = [](auto& vec, size_t maxCap) {
-        if (vec.capacity() > maxCap) {
-            vec.clear();
-            vec.shrink_to_fit();
-        }
-    };
-    shrinkIfOversized(scene.triangles, 4096);
-    shrinkIfOversized(scene.attrBaseArena, 262144);
-    shrinkIfOversized(scene.attrFlatArena, 65536);
-    shrinkIfOversized(scene.origBaryArena, 32768);
-    if (bins.capacity() > 2048) {
-        bins.clear();
-        bins.shrink_to_fit();
-    }
 }
 
 void msaaSampleOffset16ths(uint32_t sampleCount, uint32_t sampleIdx, int32_t& dx16, int32_t& dy16) {
