@@ -1030,6 +1030,7 @@ bool emitVertexStageFunction(
 
     StageHooks vsHooks;
     vsHooks.isPixelShader = false;
+    vsHooks.entryBlock = entry;
     vsHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                             const SimdVal&, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
         const DxilSigRecord* sig = vsLoaded.findInputSig(sigId);
@@ -1899,6 +1900,7 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::Value outPayload = h.loadScalar(ptrTy, h.gepBytes(argsPtr, offsetof(AmplificationThreadGroupArgs, outPayload)));
 
             StageHooks asHooks;
+            asHooks.entryBlock = entry;
             asHooks.dispatchMesh = [&](mlir::OpBuilder& db, mlir::Location dloc,
                                        const SimdVal& countX, const SimdVal& countY, const SimdVal& countZ,
                                        const SimdVal& payloadArg, mlir::Value realMask) -> bool {
@@ -1995,6 +1997,7 @@ bool synthesizeGraphicsPSOMLIR(
             const uint32_t maxPrims = msLoaded.msMaxPrimitiveCount;
 
             StageHooks msHooks;
+            msHooks.entryBlock = entry;
             msHooks.meshPayloadBase = payloadPtr;
 
             msHooks.setMeshOutputCounts = [&](mlir::OpBuilder& sb, mlir::Location sloc,
@@ -2491,6 +2494,7 @@ bool synthesizeGraphicsPSOMLIR(
                 h.splatInt(i32Ty, 0));
 
             StageHooks hsHooks;
+            hsHooks.entryBlock = entry;
             mlir::Value hsRealMask = activeMask;
             hsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                               const SimdVal& row, uint32_t col, const SimdVal& vAxis,
@@ -2562,6 +2566,7 @@ bool synthesizeGraphicsPSOMLIR(
                 b, loc, mlir::LLVM::ICmpPredicate::eq, h.laneIota(), h.splatInt(i32Ty, 0));
 
             StageHooks hspcHooks;
+            hspcHooks.entryBlock = entry;
             hspcHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                                 const SimdVal& row, uint32_t col, const SimdVal& vAxis,
                                                 mlir::Type scalarTy, SimdVal& out) -> bool {
@@ -2673,6 +2678,7 @@ bool synthesizeGraphicsPSOMLIR(
             mlir::Value domWVec = mlir::LLVM::SelectOp::create(b, loc, activeMask, h.loadScalar(h.vecTy(f32Ty), domWPtr), zeroFltVec);
 
             StageHooks dsHooks;
+            dsHooks.entryBlock = entry;
             dsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                               const SimdVal& row, uint32_t col, const SimdVal& cpIdx,
                                               mlir::Type scalarTy, SimdVal& out) -> bool {
@@ -2833,6 +2839,7 @@ bool synthesizeGraphicsPSOMLIR(
         h.storeScalar(h.splatInt(i32Ty, 0), numStripsPtr);
 
         StageHooks gsHooks;
+        gsHooks.entryBlock = entry;
         gsHooks.loadInputWithVertex = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                           const SimdVal& row, uint32_t col, const SimdVal& vAxis,
                                           mlir::Type scalarTy, SimdVal& out) -> bool {
@@ -3732,25 +3739,28 @@ bool synthesizeGraphicsPSOMLIR(
                     }
                 }
 
-                // Allocate stack slots for PS outputs (SV_Target0..7 and optional SV_Depth) so writes inside scf.if work naturally
+                // Allocate stack slots for PS outputs (SV_Target0..7 and optional SV_Depth) in the function entry block
+                // so batch loop iterations do not grow the stack dynamically.
+                mlir::OpBuilder entryAllocBuilder(entry, entry->begin());
+                IRHelpers eh{entryAllocBuilder, ploc, simdWidth};
                 std::array<std::array<mlir::Value, 4>, 8> rtOutPtrs{};
                 for (uint32_t rt = 0; rt < 8; ++rt) {
                     if (rt < desc.NumRenderTargets && desc.RTVFormats[rt] != DXGI_FORMAT_UNKNOWN) {
                         for (uint32_t c = 0; c < 4; ++c) {
                             rtOutPtrs[rt][c] = mlir::LLVM::AllocaOp::create(
-                                pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                                entryAllocBuilder, ploc, ptrTy, eh.vecTy(f32Ty), eh.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                             ph.storeScalar(ph.splatFlt(c == 3 ? 1.0 : 0.0), rtOutPtrs[rt][c]);
                         }
                     }
                 }
                 mlir::Value outDepthPtr = mlir::LLVM::AllocaOp::create(
-                    pb, ploc, ptrTy, ph.vecTy(f32Ty), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                    entryAllocBuilder, ploc, ptrTy, eh.vecTy(f32Ty), eh.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                 ph.storeScalar(interpZ, outDepthPtr);
 
                 mlir::Value outStencilRefPtr;
                 if (psWritesStencilRef) {
                     outStencilRefPtr = mlir::LLVM::AllocaOp::create(
-                        pb, ploc, ptrTy, ph.vecTy(ph.i8Ty()), ph.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
+                        entryAllocBuilder, ploc, ptrTy, eh.vecTy(eh.i8Ty()), eh.cInt(i32Ty, 1), std::max<uint32_t>(64, ph.W * 8));
                     mlir::Value initRef32 = ph.loadScalar(i32Ty, ph.gepBytes(rootCtx, offsetof(DriverRootContext, stencil_ref)));
                     mlir::Value initRef8 = mlir::LLVM::TruncOp::create(pb, ploc, ph.i8Ty(), initRef32);
                     ph.storeScalar(llvmSplat(pb, ploc, llvm::cast<mlir::VectorType>(ph.vecTy(ph.i8Ty())).getElementType(), initRef8, llvm::cast<mlir::VectorType>(ph.vecTy(ph.i8Ty())).getNumElements()), outStencilRefPtr);
@@ -3758,6 +3768,7 @@ bool synthesizeGraphicsPSOMLIR(
 
                 StageHooks psHooks;
                 psHooks.isPixelShader = true;
+                psHooks.entryBlock = entry;
                 psHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                         const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
                     const DxilSigRecord* sig = psLoaded.findInputSig(sigId);
