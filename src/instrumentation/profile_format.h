@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -8,6 +10,8 @@ namespace nacelle::profile {
 
 inline constexpr uint64_t maxProfileBytes = 256ull * 1024 * 1024;
 inline constexpr uint64_t maxManifestBytes = 1024ull * 1024;
+inline constexpr std::size_t maxCodeVersions = 65536;
+std::string formatProfileHash(uint64_t lo, uint64_t hi);
 
 struct Entry {
     std::string path;
@@ -54,6 +58,24 @@ struct TraceArgs {
     uint32_t simdWidth = 0;
     uint32_t tier = 0;
     std::string cache;
+    std::optional<uint64_t> pipelineId;
+    std::optional<uint64_t> codeVersionId;
+};
+
+struct CodeVersion {
+    uint64_t id = 0;
+    uint64_t pipelineId = 0;
+    std::string pso;
+    std::string stage = "compute";
+    uint32_t simdWidth = 0;
+    uint32_t version = 0;
+    uint8_t tier = 0;
+    std::string cache;
+};
+
+struct ShaderMetadata {
+    uint32_t schemaVersion = 1;
+    std::vector<CodeVersion> codeVersions;
 };
 
 struct TraceEvent {
@@ -75,6 +97,7 @@ struct Trace {
 struct Profile {
     Manifest manifest;
     Trace trace;
+    ShaderMetadata shaders;
 };
 
 bool readProfile(const std::string& path, Profile& profile, std::string& error);

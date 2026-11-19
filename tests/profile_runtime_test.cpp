@@ -44,7 +44,8 @@ void initialize(testutil::TestRuntime& runtime) {
         IID_PPV_ARGS(&runtime.fence)), "Fence");
 }
 
-void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture = nullptr) {
+void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture,
+             const std::string& mode, const std::string& outputPath) {
     D3D12_ROOT_PARAMETER parameters[4]{};
     for (UINT i = 0; i < 3; ++i) {
         parameters[i].ParameterType = i == 2 ? D3D12_ROOT_PARAMETER_TYPE_UAV : D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -63,6 +64,13 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     desc.CS = {shader.data(), shader.size()};
     ComPtr<ID3D12PipelineState> pso;
     testutil::checkHR(runtime.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)), "Compute PSO");
+    if (mode == "promoted" || mode == "cached") {
+        NacelleProfileSummary summary;
+        testutil::checkHR(NacelleEndProfileCapture(*executionCapture,
+            (outputPath + ".warmup").c_str(), &summary), "Drain captured Tier-2 compilation");
+        NacelleDestroyProfileCapture(*executionCapture);
+        *executionCapture = nullptr;
+    }
     // A second creation exercises the same capture's cache metadata.
     ComPtr<ID3D12PipelineState> cached;
     testutil::checkHR(runtime.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&cached)), "Cached compute PSO");
@@ -79,7 +87,7 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     if (executionCapture) beginCapture(executionCapture);
     runtime.resetCmd();
     runtime.cmdList->SetComputeRootSignature(signature.Get());
-    runtime.cmdList->SetPipelineState(executionCapture ? cached.Get() : pso.Get());
+    runtime.cmdList->SetPipelineState(executionCapture && mode != "promoted" ? cached.Get() : pso.Get());
     runtime.cmdList->SetComputeRootShaderResourceView(0, inputA->GetGPUVirtualAddress());
     runtime.cmdList->SetComputeRootShaderResourceView(1, inputB->GetGPUVirtualAddress());
     runtime.cmdList->SetComputeRootUnorderedAccessView(2, output->GetGPUVirtualAddress());
@@ -177,21 +185,25 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
 
 int main(int argc, char** argv) {
     if (argc != 2 && argc != 3) {
-        std::cerr << "Usage: profile_runtime_test <new-profile-path> [all|compute|graphics]\n";
+        std::cerr << "Usage: profile_runtime_test <new-profile-path> "
+                     "[all|compute|graphics|tier1|promoted|cached|disk]\n";
         return 1;
     }
     const std::string mode = argc == 3 ? argv[2] : "all";
-    if (mode != "all" && mode != "compute" && mode != "graphics") {
+    if (mode != "all" && mode != "compute" && mode != "graphics" && mode != "tier1" &&
+        mode != "promoted" && mode != "cached" && mode != "disk") {
         std::cerr << "Invalid capture mode: " << mode << '\n';
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
     try {
-        if (mode == "all") beginCapture(&capture);
+        if (mode == "all" || mode == "promoted" || mode == "cached") beginCapture(&capture);
         testutil::TestRuntime runtime;
         initialize(runtime);
-        if (mode != "graphics") compute(runtime, mode == "compute" ? &capture : nullptr);
-        if (mode != "compute") draw(runtime, mode == "graphics" ? &capture : nullptr);
+        if (mode != "graphics")
+            compute(runtime, mode == "all" ? nullptr : &capture, mode, argv[1]);
+        if (mode == "all" || mode == "graphics")
+            draw(runtime, mode == "graphics" ? &capture : nullptr);
         NacelleProfileSummary summary;
         testutil::checkHR(NacelleEndProfileCapture(capture, argv[1], &summary), "End profile");
         NacelleDestroyProfileCapture(capture);
@@ -210,8 +222,28 @@ int main(int argc, char** argv) {
         } else {
             require(!hasSpan("Compile compute PSO") && !hasSpan("Compile graphics PSO"),
                     "Execution-only capture must not require pipeline creation");
-            require(hasSpan(mode == "compute" ? "Compute dispatch" : "Graphics draw"),
+            require(hasSpan(mode == "graphics" ? "Graphics draw" : "Compute dispatch"),
                     "Pre-existing pipeline execution recorded");
+        }
+        if (mode != "graphics") {
+            require(!profile.shaders.codeVersions.empty(), "Executed compute version metadata exists");
+            for (const auto& event : profile.trace.traceEvents) {
+                if (event.name != "Compute dispatch" && event.name != "Compute worker") continue;
+                require(event.args.pipelineId && event.args.codeVersionId,
+                        "Compute dispatches and workers identify the selected native entry");
+                const auto& code = profile.shaders.codeVersions.at(*event.args.codeVersionId - 1);
+                if (mode == "tier1")
+                    require(code.version == 1 && code.tier == 1 && code.cache == "miss",
+                            "Cold Tier-1 execution");
+                if (mode == "promoted")
+                    require(code.version == 2 && code.tier == 2 && code.cache == "miss",
+                            "Execute promoted entry on the original pipeline");
+                if (mode == "cached" || mode == "disk")
+                    require(code.version == 1 && code.tier == 2 && code.cache == "hit",
+                            "Cached native entry is Tier 2 on a new pipeline");
+            }
+        } else {
+            require(profile.shaders.codeVersions.empty(), "Graphics versions remain explicitly unavailable");
         }
         const auto& build = profile.manifest.build;
         require(!build.compilerHash.empty() && !build.targetTriple.empty() && !build.cpu.empty(),

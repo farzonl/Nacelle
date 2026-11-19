@@ -13,9 +13,17 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 
 namespace nacelle::profile {
+std::string formatProfileHash(uint64_t lo, uint64_t hi) {
+    if (lo == 0 && hi == 0) return {};
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
+    return stream.str();
+}
+
 namespace {
 
 struct Zip {
@@ -26,13 +34,6 @@ struct Zip {
         else mz_zip_reader_end(&archive);
     }
 };
-
-std::string hashString(uint64_t lo, uint64_t hi) {
-    if (lo == 0 && hi == 0) return {};
-    std::ostringstream stream;
-    stream << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
-    return stream.str();
-}
 
 bool safePath(const std::string& path) {
     if (path.empty() || path.front() == '/' || path.find('\\') != std::string::npos ||
@@ -107,6 +108,10 @@ bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::s
 }
 
 bool writeProfile(const std::string& path, const Session& session, std::string& error) {
+    if (session.shaderMetadataOverflow) {
+        error = "Profile exceeds the 65536 compute code-version metadata limit";
+        return false;
+    }
     Manifest manifest;
     manifest.complete = session.dropped.load() == 0;
     manifest.recordedEvents = session.eventCount;
@@ -119,6 +124,13 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     std::string manifestJson;
     // Reject oversized metadata before allocating trace objects and compression buffers.
     if (!manifestToJson(manifest, manifestJson, error)) return false;
+    std::string shadersJson = "[]";
+    if (!session.shaders.codeVersions.empty() && !toJson(session.shaders, shadersJson, error))
+        return false;
+    if (shadersJson.size() > maxProfileBytes) {
+        error = "Profile shader metadata exceeds the 256 MiB format limit";
+        return false;
+    }
 
     Trace trace;
     trace.traceEvents.reserve(static_cast<size_t>(session.eventCount));
@@ -129,22 +141,26 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         if (event.id == 0) continue;
         TraceEvent item;
         item.name = event.name;
-        item.cat = event.attributes.tier ? "jit" : "runtime";
+        item.cat = event.attributes.tier && !event.attributes.codeVersionId ? "jit" : "runtime";
         item.ts = static_cast<double>(event.startNs) / 1000.0;
         item.dur = static_cast<double>(event.durationNs) / 1000.0;
         item.tid = event.thread;
         item.args = {event.id, event.parent,
-                     hashString(event.attributes.hashLo, event.attributes.hashHi),
+                     formatProfileHash(event.attributes.hashLo, event.attributes.hashHi),
                      stages[static_cast<unsigned>(event.attributes.stage)],
                      event.attributes.simdWidth, event.attributes.tier,
                      caches[static_cast<unsigned>(event.attributes.cache)]};
+        if (event.attributes.codeVersionId) {
+            item.args.pipelineId = event.attributes.pipelineId;
+            item.args.codeVersionId = event.attributes.codeVersionId;
+        }
         trace.traceEvents.push_back(std::move(item));
     }
     std::sort(trace.traceEvents.begin(), trace.traceEvents.end(),
               [](const auto& a, const auto& b) { return a.ts < b.ts; });
     std::string traceJson;
     if (!toJson(trace, traceJson, error)) return false;
-    if (traceJson.size() > maxProfileBytes - 2) {
+    if (traceJson.size() > maxProfileBytes - shadersJson.size()) {
         error = "Profile trace exceeds the 256 MiB uncompressed format limit";
         return false;
     }
@@ -158,6 +174,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     compressed.resize(result);
 
     manifest.entries.front().uncompressedSize = traceJson.size();
+    manifest.entries.back().uncompressedSize = shadersJson.size();
     if (!manifestToJson(manifest, manifestJson, error)) return false;
 
     Zip zip;
@@ -165,7 +182,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     if (!mz_zip_writer_init_heap(&zip.archive, 0, 0) ||
         !mz_zip_writer_add_mem(&zip.archive, "manifest.json", manifestJson.data(), manifestJson.size(), 0) ||
         !mz_zip_writer_add_mem(&zip.archive, "trace.json.zst", compressed.data(), compressed.size(), 0) ||
-        !mz_zip_writer_add_mem(&zip.archive, "shaders.json", "[]", 2, 0)) {
+        !mz_zip_writer_add_mem(&zip.archive, "shaders.json", shadersJson.data(), shadersJson.size(), 0)) {
         error = "miniz could not construct the profile archive";
         return false;
     }
@@ -237,7 +254,7 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
     if (manifest.schemaVersion != 1 || manifest.kind != "profile" || manifest.replayable ||
         manifest.clock != "monotonic" || manifest.timestampUnit != "ns" ||
         manifest.entries.size() != 2 || manifest.complete != (manifest.droppedEvents == 0) ||
-        manifest.recordedEvents > maxProfileBytes / sizeof(Event)) {
+        manifest.recordedEvents > 1'000'000) {
         error = "Unsupported or inconsistent profile manifest";
         return false;
     }
@@ -289,9 +306,55 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
     }
     if (!extract(zip, "shaders.json", static_cast<size_t>(shadersEntry->uncompressedSize), json, error))
         return false;
-    if (json.size() != shadersEntry->uncompressedSize || json != "[]") {
-        error = "Unsupported shader metadata payload";
+    if (json.size() != shadersEntry->uncompressedSize) {
+        error = "Shader metadata size does not match manifest";
         return false;
+    }
+    if (json != "[]") {
+        if (const auto ec = glz::read<glz::opts{.error_on_missing_keys = true}>(parsed.shaders, json)) {
+            error = "Invalid shader metadata: " + glz::format_error(ec, json);
+            return false;
+        }
+        if (parsed.shaders.schemaVersion != 1 || parsed.shaders.codeVersions.size() > maxCodeVersions) {
+            error = "Unsupported shader metadata schema or code-version count";
+            return false;
+        }
+        uint64_t expectedId = 1;
+        std::set<std::pair<uint64_t, uint32_t>> identities;
+        std::map<uint64_t, std::pair<std::string, uint32_t>> pipelines;
+        for (const auto& code : parsed.shaders.codeVersions) {
+            if (code.id != expectedId++ || !code.pipelineId || code.pipelineId > maxCodeVersions ||
+                code.pso.size() != 32 || code.pso.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                code.stage != "compute" || !code.simdWidth || code.version < 1 || code.version > 2 ||
+                code.tier < 1 || code.tier > 2 || (code.cache != "hit" && code.cache != "miss") ||
+                (code.cache == "hit" && (code.tier != 2 || code.version != 1)) ||
+                (code.version == 2 && code.tier != 2)) {
+                error = "Invalid compute code-version metadata";
+                return false;
+            }
+            const auto signature = std::make_pair(code.pso, code.simdWidth);
+            const auto pipeline = pipelines.try_emplace(code.pipelineId, signature).first;
+            if (!identities.emplace(code.pipelineId, code.version).second ||
+                pipeline->second != signature) {
+                error = "Inconsistent compute pipeline or duplicate code-version identity";
+                return false;
+            }
+        }
+    }
+    for (const auto& event : parsed.trace.traceEvents) {
+        const auto& args = event.args;
+        if (!args.pipelineId && !args.codeVersionId) continue;
+        if (!args.pipelineId || !args.codeVersionId || *args.codeVersionId == 0 ||
+            *args.codeVersionId > parsed.shaders.codeVersions.size()) {
+            error = "Invalid trace code-version reference";
+            return false;
+        }
+        const auto& code = parsed.shaders.codeVersions[*args.codeVersionId - 1];
+        if (*args.pipelineId != code.pipelineId || args.pso != code.pso || args.stage != code.stage ||
+            args.simdWidth != code.simdWidth || args.tier != code.tier || args.cache != code.cache) {
+            error = "Trace does not match referenced compute code version";
+            return false;
+        }
     }
     profile = std::move(parsed);
     return true;
