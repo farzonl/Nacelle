@@ -367,6 +367,14 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                 "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}.nacelle-profile"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        foreach(stage IN ITEMS compute graphics)
+            add_test(NAME profile_runtime_${linkage}_preexisting_${stage}_test
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-preexisting-${stage}.nacelle-profile"
+                    "-DCAPTURE_MODE=${stage}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
     endforeach()
 endif()
 add_nacelle_test(simd_wave_test simd_wave_test.cpp)

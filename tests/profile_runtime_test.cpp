@@ -7,10 +7,16 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void beginCapture(NacelleProfileCapture** capture) {
+    NacelleProfileOptions options;
+    testutil::checkHR(NacelleBeginProfileCapture(&options, capture), "Begin profile");
 }
 
 ComPtr<ID3D12RootSignature> createSignature(testutil::TestRuntime& runtime,
@@ -38,7 +44,7 @@ void initialize(testutil::TestRuntime& runtime) {
         IID_PPV_ARGS(&runtime.fence)), "Fence");
 }
 
-void compute(testutil::TestRuntime& runtime) {
+void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture = nullptr) {
     D3D12_ROOT_PARAMETER parameters[4]{};
     for (UINT i = 0; i < 3; ++i) {
         parameters[i].ParameterType = i == 2 ? D3D12_ROOT_PARAMETER_TYPE_UAV : D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -70,9 +76,10 @@ void compute(testutil::TestRuntime& runtime) {
     auto output = runtime.createBuffer(sizeof(a), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     runtime.uploadBuffer(inputA.Get(), a.data(), sizeof(a));
     runtime.uploadBuffer(inputB.Get(), b.data(), sizeof(b));
+    if (executionCapture) beginCapture(executionCapture);
     runtime.resetCmd();
     runtime.cmdList->SetComputeRootSignature(signature.Get());
-    runtime.cmdList->SetPipelineState(pso.Get());
+    runtime.cmdList->SetPipelineState(executionCapture ? cached.Get() : pso.Get());
     runtime.cmdList->SetComputeRootShaderResourceView(0, inputA->GetGPUVirtualAddress());
     runtime.cmdList->SetComputeRootShaderResourceView(1, inputB->GetGPUVirtualAddress());
     runtime.cmdList->SetComputeRootUnorderedAccessView(2, output->GetGPUVirtualAddress());
@@ -89,7 +96,7 @@ void compute(testutil::TestRuntime& runtime) {
         require(actual[i] == a[i] + b[i], "Capture changed compute output");
 }
 
-void draw(testutil::TestRuntime& runtime) {
+void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture = nullptr) {
     D3D12_ROOT_SIGNATURE_DESC signatureDesc{};
     auto signature = createSignature(runtime, signatureDesc);
     auto vs = testutil::loadShaderBytes("raster_basic_vs.dxil");
@@ -135,6 +142,7 @@ void draw(testutil::TestRuntime& runtime) {
     D3D12_VERTEX_BUFFER_VIEW vb{vertexBuffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(vertices[0])};
     D3D12_VIEWPORT viewport{0, 0, width, width, 0, 1};
     D3D12_RECT scissor{0, 0, width, width};
+    if (executionCapture) beginCapture(executionCapture);
     runtime.resetCmd();
     runtime.cmdList->SetGraphicsRootSignature(signature.Get());
     runtime.cmdList->SetPipelineState(pso.Get());
@@ -168,18 +176,22 @@ void draw(testutil::TestRuntime& runtime) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: profile_runtime_test <new-profile-path>\n";
+    if (argc != 2 && argc != 3) {
+        std::cerr << "Usage: profile_runtime_test <new-profile-path> [all|compute|graphics]\n";
+        return 1;
+    }
+    const std::string mode = argc == 3 ? argv[2] : "all";
+    if (mode != "all" && mode != "compute" && mode != "graphics") {
+        std::cerr << "Invalid capture mode: " << mode << '\n';
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
     try {
-        NacelleProfileOptions options;
-        testutil::checkHR(NacelleBeginProfileCapture(&options, &capture), "Begin profile");
+        if (mode == "all") beginCapture(&capture);
         testutil::TestRuntime runtime;
         initialize(runtime);
-        compute(runtime);
-        draw(runtime);
+        if (mode != "graphics") compute(runtime, mode == "compute" ? &capture : nullptr);
+        if (mode != "compute") draw(runtime, mode == "graphics" ? &capture : nullptr);
         NacelleProfileSummary summary;
         testutil::checkHR(NacelleEndProfileCapture(capture, argv[1], &summary), "End profile");
         NacelleDestroyProfileCapture(capture);
@@ -187,13 +199,28 @@ int main(int argc, char** argv) {
         nacelle::profile::Profile profile;
         std::string error;
         require(nacelle::profile::readProfile(argv[1], profile, error), error.c_str());
-        for (const char* name : {"Compile compute PSO", "Compile graphics PSO",
-                                 "Compute dispatch", "Graphics draw", "Raster worker", "Compute Tier 2"}) {
-            require(std::any_of(profile.trace.traceEvents.begin(), profile.trace.traceEvents.end(),
-                [&](const auto& event) { return event.name == name; }), name);
+        const auto hasSpan = [&](const char* name) {
+            return std::any_of(profile.trace.traceEvents.begin(), profile.trace.traceEvents.end(),
+                [&](const auto& event) { return event.name == name; });
+        };
+        if (mode == "all") {
+            for (const char* name : {"Compile compute PSO", "Compile graphics PSO",
+                                     "Compute dispatch", "Graphics draw", "Raster worker", "Compute Tier 2"})
+                require(hasSpan(name), name);
+        } else {
+            require(!hasSpan("Compile compute PSO") && !hasSpan("Compile graphics PSO"),
+                    "Execution-only capture must not require pipeline creation");
+            require(hasSpan(mode == "compute" ? "Compute dispatch" : "Graphics draw"),
+                    "Pre-existing pipeline execution recorded");
         }
-        require(profile.manifest.complete && summary.recorded_events > 10, "Complete runtime capture");
-        std::cout << "Compute output + graphics output + runtime profile spans: PASS ("
+        const auto& build = profile.manifest.build;
+        require(!build.compilerHash.empty() && !build.targetTriple.empty() && !build.cpu.empty(),
+                "Compiler and CPU metadata available without requiring pipeline creation");
+        require(std::is_sorted(build.cpuFeatures.begin(), build.cpuFeatures.end()),
+                "CPU features have stable ordering");
+        require(profile.manifest.complete && summary.recorded_events > (mode == "all" ? 10u : 0u),
+                "Complete runtime capture");
+        std::cout << mode << " output + runtime profile spans + compiler metadata: PASS ("
                   << summary.recorded_events << " events)\n";
         return 0;
     } catch (const std::exception& error) {

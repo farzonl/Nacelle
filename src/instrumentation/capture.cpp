@@ -156,11 +156,12 @@ void setCompilerConfiguration(const std::string& hash, const std::string& triple
     if (!context.work) return;
     auto& session = *context.work->session;
     std::lock_guard lock(session.metadataMutex);
-    if (!session.compilerHash.empty()) return;
+    if (session.compilerConfigurationRecorded.load(std::memory_order_relaxed)) return;
     session.compilerHash = hash;
     session.targetTriple = triple;
     session.cpu = cpu;
     session.cpuFeatures = features;
+    session.compilerConfigurationRecorded.store(true, std::memory_order_release);
 }
 
 } // namespace nacelle::profile

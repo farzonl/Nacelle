@@ -199,6 +199,43 @@ int main(int argc, char** argv) {
                     profile.trace.traceEvents.empty(), "Empty capture has no stale events");
         }
         {
+            nacelle::profile::Scope inactive("Inactive metadata");
+            require(!inactive.needsCompilerConfiguration(), "No compiler metadata work while idle");
+        }
+        for (int session = 0; session < 2; ++session) {
+            Capture capture;
+            capture.begin();
+            {
+                nacelle::profile::Scope root("Concurrent compiler metadata");
+                require(root.needsCompilerConfiguration(), "Compiler metadata is capture-local");
+                std::vector<std::jthread> workers;
+                for (int worker = 0; worker < 4; ++worker) {
+                    workers.emplace_back([context = root.context(), worker] {
+                        nacelle::profile::Scope child(context, "Compiler metadata worker");
+                        if (child.needsCompilerConfiguration()) {
+                            const auto hash = "compiler-" + std::to_string(worker);
+                            nacelle::profile::setCompilerConfiguration(
+                                hash, hash + "-triple", hash + "-cpu", {hash + "-feature"});
+                        }
+                    });
+                }
+                for (auto& worker : workers) worker.join();
+                require(!root.needsCompilerConfiguration(), "Reuse recorded compiler configuration");
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory /
+                ("compiler-metadata-" + std::to_string(session) + ".nacelle-profile");
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                    "Save concurrent compiler metadata");
+            const auto profile = read(path);
+            const auto& build = profile.manifest.build;
+            require(build.compilerHash.starts_with("compiler-") &&
+                    build.targetTriple == build.compilerHash + "-triple" &&
+                    build.cpu == build.compilerHash + "-cpu" &&
+                    build.cpuFeatures == std::vector<std::string>{build.compilerHash + "-feature"},
+                    "Concurrent callers publish one consistent compiler configuration");
+        }
+        {
             Capture cancelled;
             cancelled.begin();
             NACELLE_PROFILE_SCOPE("Cancelled event");

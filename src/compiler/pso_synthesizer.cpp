@@ -4262,7 +4262,7 @@ bool compileGraphicsPSO(
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     profile::Scope compileProfile("Compile graphics PSO");
     compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Graphics, 1, profile::Cache::Miss});
-    if (compileProfile.enabled()) recordProfileCompilerConfiguration();
+    if (compileProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
 #endif
     const bool hasMS = (meshStages.MS.pShaderBytecode && meshStages.MS.BytecodeLength > 0);
     bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&

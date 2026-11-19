@@ -2246,7 +2246,7 @@ bool compileComputePSO(
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     profile::Scope compileProfile("Compile compute PSO");
     compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Compute, 1});
-    if (compileProfile.enabled()) recordProfileCompilerConfiguration();
+    if (compileProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
 #endif
     std::string hex = hashToHex128(lo, hi);
     std::string symbolName = "nacelle_cs_" + hex;
