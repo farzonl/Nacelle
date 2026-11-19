@@ -7,6 +7,58 @@ trace JSON (timestamps/durations in **microseconds**, despite manifest clock
 timestamps being specified in nanoseconds). No replay or custom flamegraph.
 Empty shader metadata and empty traces are supported.
 
+## Local filters and Speedscope export
+
+Apply process/thread, case-insensitive PSO-substring, stage and optional
+microsecond time-window filters to the paginated tables. Bounds are inclusive:
+any intersecting span is selected at its full original duration, not clipped.
+Filtering can hide parents. The separate filter count does not replace capture
+completeness or dropped-event warnings. **Export Chrome trace JSON** always
+preserves the entire original decoded trace, irrespective of active filters.
+
+**Export filtered Speedscope profile** produces a local download using the
+[Speedscope evented format](https://github.com/jlfwong/speedscope/blob/v1.25.0/src/lib/file-format-spec.ts).
+For offline interactive navigation, install a fixed release while online, then
+open the downloaded profile locally:
+
+```sh
+npm install --global speedscope@1.25.0
+speedscope ./nacelle-speedscope.json
+```
+
+The CLI starts its own local viewer. Speedscope's Time Order, Left Heavy and
+Sandwich views provide established zoom/search/thread-navigation/flamegraph
+tooling; no renderer is implemented here. No viewer dependency or remote handoff
+is added to Nacelle, and its CSP and asset-only deployment remain unchanged.
+Do not upload private captures to a hosted viewer.
+
+Each recorded process/thread becomes an evented profile in **microseconds**,
+with shared selected-trace time bounds, original timestamps, gaps and durations.
+Frame labels include available category/PSO/stage/SIMD/tier/code-version data.
+Nesting represents temporal containment on that recorded thread, **not HLSL call
+stacks or CPU samples**. Asynchronous parent IDs do not create cross-thread call
+stacks. Inclusive nested durations and different thread profiles must not be
+summed as CPU time. Incomplete/filtered status is included in exported names.
+Zero-duration spans are preserved. Empty selections disable this export.
+
+Speedscope requires properly nested per-thread intervals: crossing overlaps
+produce an explicit export error, never dropped spans, clipped durations or
+fabricated nesting. Tables and unchanged Chrome export remain available.
+Exports above 256 MiB are rejected. Conversion/serialization is synchronous;
+large bounded captures may briefly occupy the browser.
+Validation covers nested/equal-start/zero-duration spans, crossing rejection,
+incomplete captures, filter/export isolation, and a 100,000-span conversion.
+An actual native capture was exported and opened in locally served Speedscope
+1.25.0 with the browser offline, without external requests or viewer storage.
+
+This is the export-first increment for #216, not an embedded timeline UI.
+[Perfetto's embedding API](https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui)
+was also evaluated: it supports richer Chrome-trace exploration but requires a
+separately self-hosted application or an explicitly consented external handoff.
+Speedscope's documented offline CLI and evented format were selected for this
+bounded increment. Bundled offline UI integration remains future work; neither
+hosted Perfetto nor hosted Speedscope is contacted by this viewer.
+
 ## Build and test
 
 Requires Node.js 22 and npm:

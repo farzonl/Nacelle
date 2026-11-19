@@ -1,7 +1,7 @@
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
 body { margin: 0; }
 main { max-width: 90rem; margin: auto; padding: 1.5rem; }
-button, input { font: inherit; margin: .4rem 0; padding: .4rem; }
+button, input, select { font: inherit; margin: .4rem 0; padding: .4rem; }
 button { cursor: pointer; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 section { margin-block: 1.5rem; overflow-x: auto; }

@@ -16,8 +16,22 @@
         <h2>Capture summary</h2>
         <pre id="summary"></pre>
         <button id="export" type="button" disabled>Export Chrome trace JSON</button>
+        <button id="export-speedscope" type="button" disabled>Export filtered Speedscope profile</button>
+        <p id="export-status" role="status" aria-live="polite"></p>
         <h2>Timing spans by process and thread</h2>
         <p>Times and durations are in microseconds (Chrome trace units). Overlapping spans are listed independently, not summed.</p>
+        <p>Speedscope export is for a locally installed viewer, not an upload. Nesting represents time containment on a recorded thread, not HLSL call stacks or additive CPU time. The original Chrome export always contains the entire unchanged trace.</p>
+        <form id="filters">
+          <label>Thread <select id="thread-filter"><option value="">All threads</option></select></label>
+          <label>PSO contains <input id="pso-filter" type="text"></label>
+          <label>Stage <select id="stage-filter"><option value="">All stages</option></select></label>
+          <label>Start (µs) <input id="start-filter" type="number" step="any"></label>
+          <label>End (µs) <input id="end-filter" type="number" step="any"></label>
+          <button type="submit">Apply filters</button>
+          <button id="clear-filters" type="button">Clear filters</button>
+        </form>
+        <p>Time filters select intersecting spans, including boundaries; they do not clip durations. Filtering may hide parent scopes.</p>
+        <p id="filter-status" role="status" aria-live="polite"></p>
         <div id="threads"></div>
         <button id="more" type="button" hidden>Show more spans</button>
       </section>

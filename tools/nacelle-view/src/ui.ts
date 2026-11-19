@@ -1,6 +1,7 @@
 import { FileProfileDataSource } from './file-source';
-import { loadProfile, type Profile, type ProfileDataSource } from './profile';
-import { captureStatus, groupThreads, summaryText, type ThreadGroup } from './presentation';
+import { LIMITS, loadProfile, requireValid, type Profile, type ProfileDataSource } from './profile';
+import { captureStatus, filterThreads, groupThreads, summaryText, type SpanFilter, type ThreadGroup } from './presentation';
+import { speedscopeProfile } from './speedscope';
 
 export function mountViewer(
   root: Document,
@@ -12,9 +13,20 @@ export function mountViewer(
   const summary = root.querySelector<HTMLElement>('#summary')!;
   const threads = root.querySelector<HTMLElement>('#threads')!;
   const exportButton = root.querySelector<HTMLButtonElement>('#export')!;
+  const speedscopeButton = root.querySelector<HTMLButtonElement>('#export-speedscope')!;
+  const exportStatus = root.querySelector<HTMLElement>('#export-status')!;
+  const filterForm = root.querySelector<HTMLFormElement>('#filters')!;
+  const threadFilter = root.querySelector<HTMLSelectElement>('#thread-filter')!;
+  const psoFilter = root.querySelector<HTMLInputElement>('#pso-filter')!;
+  const stageFilter = root.querySelector<HTMLSelectElement>('#stage-filter')!;
+  const startFilter = root.querySelector<HTMLInputElement>('#start-filter')!;
+  const endFilter = root.querySelector<HTMLInputElement>('#end-filter')!;
+  const filterStatus = root.querySelector<HTMLElement>('#filter-status')!;
   const more = root.querySelector<HTMLButtonElement>('#more')!;
   let current: Profile | undefined;
+  let allGroups: ThreadGroup[] = [];
   let groups: ThreadGroup[] = [];
+  let filtered = false;
   let generation = 0;
   let shown = 0;
   let total = 0;
@@ -24,6 +36,41 @@ export function mountViewer(
     node.textContent = text;
     return node;
   };
+
+  function option(select: HTMLSelectElement, value: string, label: string): void {
+    const item = element('option', label);
+    item.value = value;
+    select.append(item);
+  }
+
+  function applyFilters(): void {
+    if (!current) return;
+    threads.replaceChildren();
+    shown = 0;
+    total = 0;
+    groups = [];
+    more.hidden = true;
+    speedscopeButton.disabled = true;
+    exportStatus.textContent = '';
+    try {
+      const filter: SpanFilter = {
+        thread: threadFilter.value, pso: psoFilter.value.trim(), stage: stageFilter.value,
+        start: startFilter.value === '' ? undefined : Number(startFilter.value),
+        end: endFilter.value === '' ? undefined : Number(endFilter.value),
+      };
+      groups = filterThreads(allGroups, filter);
+      filtered = Boolean(filter.thread || filter.pso || filter.stage
+        || filter.start !== undefined || filter.end !== undefined);
+      total = groups.reduce((count, group) => count + group.spans.length, 0);
+      const original = allGroups.reduce((count, group) => count + group.spans.length, 0);
+      filterStatus.textContent = `${total} of ${original} timing spans match. Durations remain inclusive wall time, not CPU time.`;
+      speedscopeButton.disabled = total === 0;
+      if (!total) threads.append(element('p', 'No timing spans match the current filters.'));
+      showNext();
+    } catch (error) {
+      filterStatus.textContent = `Invalid filters: ${error instanceof Error ? error.message : 'Unable to filter spans.'}`;
+    }
+  }
 
   function showNext(): void {
     const start = shown;
@@ -69,10 +116,19 @@ export function mountViewer(
     if (!file) return;
     const request = ++generation;
     current = undefined;
+    allGroups = [];
     groups = [];
     shown = 0;
     total = 0;
     exportButton.disabled = true;
+    speedscopeButton.disabled = true;
+    exportStatus.textContent = '';
+    filterStatus.textContent = '';
+    filterForm.reset();
+    threadFilter.replaceChildren();
+    stageFilter.replaceChildren();
+    option(threadFilter, '', 'All threads');
+    option(stageFilter, '', 'All stages');
     panel.hidden = true;
     more.hidden = true;
     summary.textContent = '';
@@ -87,15 +143,22 @@ export function mountViewer(
       const profile = await loadProfile(source);
       if (request !== generation) return;
       current = profile;
-      groups = groupThreads(profile.trace);
-      total = groups.reduce((count, group) => count + group.spans.length, 0);
+      allGroups = groupThreads(profile.trace);
+      const stages = new Set<string>();
+      for (const group of allGroups) {
+        option(threadFilter, `${group.pid}:${group.tid}`,
+          `Process ${group.pid} / Thread ${group.tid}${group.name ? ` — ${group.name}` : ''}`);
+        for (const span of group.spans) {
+          if (typeof span.args.stage === 'string' && span.args.stage) stages.add(span.args.stage);
+        }
+      }
+      for (const stage of [...stages].sort()) option(stageFilter, stage, stage);
       summary.textContent = summaryText(profile);
       status.textContent = captureStatus(profile);
       status.dataset.state = profile.manifest.complete && !profile.manifest.droppedEvents ? 'complete' : 'incomplete';
       panel.hidden = false;
       exportButton.disabled = false;
-      if (!total) threads.append(element('p', 'No timing spans in this capture.'));
-      showNext();
+      applyFilters();
     } catch (error) {
       if (request !== generation) return;
       status.textContent = `Invalid profile: ${error instanceof Error ? error.message : 'Unable to decode archive.'}`;
@@ -105,16 +168,40 @@ export function mountViewer(
     }
   });
 
+  filterForm.addEventListener('submit', event => {
+    event.preventDefault();
+    applyFilters();
+  });
+  root.querySelector<HTMLButtonElement>('#clear-filters')!.addEventListener('click', () => {
+    filterForm.reset();
+    applyFilters();
+  });
   more.addEventListener('click', showNext);
-  exportButton.addEventListener('click', () => {
-    if (!current) return;
-    const url = URL.createObjectURL(new Blob([current.traceBytes], { type: 'application/json' }));
+  function download(blob: Blob, name: string): void {
+    const url = URL.createObjectURL(blob);
     const link = root.createElement('a');
     link.href = url;
-    link.download = 'nacelle-trace.json';
+    link.download = name;
     root.body.append(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  exportButton.addEventListener('click', () => {
+    if (!current) return;
+    download(new Blob([current.traceBytes], { type: 'application/json' }), 'nacelle-trace.json');
+  });
+  speedscopeButton.addEventListener('click', () => {
+    if (!current || !total) return;
+    exportStatus.textContent = '';
+    try {
+      const json = JSON.stringify(speedscopeProfile(current, groups, filtered));
+      const blob = new Blob([json], { type: 'application/json' });
+      requireValid(blob.size <= LIMITS.entry, 'Speedscope export exceeds the 256 MiB size limit.');
+      download(blob, 'nacelle-speedscope.json');
+      exportStatus.textContent = 'Saved a local Speedscope profile. Open it in your locally installed Speedscope viewer; nothing was uploaded.';
+    } catch (error) {
+      exportStatus.textContent = `Speedscope export failed: ${error instanceof Error ? error.message : 'Unable to export spans.'}`;
+    }
   });
 }
