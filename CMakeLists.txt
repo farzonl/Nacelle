@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(NACELLE_ENABLE_INSTRUMENTATION "Compile optional offline profiling hooks" OFF)
+option(NACELLE_BUILD_PROFILE_TOOLS "Build offline profile inspection tools" OFF)
+option(NACELLE_BUILD_PROFILE_TESTS "Build profile capture and format tests" OFF)
+if(NACELLE_ENABLE_INSTRUMENTATION OR NACELLE_BUILD_PROFILE_TOOLS OR NACELLE_BUILD_PROFILE_TESTS)
+    include(cmake/ProfileTools.cmake)
+    nacelle_add_profile_support()
+endif()
+
 # Auto-detect LLVM/MLIR if not explicitly provided
 if(NOT LLVM_DIR)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.toolchains/llvm/lib/cmake/llvm/LLVMConfig.cmake" AND
@@ -467,6 +475,21 @@ elseif(APPLE)
 endif()
 
 # 5. CLI Tools
+if(NACELLE_ENABLE_INSTRUMENTATION)
+    target_compile_definitions(nacelle_objs PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
+    target_compile_definitions(nacelle_d3d12 PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
+    target_link_libraries(nacelle PUBLIC nacelle_profile_capture)
+    target_link_libraries(nacelle_d3d12 PUBLIC nacelle_profile_capture)
+    target_compile_definitions(nacelle_profile_capture PRIVATE NACELLE_PROFILE_EXPORTS=1)
+endif()
+if(NACELLE_BUILD_PROFILE_TOOLS)
+    add_subdirectory(tools/nacelle-dbg)
+endif()
+if(NACELLE_BUILD_PROFILE_TESTS)
+    enable_testing()
+    nacelle_add_profile_tests()
+endif()
+
 add_executable(nacelle-compile tools/nacelle_compile.cpp)
 nacelle_apply_lto_pgo(nacelle-compile)
 target_include_directories(nacelle-compile PRIVATE

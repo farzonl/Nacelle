@@ -108,6 +108,9 @@ struct CachedPSOMeta {
 
 /// Computes canonical 128-bit XXH3 hash (hex string + hi/lo) for compute or graphics PSO inputs.
 const char* getCompilerBuildHash();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+void recordProfileCompilerConfiguration();
+#endif
 std::string hashToHex128(uint64_t lo, uint64_t hi);
 void computeComputePSOHash(
     const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc,

@@ -133,6 +133,9 @@ inline std::filesystem::path getCacheDirectory() {
     };
     if (auto overrideDir = getEnv("NACELLE_CACHE_DIR"); overrideDir && !overrideDir->empty()) {
         std::filesystem::path p(*overrideDir);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        p /= "profile-v1";
+#endif
         if (tryUse(p)) return p;
     }
     std::filesystem::path candidate;
@@ -147,10 +150,16 @@ inline std::filesystem::path getCacheDirectory() {
         candidate = std::filesystem::path(*home) / ".cache" / "nacelle";
     }
 #endif
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (!candidate.empty()) candidate /= "profile-v1";
+#endif
     if (!candidate.empty() && tryUse(candidate)) {
         return candidate;
     }
     std::filesystem::path fallback = std::filesystem::temp_directory_path() / "nacelle";
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    fallback /= "profile-v1";
+#endif
     std::error_code ec;
     std::filesystem::create_directories(fallback, ec);
     return fallback;

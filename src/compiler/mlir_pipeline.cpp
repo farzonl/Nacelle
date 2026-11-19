@@ -1,4 +1,5 @@
 #include "mlir_pipeline.h"
+#include "../instrumentation/capture.h"
 
 #include <llvm/IR/Module.h>
 #include <mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h>
@@ -158,6 +159,7 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
     mlir::MLIRContext& mlirCtx,
     std::string& outError,
     const std::string& extraEntryName) {
+    NACELLE_PROFILE_SCOPE("Import and lift DXIL to MLIR");
     configureNacelleMLIRContext(mlirCtx);
 
     auto mlirMod = mlir::translateLLVMIRToModule(std::move(llvmModule), &mlirCtx);

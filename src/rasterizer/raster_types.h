@@ -10,6 +10,7 @@
 
 #include "../compiler/shader_compiler.h"
 #include "rasterizer.h"
+#include "../instrumentation/capture.h"
 
 namespace nacelle {
 
@@ -50,7 +51,13 @@ inline void parallelForDynamic(BS::thread_pool<>& pool, IndexT count, Fn&& fn) {
     const size_t workers = std::min<size_t>(static_cast<size_t>(count), poolThreads);
     const IndexT grain = std::max<IndexT>(1, static_cast<IndexT>(count / (workers * 4)));
     std::atomic<IndexT> nextIdx{0};
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto workerContext = profile::captureContext();
+#endif
     auto workerLoop = [&]() {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        profile::Scope workerProfile(workerContext, "Raster worker");
+#endif
         while (true) {
             IndexT begin = nextIdx.fetch_add(grain, std::memory_order_relaxed);
             if (begin >= count) break;

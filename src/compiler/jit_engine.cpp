@@ -1,4 +1,5 @@
 #include "jit_engine.h"
+#include "../instrumentation/capture.h"
 #include "../rasterizer/raytracing_bvh.h"
 
 #include <algorithm>
@@ -82,6 +83,21 @@
 #endif
 
 namespace nacelle {
+
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+void recordProfileCompilerConfiguration() {
+    static const std::vector<std::string> features = [] {
+        std::vector<std::string> result;
+        for (const auto& feature : llvm::sys::getHostCPUFeatures()) {
+            if (feature.second) result.push_back(feature.first().str());
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    }();
+    profile::setCompilerConfiguration(getCompilerBuildHash(), getHostTargetTripleString(),
+                                      llvm::sys::getHostCPUName().str(), features);
+}
+#endif
 
 enum class GemmBackend : uint8_t {
     Accelerate,
@@ -642,6 +658,7 @@ bool emitObjectBytesO3(
     llvm::Module& mod,
     llvm::SmallVectorImpl<char>& outObjBytes,
     std::string& outError) {
+    NACELLE_PROFILE_SCOPE("Optimize and emit Tier 2 object");
     if (!linkRuntimeBitcodeAndInline(mod, outError)) {
         return false;
     }
@@ -714,6 +731,7 @@ bool emitObjectBytesO3(
 }
 
 void runTier1Optimize(llvm::Module& mod) {
+    NACELLE_PROFILE_SCOPE("Optimize Tier 1");
     llvm::FunctionAnalysisManager fam;
 
 #if LLVM_VERSION_MAJOR >= 24
@@ -1339,6 +1357,7 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
     llvm::LLVMContext& llvmCtx,
     std::string& outError,
     bool linkRuntime) {
+    NACELLE_PROFILE_SCOPE("Lower MLIR and translate to LLVM");
     mlir::PassManager pm(mlirMod.getContext());
     pm.addPass(mlir::createSCFToControlFlowPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
@@ -1770,7 +1789,8 @@ bool jitCompileComputeTier1AndScheduleTier2(
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
 
-    ensureTier2PoolReady(rt).detach_task([box, meta, symbolName, cacheDir, hex, bcStr = std::move(bcStr)]() mutable {
+    ensureTier2PoolReady(rt).detach_task([box, meta, symbolName, cacheDir, hex, bcStr = std::move(bcStr) NACELLE_PROFILE_CAPTURE_CONTEXT]() mutable {
+        NACELLE_PROFILE_ASYNC_SCOPE("Compute Tier 2");
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
         auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
         auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -1896,7 +1916,8 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
 
-    ensureTier2PoolReady(rt).detach_task([box, meta, vsSym, psSym, cacheDir, hex, bcStr = std::move(bcStr)]() mutable {
+    ensureTier2PoolReady(rt).detach_task([box, meta, vsSym, psSym, cacheDir, hex, bcStr = std::move(bcStr) NACELLE_PROFILE_CAPTURE_CONTEXT]() mutable {
+        NACELLE_PROFILE_ASYNC_SCOPE("Graphics Tier 2");
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
         auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
         auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -2032,7 +2053,8 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
 
     if (launchedTier2) {
-        ensureTier2PoolReady(rt).detach_task([vsMeta, vsHashLo, vsHashHi, vsSym, cacheDir, vsHex, vsKey, bcStr = std::move(bcStr)]() mutable {
+        ensureTier2PoolReady(rt).detach_task([vsMeta, vsHashLo, vsHashHi, vsSym, cacheDir, vsHex, vsKey, bcStr = std::move(bcStr) NACELLE_PROFILE_CAPTURE_CONTEXT]() mutable {
+            NACELLE_PROFILE_ASYNC_SCOPE("Vertex Tier 2");
             auto ctx2 = std::make_unique<llvm::LLVMContext>();
             auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, vsHex + ".bc", false);
             auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -2160,7 +2182,8 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
 
     std::string hex = hashToHex128(outPSO.cacheHashLo, outPSO.cacheHashHi);
 
-    ensureTier2PoolReady(rt).detach_task([box, meta, psSym, cacheDir, hex, vsKey, bcStr = std::move(bcStr)]() mutable {
+    ensureTier2PoolReady(rt).detach_task([box, meta, psSym, cacheDir, hex, vsKey, bcStr = std::move(bcStr) NACELLE_PROFILE_CAPTURE_CONTEXT]() mutable {
+        NACELLE_PROFILE_ASYNC_SCOPE("Pixel Tier 2");
         auto ctx2 = std::make_unique<llvm::LLVMContext>();
         auto buf = llvm::MemoryBuffer::getMemBuffer(bcStr, hex + ".bc", false);
         auto modOrErr = llvm::parseBitcodeFile(buf->getMemBufferRef(), *ctx2);
@@ -2220,12 +2243,27 @@ bool compileComputePSO(
     outPSO.cacheHashLo = lo;
     outPSO.cacheHashHi = hi;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope compileProfile("Compile compute PSO");
+    compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Compute, 1});
+    if (compileProfile.enabled()) recordProfileCompilerConfiguration();
+#endif
     std::string hex = hashToHex128(lo, hi);
     std::string symbolName = "nacelle_cs_" + hex;
 
     if (tryLoadComputePSOFromCache(lo, hi, symbolName, outPSO)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        auto attributes = compileProfile.attributes();
+        attributes.cache = profile::Cache::Hit;
+        compileProfile.setAttributes(attributes);
+#endif
         return true;
     }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    auto attributes = compileProfile.attributes();
+    attributes.cache = profile::Cache::Miss;
+    compileProfile.setAttributes(attributes);
+#endif
 
     const char* profEnv = std::getenv("NACELLE_PROFILE_COMPILE");
     const bool profileCompile = profEnv && profEnv[0] == '1';

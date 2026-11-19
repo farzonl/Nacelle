@@ -21,6 +21,11 @@
 
 ## Overview
 
+Optional [offline shader/runtime profiling](tools/nacelle-dbg/README.md) provides
+local `.nacelle-profile` capture, Chrome Trace export, and a
+[static profile viewer](tools/nacelle-view/README.md). Instrumentation is OFF by
+default; debugging, replay, heatmaps, and differential testing are not yet included.
+
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 
 Instead of interpreting bytecode or translating shaders through lossy intermediate APIs (SPIR-V, Metal, or OpenGL), Nacelle ingests native **Shader Model 6.x DXIL** directly, lifts unstructured LLVM 3.7 bitcode into structured **MLIR**, packetizes scalar SIMT threads into wide host SIMD lanes (`AVX-512`, `AVX2`, `ARM64 NEON`), fuses fixed-function graphics state into monolithic **Uber-PSOs**, and JIT-compiles machine code via **LLVM ORC `LLJIT`**.

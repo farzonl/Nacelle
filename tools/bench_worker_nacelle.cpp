@@ -1,5 +1,9 @@
 #include "bench_common.h"
 #include "bench_nacelle_runners.h"
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include <nacelle/instrumentation.h>
+#include <cstdlib>
+#endif
 
 #include <cstdint>
 #include <string>
@@ -8,7 +12,15 @@
 using namespace nacelle_bench;
 
 int main(int argc, char** argv) {
-    return runWorkerMain(argc, argv, [](const BenchmarkSpec& spec, const WorkerCliArgs& args) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const char* profilePath = std::getenv("NACELLE_PROFILE_OUTPUT");
+    NacelleProfileCapture* capture = nullptr;
+    if (profilePath && *profilePath) {
+        NacelleProfileOptions options;
+        if (FAILED(NacelleBeginProfileCapture(&options, &capture))) return 1;
+    }
+#endif
+    const int result = runWorkerMain(argc, argv, [](const BenchmarkSpec& spec, const WorkerCliArgs& args) {
         std::vector<BenchRunResult> out;
         uint32_t w = 4;
         if (args.singleBackend.rfind("nacelle-w", 0) == 0) {
@@ -42,4 +54,17 @@ int main(int argc, char** argv) {
         }
         return out;
     });
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (capture) {
+        NacelleProfileSummary summary;
+        const HRESULT status = NacelleEndProfileCapture(capture, profilePath, &summary);
+        NacelleDestroyProfileCapture(capture);
+        if (status != S_OK) {
+            std::fprintf(stderr, "[NacelleProfile] Capture failed or incomplete (%llu dropped)\n",
+                         static_cast<unsigned long long>(summary.dropped_events));
+            return 1;
+        }
+    }
+#endif
+    return result;
 }

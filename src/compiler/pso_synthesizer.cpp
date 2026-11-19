@@ -1,4 +1,5 @@
 #include "pso_synthesizer.h"
+#include "../instrumentation/capture.h"
 
 #include <algorithm>
 #include <cctype>
@@ -4258,6 +4259,11 @@ bool compileGraphicsPSO(
     outPSO.cacheHashLo = lo;
     outPSO.cacheHashHi = hi;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope compileProfile("Compile graphics PSO");
+    compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Graphics, 1, profile::Cache::Miss});
+    if (compileProfile.enabled()) recordProfileCompilerConfiguration();
+#endif
     const bool hasMS = (meshStages.MS.pShaderBytecode && meshStages.MS.BytecodeLength > 0);
     bool hasTess = !hasMS && (desc.HS.pShaderBytecode && desc.HS.BytecodeLength > 0 &&
                               desc.DS.pShaderBytecode && desc.DS.BytecodeLength > 0);
@@ -4328,6 +4334,12 @@ bool compileGraphicsPSO(
         std::string vsSym = "nacelle_vs_" + hashToHex128(vsHashLo, vsHashHi);
 
         if (tryLoadGraphicsPSOFromCache(lo, hi, vsSym, psSym, outPSO)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            auto attributes = compileProfile.attributes();
+            attributes.cache = profile::Cache::Hit;
+            attributes.tier = 2;
+            compileProfile.setAttributes(attributes);
+#endif
             return true;
         }
 

@@ -1,0 +1,22 @@
+{
+  "name": "nacelle-view",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "stage": "node scripts/stage.mjs"
+  },
+  "dependencies": {
+    "fflate": "0.8.3",
+    "fzstd": "0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "jsdom": "26.1.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.6",
+    "vitest": "4.1.12"
+  }
+}

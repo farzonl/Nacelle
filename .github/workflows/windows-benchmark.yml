@@ -454,6 +454,24 @@ jobs:
           path: .bench-cache
           key: bench-history-${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Set up Node for profile viewer
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/nacelle-view/package-lock.json
+
+      - name: Build, test, and stage offline profile viewer
+        working-directory: tools/nacelle-view
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run stage -- ../../_site
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 

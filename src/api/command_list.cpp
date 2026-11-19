@@ -1,4 +1,5 @@
 #include "command_list.h"
+#include "../instrumentation/capture.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1011,6 +1012,12 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     CompiledComputeFn fn = cpso->fn.load(std::memory_order_acquire);
     if (!fn || gx == 0 || gy == 0 || gz == 0) return;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope dispatchProfile("Compute dispatch");
+    dispatchProfile.setAttributes({cpso->cacheHashLo, cpso->cacheHashHi, cpso->simdWidth,
+                                   profile::Stage::Compute});
+    const auto dispatchContext = dispatchProfile.context();
+#endif
     const DriverRootContext ctxSnapshot = state.computeCtx;
     if (cpso->singleGroupDispatch) {
         ScopedFlushDenormals flushDenorms;
@@ -1022,6 +1029,9 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     const uint32_t scratchSize = std::max<uint32_t>(64, cpso->groupSharedBytes);
 
     auto runRange = [&](uint64_t begin, uint64_t end) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        profile::Scope workerProfile(dispatchContext, "Compute worker");
+#endif
         ScopedFlushDenormals flushDenorms;
         thread_local std::vector<uint8_t> tlScratch;
         if (tlScratch.size() < scratchSize) tlScratch.resize(scratchSize);

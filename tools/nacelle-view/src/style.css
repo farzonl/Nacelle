@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+body { margin: 0; }
+main { max-width: 90rem; margin: auto; padding: 1.5rem; }
+button, input { font: inherit; margin: .4rem 0; padding: .4rem; }
+button { cursor: pointer; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+section { margin-block: 1.5rem; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+th, td { padding: .5rem; text-align: left; vertical-align: top; border: 1px solid #888; overflow-wrap: anywhere; max-width: 30rem; }
+caption { text-align: left; }
+#status { padding: .75rem; border: 2px solid #888; }
+#status[data-state="invalid"], #status[data-state="incomplete"] { border-color: #b76b00; font-weight: bold; }

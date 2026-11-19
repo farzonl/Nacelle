@@ -1,4 +1,5 @@
 #include "dxil_loader.h"
+#include "../instrumentation/capture.h"
 
 #include <algorithm>
 #include <cstring>
@@ -837,6 +838,7 @@ bool loadAndUpgradeDXIL(
     llvm::LLVMContext& llvmCtx,
     DxilLoadedShader& outShader,
     std::string& outError) {
+    NACELLE_PROFILE_SCOPE("Load and upgrade DXIL");
     return loadAndUpgradeDXILImpl(bytecode, {}, llvmCtx, outShader, outError);
 }
 
@@ -846,6 +848,7 @@ bool loadAndUpgradeDXILLibraryExport(
     llvm::LLVMContext& llvmCtx,
     DxilLoadedShader& outShader,
     std::string& outError) {
+    NACELLE_PROFILE_SCOPE("Load DXIL library export");
     return loadAndUpgradeDXILImpl(bytecode, exportName, llvmCtx, outShader, outError);
 }
 

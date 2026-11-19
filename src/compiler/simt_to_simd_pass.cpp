@@ -1,4 +1,5 @@
 #include "simt_to_simd_pass.h"
+#include "../instrumentation/capture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9691,6 +9692,7 @@ bool packetizeComputeEntry(
     const std::string& symbolName,
     std::string& outError,
     bool* outSingleGroupFastPath) {
+    NACELLE_PROFILE_SCOPE("Packetize compute entry");
     auto srcFunc = mod.lookupSymbol<mlir::func::FuncOp>(shader.entryName);
     if (!srcFunc || srcFunc.getBody().empty()) {
         outError = "Source compute func.func not found: " + shader.entryName;

@@ -1261,6 +1261,14 @@ void executeRasterDrawCall(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const DrawCallParams& draw) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope drawProfile("Graphics draw");
+    if (state.pso && state.pso->graphicsPSO()) {
+        const auto& pso = *state.pso->graphicsPSO();
+        drawProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
+                                   profile::Stage::Graphics});
+    }
+#endif
     thread_local RasterScene scene;
     thread_local std::vector<TileBin> bins;
     if (!buildRasterScene(pool, state, draw, scene, &bins)) return;
@@ -1273,6 +1281,14 @@ void executeRasterMeshDispatch(
     BS::thread_pool<>& pool,
     const GraphicsExecutionState& state,
     const MeshDispatchParams& dispatch) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope dispatchProfile("Mesh dispatch");
+    if (state.pso && state.pso->graphicsPSO()) {
+        const auto& pso = *state.pso->graphicsPSO();
+        dispatchProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
+                                       profile::Stage::Mesh});
+    }
+#endif
     RasterScene scene;
     std::vector<TileBin> bins;
     if (!buildMeshRasterScene(pool, state, dispatch, scene, &bins)) return;
