@@ -1,5 +1,5 @@
-#include "bench_common.h"
-#include "bench_memory.h"
+#include "common/bench_common.h"
+#include "common/bench_memory.h"
 #include "metal_bench.h"
 
 #include <algorithm>

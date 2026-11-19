@@ -1,18 +1,18 @@
 #pragma once
 
-#include "bench_memory.h"
-#include "bench_types.h"
-#include "bench_gdeflate.h"
-#include "bench_bcn_textures.h"
-#include "bench_rt_scene.h"
+#include "common/bench_memory.h"
+#include "common/bench_types.h"
+#include "workloads/gdeflate.h"
+#include "workloads/bcn_textures.h"
+#include "workloads/rt_scene.h"
 
 #include <chrono>
 #include <cstring>
 #include <vector>
 
 #include <nacelle/nacelle.h>
-#include "../src/compiler/jit_engine.h"
-#include "../src/compiler/shader_compiler.h"
+#include "compiler/jit_engine.h"
+#include "compiler/shader_compiler.h"
 
 namespace nacelle_bench {
 

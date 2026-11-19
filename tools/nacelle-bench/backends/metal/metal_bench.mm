@@ -1,6 +1,6 @@
 #include "metal_bench.h"
-#include "bench_common.h"
-#include "bench_types.h"
+#include "common/bench_common.h"
+#include "common/bench_types.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

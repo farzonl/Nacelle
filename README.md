@@ -314,7 +314,11 @@ Nacelle/
 │   ├── rasterizer/        # SIMD geometry pipe, 32x32 sort-middle tile binner, quad rasterizer & RT BVH
 │   ├── runtime_bc/        # Freestanding C++20 texture sampler & SIMD math compiled to embedded LLVM bitcode
 │   └── common/            # Format conversion, FP environment & POSIX SAL compatibility
-├── tools/                 # nacelle-compile & nacelle-bench cross-rasterizer benchmark suite
+├── tools/
+│   ├── nacelle-bench/     # Cross-rasterizer benchmark harness, workloads & isolated backend workers
+│   ├── nacelle-compile/   # Standalone DXIL -> MLIR/LLVM AOT inspection CLI
+│   ├── nacelle-dbg/       # Offline profile inspection CLI
+│   └── nacelle-view/      # Static web profile viewer
 ├── apps/                  # nacelle_viewer (interactive SDL3 + headless D3D12 app)
 ├── pages/                 # Live GitHub Pages dashboards (Offload compliance & benchmarks)
 └── tests/                 # Unit, compiler FileCheck, rendering, and D3D12 conformance tests

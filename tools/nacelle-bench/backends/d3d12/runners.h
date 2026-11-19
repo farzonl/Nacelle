@@ -1,9 +1,9 @@
 #pragma once
 
-#include "bench_types.h"
-#include "bench_common.h"
-#include "bench_bcn_textures.h"
-#include "bench_rt_scene.h"
+#include "common/bench_types.h"
+#include "common/bench_common.h"
+#include "workloads/bcn_textures.h"
+#include "workloads/rt_scene.h"
 
 #if defined(_WIN32)
 #include <windows.h>

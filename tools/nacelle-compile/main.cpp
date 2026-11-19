@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "../src/common/platform.h"
+#include "common/platform.h"
 
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -16,12 +16,12 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/IR/OwningOpRef.h>
 
-#include "../src/compiler/dxil_loader.h"
-#include "../src/compiler/jit_engine.h"
-#include "../src/compiler/mlir_pipeline.h"
-#include "../src/compiler/pso_synthesizer.h"
-#include "../src/compiler/shader_compiler.h"
-#include "../src/compiler/simt_to_simd_pass.h"
+#include "compiler/dxil_loader.h"
+#include "compiler/jit_engine.h"
+#include "compiler/mlir_pipeline.h"
+#include "compiler/pso_synthesizer.h"
+#include "compiler/shader_compiler.h"
+#include "compiler/simt_to_simd_pass.h"
 
 namespace {
 

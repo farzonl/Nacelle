@@ -1,5 +1,5 @@
-#include "bench_common.h"
-#include "bench_vulkan_runners.h"
+#include "common/bench_common.h"
+#include "runners.h"
 
 #include <cstdint>
 #include <iostream>
