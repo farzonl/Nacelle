@@ -237,6 +237,9 @@ The initial implementation is experimental. Linux x86_64 validation covers
 static/shared runtime capture with compute and graphics output checks, recorder
 lifecycle/overflow tests, native bundle interoperability, and offline browser
 upload/render/export. Windows and macOS have not been executed locally.
+Static capture tests use the `Nacelle*` entry points; shared capture tests use
+the DLL-exported `D3D12*` entry points, including on Windows, without expanding
+the runtime export surface.
 Compute-version tests additionally cover cold Tier 1, promotion on the original
 pipeline, memory/disk cache hits, delayed selection across publication, repeated
 captures, metadata limits and invalid references. Linux static/shared execution
