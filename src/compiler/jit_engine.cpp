@@ -798,6 +798,9 @@ void applyComputeMeta(const CachedPSOMeta& meta, const std::string& sym, uint64_
     outPSO.singleGroupDispatch = (meta.singleGroupDispatch != 0);
     outPSO.symbolName = sym;
     outPSO.fn.store(reinterpret_cast<CompiledComputeFn>(addr), std::memory_order_release);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    outPSO.profileEntries.initialize(reinterpret_cast<CompiledComputeFn>(addr), 2, profile::Cache::Hit);
+#endif
 }
 
 void applyGraphicsMeta(
@@ -1777,6 +1780,9 @@ bool jitCompileComputeTier1AndScheduleTier2(
 
     outPSO.symbolName = symbolName;
     outPSO.fn.store(reinterpret_cast<CompiledComputeFn>(tier1Addr), std::memory_order_release);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    outPSO.profileEntries.initialize(reinterpret_cast<CompiledComputeFn>(tier1Addr), 1, profile::Cache::Miss);
+#endif
 
     if (!scheduleTier2) {
         return true;
@@ -1824,6 +1830,9 @@ bool jitCompileComputeTier1AndScheduleTier2(
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->cs) {
             box->cs->fn.store(reinterpret_cast<CompiledComputeFn>(addr0), std::memory_order_release);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            box->cs->profileEntries.promote(reinterpret_cast<CompiledComputeFn>(addr0));
+#endif
         }
     });
 

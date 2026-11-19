@@ -1,6 +1,7 @@
 #include <nacelle/instrumentation.h>
 #include "instrumentation/capture.h"
 #include "instrumentation/profile_format.h"
+#include "compiler/shader_compiler.h"
 
 #include <miniz.h>
 
@@ -64,6 +65,64 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         require(std::filesystem::create_directory(directory), "Create test directory");
+        {
+            nacelle::ComputeEntryVersions entries;
+            const nacelle::CompiledComputeFn initial = [](const nacelle::DriverRootContext*,
+                uint8_t* result, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {
+                *result = 1;
+            };
+            const nacelle::CompiledComputeFn promoted = [](const nacelle::DriverRootContext*,
+                uint8_t* result, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {
+                *result = 2;
+            };
+            entries.initialize(initial, 1, nacelle::profile::Cache::Miss);
+            for (int session = 0; session < 2; ++session) {
+                Capture capture;
+                capture.begin();
+                {
+                    nacelle::profile::Scope root("Compute version test");
+                    std::promise<void> selected, resume;
+                    auto resumed = resume.get_future();
+                    std::jthread worker([&, context = root.context()] {
+                        const auto* snapshot = entries.load();
+                        selected.set_value();
+                        resumed.wait();
+                        uint8_t result = 0;
+                        snapshot->fn(nullptr, &result, 0, 0, 0, 1, 1, 1);
+                        require(result == snapshot->tier, "Selected callable matches immutable tier");
+                        nacelle::profile::Scope dispatch(context, "Versioned dispatch");
+                        dispatch.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute});
+                        dispatch.setComputeVersion(entries.pipelineIdentity, snapshot->version,
+                                                   snapshot->tier, snapshot->cache);
+                        nacelle::profile::Scope child(dispatch.context(), "Versioned worker");
+                    });
+                    selected.get_future().wait();
+                    if (session == 0) entries.promote(promoted);
+                    resume.set_value();
+                    worker.join();
+                    const auto* snapshot = entries.load();
+                    root.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute});
+                    root.setComputeVersion(entries.pipelineIdentity, snapshot->version,
+                                           snapshot->tier, snapshot->cache);
+                }
+                NacelleProfileSummary summary;
+                const auto path = directory /
+                    ("compute-versions-" + std::to_string(session) + ".nacelle-profile");
+                require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                        "Save selected compute entry versions");
+                const auto profile = read(path);
+                require(profile.shaders.codeVersions.size() == (session == 0 ? 2u : 1u),
+                        "Retain old versions across promotion and reset capture-local IDs");
+                for (const auto& event : profile.trace.traceEvents) {
+                    require(event.cat == "runtime" && event.args.pipelineId == 1 &&
+                            event.args.codeVersionId.has_value(),
+                            "Dispatch and worker carry capture-local pipeline and code identity");
+                    const auto& code = profile.shaders.codeVersions[*event.args.codeVersionId - 1];
+                    require(code.version == code.tier && code.cache == "miss",
+                            "Trace resolves to the actual selected entry, not the latest promotion");
+                }
+            }
+        }
         {
             Capture capture;
             capture.begin();
@@ -310,6 +369,54 @@ int main(int argc, char** argv) {
             std::string error;
             require(!nacelle::profile::readProfile(path.string(), profile, error) && !error.empty(),
                     "Reject corrupt archive explicitly");
+        }
+        {
+            nacelle::profile::Session session(1024);
+            session.shaders.codeVersions.push_back({
+                2, 1, std::string(32, 'a'), "compute", 8, 1, 1, "miss"});
+            const auto path = directory / "invalid-code-identity.nacelle-profile";
+            std::string error;
+            require(nacelle::profile::writeProfile(path.string(), session, error), error.c_str());
+            nacelle::profile::Profile profile;
+            require(!nacelle::profile::readProfile(path.string(), profile, error) &&
+                    error.find("code-version") != std::string::npos, "Reject invalid code-version IDs");
+        }
+        {
+            nacelle::profile::Session session(1024);
+            session.shaders.codeVersions.push_back({
+                1, 1, "00000000000000020000000000000001", "compute", 8, 1, 1, "miss"});
+            nacelle::profile::Event event{};
+            event.id = 1;
+            event.attributes = {1, 2, 8, nacelle::profile::Stage::Compute, 1,
+                                nacelle::profile::Cache::Miss, 1, 2};
+            session.record(event);
+            session.wait();
+            nacelle::profile::Profile profile;
+            std::string error;
+            const auto dangling = directory / "dangling-code-reference.nacelle-profile";
+            require(nacelle::profile::writeProfile(dangling.string(), session, error), error.c_str());
+            require(!nacelle::profile::readProfile(dangling.string(), profile, error) &&
+                    error.find("reference") != std::string::npos, "Reject dangling trace code references");
+            session.events[0].attributes.codeVersionId = 1;
+            session.events[0].attributes.tier = 2;
+            const auto mismatch = directory / "mismatched-code-reference.nacelle-profile";
+            require(nacelle::profile::writeProfile(mismatch.string(), session, error), error.c_str());
+            require(!nacelle::profile::readProfile(mismatch.string(), profile, error) &&
+                    error.find("match") != std::string::npos, "Reject trace/version tier mismatches");
+        }
+        {
+            Capture capture;
+            capture.begin();
+            const uint64_t pipeline = nacelle::profile::allocatePipelineIdentity();
+            for (uint32_t i = 0; i <= nacelle::profile::maxCodeVersions; ++i) {
+                nacelle::profile::Scope scope("Metadata limit");
+                scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute});
+                scope.setComputeVersion(pipeline + i, 1, 1, nacelle::profile::Cache::Miss);
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory / "code-metadata-overflow.nacelle-profile";
+            require(FAILED(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary)) &&
+                    !std::filesystem::exists(path), "Reject metadata overflow without a partial bundle");
         }
         NacelleProfileOptions invalidOptions;
         invalidOptions.flags = 1;

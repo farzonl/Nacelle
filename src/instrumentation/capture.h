@@ -6,9 +6,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
+#include "profile_format.h"
 
 namespace nacelle::profile {
 
@@ -22,7 +24,11 @@ struct Attributes {
     Stage stage;
     uint8_t tier;
     Cache cache;
+    uint64_t pipelineId = 0;
+    uint64_t codeVersionId = 0;
 };
+
+uint64_t allocatePipelineIdentity();
 
 struct Event {
     uint64_t startNs;
@@ -56,6 +62,10 @@ struct Session {
     std::atomic<bool> compilerConfigurationRecorded{false};
     std::string compilerHash, targetTriple, cpu;
     std::vector<std::string> cpuFeatures;
+    std::map<uint64_t, uint64_t> pipelineIds;
+    std::map<std::pair<uint64_t, uint32_t>, uint64_t> codeVersionIds;
+    ShaderMetadata shaders;
+    bool shaderMetadataOverflow = false;
 };
 
 struct Work {
@@ -78,6 +88,7 @@ public:
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
     void setAttributes(Attributes attributes) { if (session_) event_.attributes = attributes; }
+    void setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache);
     Attributes attributes() const { return session_ ? event_.attributes : Attributes{}; }
     bool enabled() const { return static_cast<bool>(session_); }
     bool needsCompilerConfiguration() const {

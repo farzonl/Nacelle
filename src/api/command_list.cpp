@@ -1013,13 +1013,20 @@ void execClearDSV(const CmdClearDSV& c) {
 void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx, UINT gy, UINT gz) {
     if (!state.pso || !state.pso->isCompute() || !state.pso->computePSO()) return;
     const auto& cpso = state.pso->computePSO();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto* entry = cpso->profileEntries.load();
+    CompiledComputeFn fn = entry ? entry->fn : nullptr;
+#else
     CompiledComputeFn fn = cpso->fn.load(std::memory_order_acquire);
+#endif
     if (!fn || gx == 0 || gy == 0 || gz == 0) return;
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     profile::Scope dispatchProfile("Compute dispatch");
     dispatchProfile.setAttributes({cpso->cacheHashLo, cpso->cacheHashHi, cpso->simdWidth,
                                    profile::Stage::Compute});
+    dispatchProfile.setComputeVersion(cpso->profileEntries.pipelineIdentity, entry->version,
+                                      entry->tier, entry->cache);
     if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     const auto dispatchContext = dispatchProfile.context();
 #endif

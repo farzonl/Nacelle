@@ -28,6 +28,11 @@ struct NacelleProfileCapture {
 
 namespace nacelle::profile {
 
+uint64_t allocatePipelineIdentity() {
+    static std::atomic<uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 Session::Session(uint64_t bytes)
     : generation(::generation.fetch_add(1)), bufferBytes(bytes),
       capacity(static_cast<size_t>(bytes / sizeof(Event))),
@@ -146,6 +151,33 @@ Scope::~Scope() {
 Context Scope::context() const {
     if (!session_) return {};
     return {std::make_shared<Work>(session_), event_.id, event_.attributes};
+}
+
+void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache) {
+    if (!session_) return;
+    auto& session = *session_;
+    std::lock_guard lock(session.metadataMutex);
+    auto& attributes = event_.attributes;
+    const auto key = std::make_pair(pipeline, version);
+    auto found = session.codeVersionIds.find(key);
+    if (found == session.codeVersionIds.end()) {
+        if (session.shaders.codeVersions.size() == maxCodeVersions) {
+            session.shaderMetadataOverflow = true;
+            return;
+        }
+        const auto pipelineIt =
+            session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first;
+        const uint64_t id = session.shaders.codeVersions.size() + 1;
+        constexpr const char* caches[] = {"unknown", "hit", "miss"};
+        session.shaders.codeVersions.push_back({
+            id, pipelineIt->second, formatProfileHash(attributes.hashLo, attributes.hashHi),
+            "compute", attributes.simdWidth, version, tier, caches[static_cast<unsigned>(cache)]});
+        found = session.codeVersionIds.emplace(key, id).first;
+    }
+    attributes.pipelineId = session.shaders.codeVersions[found->second - 1].pipelineId;
+    attributes.codeVersionId = found->second;
+    attributes.tier = tier;
+    attributes.cache = cache;
 }
 
 Context captureContext() { return currentScope ? currentScope->context() : Context{}; }

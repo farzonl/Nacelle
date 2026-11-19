@@ -26,6 +26,7 @@ export const LIMITS = {
   manifest: 1024 * 1024,
   entries: 16,
   events: 1_000_000,
+  codeVersions: 65_536,
 } as const;
 
 export function object(value: unknown): value is Record<string, unknown> {
@@ -98,6 +99,63 @@ export interface Profile {
   manifest: ProfileManifest;
   trace: Trace;
   traceBytes: ArrayBuffer;
+  shaders: ShaderMetadata;
+}
+
+export interface CodeVersion {
+  id: number;
+  pipelineId: number;
+  pso: string;
+  stage: 'compute';
+  simdWidth: number;
+  version: 1 | 2;
+  tier: 1 | 2;
+  cache: 'hit' | 'miss';
+}
+
+export interface ShaderMetadata {
+  schemaVersion: 1;
+  codeVersions: CodeVersion[];
+}
+
+export function validateShaderMetadata(value: unknown, trace: Trace): ShaderMetadata {
+  if (Array.isArray(value) && value.length === 0) value = { schemaVersion: 1, codeVersions: [] };
+  requireValid(object(value) && value.schemaVersion === 1 && Array.isArray(value.codeVersions)
+    && value.codeVersions.length <= LIMITS.codeVersions, 'Unsupported shader metadata schema or code-version count.');
+  const identities = new Set<string>();
+  const pipelines = new Map<number, string>();
+  for (const [index, code] of value.codeVersions.entries()) {
+    requireValid(object(code) && code.id === index + 1
+      && Number.isSafeInteger(code.pipelineId) && (code.pipelineId as number) > 0
+      && (code.pipelineId as number) <= LIMITS.codeVersions
+      && typeof code.pso === 'string' && /^[0-9a-f]{32}$/.test(code.pso)
+      && code.stage === 'compute' && Number.isSafeInteger(code.simdWidth)
+      && (code.simdWidth as number) > 0 && (code.simdWidth as number) <= 0xffffffff
+      && (code.version === 1 || code.version === 2) && (code.tier === 1 || code.tier === 2)
+      && (code.cache === 'hit' || code.cache === 'miss')
+      && (code.cache !== 'hit' || (code.tier === 2 && code.version === 1))
+      && (code.version !== 2 || code.tier === 2), 'Invalid compute code-version metadata.');
+    const identity = `${code.pipelineId}:${code.version}`;
+    const signature = `${code.pso}:${code.simdWidth}`;
+    const pipeline = code.pipelineId as number;
+    requireValid(!identities.has(identity)
+      && (!pipelines.has(pipeline) || pipelines.get(pipeline) === signature),
+    'Inconsistent compute pipeline or duplicate code-version metadata.');
+    identities.add(identity);
+    pipelines.set(pipeline, signature);
+  }
+  const shaders = value as unknown as ShaderMetadata;
+  for (const { args } of trace.traceEvents) {
+    if (args.pipelineId === undefined && args.codeVersionId === undefined) continue;
+    requireValid(Number.isSafeInteger(args.codeVersionId) && (args.codeVersionId as number) > 0
+      && (args.codeVersionId as number) <= shaders.codeVersions.length, 'Invalid trace code-version reference.');
+    const code = shaders.codeVersions[(args.codeVersionId as number) - 1];
+    requireValid(args.pipelineId === code.pipelineId && args.pso === code.pso
+      && args.stage === code.stage && args.simdWidth === code.simdWidth
+      && args.tier === code.tier && args.cache === code.cache,
+    'Trace does not match referenced compute code version.');
+  }
+  return shaders;
 }
 
 export function validateTrace(value: unknown): Trace {
@@ -121,9 +179,8 @@ export async function loadProfile(source: ProfileDataSource): Promise<Profile> {
     const manifest = validateManifest(await source.readManifest());
     const traceBytes = await source.readEntry('trace.json.zst');
     const trace = validateTrace(parseJson(traceBytes));
-    const shaders = parseJson(await source.readEntry('shaders.json'));
-    requireValid(object(shaders) || Array.isArray(shaders), 'Invalid shader metadata JSON.');
-    return { manifest, trace, traceBytes };
+    const shaders = validateShaderMetadata(parseJson(await source.readEntry('shaders.json')), trace);
+    return { manifest, trace, traceBytes, shaders };
   } finally {
     source.close();
   }

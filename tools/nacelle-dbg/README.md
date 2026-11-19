@@ -111,7 +111,9 @@ These are medians, not memory or latency guarantees. Nearly-full workloads leave
 13 event slots unused; the short-lived-thread case records one span per thread,
 showing explicit loss from stranded blocks. Every saved bundle was checked for
 format limits and event accounting, and a sample of each workload was read by
-the native CLI. Rejected metadata created no bundle.
+the native CLI. Rejected metadata created no bundle. These measurements predate
+the additional per-event compute identity fields and compute metadata registry;
+they are not memory measurements of version-tracked captures.
 
 At 64 MiB, event allocation alone raised RSS from about 3.54 to 67.80 MiB.
 Synthetic metadata and one retained context added approximately 12 KiB, below
@@ -134,14 +136,59 @@ A `.nacelle-profile` is a stored ZIP containing:
   unavailable. Configuration is recorded once per session, including concurrent
   compilation/execution, rather than collected for every dispatch.
 * `trace.json.zst`: dictionary-free zstd-compressed Chrome Trace JSON.
-* `shaders.json`: currently `[]`; PSO hashes, stage, SIMD width, compilation tier,
-  cache outcome, and parent IDs live in trace arguments.
+* `shaders.json`: `[]` when no compute entry was observed, otherwise the versioned
+  compute metadata object described below. PSO hashes, stage, SIMD width,
+  compilation tier, cache outcome, and parent IDs also live in trace arguments.
 
 Manifest clock offsets are nanoseconds; Chrome Trace `ts`/`dur` are microseconds.
 Trace IDs and thread IDs are capture-local, not addresses or OS thread IDs.
 Overlapping spans are not additive CPU time. Tier 0 and cache `unknown` mean
-unavailable, not Tier 1 or a miss; execution scopes do not yet identify the
-exact promoted native entry version.
+unavailable, not Tier 1 or a miss. Compute dispatch/worker spans identify the
+selected native entry version, including pre-existing and cached pipelines.
+Graphics/mesh stage execution versions remain unavailable.
+
+### Compute entry metadata
+
+The manifest remains schema v1 with the same three required entries. Nonempty
+`shaders.json` has independent `schemaVersion: 1` and a `codeVersions` array.
+Every record requires `id`, `pipelineId`, `pso` (32 lowercase hex digits),
+`stage` (`compute`), `simdWidth` (positive integer), `version`, `tier`, and `cache`.
+Code IDs are consecutive, one-based array positions in first-observed order.
+Pipeline IDs are capture-local, one-based pipeline-instance identities; two
+instances with the same PSO hash are distinct. A pipeline/version pair is unique,
+and its PSO hash and SIMD width cannot change. These are publication identities,
+not shader-source or native-object content hashes.
+
+An initially published entry has version 1: a freshly compiled entry is Tier 1
+with cache `miss`, while a memory/disk cache hit is Tier 2 with cache `hit`.
+Asynchronous promotion on the original pipeline publishes version 2, Tier 2,
+cache `miss`. A capture may observe only the promoted version. IDs are assigned
+only to entries actually selected for captured dispatches, not every compilation.
+Compute span arguments add optional `pipelineId`/`codeVersionId` together; when
+present, PSO/stage/SIMD/tier/cache must match the referenced record. Other spans
+and legacy captures omit these IDs rather than implying an exact version.
+
+Instrumented dispatches acquire one immutable entry/function/metadata snapshot.
+Promotion publishes a separate record without changing snapshots held by
+in-flight dispatches; workers inherit their dispatch's selected identity.
+Both records live with the pipeline, and the existing JIT code lifetime is
+unchanged. No generated-kernel hooks, additional code unloading, source embedding,
+or address serialization are introduced. Instrumentation-OFF layouts and callable
+selection remain unchanged.
+
+At most 65,536 observed compute versions may be registered per capture. Exceeding
+this limit reports a save error and produces no bundle, rather than silently
+truncating metadata. Registry and serialization allocations are additional to the
+event-buffer budget. Version tracking has not certified the performance targets.
+
+Current native/browser readers accept legacy `[]` metadata and validate versioned
+records and trace references. Unsupported shader schema versions are rejected;
+missing required fields and inconsistent references are errors. Native readers
+remain strict about unknown fields and extra entries; browser readers tolerate
+additional object fields and manifest-declared payloads. Old native readers
+explicitly reject new compute-version captures; the original browser reader can
+display/export them but does not interpret shader metadata. No extra payloads or
+manifest fields were added.
 
 Captures include compile/import/lowering/optimization, draw/compute/mesh
 dispatch, and coarse worker spans. They do not instrument generated kernels,
@@ -154,8 +201,8 @@ deterministic replay, and native/HLSL lane stepping are later work.
 Readers reject malformed versions, paths, duplicates, corruption, and oversized
 payloads. Native v1 requires exactly the three entries above; the browser can
 accept additional manifest-declared payloads. Both cap archives and aggregate
-decoded payloads at 256 MiB and manifests at 1 MiB; the browser additionally caps
-trace events at one million. Large offline profiles may occupy the browser briefly
+decoded payloads at 256 MiB, manifests at 1 MiB, and trace events at one million.
+Large offline profiles may occupy the browser briefly
 while decoding.
 The producer checks serialized metadata before constructing trace/compression
 buffers and rechecks the final manifest after payload sizes are known. The limit
@@ -175,6 +222,10 @@ The initial implementation is experimental. Linux x86_64 validation covers
 static/shared runtime capture with compute and graphics output checks, recorder
 lifecycle/overflow tests, native bundle interoperability, and offline browser
 upload/render/export. Windows and macOS have not been executed locally.
+Compute-version tests additionally cover cold Tier 1, promotion on the original
+pipeline, memory/disk cache hits, delayed selection across publication, repeated
+captures, metadata limits and invalid references. Linux static/shared execution
+has been checked at SIMD widths 4 and 8.
 
 Performance acceptance remains open. A shared-host sample using Release builds
 with identical compiler hashes, randomized sequential interleaving, 11 runs per

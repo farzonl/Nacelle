@@ -162,6 +162,49 @@ describe('file data source', () => {
 });
 
 describe('transport-independent loading and presentation', () => {
+  const code = {
+    id: 1, pipelineId: 1, pso: '00000000000000020000000000000001',
+    stage: 'compute', simdWidth: 8, version: 1, tier: 2, cache: 'hit',
+  };
+  function codeFixture(metadata: unknown = { schemaVersion: 1, codeVersions: [code] },
+    args = { ...code, codeVersionId: 1 }) {
+    return fixture({}, trace([span({ args })]), (entries, manifest) => {
+      entries['shaders.json'] = strToU8(JSON.stringify(metadata));
+      manifest.entries[1].uncompressedSize = entries['shaders.json'].length;
+    });
+  }
+
+  it('resolves compute entry versions and preserves the exact exported trace', async () => {
+    const profile = await loadProfile(open(codeFixture()));
+    expect(profile.shaders.codeVersions).toEqual([code]);
+    expect(profile.trace.traceEvents[0].args.codeVersionId).toBe(1);
+    expect(JSON.parse(new TextDecoder().decode(profile.traceBytes))).toEqual(profile.trace);
+    expect((await loadProfile(open(fixture()))).shaders.codeVersions).toEqual([]);
+  });
+
+  it.each([
+    { schemaVersion: 2, codeVersions: [code] },
+    { schemaVersion: 1, codeVersions: [{ ...code, id: 2 }] },
+    { schemaVersion: 1, codeVersions: [{ ...code, pipelineId: 0 }] },
+    { schemaVersion: 1, codeVersions: [{ ...code, tier: 0 }] },
+    { schemaVersion: 1, codeVersions: [{ ...code, tier: 1 }] },
+    { schemaVersion: 1, codeVersions: [{ ...code, pso: '/private/shader' }] },
+    { schemaVersion: 1, codeVersions: [{ ...code, version: 2 }] },
+    { schemaVersion: 1, codeVersions: [code, code] },
+    { schemaVersion: 1, codeVersions: [code, { ...code, id: 2 }] },
+    { schemaVersion: 1, codeVersions: [code,
+      { ...code, id: 2, version: 2, cache: 'miss', simdWidth: 4 }] },
+  ])('rejects invalid versioned compute metadata %j', async metadata => {
+    await expect(loadProfile(open(codeFixture(metadata)))).rejects.toThrow(/metadata/);
+  });
+
+  it.each([
+    { ...code, codeVersionId: 0 }, { ...code, codeVersionId: 2 },
+    { ...code, codeVersionId: 1, pipelineId: 2 }, { ...code, codeVersionId: 1, tier: 1 },
+  ])('rejects dangling or inconsistent code references %j', async args => {
+    await expect(loadProfile(open(codeFixture(undefined, args)))).rejects.toThrow(/code.version/);
+  });
+
   it('accepts empty captures and incomplete captures without assuming event-counter semantics', async () => {
     const profile = await loadProfile(open(fixture({ complete: false, droppedEvents: 7 }, trace([]))));
     expect(groupThreads(profile.trace)).toEqual([]);

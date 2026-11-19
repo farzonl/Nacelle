@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../api/d3d12_types.h"
+#include "../instrumentation/capture.h"
 
 namespace nacelle {
 
@@ -225,6 +226,37 @@ struct MeshShaderStages {
 
 struct PsoUpdateBox;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+struct ComputeEntryVersion {
+    CompiledComputeFn fn = nullptr;
+    uint32_t version = 0;
+    uint8_t tier = 0;
+    profile::Cache cache = profile::Cache::Unknown;
+};
+
+class ComputeEntryVersions {
+public:
+    const uint64_t pipelineIdentity = profile::allocatePipelineIdentity();
+
+    void initialize(CompiledComputeFn fn, uint8_t tier, profile::Cache cache) {
+        initial_ = {fn, 1, tier, cache};
+        current_.store(&initial_, std::memory_order_release);
+    }
+    void promote(CompiledComputeFn fn) {
+        promoted_ = {fn, 2, 2, profile::Cache::Miss};
+        current_.store(&promoted_, std::memory_order_release);
+    }
+    const ComputeEntryVersion* load() const {
+        return current_.load(std::memory_order_acquire);
+    }
+
+private:
+    // Both records remain immutable after publication and live as long as the PSO.
+    ComputeEntryVersion initial_, promoted_;
+    std::atomic<const ComputeEntryVersion*> current_{nullptr};
+};
+#endif
+
 /// Compiled Compute PSO artifact.
 struct CompiledComputePSO {
     CompiledComputePSO() = default;
@@ -235,6 +267,9 @@ struct CompiledComputePSO {
     ~CompiledComputePSO();
 
     std::atomic<CompiledComputeFn> fn{nullptr};
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    ComputeEntryVersions profileEntries;
+#endif
     uint32_t threadGroupSize[3]{1, 1, 1};
     uint32_t groupSharedBytes = 0;
     uint32_t simdWidth = 4;
