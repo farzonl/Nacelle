@@ -7,6 +7,7 @@
 namespace nacelle::profile {
 
 inline constexpr uint64_t maxProfileBytes = 256ull * 1024 * 1024;
+inline constexpr uint64_t maxManifestBytes = 1024ull * 1024;
 
 struct Entry {
     std::string path;

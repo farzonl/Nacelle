@@ -2,6 +2,8 @@
 #include "instrumentation/capture.h"
 #include "instrumentation/profile_format.h"
 
+#include <miniz.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -9,6 +11,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -34,6 +37,24 @@ nacelle::profile::Profile read(const std::filesystem::path& path) {
     std::string error;
     require(nacelle::profile::readProfile(path.string(), result, error), error.c_str());
     return result;
+}
+
+uint64_t manifestSize(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    require(static_cast<bool>(input), "Open profile for manifest inspection");
+    const std::string bytes((std::istreambuf_iterator<char>(input)),
+                            std::istreambuf_iterator<char>());
+    require(!input.bad(), "Read profile for manifest inspection");
+    mz_zip_archive zip{};
+    require(mz_zip_reader_init_mem(&zip, bytes.data(), bytes.size(), 0),
+            "Open ZIP for manifest inspection");
+    const int index = mz_zip_reader_locate_file(&zip, "manifest.json", nullptr, 0);
+    mz_zip_archive_file_stat stat{};
+    const bool found = index >= 0 &&
+        mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(index), &stat);
+    mz_zip_reader_end(&zip);
+    require(found, "Find manifest for size inspection");
+    return stat.m_uncomp_size;
 }
 }
 
@@ -196,6 +217,54 @@ int main(int argc, char** argv) {
             require(NacelleEndProfileCapture(capture.value, retry.string().c_str(), &summary) == S_OK,
                     "Stopped capture can retry output");
             require(read(retry).manifest.recordedEvents == 1, "Repeated sessions have no stale records");
+        }
+        {
+            constexpr uint64_t manifestLimit = 1024 * 1024;
+            nacelle::profile::Session session(sizeof(nacelle::profile::Event));
+            session.wait();
+            std::string error;
+            const auto baseline = directory / "metadata-baseline.nacelle-profile";
+            require(nacelle::profile::writeProfile(baseline.string(), session, error),
+                    error.c_str());
+            const auto overhead = manifestSize(baseline);
+            require(overhead < manifestLimit, "Baseline manifest fits documented limit");
+            session.compilerHash.assign(static_cast<size_t>(manifestLimit - overhead), 'a');
+            const auto boundary = directory / "metadata-boundary.nacelle-profile";
+            require(nacelle::profile::writeProfile(boundary.string(), session, error),
+                    error.c_str());
+            require(manifestSize(boundary) == manifestLimit &&
+                    read(boundary).manifest.build.compilerHash == session.compilerHash,
+                    "Exactly 1 MiB manifest round-trips");
+
+            session.compilerHash.push_back('a');
+            const auto oversized = directory / "metadata-oversized.nacelle-profile";
+            error.clear();
+            require(!nacelle::profile::writeProfile(oversized.string(), session, error) &&
+                    error.find("manifest") != std::string::npos &&
+                    !std::filesystem::exists(oversized),
+                    "Reject a manifest one byte over the limit without creating a bundle");
+
+            session.compilerHash.assign(static_cast<size_t>(manifestLimit / 2), '"');
+            const auto escaped = directory / "metadata-escaped.nacelle-profile";
+            error.clear();
+            require(!nacelle::profile::writeProfile(escaped.string(), session, error) &&
+                    error.find("manifest") != std::string::npos &&
+                    !std::filesystem::exists(escaped),
+                    "Manifest limit includes JSON escaping expansion");
+        }
+        {
+            Capture capture;
+            capture.begin();
+            {
+                NACELLE_PROFILE_SCOPE("Oversized metadata");
+                nacelle::profile::setCompilerConfiguration(std::string(1024 * 1024, 'a'),
+                                                           "", "", {});
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory / "metadata-api-error.nacelle-profile";
+            require(FAILED(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary)) &&
+                    !std::filesystem::exists(path),
+                    "Public API reports oversized metadata instead of saving an unreadable bundle");
         }
         {
             const auto path = directory / "corrupt.nacelle-profile";

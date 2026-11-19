@@ -90,6 +90,38 @@ Event IDs are reserved in per-thread blocks and need not be contiguous or
 chronologically ordered. Exact recorded-event counts are finalized from completed
 buffer slots after captured work drains, avoiding shared per-event count updates.
 
+### Memory validation
+
+The first [#212](https://github.com/farzonl/Nacelle/issues/212) diagnostic used
+three fresh Linux x86_64 processes per synthetic workload (Clang 21 Release).
+RSS was sampled after allocation, metadata/context creation, recording, drain,
+serialization/write, and destruction. Peak figures below are process-lifetime
+high-water marks sampled after serialization, not allocation attribution:
+
+| Workload | Event budget | Recorded / dropped | Recording RSS | Save peak RSS | Serialize/write |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Nearly full | 1 MiB | 9,349 / 0 | 4.89 MiB | 11.44 MiB | 7.92 ms |
+| Nearly full | 16 MiB | 149,783 / 0 | 19.95 MiB | 122.51 MiB | 125.94 ms |
+| Nearly full | 64 MiB | 599,173 / 0 | 67.95 MiB | 479.44 MiB | 503.92 ms |
+| Overflow | 64 MiB | 599,186 / 4,096 | 67.95 MiB | 479.45 MiB | 499.19 ms |
+| 512 short-lived threads | 1 MiB | 147 / 365 | 4.96 MiB | 5.59 MiB | 0.38 ms |
+| Oversized metadata, rejected | 64 MiB | 599,173 / 0 | 68.92 MiB | 71.50 MiB | 1.79 ms |
+
+These are medians, not memory or latency guarantees. Nearly-full workloads leave
+13 event slots unused; the short-lived-thread case records one span per thread,
+showing explicit loss from stranded blocks. Every saved bundle was checked for
+format limits and event accounting, and a sample of each workload was read by
+the native CLI. Rejected metadata created no bundle.
+
+At 64 MiB, event allocation alone raised RSS from about 3.54 to 67.80 MiB.
+Synthetic metadata and one retained context added approximately 12 KiB, below
+reliable RSS attribution granularity. Metadata and 512 retained contexts used
+about 56 KiB in the short-lived-thread case, excluding thread execution effects.
+Workers were joined before drain, so drain latency does not characterize waiting
+for live application work. Serialization remains non-streaming and its peak
+memory is not separately bounded; metadata admission, allocation-failure tests,
+and per-serialization-stage attribution remain open under #212.
+
 ## Format and current scope
 
 A `.nacelle-profile` is a stored ZIP containing:
@@ -118,8 +150,14 @@ deterministic replay, and native/HLSL lane stepping are later work.
 Readers reject malformed versions, paths, duplicates, corruption, and oversized
 payloads. Native v1 requires exactly the three entries above; the browser can
 accept additional manifest-declared payloads. Both cap archives and aggregate
-decoded payloads at 256 MiB; the browser additionally caps trace events at one
-million. Large offline profiles may occupy the browser briefly while decoding.
+decoded payloads at 256 MiB and manifests at 1 MiB; the browser additionally caps
+trace events at one million. Large offline profiles may occupy the browser briefly
+while decoding.
+The producer checks serialized metadata before constructing trace/compression
+buffers and rechecks the final manifest after payload sizes are known. The limit
+includes JSON escaping. Oversized metadata returns a save error without creating
+a bundle; it is not silently discarded or truncated. This check does not bound
+metadata allocations made earlier during capture or total serialization RSS.
 
 Keep application captures private. Only viewer assets, never captures, are
 staged by the Pages publishers. The accepted measurement targets are no OFF
