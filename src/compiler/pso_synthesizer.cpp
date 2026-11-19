@@ -1348,6 +1348,9 @@ bool synthesizeGraphicsPSOMLIR(
         if (!skipVS) {
             vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
             if (!vsMlirMod) return false;
+        } else {
+            // Metadata-only cache hits must release the module before its context.
+            vsLoaded.module.reset();
         }
     }
 
