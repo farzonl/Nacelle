@@ -1,10 +1,37 @@
-import type { Profile, Trace, TraceEvent } from './profile';
+import { requireValid, type Profile, type Trace, type TraceEvent } from './profile';
 
 export interface ThreadGroup {
   pid: number;
   tid: number;
   name: string;
   spans: TraceEvent[];
+}
+
+export interface SpanFilter {
+  thread?: string;
+  pso?: string;
+  stage?: string;
+  start?: number;
+  end?: number;
+}
+
+export function filterThreads(groups: ThreadGroup[], filter: SpanFilter): ThreadGroup[] {
+  requireValid((filter.start === undefined || Number.isFinite(filter.start))
+    && (filter.end === undefined || Number.isFinite(filter.end)), 'Time bounds must be finite microseconds.');
+  requireValid(filter.start === undefined || filter.end === undefined || filter.start <= filter.end,
+    'Start time must not exceed end time.');
+  const pso = filter.pso?.trim().toLowerCase();
+  const result: ThreadGroup[] = [];
+  for (const group of groups) {
+    if (filter.thread && filter.thread !== `${group.pid}:${group.tid}`) continue;
+    const spans = group.spans.filter(span =>
+      (!pso || (typeof span.args.pso === 'string' && span.args.pso.toLowerCase().includes(pso)))
+      && (!filter.stage || span.args.stage === filter.stage)
+      && (filter.start === undefined || span.ts + span.dur >= filter.start)
+      && (filter.end === undefined || span.ts <= filter.end));
+    if (spans.length) result.push({ ...group, spans });
+  }
+  return result;
 }
 
 export function groupThreads(trace: Trace): ThreadGroup[] {
