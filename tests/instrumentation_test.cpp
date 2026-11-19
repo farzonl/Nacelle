@@ -9,8 +9,10 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 void require(bool condition, const char* message) {
@@ -97,6 +99,83 @@ int main(int argc, char** argv) {
             auto profile = read(path);
             require(!profile.manifest.complete && summary.recorded_events == 1 &&
                     summary.dropped_events == 9, "Bounded recorder reports exact drops");
+        }
+        {
+            for (int session = 0; session < 2; ++session) {
+                Capture capture;
+                capture.begin();
+                std::vector<std::jthread> workers;
+                {
+                    nacelle::profile::Scope root("Concurrent root");
+                    const auto context = root.context();
+                    for (int worker = 0; worker < 4; ++worker) {
+                        workers.emplace_back([context] {
+                            nacelle::profile::Scope child(context, "Concurrent worker");
+                            for (int i = 0; i < 97; ++i) {
+                                nacelle::profile::Scope outer("Concurrent outer");
+                                nacelle::profile::Scope inner("Concurrent inner");
+                            }
+                        });
+                    }
+                }
+                NacelleProfileSummary summary;
+                const auto path = directory /
+                    ("concurrent-" + std::to_string(session) + ".nacelle-profile");
+                require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                        "Drain concurrent events across repeated sessions");
+                for (auto& worker : workers) worker.join();
+                const auto profile = read(path);
+                constexpr uint64_t expected = 1 + 4 * (1 + 2 * 97);
+                require(summary.recorded_events == expected &&
+                        profile.manifest.recordedEvents == expected &&
+                        profile.trace.traceEvents.size() == expected,
+                        "Count every completed concurrent event, including partial blocks");
+                std::set<uint64_t> ids;
+                for (const auto& event : profile.trace.traceEvents) {
+                    require(event.args.id != 0 && ids.insert(event.args.id).second,
+                            "Concurrent event IDs are nonzero and unique");
+                }
+                size_t roots = 0;
+                for (const auto& event : profile.trace.traceEvents) {
+                    if (event.args.parent == 0) ++roots;
+                    else require(ids.contains(event.args.parent), "Concurrent parent ID exists");
+                }
+                require(roots == 1, "Concurrent scopes retain one root");
+            }
+        }
+        {
+            Capture capture;
+            capture.begin(65 * sizeof(nacelle::profile::Event));
+            std::vector<std::jthread> workers;
+            for (int worker = 0; worker < 4; ++worker) {
+                workers.emplace_back([] {
+                    for (int i = 0; i < 130; ++i) {
+                        NACELLE_PROFILE_SCOPE("Concurrent overflow");
+                    }
+                });
+            }
+            for (auto& worker : workers) worker.join();
+            NacelleProfileSummary summary;
+            const auto path = directory / "concurrent-overflow.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_FALSE,
+                    "Concurrent overflow explicitly incomplete");
+            const auto profile = read(path);
+            require(summary.recorded_events == 65 && summary.dropped_events == 455 &&
+                    profile.manifest.recordedEvents == 65 &&
+                    profile.manifest.droppedEvents == 455 &&
+                    profile.trace.traceEvents.size() == 65,
+                    "Exact concurrent accounting with a partially available final block");
+        }
+        {
+            Capture capture;
+            capture.begin();
+            NacelleProfileSummary summary;
+            const auto path = directory / "empty.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                    "End empty capture");
+            const auto profile = read(path);
+            require(summary.recorded_events == 0 && summary.dropped_events == 0 &&
+                    profile.trace.traceEvents.empty(), "Empty capture has no stale events");
         }
         {
             Capture cancelled;

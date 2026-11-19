@@ -86,6 +86,10 @@ or consumer callback executes in recording scopes. Serialization, compression,
 thread/context bookkeeping, and decoded viewer objects use additional memory;
 the event budget is not a total-process RSS limit.
 
+Event IDs are reserved in per-thread blocks and need not be contiguous or
+chronologically ordered. Exact recorded-event counts are finalized from completed
+buffer slots after captured work drains, avoiding shared per-event count updates.
+
 ## Format and current scope
 
 A `.nacelle-profile` is a stored ZIP containing:
@@ -147,3 +151,24 @@ peak RSS, consistent with the event allocation. That benchmark samples memory
 before final bundle serialization and does not isolate serialization peak
 memory. Instrumentation-OFF binaries were checked for absence of capture
 symbols and support targets; this alone is not a universal no-regression proof.
+
+The first recorder optimization for [#211](https://github.com/farzonl/Nacelle/issues/211)
+batches ID allocation and moves recorded-event counting to capture drain. An
+isolated test with eight threads, each recording 10,000 nested scope pairs,
+reduced median recording time from 29.8003 ms to 15.1204 ms across ten interleaved
+runs. Both versions recorded all 160,009 events. This diagnostic excludes capture
+allocation, draining, and serialization; it is not the shader-overhead gate.
+
+A separate matched-hash shader comparison used 12 balanced, interleaved rounds
+per configuration, warm caches, and the same workload settings as above:
+
+| Workload | OFF | ON idle | Original ON active | Batched ON active |
+| --- | ---: | ---: | ---: | ---: |
+| Raymarch compute | 2.1024 ms | 2.0996 ms | 2.1145 ms | 2.1081 ms |
+| Textured filter pixel | 7.1973 ms | 7.1287 ms | 7.1564 ms | 7.1546 ms |
+
+Outputs and recorded-event counts matched between active versions, with no
+drops. End-to-end changes were within shared-host variability: paired pixel
+overhead ranged from -9.0% to +16.9% for the original recorder. These samples do
+not demonstrate a reliable shader speedup or certify the performance budgets;
+further isolation and controlled-host measurements remain necessary.

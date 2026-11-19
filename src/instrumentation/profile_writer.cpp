@@ -99,7 +99,7 @@ bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::s
 
 bool writeProfile(const std::string& path, const Session& session, std::string& error) {
     Trace trace;
-    trace.traceEvents.reserve(static_cast<size_t>(session.eventCount.load()));
+    trace.traceEvents.reserve(static_cast<size_t>(session.eventCount));
     constexpr const char* stages[] = {"unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing"};
     constexpr const char* caches[] = {"unknown", "hit", "miss"};
     for (size_t i = 0; i < std::min(session.capacity, session.nextBlock.load()); ++i) {
@@ -137,7 +137,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
 
     Manifest manifest;
     manifest.complete = session.dropped.load() == 0;
-    manifest.recordedEvents = session.eventCount.load();
+    manifest.recordedEvents = session.eventCount;
     manifest.droppedEvents = session.dropped.load();
     manifest.captureOptions.eventBufferBytes = session.bufferBytes;
     manifest.build = {NACELLE_PROFILE_COMPILER, NACELLE_PROFILE_OS,
