@@ -7,10 +7,10 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 
-#include "bench_common.h"
-#include "bench_gdeflate.h"
-#include "bench_memory.h"
-#include "bench_d3d12_runners.h"
+#include "common/bench_common.h"
+#include "workloads/gdeflate.h"
+#include "common/bench_memory.h"
+#include "runners.h"
 
 #include <algorithm>
 #include <chrono>

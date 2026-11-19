@@ -1,5 +1,5 @@
-#include "bench_common.h"
-#include "bench_nacelle_runners.h"
+#include "common/bench_common.h"
+#include "runners.h"
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
 #include <nacelle/instrumentation.h>
 #include <cstdlib>

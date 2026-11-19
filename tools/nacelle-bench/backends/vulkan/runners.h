@@ -1,8 +1,8 @@
 #pragma once
 
-#include "bench_memory.h"
-#include "bench_types.h"
-#include "bench_gdeflate.h"
+#include "common/bench_memory.h"
+#include "common/bench_types.h"
+#include "workloads/gdeflate.h"
 #include "vk_minimal_loader.h"
 
 #include <chrono>
