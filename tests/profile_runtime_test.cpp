@@ -16,7 +16,7 @@ void require(bool condition, const char* message) {
 ComPtr<ID3D12RootSignature> createSignature(testutil::TestRuntime& runtime,
                                            const D3D12_ROOT_SIGNATURE_DESC& desc) {
     ComPtr<ID3DBlob> blob;
-    testutil::checkHR(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+    testutil::checkHR(NacelleSerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
                                                 &blob, nullptr), "Serialize signature");
     ComPtr<ID3D12RootSignature> signature;
     testutil::checkHR(runtime.device->CreateRootSignature(0, blob->GetBufferPointer(),
@@ -25,7 +25,7 @@ ComPtr<ID3D12RootSignature> createSignature(testutil::TestRuntime& runtime,
 }
 
 void initialize(testutil::TestRuntime& runtime) {
-    testutil::checkHR(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+    testutil::checkHR(NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
                                       IID_PPV_ARGS(&runtime.device)), "Create device");
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     testutil::checkHR(runtime.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&runtime.queue)), "Queue");
