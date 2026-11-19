@@ -43,6 +43,24 @@ void Session::releaseWork() {
 void Session::wait() {
     std::unique_lock lock(waitMutex);
     drained.wait(lock, [&] { return outstanding.load() == 0; });
+    const auto end = events.get() + std::min(capacity, nextBlock.load());
+    eventCount = static_cast<uint64_t>(std::count_if(events.get(), end,
+        [](const Event& event) { return event.id != 0; }));
+}
+
+uint64_t Session::allocateEventId() {
+    struct ThreadIds {
+        uint64_t generation = 0;
+        uint64_t cursor = 0, end = 0;
+    };
+    thread_local ThreadIds ids;
+    if (ids.generation != generation || ids.cursor == ids.end) {
+        constexpr uint64_t blockSize = 64;
+        ids.generation = generation;
+        ids.cursor = nextId.fetch_add(blockSize, std::memory_order_relaxed);
+        ids.end = ids.cursor + blockSize;
+    }
+    return ids.cursor++;
 }
 
 void Session::record(Event event) {
@@ -68,7 +86,6 @@ void Session::record(Event event) {
     }
     event.thread = buffer.thread;
     events[buffer.cursor++] = event;
-    eventCount.fetch_add(1, std::memory_order_relaxed);
 }
 
 Work::Work(std::shared_ptr<Session> value) : session(std::move(value)) {
@@ -110,7 +127,7 @@ void Scope::begin(const char* name) {
     event_ = {};
     previous_ = currentScope;
     currentScope = this;
-    event_.id = session_->nextId.fetch_add(1, std::memory_order_relaxed);
+    event_.id = session_->allocateEventId();
     event_.startNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - session_->origin).count());
     std::strncpy(event_.name, name, sizeof(event_.name) - 1);
@@ -189,7 +206,7 @@ extern "C" HRESULT NacelleEndProfileCapture(
         }
     }
     capture->session->wait();
-    summary->recorded_events = capture->session->eventCount.load();
+    summary->recorded_events = capture->session->eventCount;
     summary->dropped_events = capture->session->dropped.load();
     summary->complete = summary->dropped_events == 0;
     std::string error;

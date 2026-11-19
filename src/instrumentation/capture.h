@@ -38,6 +38,7 @@ struct Session {
     explicit Session(uint64_t bytes);
     void releaseWork();
     void wait();
+    uint64_t allocateEventId();
     void record(Event event);
 
     uint64_t generation;
@@ -46,7 +47,8 @@ struct Session {
     std::unique_ptr<Event[]> events;
     std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
     std::atomic<size_t> nextBlock{0};
-    std::atomic<uint64_t> eventCount{0}, dropped{0}, nextId{1}, outstanding{0};
+    uint64_t eventCount = 0; // Finalized only after all writers drain.
+    std::atomic<uint64_t> dropped{0}, nextId{1}, outstanding{0};
     std::atomic<uint32_t> nextThread{1};
     std::mutex waitMutex;
     std::condition_variable drained;
