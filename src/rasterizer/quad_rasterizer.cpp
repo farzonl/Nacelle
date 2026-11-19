@@ -10,6 +10,10 @@
 #include "../common/format_utils.h"
 #include "../common/fp_env.h"
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include "../compiler/jit_engine.h"
+#endif
+
 namespace nacelle {
 namespace {
 
@@ -1267,6 +1271,7 @@ void executeRasterDrawCall(
         const auto& pso = *state.pso->graphicsPSO();
         drawProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
                                    profile::Stage::Graphics});
+        if (drawProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     }
 #endif
     thread_local RasterScene scene;
@@ -1287,6 +1292,7 @@ void executeRasterMeshDispatch(
         const auto& pso = *state.pso->graphicsPSO();
         dispatchProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
                                        profile::Stage::Mesh});
+        if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     }
 #endif
     RasterScene scene;

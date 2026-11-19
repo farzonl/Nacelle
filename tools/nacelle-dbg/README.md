@@ -128,7 +128,11 @@ A `.nacelle-profile` is a stored ZIP containing:
 
 * `manifest.json`: schema version 1, capture options, completeness/event counts,
   producer revision/compiler/OS/architecture, and captured compiler hash,
-  target triple, CPU/features when a pipeline is created during the capture.
+  target triple, CPU/features when a pipeline is created or an existing compute,
+  raster draw, or mesh pipeline executes during the capture. Execution-only
+  captures do not require recompilation; empty captures leave these fields
+  unavailable. Configuration is recorded once per session, including concurrent
+  compilation/execution, rather than collected for every dispatch.
 * `trace.json.zst`: dictionary-free zstd-compressed Chrome Trace JSON.
 * `shaders.json`: currently `[]`; PSO hashes, stage, SIMD width, compilation tier,
   cache outcome, and parent IDs live in trace arguments.

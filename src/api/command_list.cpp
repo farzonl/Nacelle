@@ -11,6 +11,10 @@
 #include "../common/fp_env.h"
 #include "../rasterizer/raytracing_bvh.h"
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include "../compiler/jit_engine.h"
+#endif
+
 namespace nacelle {
 
 // --- NacelleFence ---
@@ -1016,6 +1020,7 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     profile::Scope dispatchProfile("Compute dispatch");
     dispatchProfile.setAttributes({cpso->cacheHashLo, cpso->cacheHashHi, cpso->simdWidth,
                                    profile::Stage::Compute});
+    if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     const auto dispatchContext = dispatchProfile.context();
 #endif
     const DriverRootContext ctxSnapshot = state.computeCtx;

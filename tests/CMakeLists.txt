@@ -355,8 +355,7 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         add_executable(profile_runtime_${linkage}_test profile_runtime_test.cpp)
         add_dependencies(profile_runtime_${linkage}_test nacelle_test_shaders)
         target_compile_definitions(profile_runtime_${linkage}_test PRIVATE
-            NACELLE_SHADER_BIN_DIR="${NACELLE_SHADER_BIN_DIR}"
-            NACELLE_EXPORT_D3D12_SYMBOLS)
+            NACELLE_SHADER_BIN_DIR="${NACELLE_SHADER_BIN_DIR}")
         target_include_directories(profile_runtime_${linkage}_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
         if(linkage STREQUAL "static")
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle nacelle_profile_io)
@@ -368,6 +367,14 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                 "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}.nacelle-profile"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        foreach(stage IN ITEMS compute graphics)
+            add_test(NAME profile_runtime_${linkage}_preexisting_${stage}_test
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-preexisting-${stage}.nacelle-profile"
+                    "-DCAPTURE_MODE=${stage}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
     endforeach()
 endif()
 add_nacelle_test(simd_wave_test simd_wave_test.cpp)

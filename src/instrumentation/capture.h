@@ -53,6 +53,7 @@ struct Session {
     std::mutex waitMutex;
     std::condition_variable drained;
     std::mutex metadataMutex;
+    std::atomic<bool> compilerConfigurationRecorded{false};
     std::string compilerHash, targetTriple, cpu;
     std::vector<std::string> cpuFeatures;
 };
@@ -79,6 +80,9 @@ public:
     void setAttributes(Attributes attributes) { if (session_) event_.attributes = attributes; }
     Attributes attributes() const { return session_ ? event_.attributes : Attributes{}; }
     bool enabled() const { return static_cast<bool>(session_); }
+    bool needsCompilerConfiguration() const {
+        return session_ && !session_->compilerConfigurationRecorded.load(std::memory_order_acquire);
+    }
     Context context() const;
 
 private:
