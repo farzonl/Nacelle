@@ -49,6 +49,21 @@ ctest --test-dir build/profile-tools --output-on-failure
 
 This standalone build also needs the initialized DirectX-Headers submodule.
 
+## CI coverage
+
+The existing Linux, macOS, and Windows CI jobs retain their normal OFF build and
+test run. Before fetching profiling dependencies they check OFF compile commands,
+build targets, and static-library symbols for instrumentation leakage using the
+repository-built `llvm-nm`. A separate `build-profile/` configuration then runs
+the recorder and real static/shared capture tests with instrumentation enabled,
+followed by native-to-viewer interoperability tests and the viewer build.
+
+The integration tests use fresh caches and exercise compute/graphics output
+checks and asynchronous Tier-2 capture. Captures remain temporary CI workspace
+data, not Pages assets. These jobs do not certify performance budgets, run a real
+browser, or guarantee a separate ARM64 runner. Platform coverage is only verified
+when the corresponding instrumented job actually passes.
+
 ## Application API
 
 Include [instrumentation.h](../../include/nacelle/instrumentation.h) and link
