@@ -55,6 +55,15 @@ bool toJson(const T& value, std::string& json, std::string& error) {
     return true;
 }
 
+bool manifestToJson(const Manifest& manifest, std::string& json, std::string& error) {
+    if (!toJson(manifest, json, error)) return false;
+    if (json.size() > maxManifestBytes) {
+        error = "Profile manifest exceeds the 1 MiB format limit";
+        return false;
+    }
+    return true;
+}
+
 bool writeExclusive(const std::string& path, const void* bytes, size_t size, std::string& error) {
     const auto nativePath = std::filesystem::path(std::u8string(path.begin(), path.end()));
     FILE* file = nullptr;
@@ -98,6 +107,19 @@ bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::s
 }
 
 bool writeProfile(const std::string& path, const Session& session, std::string& error) {
+    Manifest manifest;
+    manifest.complete = session.dropped.load() == 0;
+    manifest.recordedEvents = session.eventCount;
+    manifest.droppedEvents = session.dropped.load();
+    manifest.captureOptions.eventBufferBytes = session.bufferBytes;
+    manifest.build = {NACELLE_PROFILE_COMPILER, NACELLE_PROFILE_OS,
+                      NACELLE_PROFILE_ARCH, NACELLE_PROFILE_REVISION,
+                      session.compilerHash, session.targetTriple, session.cpu, session.cpuFeatures};
+    manifest.entries = {{"trace.json.zst", "zstd", 0}, {"shaders.json", "json", 2}};
+    std::string manifestJson;
+    // Reject oversized metadata before allocating trace objects and compression buffers.
+    if (!manifestToJson(manifest, manifestJson, error)) return false;
+
     Trace trace;
     trace.traceEvents.reserve(static_cast<size_t>(session.eventCount));
     constexpr const char* stages[] = {"unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing"};
@@ -135,17 +157,8 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     }
     compressed.resize(result);
 
-    Manifest manifest;
-    manifest.complete = session.dropped.load() == 0;
-    manifest.recordedEvents = session.eventCount;
-    manifest.droppedEvents = session.dropped.load();
-    manifest.captureOptions.eventBufferBytes = session.bufferBytes;
-    manifest.build = {NACELLE_PROFILE_COMPILER, NACELLE_PROFILE_OS,
-                      NACELLE_PROFILE_ARCH, NACELLE_PROFILE_REVISION,
-                      session.compilerHash, session.targetTriple, session.cpu, session.cpuFeatures};
-    manifest.entries = {{"trace.json.zst", "zstd", traceJson.size()}, {"shaders.json", "json", 2}};
-    std::string manifestJson;
-    if (!toJson(manifest, manifestJson, error)) return false;
+    manifest.entries.front().uncompressedSize = traceJson.size();
+    if (!manifestToJson(manifest, manifestJson, error)) return false;
 
     Zip zip;
     zip.writing = true;
@@ -214,7 +227,7 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
         names.emplace_back(stat.m_filename);
     }
     std::string json;
-    if (!extract(zip, "manifest.json", 1024 * 1024, json, error)) return false;
+    if (!extract(zip, "manifest.json", maxManifestBytes, json, error)) return false;
     Profile parsed;
     if (const auto ec = glz::read<glz::opts{.error_on_missing_keys = true}>(parsed.manifest, json)) {
         error = "Invalid profile manifest: " + glz::format_error(ec, json);
