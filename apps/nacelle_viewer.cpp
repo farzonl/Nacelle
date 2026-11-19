@@ -198,10 +198,14 @@ bool createRootSignatureFromDxilMetadata(
 
 int main(int argc, char** argv) {
     bool headless = false;
+    bool vsync = false;
     uint32_t maxFrames = 0;
+    uint32_t recordFps = 60;
+    double durationSec = 0.0;
     uint32_t kW = 640;
     uint32_t kH = 480;
     std::string dumpPath;
+    std::string recordPath;
     std::string psPath;
     std::string vsPath;
 
@@ -211,7 +215,11 @@ int main(int argc, char** argv) {
             std::printf(
                 "Usage: %s [options]\n"
                 "  --headless          Render offscreen without opening an SDL3 window\n"
+                "  --vsync             Enable VSync presentation (default: off)\n"
                 "  --frames <N>        Exit after rendering N frames\n"
+                "  --duration <sec>    Exit after rendering <sec> seconds (uses --fps)\n"
+                "  --fps <N>           Framerate for --record / --duration (default: 60)\n"
+                "  --record <file.mp4> Record rendered frames to an MP4 via ffmpeg\n"
                 "  --dump <file.ppm>   Write final rendered frame to a PPM file\n"
                 "  --ps <shader.dxil>  Pixel shader path or filename in shader bin dir\n"
                 "  --vs <shader.dxil>  Vertex shader path or filename in shader bin dir\n"
@@ -221,8 +229,16 @@ int main(int argc, char** argv) {
             return 0;
         } else if (arg == "--headless" || arg == "-headless") {
             headless = true;
+        } else if (arg == "--vsync" || arg == "-vsync") {
+            vsync = true;
         } else if ((arg == "--frames" || arg == "-frames") && i + 1 < argc) {
             maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if ((arg == "--duration" || arg == "-duration") && i + 1 < argc) {
+            durationSec = std::stod(argv[++i]);
+        } else if ((arg == "--fps" || arg == "-fps") && i + 1 < argc) {
+            recordFps = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if ((arg == "--record" || arg == "-record") && i + 1 < argc) {
+            recordPath = argv[++i];
         } else if ((arg == "--dump" || arg == "-dump") && i + 1 < argc) {
             dumpPath = argv[++i];
         } else if ((arg == "--ps" || arg == "-ps") && i + 1 < argc) {
@@ -236,6 +252,23 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "Unknown or incomplete option: %s\n", arg.c_str());
             return 1;
+        }
+    }
+
+    if (recordFps == 0) {
+        std::fprintf(stderr, "--fps must be greater than 0\n");
+        return 1;
+    }
+    if (durationSec > 0.0 && maxFrames == 0) {
+        maxFrames = std::max<uint32_t>(1, static_cast<uint32_t>(std::lround(durationSec * recordFps)));
+    }
+    if (!recordPath.empty()) {
+        if ((kW % 2) != 0 || (kH % 2) != 0) {
+            std::fprintf(stderr, "--record requires even width and height for yuv420p (got %ux%u)\n", kW, kH);
+            return 1;
+        }
+        if (headless && maxFrames == 0) {
+            maxFrames = recordFps * 4;
         }
     }
 
@@ -392,7 +425,7 @@ int main(int argc, char** argv) {
             SDL_Quit();
             return 1;
         }
-        SDL_SetRenderVSync(renderer, 1);
+        SDL_SetRenderVSync(renderer, vsync ? 1 : 0);
         tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, static_cast<int>(kW), static_cast<int>(kH));
         if (!tex) {
             std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
@@ -404,10 +437,37 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    std::FILE* recordPipe = nullptr;
+    if (!recordPath.empty()) {
+        std::string escapedPath;
+        escapedPath.reserve(recordPath.size());
+        for (char ch : recordPath) {
+            if (ch == '"') escapedPath += "\\\"";
+            else escapedPath += ch;
+        }
+        std::string ffCmd =
+            "ffmpeg -y -hide_banner -loglevel error -f rawvideo -pixel_format rgba -video_size " +
+            std::to_string(kW) + "x" + std::to_string(kH) +
+            " -framerate " + std::to_string(recordFps) +
+            " -i pipe:0 -an -c:v libx264 -crf 18 -pix_fmt yuv420p -movflags +faststart \"" +
+            escapedPath + "\"";
+#if defined(_WIN32)
+        recordPipe = _popen(ffCmd.c_str(), "wb");
+#else
+        recordPipe = popen(ffCmd.c_str(), "w");
+#endif
+        if (!recordPipe) {
+            std::fprintf(stderr, "Failed to launch ffmpeg for --record %s\n", recordPath.c_str());
+            return 1;
+        }
+    }
+
     UINT64 fenceVal = 0;
     uint32_t frameIdx = 0;
     bool running = true;
     const auto startTime = std::chrono::steady_clock::now();
+    auto fpsLastTime = startTime;
+    uint32_t fpsFrames = 0;
     float mouseX = 0.0f, mouseY = 0.0f;
     bool mouseDown = false;
 
@@ -433,8 +493,8 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        float timeSec = headless
-            ? static_cast<float>(frameIdx) * (1.0f / 60.0f)
+        float timeSec = (headless || recordPipe)
+            ? static_cast<float>(frameIdx) / static_cast<float>(recordFps)
             : std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime).count();
 
         if (customPsMode) {
@@ -509,18 +569,52 @@ int main(int argc, char** argv) {
         while (fence->GetCompletedValue() < fenceVal) {}
         swapChain->Present(0, 0);
 
+        if (recordPipe && !presentState.lastFrame.empty()) {
+            const size_t expectedBytes = static_cast<size_t>(kW) * kH * 4;
+            if (std::fwrite(presentState.lastFrame.data(), 1, expectedBytes, recordPipe) != expectedBytes) {
+                std::fprintf(stderr, "Failed writing frame %u to ffmpeg pipe\n", frameIdx);
+                running = false;
+            }
+        }
+
 #if defined(NACELLE_HAS_SDL3)
         if (!headless && renderer && tex && !presentState.lastFrame.empty()) {
             SDL_UpdateTexture(tex, nullptr, presentState.lastFrame.data(), static_cast<int>(kW * 4));
             SDL_RenderClear(renderer);
             SDL_RenderTexture(renderer, tex, nullptr, nullptr);
             SDL_RenderPresent(renderer);
+            ++fpsFrames;
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsedSec = std::chrono::duration<double>(now - fpsLastTime).count();
+            if (elapsedSec >= 0.5) {
+                const double fps = static_cast<double>(fpsFrames) / elapsedSec;
+                const double ms = (elapsedSec * 1000.0) / static_cast<double>(fpsFrames);
+                char title[128];
+                std::snprintf(title, sizeof(title), "Nacelle D3D12 Viewer - %.1f FPS (%.2f ms)", fps, ms);
+                SDL_SetWindowTitle(win, title);
+                fpsFrames = 0;
+                fpsLastTime = now;
+            }
         }
 #endif
 
         ++frameIdx;
         if (maxFrames > 0 && frameIdx >= maxFrames) running = false;
         if (headless && maxFrames == 0) running = false;
+    }
+
+    if (recordPipe) {
+#if defined(_WIN32)
+        int rc = _pclose(recordPipe);
+#else
+        int rc = pclose(recordPipe);
+#endif
+        if (rc != 0) {
+            std::fprintf(stderr, "ffmpeg exited with status %d while writing %s\n", rc, recordPath.c_str());
+            return 1;
+        }
+        std::printf("Recorded %u frames to %s (%ux%u @ %u fps)\n",
+                    frameIdx, recordPath.c_str(), kW, kH, recordFps);
     }
 
     if (!dumpPath.empty() && !presentState.lastFrame.empty()) {
