@@ -303,6 +303,15 @@ jobs:
             -DSPLIT_FILE_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file"
           cmake --build build-profile --target bench-worker-nacelle --parallel
 
+      - name: Preserve other OS viewer benchmark profiles from live Pages
+        env:
+          GITHUB_EVENT_REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          python3 scripts/preserve_viewer_profiles.py \
+            --pages-url "https://${{ github.repository_owner }}.github.io/$GITHUB_EVENT_REPOSITORY_NAME" \
+            --out-dir "$GITHUB_WORKSPACE/bench-profiles" \
+            --exclude-platform macos
+
       - name: Capture benchmark suite profiles for GitHub Pages viewer
         run: |
           TARGET_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
@@ -314,6 +323,7 @@ jobs:
             --out-dir "$GITHUB_WORKSPACE/bench-profiles" \
             --sha "$TARGET_SHA" \
             --os macOS \
+            --platform macos \
             --simd-width 8 \
             --iters 3
 

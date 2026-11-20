@@ -454,13 +454,54 @@ jobs:
           path: .bench-cache
           key: bench-history-${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Preserve preloaded viewer benchmark profiles from live Pages
+      - name: Preserve other OS viewer benchmark profiles from live Pages
         env:
           GITHUB_EVENT_REPOSITORY_NAME: ${{ github.event.repository.name }}
         run: |
           python scripts/preserve_viewer_profiles.py `
             --pages-url "https://$($env:GITHUB_REPOSITORY_OWNER).github.io/$($env:GITHUB_EVENT_REPOSITORY_NAME)" `
-            --out-dir "$env:GITHUB_WORKSPACE\viewer-profiles"
+            --out-dir "$env:GITHUB_WORKSPACE\bench-profiles" `
+            --exclude-platform windows
+
+      - name: Checkout profiling submodules
+        run: |
+          git submodule update --init --depth 1 `
+            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
+
+      - name: Configure and build instrumented nacelle worker for profile viewer
+        run: |
+          cmake -S . -B build-profile -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_CXX_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_C_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
+            -DCMAKE_CXX_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
+            -DNACELLE_FETCH_SDL3=OFF `
+            -DNACELLE_ENABLE_INSTRUMENTATION=ON `
+            -DNACELLE_CLANGXX="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang++.exe" `
+            -DNACELLE_D3D12_SDK_VERSION="${{ steps.agility-release.outputs.sdk_version }}" `
+            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
+            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
+            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
+            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
+          cmake --build build-profile --target bench-worker-nacelle --parallel
+
+      - name: Capture benchmark suite profiles for GitHub Pages viewer
+        run: |
+          $targetSha = "${{ github.event.workflow_run.head_sha || github.sha }}"
+          $env:PATH = "$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\openblas\bin;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
+          python scripts/capture_bench_profiles.py `
+            --bench-json "$env:GITHUB_WORKSPACE\bench-results.json" `
+            --worker "$env:GITHUB_WORKSPACE\build-profile\bench-worker-nacelle.exe" `
+            --shader-dir "$env:GITHUB_WORKSPACE\build\tests\shaders" `
+            --out-dir "$env:GITHUB_WORKSPACE\bench-profiles" `
+            --sha "$targetSha" `
+            --os Windows `
+            --platform windows `
+            --simd-width 8 `
+            --iters 3
 
       - name: Set up Node for profile viewer
         uses: actions/setup-node@v4
@@ -471,9 +512,10 @@ jobs:
 
       - name: Build, test, and stage offline profile viewer
         working-directory: tools/nacelle-view
+        env:
+          VITE_ENABLE_PRELOADED_PROFILES: "1"
         run: |
-          $hasProfiles = Test-Path "..\..\viewer-profiles\manifest.json"
-          if ($hasProfiles) { $env:VITE_ENABLE_PRELOADED_PROFILES = "1" }
+          $hasProfiles = Test-Path "..\..\bench-profiles\manifest.json"
           npm ci
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm test
@@ -481,7 +523,7 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($hasProfiles) {
-            npm run stage -- ../../_site --profiles-dir ../../viewer-profiles
+            npm run stage -- ../../_site --profiles-dir ../../bench-profiles
           } else {
             npm run stage -- ../../_site
           }

@@ -26,6 +26,7 @@ async function profile(events = [span()]): Promise<Profile> {
 
 describe('offline viewer DOM', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/');
     document.documentElement.innerHTML = html;
   });
 
@@ -225,5 +226,63 @@ describe('offline viewer DOM', () => {
     await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('MatMul dispatch'));
     expect(select.value).toBe('matmul');
     expect(openPreloaded).toHaveBeenCalledWith('matmul.nacelle-profile');
+  });
+
+  it('toggles between Windows and macOS benchmark platforms while preserving shader selection', async () => {
+    const winRaymarch = await profile([span({ name: 'Win Raymarch dispatch', ts: 10, dur: 40 })]);
+    const macRaymarch = await profile([span({ name: 'Mac Raymarch dispatch', ts: 10, dur: 60 })]);
+    const macMatmul = await profile([span({ name: 'Mac MatMul dispatch', ts: 20, dur: 80 })]);
+    const openPreloaded = vi.fn(async (file: string) => {
+      if (file === 'windows/bench_raymarch.nacelle-profile') return source(winRaymarch);
+      if (file === 'macos/bench_raymarch.nacelle-profile') return source(macRaymarch);
+      return source(macMatmul);
+    });
+
+    mountViewer(document, async () => source(winRaymarch), {
+      preloadedEnabled: true,
+      loadPreloadedManifest: async () => ({
+        schemaVersion: 2,
+        defaultPlatform: 'windows',
+        platforms: {
+          windows: {
+            os: 'Windows',
+            simdWidth: 8,
+            shortSha: '1111111',
+            profiles: [
+              { id: 'bench_raymarch', name: 'Raymarcher', category: 'Compute', file: 'windows/bench_raymarch.nacelle-profile' },
+            ],
+          },
+          macos: {
+            os: 'macOS',
+            simdWidth: 8,
+            shortSha: '2222222',
+            profiles: [
+              { id: 'bench_raymarch', name: 'Raymarcher', category: 'Compute', file: 'macos/bench_raymarch.nacelle-profile' },
+              { id: 'matmul', name: 'MatMul 128x128', category: 'Compute', file: 'macos/matmul.nacelle-profile' },
+            ],
+          },
+        },
+      }),
+      openPreloadedProfile: openPreloaded,
+    });
+
+    await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('Win Raymarch dispatch'));
+    const toggle = document.querySelector<HTMLElement>('#benchmark-os-toggle')!;
+    expect(toggle.hidden).toBe(false);
+    const buttons = toggle.querySelectorAll<HTMLButtonElement>('button[data-platform]');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].textContent).toBe('Windows');
+    expect(buttons[0].getAttribute('aria-pressed')).toBe('true');
+    expect(buttons[1].textContent).toBe('macOS');
+    expect(buttons[1].getAttribute('aria-pressed')).toBe('false');
+    expect(document.querySelector('#benchmark-meta')!.textContent).toContain('Windows');
+
+    buttons[1].click();
+    await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('Mac Raymarch dispatch'));
+    expect(buttons[0].getAttribute('aria-pressed')).toBe('false');
+    expect(buttons[1].getAttribute('aria-pressed')).toBe('true');
+    expect(document.querySelector('#benchmark-meta')!.textContent).toContain('macOS');
+    expect(document.querySelector('#benchmark-meta')!.textContent).toContain('2 shaders');
+    expect(openPreloaded).toHaveBeenCalledWith('macos/bench_raymarch.nacelle-profile');
   });
 });
