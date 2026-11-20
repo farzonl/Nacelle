@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>Nacelle — Profile Viewer</title>
   </head>
   <body class="min-h-screen antialiased selection:bg-sky-500/25">
@@ -142,6 +142,20 @@
             <pre id="summary" class="font-mono-tabular overflow-x-auto border-t border-[var(--border)] p-3.5 text-xs leading-relaxed whitespace-pre-wrap break-words text-[var(--text)]"></pre>
           </details>
         </div>
+
+        <!-- Embedded Interactive Flamegraph / Timeline (Renderer-agnostic host) -->
+        <section id="timeline-section" class="panel overflow-hidden rounded-xl shadow-sm" hidden aria-labelledby="timeline-heading">
+          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border)] bg-[var(--surface-elevated)]/70 px-4 py-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <h2 id="timeline-heading" class="text-sm font-semibold tracking-tight">Interactive Flamegraph &amp; Timeline</h2>
+              <span id="timeline-renderer" class="font-mono-tabular rounded-full border border-[var(--border)] bg-[var(--surface)] px-2.5 py-0.5 text-[11px] text-[var(--accent)]"></span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button id="timeline-expand" type="button" class="profiler-btn rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-medium text-[var(--muted)] transition hover:border-[var(--accent)] hover:text-[var(--accent)]" aria-pressed="false">Expand height</button>
+            </div>
+          </div>
+          <div id="timeline-host" class="h-[520px] w-full bg-[var(--surface)]"></div>
+        </section>
 
         <!-- Filter Toolbar -->
         <section class="panel rounded-xl p-4 shadow-sm" aria-labelledby="spans-heading">

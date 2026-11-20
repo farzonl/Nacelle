@@ -8,11 +8,13 @@ import {
 import { LIMITS, loadProfile, requireValid, type Profile, type ProfileDataSource } from './profile';
 import { captureStatus, filterThreads, groupThreads, summaryText, type SpanFilter, type ThreadGroup } from './presentation';
 import { speedscopeProfile } from './speedscope';
+import type { TimelineSelectionEvent, TimelineView } from './timeline';
 
 export interface ViewerOptions {
   preloadedEnabled?: boolean;
   loadPreloadedManifest?: () => Promise<PreloadedProfileManifest>;
   openPreloadedProfile?: (file: string) => Promise<ProfileDataSource>;
+  timelineView?: TimelineView;
 }
 
 const THEME_STORAGE_KEY = 'nacelle-viewer-theme';
@@ -122,7 +124,14 @@ export function mountViewer(
   const kpiShaders = root.querySelector<HTMLElement>('#kpi-shaders');
   const kpiTiers = root.querySelector<HTMLElement>('#kpi-tiers');
 
+  const timelineSection = root.querySelector<HTMLElement>('#timeline-section');
+  const timelineHost = root.querySelector<HTMLElement>('#timeline-host');
+  const timelineRenderer = root.querySelector<HTMLElement>('#timeline-renderer');
+  const timelineExpand = root.querySelector<HTMLButtonElement>('#timeline-expand');
+  const timelineView = options.timelineView;
+
   let current: Profile | undefined;
+  let activeTitle = 'Nacelle Profile';
   let allGroups: ThreadGroup[] = [];
   let groups: ThreadGroup[] = [];
   let filtered = false;
@@ -131,6 +140,29 @@ export function mountViewer(
   let total = 0;
   let preloadedEntries: PreloadedProfileEntry[] = [];
   let tableCounter = 0;
+
+  function applySelectionFilter(selection: TimelineSelectionEvent): void {
+    if (selection.thread !== undefined) threadFilter.value = selection.thread;
+    if (selection.pso !== undefined) psoFilter.value = selection.pso;
+    if (selection.stage !== undefined) stageFilter.value = selection.stage;
+    if (selection.start !== undefined) startFilter.value = String(selection.start);
+    if (selection.end !== undefined) endFilter.value = String(selection.end);
+    applyFilters();
+  }
+
+  if (timelineView && timelineSection && timelineHost) {
+    timelineView.mount(timelineHost, { onSelectFilter: applySelectionFilter });
+    if (timelineRenderer) timelineRenderer.textContent = timelineView.capabilities.rendererName;
+    timelineSection.hidden = false;
+    timelineExpand?.addEventListener('click', () => {
+      const expanded = timelineExpand.getAttribute('aria-pressed') === 'true';
+      const next = !expanded;
+      timelineExpand.setAttribute('aria-pressed', String(next));
+      timelineExpand.textContent = next ? 'Compact height' : 'Expand height';
+      timelineHost.classList.toggle('h-[520px]', !next);
+      timelineHost.classList.toggle('h-[78vh]', next);
+    });
+  }
 
   const element = <K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, className?: string) => {
     const node = root.createElement(tag);
@@ -212,9 +244,11 @@ export function mountViewer(
         empty.append(element('p', 'No timing spans match the current filters.'));
         threads.append(empty);
       }
+      timelineView?.render({ profile: current, groups, filtered, title: activeTitle });
       showNext();
     } catch (error) {
       filterStatus.textContent = `Invalid filters: ${error instanceof Error ? error.message : 'Unable to filter spans.'}`;
+      timelineView?.clear();
     }
   }
 
@@ -318,12 +352,14 @@ export function mountViewer(
   }
 
   async function loadFromSource(
+    title: string,
     loadingMessage: string,
     getSource: () => Promise<ProfileDataSource>,
     onFinally?: () => void,
   ): Promise<void> {
     const request = ++generation;
     current = undefined;
+    activeTitle = title;
     allGroups = [];
     groups = [];
     shown = 0;
@@ -341,6 +377,7 @@ export function mountViewer(
     more.hidden = true;
     summary.textContent = '';
     threads.replaceChildren();
+    timelineView?.clear();
     status.textContent = loadingMessage;
     status.dataset.state = 'loading';
     try {
@@ -381,7 +418,7 @@ export function mountViewer(
   function loadLocalFile(file: File): void {
     if (benchmarkSelect) benchmarkSelect.value = '';
     updateBenchmarkNavButtons();
-    void loadFromSource('Reading local profile…', () => open(file), () => {
+    void loadFromSource(file.name || 'Local Profile', 'Reading local profile…', () => open(file), () => {
       input.value = '';
     });
   }
@@ -435,7 +472,7 @@ export function mountViewer(
     updateBenchmarkNavButtons();
     syncShaderQueryParam(entry.id);
     const openPreloaded = options.openPreloadedProfile ?? openPreloadedProfile;
-    void loadFromSource(`Loading benchmark profile: ${entry.name}…`, () => openPreloaded(entry.file));
+    void loadFromSource(entry.name, `Loading benchmark profile: ${entry.name}…`, () => openPreloaded(entry.file));
   }
 
   async function initPreloadedProfiles(): Promise<void> {

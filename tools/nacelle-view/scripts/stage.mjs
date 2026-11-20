@@ -2,6 +2,8 @@ import { cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, join } from 'node:path';
 
+const SPEEDSCOPE_ALLOWED_FILE = /^(index\.html|release\.txt|source-code-pro\.LICENSE\.md|speedscope-[A-Za-z0-9_-]+\.(js|css)|SourceCodePro-[A-Za-z0-9_.-]+\.woff2|jfrview_bg-[A-Za-z0-9_-]+\.wasm|favicon-[A-Za-z0-9_-]+\.(ico|png|js))$/;
+
 const args = process.argv.slice(2);
 let output = '';
 let profilesDir = '';
@@ -25,12 +27,18 @@ const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 const target = join(resolve(output), 'viewer');
 // Publish only the build allowlist, never arbitrary capture files or source directories.
 const files = await readdir(dist);
-if (!files.includes('index.html') || files.some(file => !['index.html', 'assets'].includes(file))) {
+if (!files.includes('index.html') || files.some(file => !['index.html', 'assets', 'speedscope'].includes(file))) {
   throw new Error('Unexpected viewer build contents; refusing to publish.');
 }
 for (const name of await readdir(join(dist, 'assets'))) {
   if (!/^index-[A-Za-z0-9_-]+\.(js|css)$/.test(name)) {
     throw new Error(`Unexpected viewer asset: ${name}`);
+  }
+}
+if (files.includes('speedscope')) {
+  const speedscopeFiles = await readdir(join(dist, 'speedscope'));
+  if (!speedscopeFiles.includes('index.html') || speedscopeFiles.some(name => !SPEEDSCOPE_ALLOWED_FILE.test(name))) {
+    throw new Error('Unexpected bundled speedscope asset; refusing to publish.');
   }
 }
 await rm(target, { recursive: true, force: true });
