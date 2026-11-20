@@ -49,6 +49,21 @@ ctest --test-dir build/profile-tools --output-on-failure
 
 This standalone build also needs the initialized DirectX-Headers submodule.
 
+## CI coverage
+
+The existing Linux, macOS, and Windows CI jobs retain their normal OFF build and
+test run. Before fetching profiling dependencies they check OFF compile commands,
+build targets, and static-library symbols for instrumentation leakage using the
+repository-built `llvm-nm`. A separate `build-profile/` configuration then runs
+the recorder and real static/shared capture tests with instrumentation enabled,
+followed by native-to-viewer interoperability tests and the viewer build.
+
+The integration tests use fresh caches and exercise compute/graphics output
+checks and asynchronous Tier-2 capture. Captures remain temporary CI workspace
+data, not Pages assets. These jobs do not certify performance budgets, run a real
+browser, or guarantee a separate ARM64 runner. Platform coverage is only verified
+when the corresponding instrumented job actually passes.
+
 ## Application API
 
 Include [instrumentation.h](../../include/nacelle/instrumentation.h) and link
@@ -222,6 +237,9 @@ The initial implementation is experimental. Linux x86_64 validation covers
 static/shared runtime capture with compute and graphics output checks, recorder
 lifecycle/overflow tests, native bundle interoperability, and offline browser
 upload/render/export. Windows and macOS have not been executed locally.
+Static capture tests use the `Nacelle*` entry points; shared capture tests use
+the DLL-exported `D3D12*` entry points, including on Windows, without expanding
+the runtime export surface.
 Compute-version tests additionally cover cold Tier 1, promotion on the original
 pipeline, memory/disk cache hits, delayed selection across publication, repeated
 captures, metadata limits and invalid references. Linux static/shared execution

@@ -361,6 +361,7 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle nacelle_profile_io)
         else()
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle_d3d12 nacelle_profile_io)
+            target_compile_definitions(profile_runtime_${linkage}_test PRIVATE NACELLE_PROFILE_SHARED_RUNTIME=1)
         endif()
         add_test(NAME profile_runtime_${linkage}_test
             COMMAND "${CMAKE_COMMAND}"

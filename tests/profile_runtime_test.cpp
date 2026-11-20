@@ -10,6 +10,14 @@
 #include <string>
 
 namespace {
+#if defined(NACELLE_PROFILE_SHARED_RUNTIME)
+constexpr auto createDevice = &D3D12CreateDevice;
+constexpr auto serializeRootSignature = &D3D12SerializeRootSignature;
+#else
+constexpr auto createDevice = &NacelleCreateDevice;
+constexpr auto serializeRootSignature = &NacelleSerializeRootSignature;
+#endif
+
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -22,7 +30,7 @@ void beginCapture(NacelleProfileCapture** capture) {
 ComPtr<ID3D12RootSignature> createSignature(testutil::TestRuntime& runtime,
                                            const D3D12_ROOT_SIGNATURE_DESC& desc) {
     ComPtr<ID3DBlob> blob;
-    testutil::checkHR(NacelleSerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+    testutil::checkHR(serializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
                                                 &blob, nullptr), "Serialize signature");
     ComPtr<ID3D12RootSignature> signature;
     testutil::checkHR(runtime.device->CreateRootSignature(0, blob->GetBufferPointer(),
@@ -31,7 +39,7 @@ ComPtr<ID3D12RootSignature> createSignature(testutil::TestRuntime& runtime,
 }
 
 void initialize(testutil::TestRuntime& runtime) {
-    testutil::checkHR(NacelleCreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
+    testutil::checkHR(createDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
                                       IID_PPV_ARGS(&runtime.device)), "Create device");
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     testutil::checkHR(runtime.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&runtime.queue)), "Queue");
