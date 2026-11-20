@@ -32,6 +32,42 @@ def discover_benchmarks(bench_json: Path) -> list[dict]:
     return specs
 
 
+def normalize_platform_key(os_name: str, explicit_platform: str = "") -> str:
+    raw = (explicit_platform or os_name or "default").strip().lower()
+    key = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
+    return key or "default"
+
+
+def load_existing_platforms(manifest_path: Path) -> dict[str, dict]:
+    if not manifest_path.exists():
+        return {}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    if raw.get("schemaVersion") == 2 and isinstance(raw.get("platforms"), dict):
+        return {
+            k: v for k, v in raw["platforms"].items()
+            if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("profiles"), list)
+        }
+    if raw.get("schemaVersion") == 1 and isinstance(raw.get("profiles"), list):
+        os_label = raw.get("os") if isinstance(raw.get("os"), str) and raw.get("os") else "macOS"
+        key = normalize_platform_key(os_label)
+        return {
+            key: {
+                "os": os_label,
+                "generatedAt": raw.get("generatedAt", ""),
+                "commitSha": raw.get("commitSha", ""),
+                "shortSha": raw.get("shortSha", ""),
+                "simdWidth": raw.get("simdWidth", 8),
+                "profiles": raw["profiles"],
+            }
+        }
+    return {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Capture .nacelle-profile archives for benchmark shaders for GitHub Pages viewer preloading."
@@ -42,6 +78,7 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--sha", default="")
     parser.add_argument("--os", dest="os_name", default="macOS")
+    parser.add_argument("--platform", default="")
     parser.add_argument("--simd-width", type=int, default=8)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=45)
@@ -54,7 +91,9 @@ def main() -> None:
     if not specs:
         raise SystemExit(f"No benchmarks discovered in {args.bench_json}")
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    platform_key = normalize_platform_key(args.os_name, args.platform)
+    platform_dir = args.out_dir / platform_key
+    platform_dir.mkdir(parents=True, exist_ok=True)
     backend_flag = f"nacelle-w{args.simd_width}"
     captured = []
 
@@ -62,7 +101,8 @@ def main() -> None:
         for spec in specs:
             bench_id = spec["id"]
             filename = f"{bench_id}.nacelle-profile"
-            out_path = args.out_dir / filename
+            rel_file = f"{platform_key}/{filename}"
+            out_path = platform_dir / filename
             if out_path.exists():
                 out_path.unlink()
 
@@ -80,7 +120,7 @@ def main() -> None:
                 "--shader-dir", str(args.shader_dir),
                 "--iters", str(args.iters),
             ]
-            print(f"[capture] {bench_id} ({spec['category']}: {spec['name']})...", flush=True)
+            print(f"[capture] {platform_key}/{bench_id} ({spec['category']}: {spec['name']})...", flush=True)
             try:
                 proc = subprocess.run(
                     cmd,
@@ -105,30 +145,44 @@ def main() -> None:
                 continue
 
             size_bytes = out_path.stat().st_size
-            print(f"  [ok]   {filename} ({size_bytes} bytes)", flush=True)
+            print(f"  [ok]   {rel_file} ({size_bytes} bytes)", flush=True)
             captured.append({
                 "id": bench_id,
                 "name": spec["name"],
                 "category": spec["category"],
-                "file": filename,
+                "file": rel_file,
                 "simdWidth": args.simd_width,
                 "sizeBytes": size_bytes,
             })
 
-    manifest = {
-        "schemaVersion": 1,
+    manifest_path = args.out_dir / "manifest.json"
+    platforms = load_existing_platforms(manifest_path)
+    platforms[platform_key] = {
+        "os": args.os_name,
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commitSha": args.sha,
         "shortSha": args.sha[:7] if args.sha else "",
-        "os": args.os_name,
         "simdWidth": args.simd_width,
         "profiles": captured,
     }
-    manifest_path = args.out_dir / "manifest.json"
+    ordered_platforms = {}
+    for key in ("windows", "macos"):
+        if key in platforms:
+            ordered_platforms[key] = platforms[key]
+    for key in sorted(platforms):
+        if key not in ordered_platforms:
+            ordered_platforms[key] = platforms[key]
+
+    default_platform = "windows" if "windows" in ordered_platforms else next(iter(ordered_platforms))
+    manifest = {
+        "schemaVersion": 2,
+        "defaultPlatform": default_platform,
+        "platforms": ordered_platforms,
+    }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"Captured {len(captured)}/{len(specs)} benchmark shader profiles into {args.out_dir}")
+    print(f"Captured {len(captured)}/{len(specs)} {args.os_name} benchmark shader profiles into {platform_dir}")
 
 
 if __name__ == "__main__":

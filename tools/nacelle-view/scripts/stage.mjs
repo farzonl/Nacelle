@@ -46,21 +46,34 @@ await mkdir(target, { recursive: true });
 for (const file of files) await cp(join(dist, file), join(target, file), { recursive: true });
 
 if (profilesDir) {
+  const SAFE_PROFILE_PATH = /^(?:[a-z0-9_-]+\/)?[A-Za-z0-9_.-]+\.nacelle-profile$/;
   const srcProfiles = resolve(profilesDir);
   const manifestPath = join(srcProfiles, 'manifest.json');
   const raw = JSON.parse(await readFile(manifestPath, 'utf-8'));
-  if (!raw || typeof raw !== 'object' || raw.schemaVersion !== 1 || !Array.isArray(raw.profiles)) {
+  const entries = [];
+  if (raw && typeof raw === 'object' && raw.schemaVersion === 1 && Array.isArray(raw.profiles)) {
+    entries.push(...raw.profiles);
+  } else if (raw && typeof raw === 'object' && raw.schemaVersion === 2 && raw.platforms && typeof raw.platforms === 'object') {
+    for (const plat of Object.values(raw.platforms)) {
+      if (!plat || typeof plat !== 'object' || !Array.isArray(plat.profiles)) {
+        throw new Error(`Invalid platform entry in preloaded profiles manifest at ${manifestPath}`);
+      }
+      entries.push(...plat.profiles);
+    }
+  } else {
     throw new Error(`Invalid preloaded profiles manifest at ${manifestPath}`);
   }
   const destProfiles = join(target, 'profiles');
   await mkdir(destProfiles, { recursive: true });
   await cp(manifestPath, join(destProfiles, 'manifest.json'));
   let stagedCount = 0;
-  for (const entry of raw.profiles) {
-    if (!entry || typeof entry.file !== 'string' || !/^[A-Za-z0-9_.-]+\.nacelle-profile$/.test(entry.file)) {
+  for (const entry of entries) {
+    if (!entry || typeof entry.file !== 'string' || entry.file.includes('..') || !SAFE_PROFILE_PATH.test(entry.file)) {
       throw new Error(`Unsafe preloaded profile filename: ${String(entry?.file)}`);
     }
-    await cp(join(srcProfiles, entry.file), join(destProfiles, entry.file));
+    const destPath = join(destProfiles, entry.file);
+    await mkdir(resolve(destPath, '..'), { recursive: true });
+    await cp(join(srcProfiles, entry.file), destPath);
     stagedCount++;
   }
   console.log(`Staged bundled profile viewer with ${stagedCount} preloaded benchmark profiles at ${target}`);

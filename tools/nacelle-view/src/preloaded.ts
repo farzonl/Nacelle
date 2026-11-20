@@ -10,7 +10,16 @@ export interface PreloadedProfileEntry {
   sizeBytes?: number;
 }
 
-export interface PreloadedProfileManifest {
+export interface PreloadedPlatformManifest {
+  os: string;
+  generatedAt?: string;
+  commitSha?: string;
+  shortSha?: string;
+  simdWidth?: number;
+  profiles: PreloadedProfileEntry[];
+}
+
+export interface LegacyPreloadedProfileManifest {
   schemaVersion: 1;
   generatedAt?: string;
   commitSha?: string;
@@ -20,18 +29,25 @@ export interface PreloadedProfileManifest {
   profiles: PreloadedProfileEntry[];
 }
 
-const SAFE_PROFILE_FILE = /^[A-Za-z0-9_.-]+\.nacelle-profile$/;
-
-export function isSafeProfileFile(file: string): boolean {
-  return file.length <= 128 && SAFE_PROFILE_FILE.test(file) && !file.includes('..');
+export interface PreloadedProfileManifest {
+  schemaVersion: 2;
+  defaultPlatform?: string;
+  platforms: Record<string, PreloadedPlatformManifest>;
 }
 
-export function validatePreloadedManifest(value: unknown): PreloadedProfileManifest {
-  requireValid(object(value) && value.schemaVersion === 1 && Array.isArray(value.profiles),
-    'Invalid benchmark profile manifest.');
+export type PreloadedManifestInput = PreloadedProfileManifest | LegacyPreloadedProfileManifest;
+
+const SAFE_PLATFORM_KEY = /^[a-z0-9_-]+$/;
+const SAFE_PROFILE_FILE = /^(?:[a-z0-9_-]+\/)?[A-Za-z0-9_.-]+\.nacelle-profile$/;
+
+export function isSafeProfileFile(file: string): boolean {
+  return file.length <= 160 && SAFE_PROFILE_FILE.test(file) && !file.includes('..');
+}
+
+function validateProfileEntries(items: unknown[]): PreloadedProfileEntry[] {
   const seenIds = new Set<string>();
   const profiles: PreloadedProfileEntry[] = [];
-  for (const item of value.profiles) {
+  for (const item of items) {
     requireValid(
       object(item)
         && typeof item.id === 'string' && item.id.length > 0 && item.id.length <= 128
@@ -51,14 +67,62 @@ export function validatePreloadedManifest(value: unknown): PreloadedProfileManif
       sizeBytes: typeof item.sizeBytes === 'number' ? item.sizeBytes : undefined,
     });
   }
+  return profiles;
+}
+
+function normalizePlatformKey(osName: string | undefined): string {
+  const raw = (osName ?? 'default').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return raw || 'default';
+}
+
+export function validatePreloadedManifest(value: unknown): PreloadedProfileManifest {
+  requireValid(object(value), 'Invalid benchmark profile manifest.');
+  if (value.schemaVersion === 1) {
+    requireValid(Array.isArray(value.profiles), 'Invalid benchmark profile manifest.');
+    const osLabel = typeof value.os === 'string' && value.os ? value.os : 'macOS';
+    const key = normalizePlatformKey(osLabel);
+    const profiles = validateProfileEntries(value.profiles);
+    return {
+      schemaVersion: 2,
+      defaultPlatform: key,
+      platforms: {
+        [key]: {
+          os: osLabel,
+          generatedAt: typeof value.generatedAt === 'string' ? value.generatedAt : undefined,
+          commitSha: typeof value.commitSha === 'string' ? value.commitSha : undefined,
+          shortSha: typeof value.shortSha === 'string' ? value.shortSha : undefined,
+          simdWidth: typeof value.simdWidth === 'number' ? value.simdWidth : undefined,
+          profiles,
+        },
+      },
+    };
+  }
+
+  requireValid(value.schemaVersion === 2 && object(value.platforms), 'Invalid benchmark profile manifest.');
+  const platforms: Record<string, PreloadedPlatformManifest> = {};
+  for (const [key, plat] of Object.entries(value.platforms)) {
+    requireValid(SAFE_PLATFORM_KEY.test(key) && object(plat) && Array.isArray(plat.profiles),
+      `Invalid platform manifest entry: ${key}`);
+    const profiles = validateProfileEntries(plat.profiles);
+    if (!profiles.length) continue;
+    platforms[key] = {
+      os: typeof plat.os === 'string' && plat.os ? plat.os : key,
+      generatedAt: typeof plat.generatedAt === 'string' ? plat.generatedAt : undefined,
+      commitSha: typeof plat.commitSha === 'string' ? plat.commitSha : undefined,
+      shortSha: typeof plat.shortSha === 'string' ? plat.shortSha : undefined,
+      simdWidth: typeof plat.simdWidth === 'number' ? plat.simdWidth : undefined,
+      profiles,
+    };
+  }
+
+  const defaultPlatform = typeof value.defaultPlatform === 'string' && value.defaultPlatform in platforms
+    ? value.defaultPlatform
+    : Object.keys(platforms)[0];
+
   return {
-    schemaVersion: 1,
-    generatedAt: typeof value.generatedAt === 'string' ? value.generatedAt : undefined,
-    commitSha: typeof value.commitSha === 'string' ? value.commitSha : undefined,
-    shortSha: typeof value.shortSha === 'string' ? value.shortSha : undefined,
-    os: typeof value.os === 'string' ? value.os : undefined,
-    simdWidth: typeof value.simdWidth === 'number' ? value.simdWidth : undefined,
-    profiles,
+    schemaVersion: 2,
+    defaultPlatform,
+    platforms,
   };
 }
 
@@ -70,7 +134,8 @@ export async function fetchPreloadedManifest(url = './profiles/manifest.json'): 
 
 export async function openPreloadedProfile(file: string): Promise<ProfileDataSource> {
   requireValid(isSafeProfileFile(file), 'Invalid preloaded profile filename.');
-  const response = await fetch(`./profiles/${encodeURIComponent(file)}`);
+  const encodedPath = file.split('/').map(encodeURIComponent).join('/');
+  const response = await fetch(`./profiles/${encodedPath}`);
   requireValid(response.ok, `Unable to load benchmark profile ${file} (${response.status}).`);
   const buffer = await response.arrayBuffer();
   requireValid(buffer.byteLength <= LIMITS.archive, 'Benchmark profile exceeds 256 MiB limit.');

@@ -2,8 +2,10 @@ import { FileProfileDataSource } from './file-source';
 import {
   fetchPreloadedManifest,
   openPreloadedProfile,
+  validatePreloadedManifest,
+  type PreloadedManifestInput,
+  type PreloadedPlatformManifest,
   type PreloadedProfileEntry,
-  type PreloadedProfileManifest,
 } from './preloaded';
 import { LIMITS, loadProfile, requireValid, type Profile, type ProfileDataSource } from './profile';
 import { captureStatus, filterThreads, groupThreads, summaryText, type SpanFilter, type ThreadGroup } from './presentation';
@@ -12,7 +14,7 @@ import type { TimelineSelectionEvent, TimelineView } from './timeline';
 
 export interface ViewerOptions {
   preloadedEnabled?: boolean;
-  loadPreloadedManifest?: () => Promise<PreloadedProfileManifest>;
+  loadPreloadedManifest?: () => Promise<PreloadedManifestInput>;
   openPreloadedProfile?: (file: string) => Promise<ProfileDataSource>;
   timelineView?: TimelineView;
 }
@@ -110,6 +112,7 @@ export function mountViewer(
 
   const modeBadge = root.querySelector<HTMLElement>('#mode-badge');
   const benchmarkBar = root.querySelector<HTMLElement>('#benchmark-bar');
+  const benchmarkOsToggle = root.querySelector<HTMLElement>('#benchmark-os-toggle');
   const benchmarkSelect = root.querySelector<HTMLSelectElement>('#benchmark-select');
   const benchmarkPrev = root.querySelector<HTMLButtonElement>('#benchmark-prev');
   const benchmarkNext = root.querySelector<HTMLButtonElement>('#benchmark-next');
@@ -138,6 +141,8 @@ export function mountViewer(
   let generation = 0;
   let shown = 0;
   let total = 0;
+  let preloadedPlatforms: Record<string, PreloadedPlatformManifest> = {};
+  let activePlatformKey = '';
   let preloadedEntries: PreloadedProfileEntry[] = [];
   let tableCounter = 0;
 
@@ -453,15 +458,28 @@ export function mountViewer(
     benchmarkNext.disabled = idx < 0 || idx >= preloadedEntries.length - 1;
   }
 
-  function syncShaderQueryParam(id: string): void {
+  function syncQueryParams(shaderId: string, platformKey?: string): void {
     const win = root.defaultView;
     if (!win?.history?.replaceState || !win.location) return;
     try {
       const url = new URL(win.location.href);
-      url.searchParams.set('shader', id);
+      if (platformKey) url.searchParams.set('os', platformKey);
+      url.searchParams.set('shader', shaderId);
       win.history.replaceState(null, '', url.toString());
     } catch {
       // Ignore in opaque/non-standard origins (e.g., jsdom tests).
+    }
+  }
+
+  function updateOsToggleButtons(): void {
+    if (!benchmarkOsToggle) return;
+    const buttons = benchmarkOsToggle.querySelectorAll<HTMLButtonElement>('button[data-platform]');
+    for (const btn of buttons) {
+      const active = btn.dataset.platform === activePlatformKey;
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+      btn.className = active
+        ? 'profiler-btn px-3 py-2 text-xs font-semibold bg-[var(--accent-soft)] text-[var(--accent-strong)] transition'
+        : 'profiler-btn px-3 py-2 text-xs font-medium text-[var(--muted)] transition hover:bg-[var(--surface-hover)] hover:text-[var(--text)]';
     }
   }
 
@@ -470,44 +488,87 @@ export function mountViewer(
     if (!entry) return;
     if (benchmarkSelect) benchmarkSelect.value = entry.id;
     updateBenchmarkNavButtons();
-    syncShaderQueryParam(entry.id);
+    syncQueryParams(entry.id, activePlatformKey || undefined);
+    const plat = activePlatformKey ? preloadedPlatforms[activePlatformKey] : undefined;
+    const title = plat?.os ? `${entry.name} (${plat.os})` : entry.name;
     const openPreloaded = options.openPreloadedProfile ?? openPreloadedProfile;
-    void loadFromSource(entry.name, `Loading benchmark profile: ${entry.name}…`, () => openPreloaded(entry.file));
+    void loadFromSource(title, `Loading benchmark profile: ${title}…`, () => openPreloaded(entry.file));
+  }
+
+  function selectBenchmarkPlatform(platformKey: string, preferredShaderId?: string | null): void {
+    const plat = preloadedPlatforms[platformKey];
+    if (!plat || !benchmarkSelect) return;
+    const prevShaderId = preferredShaderId ?? (benchmarkSelect.value || null);
+    activePlatformKey = platformKey;
+    preloadedEntries = plat.profiles;
+    updateOsToggleButtons();
+
+    benchmarkSelect.replaceChildren();
+    option(benchmarkSelect, '', '— Local file —');
+    const byCategory = new Map<string, PreloadedProfileEntry[]>();
+    for (const entry of preloadedEntries) {
+      const list = byCategory.get(entry.category) ?? [];
+      list.push(entry);
+      byCategory.set(entry.category, list);
+    }
+    for (const [category, entries] of byCategory) {
+      const group = root.createElement('optgroup');
+      group.label = category;
+      for (const entry of entries) {
+        option(group, entry.id, `${entry.name} (${entry.id})`);
+      }
+      benchmarkSelect.append(group);
+    }
+
+    if (benchmarkMeta) {
+      const parts: string[] = [];
+      if (plat.os) parts.push(plat.os);
+      if (plat.simdWidth) parts.push(`SIMD-${plat.simdWidth}`);
+      if (plat.shortSha) parts.push(`commit ${plat.shortSha}`);
+      parts.push(`${preloadedEntries.length} shaders`);
+      benchmarkMeta.textContent = parts.join(' · ');
+    }
+
+    const initial = (prevShaderId && preloadedEntries.find(e => e.id === prevShaderId))
+      ?? preloadedEntries.find(e => e.id === 'bench_raymarch')
+      ?? preloadedEntries[0];
+    if (initial) selectBenchmarkShader(initial.id);
+    else updateBenchmarkNavButtons();
   }
 
   async function initPreloadedProfiles(): Promise<void> {
     if (!options.preloadedEnabled || !benchmarkBar || !benchmarkSelect) return;
     const loadManifest = options.loadPreloadedManifest ?? fetchPreloadedManifest;
     try {
-      const manifest = await loadManifest();
-      if (!manifest.profiles.length) return;
-      preloadedEntries = manifest.profiles;
+      const manifest = validatePreloadedManifest(await loadManifest());
+      const keys = Object.keys(manifest.platforms).sort((a, b) => {
+        const order = (k: string) => (k === 'windows' ? 0 : k === 'macos' ? 1 : 2);
+        const diff = order(a) - order(b);
+        return diff !== 0 ? diff : a.localeCompare(b);
+      });
+      if (!keys.length) return;
+      preloadedPlatforms = manifest.platforms;
 
-      benchmarkSelect.replaceChildren();
-      option(benchmarkSelect, '', '— Local file —');
-      const byCategory = new Map<string, PreloadedProfileEntry[]>();
-      for (const entry of preloadedEntries) {
-        const list = byCategory.get(entry.category) ?? [];
-        list.push(entry);
-        byCategory.set(entry.category, list);
-      }
-      for (const [category, entries] of byCategory) {
-        const group = root.createElement('optgroup');
-        group.label = category;
-        for (const entry of entries) {
-          option(group, entry.id, `${entry.name} (${entry.id})`);
-        }
-        benchmarkSelect.append(group);
+      if (benchmarkOsToggle) {
+        benchmarkOsToggle.replaceChildren();
+        keys.forEach((key, index) => {
+          if (index > 0) {
+            const divider = root.createElement('span');
+            divider.className = 'h-4 w-px bg-[var(--border)]';
+            divider.setAttribute('aria-hidden', 'true');
+            benchmarkOsToggle.append(divider);
+          }
+          const btn = element('button', preloadedPlatforms[key].os);
+          btn.type = 'button';
+          btn.dataset.platform = key;
+          btn.addEventListener('click', () => {
+            if (activePlatformKey !== key) selectBenchmarkPlatform(key);
+          });
+          benchmarkOsToggle.append(btn);
+        });
+        benchmarkOsToggle.hidden = keys.length === 0;
       }
 
-      if (benchmarkMeta) {
-        const parts: string[] = [];
-        if (manifest.os) parts.push(manifest.os);
-        if (manifest.simdWidth) parts.push(`SIMD-${manifest.simdWidth}`);
-        if (manifest.shortSha) parts.push(`commit ${manifest.shortSha}`);
-        parts.push(`${preloadedEntries.length} shaders`);
-        benchmarkMeta.textContent = parts.join(' · ');
-      }
       if (modeBadge) modeBadge.textContent = 'Benchmark Suite';
       benchmarkBar.hidden = false;
 
@@ -524,13 +585,15 @@ export function mountViewer(
         if (idx >= 0 && idx < preloadedEntries.length - 1) selectBenchmarkShader(preloadedEntries[idx + 1].id);
       });
 
-      const requested = root.defaultView?.location
-        ? new URLSearchParams(root.defaultView.location.search).get('shader')
+      const params = root.defaultView?.location
+        ? new URLSearchParams(root.defaultView.location.search)
         : null;
-      const initial = (requested && preloadedEntries.find(e => e.id === requested))
-        ?? preloadedEntries.find(e => e.id === 'bench_raymarch')
-        ?? preloadedEntries[0];
-      if (initial) selectBenchmarkShader(initial.id);
+      const requestedOs = params?.get('os')?.trim().toLowerCase() ?? '';
+      const requestedShader = params?.get('shader') ?? null;
+      const initialPlatform = (requestedOs && requestedOs in preloadedPlatforms)
+        ? requestedOs
+        : (manifest.defaultPlatform && manifest.defaultPlatform in preloadedPlatforms ? manifest.defaultPlatform : keys[0]);
+      selectBenchmarkPlatform(initialPlatform, requestedShader);
     } catch {
       // Preloaded profiles are optional CI-staged assets; keep local viewer usable if unavailable.
       benchmarkBar.hidden = true;
