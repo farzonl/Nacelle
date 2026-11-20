@@ -547,9 +547,9 @@ void applyShaderFastMathFlags(llvm::Module& mod) {
 void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     if (rt.jit) return;
 
-#if defined(__APPLE__) || defined(_WIN32)
-    // Secondary threads (std::thread / BS::thread_pool) have limited stacks (512 KB on macOS,
-    // 1 MB on Windows); RegAllocFast at CodeGenOptLevel::None does not reuse stack slots and
+#if defined(__APPLE__)
+    // Secondary threads (std::thread / BS::thread_pool) have limited stacks (512 KB on macOS);
+    // RegAllocFast at CodeGenOptLevel::None does not reuse stack slots and
     // can overflow or mis-handle large W=8/W=16 vector frames.
     auto jtmbOrErr = createHostJTMB(llvm::CodeGenOptLevel::Less);
 #else

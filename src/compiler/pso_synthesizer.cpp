@@ -1303,19 +1303,21 @@ bool synthesizeGraphicsPSOMLIR(
         skipVS = false;
     }
 
-    auto msLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader msLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> msMlirMod;
-    auto asLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader asLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> asMlirMod;
     if (hasMS) {
-        if (!loadAndUpgradeDXIL(meshStages.MS, *msLlvmCtx, msLoaded, outError)) {
-            return false;
+        {
+            auto msLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            if (!loadAndUpgradeDXIL(meshStages.MS, *msLlvmCtx, msLoaded, outError)) {
+                return false;
+            }
+            msMlirMod = importAndLiftDXILToSCF(std::move(msLoaded.module), msLoaded.entryName, mlirCtx, outError);
+            if (!msMlirMod) return false;
         }
-        msMlirMod = importAndLiftDXILToSCF(std::move(msLoaded.module), msLoaded.entryName, mlirCtx, outError);
-        if (!msMlirMod) return false;
         if (hasAS) {
+            auto asLlvmCtx = std::make_unique<llvm::LLVMContext>();
             if (!loadAndUpgradeDXIL(meshStages.AS, *asLlvmCtx, asLoaded, outError)) {
                 return false;
             }
@@ -1332,11 +1334,11 @@ bool synthesizeGraphicsPSOMLIR(
     const RootSignatureLayout& asEffectiveLayout =
         (hasAS && emptyRoot && asLoaded.hasEmbeddedRootSig) ? asLoaded.embeddedRootSig : msEffectiveLayout;
 
-    auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader vsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> vsMlirMod;
     bool loadedVSFromDXIL = false;
     if (!hasMS) {
+        auto vsLlvmCtx = std::make_unique<llvm::LLVMContext>();
         if (!skipVS || !precompiledVSOutputRecs || precompiledVSOutputRecs->empty() || emptyRoot) {
             if (!loadAndUpgradeDXIL(desc.VS, *vsLlvmCtx, vsLoaded, outError)) {
                 return false;
@@ -1346,6 +1348,9 @@ bool synthesizeGraphicsPSOMLIR(
         if (!skipVS) {
             vsMlirMod = importAndLiftDXILToSCF(std::move(vsLoaded.module), vsLoaded.entryName, mlirCtx, outError);
             if (!vsMlirMod) return false;
+        } else {
+            // Metadata-only cache hits must release the module before its context.
+            vsLoaded.module.reset();
         }
     }
 
@@ -1359,25 +1364,28 @@ bool synthesizeGraphicsPSOMLIR(
             ? *precompiledVSOutputRecs
             : vsLoaded.outputSigs;
 
-    auto hsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader hsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> hsMlirMod;
-    auto dsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader dsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> dsMlirMod;
     if (hasTess) {
-        if (!loadAndUpgradeDXIL(desc.HS, *hsLlvmCtx, hsLoaded, outError)) {
-            return false;
+        {
+            auto hsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            if (!loadAndUpgradeDXIL(desc.HS, *hsLlvmCtx, hsLoaded, outError)) {
+                return false;
+            }
+            hsMlirMod = importAndLiftDXILToSCF(
+                std::move(hsLoaded.module), hsLoaded.entryName, mlirCtx, outError, hsLoaded.hsPatchConstFnName);
+            if (!hsMlirMod) return false;
         }
-        hsMlirMod = importAndLiftDXILToSCF(
-            std::move(hsLoaded.module), hsLoaded.entryName, mlirCtx, outError, hsLoaded.hsPatchConstFnName);
-        if (!hsMlirMod) return false;
-
-        if (!loadAndUpgradeDXIL(desc.DS, *dsLlvmCtx, dsLoaded, outError)) {
-            return false;
+        {
+            auto dsLlvmCtx = std::make_unique<llvm::LLVMContext>();
+            if (!loadAndUpgradeDXIL(desc.DS, *dsLlvmCtx, dsLoaded, outError)) {
+                return false;
+            }
+            dsMlirMod = importAndLiftDXILToSCF(std::move(dsLoaded.module), dsLoaded.entryName, mlirCtx, outError);
+            if (!dsMlirMod) return false;
         }
-        dsMlirMod = importAndLiftDXILToSCF(std::move(dsLoaded.module), dsLoaded.entryName, mlirCtx, outError);
-        if (!dsMlirMod) return false;
     }
 
     const RootSignatureLayout& hsEffectiveLayout =
@@ -1389,10 +1397,10 @@ bool synthesizeGraphicsPSOMLIR(
             ? dsLoaded.embeddedRootSig
             : vsEffectiveLayout;
 
-    auto gsLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader gsLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> gsMlirMod;
     if (hasGS) {
+        auto gsLlvmCtx = std::make_unique<llvm::LLVMContext>();
         if (!loadAndUpgradeDXIL(desc.GS, *gsLlvmCtx, gsLoaded, outError)) {
             return false;
         }
@@ -1406,10 +1414,10 @@ bool synthesizeGraphicsPSOMLIR(
             : vsEffectiveLayout;
 
     bool hasPS = (desc.PS.pShaderBytecode && desc.PS.BytecodeLength > 0);
-    auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
     DxilLoadedShader psLoaded;
     mlir::OwningOpRef<mlir::ModuleOp> psMlirMod;
     if (hasPS) {
+        auto psLlvmCtx = std::make_unique<llvm::LLVMContext>();
         if (!loadAndUpgradeDXIL(desc.PS, *psLlvmCtx, psLoaded, outError)) {
             return false;
         }
