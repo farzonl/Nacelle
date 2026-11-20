@@ -454,6 +454,14 @@ jobs:
           path: .bench-cache
           key: bench-history-${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Preserve preloaded viewer benchmark profiles from live Pages
+        env:
+          GITHUB_EVENT_REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          python scripts/preserve_viewer_profiles.py `
+            --pages-url "https://$($env:GITHUB_REPOSITORY_OWNER).github.io/$($env:GITHUB_EVENT_REPOSITORY_NAME)" `
+            --out-dir "$env:GITHUB_WORKSPACE\viewer-profiles"
+
       - name: Set up Node for profile viewer
         uses: actions/setup-node@v4
         with:
@@ -464,13 +472,19 @@ jobs:
       - name: Build, test, and stage offline profile viewer
         working-directory: tools/nacelle-view
         run: |
+          $hasProfiles = Test-Path "..\..\viewer-profiles\manifest.json"
+          if ($hasProfiles) { $env:VITE_ENABLE_PRELOADED_PROFILES = "1" }
           npm ci
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npm run stage -- ../../_site
+          if ($hasProfiles) {
+            npm run stage -- ../../_site --profiles-dir ../../viewer-profiles
+          } else {
+            npm run stage -- ../../_site
+          }
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

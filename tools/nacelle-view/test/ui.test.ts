@@ -185,4 +185,45 @@ describe('offline viewer DOM', () => {
       click.mockRestore();
     }
   });
+
+  it('hides benchmark shader selector when preloaded profiles are disabled', () => {
+    mountViewer(document);
+    expect(document.querySelector<HTMLElement>('#benchmark-bar')!.hidden).toBe(true);
+    expect(document.querySelector('#mode-badge')!.textContent).toBe('Offline');
+  });
+
+  it('preloads benchmark shader profiles and switches between shaders when enabled', async () => {
+    const raymarch = await profile([span({ name: 'Raymarch dispatch', ts: 10, dur: 50 })]);
+    const matmul = await profile([span({ name: 'MatMul dispatch', ts: 20, dur: 80 })]);
+    const openPreloaded = vi.fn(async (file: string) =>
+      file === 'matmul.nacelle-profile' ? source(matmul) : source(raymarch));
+
+    mountViewer(document, async () => source(raymarch), {
+      preloadedEnabled: true,
+      loadPreloadedManifest: async () => ({
+        schemaVersion: 1,
+        os: 'macOS',
+        simdWidth: 8,
+        shortSha: 'abc1234',
+        profiles: [
+          { id: 'bench_raymarch', name: 'Raymarcher', category: 'Compute', file: 'bench_raymarch.nacelle-profile' },
+          { id: 'matmul', name: 'MatMul 128x128', category: 'Compute', file: 'matmul.nacelle-profile' },
+        ],
+      }),
+      openPreloadedProfile: openPreloaded,
+    });
+
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>('#benchmark-bar')!.hidden).toBe(false));
+    await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('Raymarch dispatch'));
+    expect(document.querySelector('#mode-badge')!.textContent).toBe('Benchmark Suite');
+    expect(document.querySelector('#benchmark-meta')!.textContent).toContain('macOS');
+    expect(document.querySelectorAll('#benchmark-select optgroup')).toHaveLength(1);
+
+    const select = document.querySelector<HTMLSelectElement>('#benchmark-select')!;
+    expect(select.value).toBe('bench_raymarch');
+    document.querySelector<HTMLButtonElement>('#benchmark-next')!.click();
+    await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('MatMul dispatch'));
+    expect(select.value).toBe('matmul');
+    expect(openPreloaded).toHaveBeenCalledWith('matmul.nacelle-profile');
+  });
 });
