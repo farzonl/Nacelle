@@ -220,6 +220,12 @@ jobs:
           path: .compliance-cache
           key: offload-history-${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Preserve preloaded viewer benchmark profiles from live Pages
+        run: |
+          python3 scripts/preserve_viewer_profiles.py \
+            --pages-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" \
+            --out-dir "${{ github.workspace }}/viewer-profiles"
+
       - name: Set up Node for profile viewer
         uses: actions/setup-node@v4
         with:
@@ -230,10 +236,17 @@ jobs:
       - name: Build, test, and stage offline profile viewer
         working-directory: tools/nacelle-view
         run: |
+          if [ -f ../../viewer-profiles/manifest.json ]; then
+            export VITE_ENABLE_PRELOADED_PROFILES=1
+          fi
           npm ci
           npm test
           npm run build
-          npm run stage -- ../../_site
+          if [ -f ../../viewer-profiles/manifest.json ]; then
+            npm run stage -- ../../_site --profiles-dir ../../viewer-profiles
+          else
+            npm run stage -- ../../_site
+          fi
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

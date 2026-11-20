@@ -279,6 +279,44 @@ jobs:
           path: .bench-cache
           key: bench-history-macos-${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Checkout profiling submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
+
+      - name: Configure and build instrumented nacelle worker for profile viewer
+        run: |
+          CLANGXX_ARG=()
+          if [ -x "$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang++" ]; then
+            CLANGXX_ARG=(-DNACELLE_CLANGXX="$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang++")
+          fi
+          cmake -S . -B build-profile -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNACELLE_FETCH_SDL3=OFF \
+            -DNACELLE_ENABLE_INSTRUMENTATION=ON \
+            "${CLANGXX_ARG[@]}" \
+            -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/.sdk" \
+            -DLLVM_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="$GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="$GITHUB_WORKSPACE/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="$GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file"
+          cmake --build build-profile --target bench-worker-nacelle --parallel
+
+      - name: Capture benchmark suite profiles for GitHub Pages viewer
+        run: |
+          TARGET_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          export DYLD_FALLBACK_LIBRARY_PATH="$GITHUB_WORKSPACE/.sdk/lib:$GITHUB_WORKSPACE/.toolchains/llvm/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+          python3 scripts/capture_bench_profiles.py \
+            --bench-json "$GITHUB_WORKSPACE/bench-results.json" \
+            --worker "$GITHUB_WORKSPACE/build-profile/bench-worker-nacelle" \
+            --shader-dir "$GITHUB_WORKSPACE/build/tests/shaders" \
+            --out-dir "$GITHUB_WORKSPACE/bench-profiles" \
+            --sha "$TARGET_SHA" \
+            --os macOS \
+            --simd-width 8 \
+            --iters 3
+
       - name: Set up Node for profile viewer
         uses: actions/setup-node@v4
         with:
@@ -288,11 +326,17 @@ jobs:
 
       - name: Build, test, and stage offline profile viewer
         working-directory: tools/nacelle-view
+        env:
+          VITE_ENABLE_PRELOADED_PROFILES: "1"
         run: |
           npm ci
           npm test
           npm run build
-          npm run stage -- ../../_site
+          if [ -f ../../bench-profiles/manifest.json ]; then
+            npm run stage -- ../../_site --profiles-dir ../../bench-profiles
+          else
+            npm run stage -- ../../_site
+          fi
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
