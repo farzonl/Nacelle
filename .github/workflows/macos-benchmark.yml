@@ -22,9 +22,8 @@ jobs:
     name: Benchmark (Nacelle vs Metal vs MoltenVK vs llvmpipe vs KosmicKrisp)
     runs-on: macos-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      artifact_name: ${{ steps.set-artifact-name.outputs.artifact_name }}
 
     steps:
       - name: Checkout repository
@@ -354,11 +353,26 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
+      - name: Set Pages artifact name
+        id: set-artifact-name
+        run: echo "artifact_name=github-pages-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
+          name: ${{ steps.set-artifact-name.outputs.artifact_name }}
           path: _site
 
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: macos-benchmark
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ needs.macos-benchmark.outputs.artifact_name }}
