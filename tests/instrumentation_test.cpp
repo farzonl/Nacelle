@@ -9,16 +9,40 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+namespace {
+// Faults affect one allocation on the API-calling thread, never concurrent workers.
+thread_local size_t allocationFailureMinimum = 0;
+thread_local size_t failedAllocationBytes = 0;
+}
+
+void* operator new(size_t bytes) {
+    if (allocationFailureMinimum && bytes >= allocationFailureMinimum) {
+        allocationFailureMinimum = 0;
+        failedAllocationBytes = bytes;
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+
+void* operator new[](size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, size_t) noexcept { std::free(memory); }
 
 namespace {
 void require(bool condition, const char* message) {
@@ -131,6 +155,36 @@ int main(int argc, char** argv) {
                 require(event.args.codeVersionId && event.args.pipelineId == 1,
                         "Graphics trace references capture-local version metadata");
             }
+        }
+        {
+            NacelleProfileOptions options;
+            options.event_buffer_bytes = 1024 * 1024;
+            const auto eventBytes = options.event_buffer_bytes / sizeof(nacelle::profile::Event) *
+                                    sizeof(nacelle::profile::Event);
+            NacelleProfileCapture* failed = nullptr;
+            allocationFailureMinimum = eventBytes;
+            const auto result = NacelleBeginProfileCapture(&options, &failed);
+            require(result == E_OUTOFMEMORY && !failed && failedAllocationBytes == eventBytes,
+                    "Event-pool allocation failure is explicit and leaves no active capture");
+
+            Capture capture;
+            capture.begin();
+            {
+                NACELLE_PROFILE_SCOPE("Serialization allocation retry");
+            }
+            const auto failedPath = directory / "allocation-failed.nacelle-profile";
+            const auto retryPath = directory / "allocation-retried.nacelle-profile";
+            const auto failedName = failedPath.string();
+            const auto retryName = retryPath.string();
+            NacelleProfileSummary summary;
+            allocationFailureMinimum = 1;
+            require(NacelleEndProfileCapture(capture.value, failedName.c_str(), &summary) == E_OUTOFMEMORY &&
+                    !std::filesystem::exists(failedPath),
+                    "Serialization allocation failure produces no success-shaped or partial bundle");
+            require(NacelleEndProfileCapture(capture.value, retryName.c_str(), &summary) == S_OK &&
+                    summary.recorded_events == 1 && summary.dropped_events == 0 && summary.complete &&
+                    read(retryPath).trace.traceEvents.size() == 1,
+                    "Stopped capture retries after allocation failure without losing events");
         }
         {
             nacelle::ComputeEntryVersions entries;
@@ -616,7 +670,7 @@ int main(int argc, char** argv) {
         NacelleProfileCapture* invalid = nullptr;
         require(FAILED(NacelleBeginProfileCapture(&invalidOptions, &invalid)), "Reject unsupported options");
         std::filesystem::remove_all(directory);
-        std::cout << "Capture lifecycle, async correlation, overflow, write errors, and corrupt input: PASS\n";
+        std::cout << "Capture lifecycle, async correlation, allocation retry, overflow, write errors, and corrupt input: PASS\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "instrumentation_test: " << error.what() << "\nArtifacts: " << directory << '\n';

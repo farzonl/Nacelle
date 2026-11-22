@@ -157,8 +157,12 @@ reliable RSS attribution granularity. Metadata and 512 retained contexts used
 about 56 KiB in the short-lived-thread case, excluding thread execution effects.
 Workers were joined before drain, so drain latency does not characterize waiting
 for live application work. Serialization remains non-streaming and its peak
-memory is not separately bounded; metadata admission, allocation-failure tests,
-and per-serialization-stage attribution remain open under #212.
+memory is not separately bounded; per-serialization-stage attribution and further bookkeeping bounds remain open
+under #212. Deterministic recorder tests now fail the actual event-pool allocation
+and a serialization allocation using a test-only thread-local allocator probe.
+They require `E_OUTOFMEMORY`, no partial output or stale active session, and a
+successful retry of the stopped capture with identical event/drop counts. No
+allocation-failure hooks or global allocator replacement enter the runtime.
 
 ## Format and current scope
 
