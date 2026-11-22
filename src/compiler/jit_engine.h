@@ -21,6 +21,11 @@ class ModuleOp;
 
 namespace nacelle {
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+std::string profileContentIdentity(const void* bytes, size_t size);
+std::string profileNativeObjectIdentity(uint64_t address);
+#endif
+
 struct DxilSigRecord;
 
 struct PsoUpdateBox {
@@ -158,7 +163,11 @@ bool tryLoadVertexStageFromCache(
     CompiledVertexFn& outVSFn,
     std::vector<ShaderSigElement>* outVSInputs = nullptr,
     std::vector<ShaderSigElement>* outVSOutputs = nullptr,
-    std::vector<DxilSigRecord>* outVSOutputRecs = nullptr);
+    std::vector<DxilSigRecord>* outVSOutputRecs = nullptr
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    , uint8_t* outProfileTier = nullptr
+#endif
+    );
 
 /// Compiles `llvmMod` at Tier-1 synchronously for immediate execution and schedules async Tier-2 (-O3)
 /// optimization + disk cache `.o` emission on the JIT background thread pool.

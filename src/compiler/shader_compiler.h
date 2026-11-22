@@ -4,6 +4,9 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include <mutex>
+#endif
 #include <string>
 #include <vector>
 
@@ -232,18 +235,19 @@ struct ComputeEntryVersion {
     uint32_t version = 0;
     uint8_t tier = 0;
     profile::Cache cache = profile::Cache::Unknown;
+    std::string artifactId;
 };
 
 class ComputeEntryVersions {
 public:
     const uint64_t pipelineIdentity = profile::allocatePipelineIdentity();
 
-    void initialize(CompiledComputeFn fn, uint8_t tier, profile::Cache cache) {
-        initial_ = {fn, 1, tier, cache};
+    void initialize(CompiledComputeFn fn, uint8_t tier, profile::Cache cache, std::string artifactId = {}) {
+        initial_ = {fn, 1, tier, cache, std::move(artifactId)};
         current_.store(&initial_, std::memory_order_release);
     }
-    void promote(CompiledComputeFn fn) {
-        promoted_ = {fn, 2, 2, profile::Cache::Miss};
+    void promote(CompiledComputeFn fn, std::string artifactId = {}) {
+        promoted_ = {fn, 2, 2, profile::Cache::Miss, std::move(artifactId)};
         current_.store(&promoted_, std::memory_order_release);
     }
     const ComputeEntryVersion* load() const {
@@ -254,6 +258,47 @@ private:
     // Both records remain immutable after publication and live as long as the PSO.
     ComputeEntryVersion initial_, promoted_;
     std::atomic<const ComputeEntryVersion*> current_{nullptr};
+};
+
+template <typename Fn>
+class GraphicsEntryVersions {
+public:
+    struct Entry {
+        Fn fn;
+        uint32_t version;
+        uint8_t tier;
+        profile::Cache cache;
+        std::string artifactId;
+    };
+
+    explicit GraphicsEntryVersions(std::nullptr_t = nullptr) {}
+    void store(Fn fn, std::memory_order order, uint8_t tier = 0,
+               profile::Cache cache = profile::Cache::Unknown, std::string artifactId = {}) {
+        std::lock_guard lock(mutex_);
+        const auto* previous = current_.load(std::memory_order_relaxed);
+        if (!fn) {
+            current_.store(nullptr, order);
+            return;
+        }
+        if (previous && previous->fn == fn) return;
+        auto entry = std::make_unique<Entry>(Entry{
+            fn, static_cast<uint32_t>(entries_.size() + 1), tier, cache, std::move(artifactId)});
+        const auto* published = entry.get();
+        entries_.push_back(std::move(entry));
+        current_.store(published, order);
+    }
+    const Entry* snapshot(std::memory_order order = std::memory_order_acquire) const {
+        return current_.load(order);
+    }
+    Fn load(std::memory_order order) const {
+        const auto* entry = snapshot(order);
+        return entry ? entry->fn : nullptr;
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<std::unique_ptr<Entry>> entries_;
+    std::atomic<const Entry*> current_{nullptr};
 };
 #endif
 
@@ -269,6 +314,7 @@ struct CompiledComputePSO {
     std::atomic<CompiledComputeFn> fn{nullptr};
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     ComputeEntryVersions profileEntries;
+    std::string profileShaderId;
 #endif
     uint32_t threadGroupSize[3]{1, 1, 1};
     uint32_t groupSharedBytes = 0;
@@ -289,6 +335,20 @@ struct CompiledGraphicsPSO {
     CompiledGraphicsPSO& operator=(CompiledGraphicsPSO&&) = delete;
     ~CompiledGraphicsPSO();
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const uint64_t profilePipelineIdentity = profile::allocatePipelineIdentity();
+    GraphicsEntryVersions<CompiledVertexFn> vsFn;
+    GraphicsEntryVersions<CompiledPixelQuadFn> psFn;
+    GraphicsEntryVersions<CompiledGeometryFn> gsFn;
+    GraphicsEntryVersions<CompiledHullCPFn> hsFn;
+    GraphicsEntryVersions<CompiledHullPCFn> hsPcFn;
+    GraphicsEntryVersions<CompiledDomainFn> dsFn;
+    GraphicsEntryVersions<CompiledAmplificationFn> asFn;
+    GraphicsEntryVersions<CompiledMeshFn> msFn;
+    std::string profileVertexShaderId, profilePixelShaderId;
+    std::string profileGeometryShaderId, profileHullShaderId, profileDomainShaderId;
+    std::string profileAmplificationShaderId, profileMeshShaderId;
+#else
     std::atomic<CompiledVertexFn> vsFn{nullptr};
     std::atomic<CompiledPixelQuadFn> psFn{nullptr};
     std::atomic<CompiledGeometryFn> gsFn{nullptr};
@@ -297,6 +357,7 @@ struct CompiledGraphicsPSO {
     std::atomic<CompiledDomainFn> dsFn{nullptr};
     std::atomic<CompiledAmplificationFn> asFn{nullptr};
     std::atomic<CompiledMeshFn> msFn{nullptr};
+#endif
     bool hasGS = false;
     uint32_t gsMaxVertexCount = 0;
     uint32_t gsOutputTopology = 5;

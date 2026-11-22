@@ -212,7 +212,7 @@ export function mountViewer(
     if (kpiShaders) kpiShaders.textContent = codes.length.toLocaleString();
     if (kpiTiers) {
       if (codes.length === 0) {
-        kpiTiers.textContent = 'No compute code versions';
+        kpiTiers.textContent = 'No code versions';
       } else {
         const tier1 = codes.filter(c => c.tier === 1).length;
         const tier2 = codes.filter(c => c.tier === 2).length;

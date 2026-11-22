@@ -75,6 +75,64 @@ int main(int argc, char** argv) {
     try {
         require(std::filesystem::create_directory(directory), "Create test directory");
         {
+            nacelle::GraphicsEntryVersions<nacelle::CompiledPixelQuadFn> entries;
+            const nacelle::CompiledPixelQuadFn initial = [](const nacelle::PixelBatchArgs* args) {
+                *args->tileDepthSOA = 1;
+            };
+            const nacelle::CompiledPixelQuadFn promoted = [](const nacelle::PixelBatchArgs* args) {
+                *args->tileDepthSOA = 2;
+            };
+            entries.store(initial, std::memory_order_release, 1, nacelle::profile::Cache::Miss);
+            Capture capture;
+            capture.begin();
+            const auto pipeline = nacelle::profile::allocatePipelineIdentity();
+            {
+                nacelle::profile::Scope root("Graphics snapshot root");
+                root.setAttributes({1, 2, 8, nacelle::profile::Stage::Graphics});
+                root.beginGraphicsSelection(pipeline);
+                std::promise<void> selected, resume;
+                auto resumed = resume.get_future();
+                std::jthread worker([&, context = root.context()] {
+                    const auto* snapshot = entries.snapshot();
+                    selected.set_value();
+                    resumed.wait();
+                    float result = 0;
+                    nacelle::PixelBatchArgs args;
+                    args.tileDepthSOA = &result;
+                    snapshot->fn(&args);
+                    require(result == 1 && snapshot->tier == 1,
+                            "Delayed graphics execution retains old callable and version after promotion");
+                    nacelle::profile::Scope old(context, "Old pixel entry");
+                    old.setGraphicsVersion(pipeline, nacelle::profile::Stage::Pixel,
+                                           snapshot->version, snapshot->tier, snapshot->cache);
+                });
+                selected.get_future().wait();
+                entries.store(promoted, std::memory_order_release, 2, nacelle::profile::Cache::Miss);
+                resume.set_value();
+                worker.join();
+                const auto* current = entries.snapshot();
+                root.setGraphicsVersion(pipeline, nacelle::profile::Stage::Pixel,
+                                        current->version, current->tier, current->cache);
+                nacelle::profile::Scope vertex("Vertex entry");
+                vertex.setGraphicsVersion(pipeline, nacelle::profile::Stage::Vertex,
+                                          1, 1, nacelle::profile::Cache::Hit);
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory / "graphics-snapshots.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                    "Save graphics snapshots across independent stages");
+            const auto profile = read(path);
+            require(profile.shaders.schemaVersion == 2 && profile.shaders.codeVersions.size() == 3,
+                    "Graphics identities distinguish stages and retain both pixel versions");
+            require(profile.shaders.codeSelections && profile.shaders.codeSelections->size() == 1 &&
+                    profile.shaders.codeSelections->front().codeVersionIds.size() == 3,
+                    "Delayed workers contribute their old entry to the draw's composite selection");
+            for (const auto& event : profile.trace.traceEvents) {
+                require(event.args.codeVersionId && event.args.pipelineId == 1,
+                        "Graphics trace references capture-local version metadata");
+            }
+        }
+        {
             nacelle::ComputeEntryVersions entries;
             const nacelle::CompiledComputeFn initial = [](const nacelle::DriverRootContext*,
                 uint8_t* result, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -495,6 +553,25 @@ int main(int argc, char** argv) {
         }
         {
             nacelle::profile::Session session(1024);
+            session.shaders.schemaVersion = 2;
+            session.shaders.codeVersions.push_back({
+                1, 1, std::string(32, 'a'), "hull", 8, 1, 1, "miss", "hull-control-point"});
+            session.shaders.codeVersions.push_back({
+                2, 1, std::string(32, 'a'), "hull", 8, 1, 1, "miss", "hull-patch-constant"});
+            session.shaders.codeSelections = std::vector<nacelle::profile::CodeSelection>{{1, 1, {1, 2}}};
+            std::string error;
+            const auto path = directory / "hull-selection.nacelle-profile";
+            require(nacelle::profile::writeProfile(path.string(), session, error), error.c_str());
+            require(read(path).shaders.codeVersions.size() == 2, "Distinct hull roles resolve the same version");
+            session.shaders.codeSelections->front().codeVersionIds = {1, 1};
+            const auto invalid = directory / "duplicate-selection.nacelle-profile";
+            require(nacelle::profile::writeProfile(invalid.string(), session, error), error.c_str());
+            nacelle::profile::Profile profile;
+            require(!nacelle::profile::readProfile(invalid.string(), profile, error) &&
+                    error.find("selection") != std::string::npos, "Reject duplicate composite entry references");
+        }
+        {
+            nacelle::profile::Session session(1024);
             session.shaders.codeVersions.push_back({
                 1, 1, "00000000000000020000000000000001", "compute", 8, 1, 1, "miss"});
             nacelle::profile::Event event{};
@@ -520,7 +597,11 @@ int main(int argc, char** argv) {
             Capture capture;
             capture.begin();
             const uint64_t pipeline = nacelle::profile::allocatePipelineIdentity();
-            for (uint32_t i = 0; i <= nacelle::profile::maxCodeVersions; ++i) {
+            for (uint32_t i = 0; i < nacelle::profile::maxCodeVersions / 2; ++i) {
+                nacelle::profile::Scope scope("Selection limit");
+                scope.beginGraphicsSelection(pipeline);
+            }
+            for (uint32_t i = 0; i <= nacelle::profile::maxCodeVersions / 2; ++i) {
                 nacelle::profile::Scope scope("Metadata limit");
                 scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute});
                 scope.setComputeVersion(pipeline + i, 1, 1, nacelle::profile::Cache::Miss);
@@ -528,7 +609,7 @@ int main(int argc, char** argv) {
             NacelleProfileSummary summary;
             const auto path = directory / "code-metadata-overflow.nacelle-profile";
             require(FAILED(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary)) &&
-                    !std::filesystem::exists(path), "Reject metadata overflow without a partial bundle");
+                    !std::filesystem::exists(path), "Code versions and selections share one admission limit");
         }
         NacelleProfileOptions invalidOptions;
         invalidOptions.flags = 1;

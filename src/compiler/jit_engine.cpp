@@ -42,6 +42,9 @@
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/MemoryBuffer.h>
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include <llvm/Support/SHA256.h>
+#endif
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
@@ -406,6 +409,9 @@ struct InMemVSCacheEntry {
     CachedVSMeta meta{};
     uint64_t vsAddr = 0;
     bool tier2Done = false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    uint8_t profileTier = 0;
+#endif
     std::vector<ShaderSigElement> vsInputs;
     std::vector<ShaderSigElement> vsOutputs;
     std::vector<DxilSigRecord> vsOutputRecs;
@@ -428,6 +434,10 @@ static std::atomic<uint64_t> g_vertexStageCompileCount{0};
 
 struct JitRuntime {
     std::mutex mu;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    std::mutex profileObjectMutex;
+    std::unordered_map<uint64_t, std::string> profileObjectIds;
+#endif
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::unordered_map<std::string, InMemCacheEntry> memCache;
     std::unordered_map<std::string, InMemVSCacheEntry> vsMemCache;
@@ -799,7 +809,8 @@ void applyComputeMeta(const CachedPSOMeta& meta, const std::string& sym, uint64_
     outPSO.symbolName = sym;
     outPSO.fn.store(reinterpret_cast<CompiledComputeFn>(addr), std::memory_order_release);
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    outPSO.profileEntries.initialize(reinterpret_cast<CompiledComputeFn>(addr), 2, profile::Cache::Hit);
+    outPSO.profileEntries.initialize(reinterpret_cast<CompiledComputeFn>(addr), 2, profile::Cache::Hit,
+                                    profileNativeObjectIdentity(addr));
 #endif
 }
 
@@ -863,14 +874,22 @@ void applyGraphicsMeta(
     outPSO.vsSymbolName = vsSym;
     outPSO.psSymbolName = psSym;
     outPSO.gsSymbolName = meta.hasGS ? (vsSym + "_gs") : std::string{};
-    outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
-    outPSO.psFn.store(reinterpret_cast<CompiledPixelQuadFn>(psAddr), std::memory_order_release);
-    outPSO.gsFn.store(reinterpret_cast<CompiledGeometryFn>(gsAddr), std::memory_order_release);
-    outPSO.hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr), std::memory_order_release);
-    outPSO.hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr), std::memory_order_release);
-    outPSO.dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr), std::memory_order_release);
-    outPSO.msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr), std::memory_order_release);
-    outPSO.asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr), std::memory_order_release);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    uint8_t vsTier = 2;
+    if (meta.separateVSObject) {
+        const auto& entries = getJitRuntime().vsMemCache;
+        const auto it = entries.find(cacheKeyFor(getCacheDirectory(), meta.vsHashLo, meta.vsHashHi));
+        vsTier = it != entries.end() && it->second.vsAddr == vsAddr ? it->second.profileTier : 0;
+    }
+#endif
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.vsFn, reinterpret_cast<CompiledVertexFn>(vsAddr), vsTier, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.psFn, reinterpret_cast<CompiledPixelQuadFn>(psAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.gsFn, reinterpret_cast<CompiledGeometryFn>(gsAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.hsFn, reinterpret_cast<CompiledHullCPFn>(hsAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.hsPcFn, reinterpret_cast<CompiledHullPCFn>(hsPcAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.dsFn, reinterpret_cast<CompiledDomainFn>(dsAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.msFn, reinterpret_cast<CompiledMeshFn>(msAddr), 2, Hit);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.asFn, reinterpret_cast<CompiledAmplificationFn>(asAddr), 2, Hit);
 }
 
 bool loadObjectIntoJitLocked(
@@ -951,10 +970,40 @@ bool loadObjectIntoJitLocked(
     if (!lookupOpt(sym3, outAddr3) || !lookupOpt(sym4, outAddr4) || !lookupOpt(sym5, outAddr5)) {
         return false;
     }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto identity = profileContentIdentity(objData, objSize);
+    std::lock_guard lock(rt.profileObjectMutex);
+    for (const auto address : {outAddr0, outAddr1, outAddr2 ? *outAddr2 : 0,
+                              outAddr3 ? *outAddr3 : 0, outAddr4 ? *outAddr4 : 0, outAddr5 ? *outAddr5 : 0}) {
+        if (address) rt.profileObjectIds.emplace(address, identity);
+    }
+#endif
     return true;
 }
 
 } // namespace
+
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+std::string profileContentIdentity(const void* bytes, size_t size) {
+    if (!bytes || !size) return {};
+    const auto hash = llvm::SHA256::hash(llvm::ArrayRef(static_cast<const uint8_t*>(bytes), size));
+    constexpr char hex[] = "0123456789abcdef";
+    std::string identity;
+    identity.reserve(64);
+    for (const auto byte : hash) {
+        identity.push_back(hex[byte >> 4]);
+        identity.push_back(hex[byte & 15]);
+    }
+    return identity;
+}
+
+std::string profileNativeObjectIdentity(uint64_t address) {
+    auto& runtime = getJitRuntime();
+    std::lock_guard lock(runtime.profileObjectMutex);
+    const auto entry = runtime.profileObjectIds.find(address);
+    return entry == runtime.profileObjectIds.end() ? std::string{} : entry->second;
+}
+#endif
 
 void computeComputePSOHash(
     const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc,
@@ -1576,7 +1625,11 @@ bool tryLoadVertexStageFromCache(
     CompiledVertexFn& outVSFn,
     std::vector<ShaderSigElement>* outVSInputs,
     std::vector<ShaderSigElement>* outVSOutputs,
-    std::vector<DxilSigRecord>* outVSOutputRecs) {
+    std::vector<DxilSigRecord>* outVSOutputRecs
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    , uint8_t* outProfileTier
+#endif
+    ) {
     JitRuntime& rt = getJitRuntime();
     std::filesystem::path dir = getCacheDirectory();
     std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
@@ -1589,6 +1642,9 @@ bool tryLoadVertexStageFromCache(
         if (it != rt.vsMemCache.end() && it->second.vsAddr != 0 && it->second.meta.simdWidth == targetW) {
             outVSMeta = it->second.meta;
             outVSFn = reinterpret_cast<CompiledVertexFn>(it->second.vsAddr);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (outProfileTier) *outProfileTier = it->second.profileTier;
+#endif
             if (outVSInputs && !it->second.vsInputs.empty()) *outVSInputs = it->second.vsInputs;
             if (outVSOutputs && !it->second.vsOutputs.empty()) *outVSOutputs = it->second.vsOutputs;
             if (outVSOutputRecs && !it->second.vsOutputRecs.empty()) *outVSOutputRecs = it->second.vsOutputRecs;
@@ -1610,6 +1666,9 @@ bool tryLoadVertexStageFromCache(
     if (it != rt.vsMemCache.end() && it->second.vsAddr != 0 && it->second.meta.simdWidth == targetW) {
         outVSMeta = it->second.meta;
         outVSFn = reinterpret_cast<CompiledVertexFn>(it->second.vsAddr);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (outProfileTier) *outProfileTier = it->second.profileTier;
+#endif
         if (outVSInputs && !it->second.vsInputs.empty()) *outVSInputs = it->second.vsInputs;
         if (outVSOutputs && !it->second.vsOutputs.empty()) *outVSOutputs = it->second.vsOutputs;
         if (outVSOutputRecs && !it->second.vsOutputRecs.empty()) *outVSOutputRecs = it->second.vsOutputRecs;
@@ -1626,6 +1685,10 @@ bool tryLoadVertexStageFromCache(
     entry.meta = vsMeta;
     entry.vsAddr = vsAddr;
     entry.tier2Done = true;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    entry.profileTier = 2;
+    if (outProfileTier) *outProfileTier = 2;
+#endif
     rt.vsMemCache[vsKey] = std::move(entry);
     outVSMeta = vsMeta;
     outVSFn = reinterpret_cast<CompiledVertexFn>(vsAddr);
@@ -1831,7 +1894,8 @@ bool jitCompileComputeTier1AndScheduleTier2(
         if (box->cs) {
             box->cs->fn.store(reinterpret_cast<CompiledComputeFn>(addr0), std::memory_order_release);
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-            box->cs->profileEntries.promote(reinterpret_cast<CompiledComputeFn>(addr0));
+            box->cs->profileEntries.promote(reinterpret_cast<CompiledComputeFn>(addr0),
+                                           profileNativeObjectIdentity(addr0));
 #endif
         }
     });
@@ -1905,14 +1969,14 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     outPSO.vsSymbolName = vsSym;
     outPSO.psSymbolName = psSym;
     outPSO.gsSymbolName = gsSym;
-    outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
-    outPSO.psFn.store(reinterpret_cast<CompiledPixelQuadFn>(psAddr), std::memory_order_release);
-    outPSO.gsFn.store(reinterpret_cast<CompiledGeometryFn>(gsAddr), std::memory_order_release);
-    outPSO.hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr), std::memory_order_release);
-    outPSO.hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr), std::memory_order_release);
-    outPSO.dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr), std::memory_order_release);
-    outPSO.msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr), std::memory_order_release);
-    outPSO.asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr), std::memory_order_release);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.vsFn, reinterpret_cast<CompiledVertexFn>(vsAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.psFn, reinterpret_cast<CompiledPixelQuadFn>(psAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.gsFn, reinterpret_cast<CompiledGeometryFn>(gsAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.hsFn, reinterpret_cast<CompiledHullCPFn>(hsAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.hsPcFn, reinterpret_cast<CompiledHullPCFn>(hsPcAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.dsFn, reinterpret_cast<CompiledDomainFn>(dsAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.msFn, reinterpret_cast<CompiledMeshFn>(msAddr), 1, Miss);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.asFn, reinterpret_cast<CompiledAmplificationFn>(asAddr), 1, Miss);
 
     if (!scheduleTier2) {
         return true;
@@ -1977,14 +2041,14 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
 
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->gs) {
-            box->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(meta.hasMS ? 0 : primaryAddr2), std::memory_order_release);
-            box->gs->psFn.store(reinterpret_cast<CompiledPixelQuadFn>(addr1), std::memory_order_release);
-            box->gs->gsFn.store(reinterpret_cast<CompiledGeometryFn>(gsAddr2), std::memory_order_release);
-            box->gs->hsFn.store(reinterpret_cast<CompiledHullCPFn>(hsAddr2), std::memory_order_release);
-            box->gs->hsPcFn.store(reinterpret_cast<CompiledHullPCFn>(hsPcAddr2), std::memory_order_release);
-            box->gs->dsFn.store(reinterpret_cast<CompiledDomainFn>(dsAddr2), std::memory_order_release);
-            box->gs->msFn.store(reinterpret_cast<CompiledMeshFn>(msAddr2), std::memory_order_release);
-            box->gs->asFn.store(reinterpret_cast<CompiledAmplificationFn>(asAddr2), std::memory_order_release);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->vsFn, reinterpret_cast<CompiledVertexFn>(meta.hasMS ? 0 : primaryAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->psFn, reinterpret_cast<CompiledPixelQuadFn>(addr1), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->gsFn, reinterpret_cast<CompiledGeometryFn>(gsAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->hsFn, reinterpret_cast<CompiledHullCPFn>(hsAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->hsPcFn, reinterpret_cast<CompiledHullPCFn>(hsPcAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->dsFn, reinterpret_cast<CompiledDomainFn>(dsAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->msFn, reinterpret_cast<CompiledMeshFn>(msAddr2), 2, Miss);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->asFn, reinterpret_cast<CompiledAmplificationFn>(asAddr2), 2, Miss);
         }
     });
 
@@ -2020,11 +2084,19 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     std::string vsKey = (cacheDir / vsHex).string();
     uint64_t vsAddr = 0;
     bool launchedTier2 = false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    uint8_t vsTier = 1;
+    profile::Cache vsCache = profile::Cache::Miss;
+#endif
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         auto existing = rt.vsMemCache.find(vsKey);
         if (existing != rt.vsMemCache.end() && existing->second.vsAddr != 0) {
             vsAddr = existing->second.vsAddr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            vsTier = existing->second.profileTier;
+            vsCache = profile::Cache::Hit;
+#endif
         } else {
             ensureLLJITLocked(rt, outError);
             if (!rt.jit) return false;
@@ -2050,6 +2122,9 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
             entry.meta = vsMeta;
             entry.vsAddr = vsAddr;
             entry.tier2Done = !scheduleTier2;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            entry.profileTier = 1;
+#endif
             entry.vsInputs = vsInputs;
             entry.vsOutputs = vsOutputs;
             entry.vsOutputRecs = vsOutputRecs;
@@ -2059,7 +2134,11 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     }
 
     outPSO.vsSymbolName = vsSym;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release, vsTier, vsCache);
+#else
     outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(vsAddr), std::memory_order_release);
+#endif
 
     if (launchedTier2) {
         ensureTier2PoolReady(rt).detach_task([vsMeta, vsHashLo, vsHashHi, vsSym, cacheDir, vsHex, vsKey, bcStr = std::move(bcStr) NACELLE_PROFILE_CAPTURE_CONTEXT]() mutable {
@@ -2095,6 +2174,9 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
                 entry.meta = vsMeta;
                 entry.vsAddr = tier2VSAddr;
                 entry.tier2Done = true;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                entry.profileTier = 2;
+#endif
                 waiters.swap(entry.waiters);
                 for (auto& kv : rt.memCache) {
                     if (kv.second.meta.separateVSObject != 0 &&
@@ -2109,7 +2191,7 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
                 if (!w) continue;
                 std::lock_guard<std::mutex> psoLock(w->mu);
                 if (w->gs) {
-                    w->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(tier2VSAddr), std::memory_order_release);
+                    NACELLE_STORE_GRAPHICS_ENTRY(w->gs->vsFn, reinterpret_cast<CompiledVertexFn>(tier2VSAddr), 2, Miss);
                 }
             }
         });
@@ -2148,6 +2230,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
 
     uint64_t psAddr = 0;
     uint64_t latestVSAddr = 0;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    uint8_t latestVSTier = 0;
+#endif
     {
         std::lock_guard<std::mutex> lock(rt.mu);
         ensureLLJITLocked(rt, outError);
@@ -2173,6 +2258,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         auto vsIt = rt.vsMemCache.find(vsKey);
         if (vsIt != rt.vsMemCache.end()) {
             latestVSAddr = vsIt->second.vsAddr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            latestVSTier = vsIt->second.profileTier;
+#endif
             if (!vsIt->second.tier2Done) {
                 vsIt->second.waiters.push_back(box);
             }
@@ -2180,10 +2268,10 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
     }
 
     if (latestVSAddr != 0) {
-        outPSO.vsFn.store(reinterpret_cast<CompiledVertexFn>(latestVSAddr), std::memory_order_release);
+        NACELLE_STORE_GRAPHICS_ENTRY(outPSO.vsFn, reinterpret_cast<CompiledVertexFn>(latestVSAddr), latestVSTier, Miss);
     }
     outPSO.psSymbolName = psSym;
-    outPSO.psFn.store(reinterpret_cast<CompiledPixelQuadFn>(psAddr), std::memory_order_release);
+    NACELLE_STORE_GRAPHICS_ENTRY(outPSO.psFn, reinterpret_cast<CompiledPixelQuadFn>(psAddr), 1, Miss);
 
     if (!scheduleTier2) {
         return true;
@@ -2214,6 +2302,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
 
         uint64_t tier2PSAddr = 0, dummy = 0;
         uint64_t curVSAddr = 0;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        uint8_t curVSTier = 0;
+#endif
         {
             std::lock_guard<std::mutex> lock(rt.mu);
             std::string key = (cacheDir / hex).string();
@@ -2224,6 +2315,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
             auto vsIt = rt.vsMemCache.find(vsKey);
             if (vsIt != rt.vsMemCache.end()) {
                 curVSAddr = vsIt->second.vsAddr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                curVSTier = vsIt->second.profileTier;
+#endif
             }
             rt.memCache[key] = InMemCacheEntry{
                 meta, curVSAddr, tier2PSAddr, 0, 0, 0, 0, 0, 0};
@@ -2232,9 +2326,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->gs) {
             if (curVSAddr != 0) {
-                box->gs->vsFn.store(reinterpret_cast<CompiledVertexFn>(curVSAddr), std::memory_order_release);
+                NACELLE_STORE_GRAPHICS_ENTRY(box->gs->vsFn, reinterpret_cast<CompiledVertexFn>(curVSAddr), curVSTier, Miss);
             }
-            box->gs->psFn.store(reinterpret_cast<CompiledPixelQuadFn>(tier2PSAddr), std::memory_order_release);
+            NACELLE_STORE_GRAPHICS_ENTRY(box->gs->psFn, reinterpret_cast<CompiledPixelQuadFn>(tier2PSAddr), 2, Miss);
         }
     });
 
@@ -2253,6 +2347,7 @@ bool compileComputePSO(
     outPSO.cacheHashHi = hi;
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    outPSO.profileShaderId = profileContentIdentity(desc.CS.pShaderBytecode, desc.CS.BytecodeLength);
     profile::Scope compileProfile("Compile compute PSO");
     compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Compute, 1});
     if (compileProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();

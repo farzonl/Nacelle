@@ -1611,12 +1611,39 @@ bool buildRasterScene(
     const auto& compiled = state.pso->graphicsPSO();
     if (!compiled) return false;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    auto* vertexEntry = compiled->vsFn.snapshot();
+    CompiledVertexFn vsFn = vertexEntry ? vertexEntry->fn : nullptr;
+#else
     CompiledVertexFn vsFn = compiled->vsFn.load(std::memory_order_acquire);
+#endif
     if (!vsFn) {
         waitForAllAsyncJITTasks();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        vertexEntry = compiled->vsFn.snapshot();
+        vsFn = vertexEntry ? vertexEntry->fn : nullptr;
+#else
         vsFn = compiled->vsFn.load(std::memory_order_acquire);
+#endif
     }
     if (!vsFn) return false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope geometryProfile(compiled->hasGS || compiled->hasTess ? "Extended geometry" : "Vertex geometry");
+    geometryProfile.setAttributes({compiled->cacheHashLo, compiled->cacheHashHi, compiled->simdWidth,
+                                   profile::Stage::Graphics});
+    if (!compiled->hasGS && !compiled->hasTess) {
+        geometryProfile.setGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Vertex,
+                                           vertexEntry->version, vertexEntry->tier, vertexEntry->cache,
+                                           compiled->profileVertexShaderId, profile::EntryRole::Default,
+                                           vertexEntry->artifactId);
+    } else {
+        geometryProfile.beginGraphicsSelection(compiled->profilePipelineIdentity);
+        geometryProfile.observeGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Vertex,
+                                               vertexEntry->version, vertexEntry->tier, vertexEntry->cache,
+                                               compiled->profileVertexShaderId, profile::EntryRole::Default,
+                                               vertexEntry->artifactId);
+    }
+#endif
     ScopedFlushDenormals flushDenorms;
 
     // Determine framebuffer dimensions from bound RTVs or DSV
@@ -1846,17 +1873,50 @@ bool buildRasterScene(
     // Extended geometry pipeline (Tessellation HS/DS and/or Geometry Shader GS):
     // W-wide SIMD packetized execution across VS, HS, DS, and GS stages.
     // =========================================================================
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    auto* hullEntry = hasTess ? compiled->hsFn.snapshot() : nullptr;
+    auto* hullPatchEntry = hasTess ? compiled->hsPcFn.snapshot() : nullptr;
+    auto* domainEntry = hasTess ? compiled->dsFn.snapshot() : nullptr;
+    auto* geometryEntry = hasGS ? compiled->gsFn.snapshot() : nullptr;
+    CompiledHullCPFn hsFn = hullEntry ? hullEntry->fn : nullptr;
+    CompiledHullPCFn hsPcFn = hullPatchEntry ? hullPatchEntry->fn : nullptr;
+    CompiledDomainFn dsFn = domainEntry ? domainEntry->fn : nullptr;
+    CompiledGeometryFn gsFn = geometryEntry ? geometryEntry->fn : nullptr;
+#else
     CompiledHullCPFn hsFn = hasTess ? compiled->hsFn.load(std::memory_order_acquire) : nullptr;
     CompiledHullPCFn hsPcFn = hasTess ? compiled->hsPcFn.load(std::memory_order_acquire) : nullptr;
     CompiledDomainFn dsFn = hasTess ? compiled->dsFn.load(std::memory_order_acquire) : nullptr;
     CompiledGeometryFn gsFn = hasGS ? compiled->gsFn.load(std::memory_order_acquire) : nullptr;
+#endif
     if ((hasTess && (!hsFn || !hsPcFn || !dsFn)) || (hasGS && !gsFn)) {
         waitForAllAsyncJITTasks();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        hullEntry = hasTess ? compiled->hsFn.snapshot() : nullptr;
+        hullPatchEntry = hasTess ? compiled->hsPcFn.snapshot() : nullptr;
+        domainEntry = hasTess ? compiled->dsFn.snapshot() : nullptr;
+        geometryEntry = hasGS ? compiled->gsFn.snapshot() : nullptr;
+        hsFn = hullEntry ? hullEntry->fn : nullptr;
+        hsPcFn = hullPatchEntry ? hullPatchEntry->fn : nullptr;
+        dsFn = domainEntry ? domainEntry->fn : nullptr;
+        gsFn = geometryEntry ? geometryEntry->fn : nullptr;
+#else
         hsFn = hasTess ? compiled->hsFn.load(std::memory_order_acquire) : nullptr;
         hsPcFn = hasTess ? compiled->hsPcFn.load(std::memory_order_acquire) : nullptr;
         dsFn = hasTess ? compiled->dsFn.load(std::memory_order_acquire) : nullptr;
         gsFn = hasGS ? compiled->gsFn.load(std::memory_order_acquire) : nullptr;
+#endif
     }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto observe = [&](const auto* entry, profile::Stage stage, const std::string& shaderId,
+                             profile::EntryRole role = profile::EntryRole::Default) {
+        if (entry) geometryProfile.observeGraphicsVersion(compiled->profilePipelineIdentity, stage,
+            entry->version, entry->tier, entry->cache, shaderId, role, entry->artifactId);
+    };
+    observe(hullEntry, profile::Stage::Hull, compiled->profileHullShaderId, profile::EntryRole::HullControlPoint);
+    observe(hullPatchEntry, profile::Stage::Hull, compiled->profileHullShaderId, profile::EntryRole::HullPatchConstant);
+    observe(domainEntry, profile::Stage::Domain, compiled->profileDomainShaderId);
+    observe(geometryEntry, profile::Stage::Geometry, compiled->profileGeometryShaderId);
+#endif
 
     const uint32_t vsOutScalars =
         hasTess ? std::min<uint32_t>(compiled->numHSInputScalars, kMaxPSInputScalars)
@@ -2595,14 +2655,28 @@ bool buildMeshRasterScene(
     const auto& compiled = state.pso->graphicsPSO();
     if (!compiled || !compiled->hasMS) return false;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    auto* meshEntry = compiled->msFn.snapshot();
+    auto* amplificationEntry = compiled->hasAS ? compiled->asFn.snapshot() : nullptr;
+    CompiledMeshFn msFn = meshEntry ? meshEntry->fn : nullptr;
+    CompiledAmplificationFn asFn = amplificationEntry ? amplificationEntry->fn : nullptr;
+#else
     CompiledMeshFn msFn = compiled->msFn.load(std::memory_order_acquire);
     CompiledAmplificationFn asFn = compiled->hasAS ? compiled->asFn.load(std::memory_order_acquire) : nullptr;
+#endif
     if (!msFn || (compiled->hasAS && !asFn)) {
         waitForAllAsyncJITTasks();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        meshEntry = compiled->msFn.snapshot();
+        amplificationEntry = compiled->hasAS ? compiled->asFn.snapshot() : nullptr;
+        msFn = meshEntry ? meshEntry->fn : nullptr;
+        asFn = amplificationEntry ? amplificationEntry->fn : nullptr;
+#else
         msFn = compiled->msFn.load(std::memory_order_acquire);
         if (compiled->hasAS) {
             asFn = compiled->asFn.load(std::memory_order_acquire);
         }
+#endif
     }
     if (!msFn || (compiled->hasAS && !asFn)) return false;
     ScopedFlushDenormals flushDenorms;
@@ -2620,6 +2694,14 @@ bool buildMeshRasterScene(
 
     const uint32_t payloadBytes = std::max<uint32_t>({64u, compiled->asPayloadBytes, compiled->msPayloadBytes});
     if (compiled->hasAS) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        profile::Scope amplificationProfile("Amplification stage");
+        amplificationProfile.setAttributes({compiled->cacheHashLo, compiled->cacheHashHi, compiled->simdWidth,
+                                            profile::Stage::Amplification});
+        amplificationProfile.setGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Amplification,
+            amplificationEntry->version, amplificationEntry->tier, amplificationEntry->cache,
+            compiled->profileAmplificationShaderId, profile::EntryRole::Default, amplificationEntry->artifactId);
+#endif
         const uint64_t totalAS64 = static_cast<uint64_t>(dispatch.groupCountX) *
                                    dispatch.groupCountY * dispatch.groupCountZ;
         if (totalAS64 > 1 && pool.get_thread_count() > 1 && totalAS64 <= 0xFFFFFFFFull) {
@@ -2714,6 +2796,14 @@ bool buildMeshRasterScene(
     }
 
     if (meshDispatches.empty()) return false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope meshProfile("Mesh geometry");
+    meshProfile.setAttributes({compiled->cacheHashLo, compiled->cacheHashHi, compiled->simdWidth,
+                               profile::Stage::Mesh});
+    meshProfile.setGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Mesh,
+        meshEntry->version, meshEntry->tier, meshEntry->cache, compiled->profileMeshShaderId,
+        profile::EntryRole::Default, meshEntry->artifactId);
+#endif
 
     const D3D12_RASTERIZER_DESC& rast = state.pso->graphicsDesc().RasterizerState;
     const uint32_t maxVerts = std::max<uint32_t>(1u, compiled->msMaxVertexCount);

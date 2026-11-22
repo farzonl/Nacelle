@@ -1026,7 +1026,7 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     dispatchProfile.setAttributes({cpso->cacheHashLo, cpso->cacheHashHi, cpso->simdWidth,
                                    profile::Stage::Compute});
     dispatchProfile.setComputeVersion(cpso->profileEntries.pipelineIdentity, entry->version,
-                                      entry->tier, entry->cache);
+                                      entry->tier, entry->cache, cpso->profileShaderId, entry->artifactId);
     if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     const auto dispatchContext = dispatchProfile.context();
 #endif

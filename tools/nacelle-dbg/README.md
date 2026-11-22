@@ -161,8 +161,9 @@ A `.nacelle-profile` is a stored ZIP containing:
   unavailable. Configuration is recorded once per session, including concurrent
   compilation/execution, rather than collected for every dispatch.
 * `trace.json.zst`: dictionary-free zstd-compressed Chrome Trace JSON.
-* `shaders.json`: `[]` when no compute entry was observed, otherwise the versioned
-  compute metadata object described below. PSO hashes, stage, SIMD width,
+* `shaders.json`: `[]` when no entries or graphics selections were observed,
+  otherwise the independently versioned metadata object described below.
+  PSO hashes, stage, SIMD width,
   compilation tier, cache outcome, and parent IDs also live in trace arguments.
 
 Manifest clock offsets are nanoseconds; Chrome Trace `ts`/`dur` are microseconds.
@@ -170,7 +171,9 @@ Trace IDs and thread IDs are capture-local, not addresses or OS thread IDs.
 Overlapping spans are not additive CPU time. Tier 0 and cache `unknown` mean
 unavailable, not Tier 1 or a miss. Compute dispatch/worker spans identify the
 selected native entry version, including pre-existing and cached pipelines.
-Graphics/mesh stage execution versions remain unavailable.
+Vertex, pixel, amplification and mesh regions identify their selected native
+entry. Draws and multi-stage geometry regions reference composite selections
+rather than claiming that one entry/tier describes the entire draw.
 
 ### Compute entry metadata
 
@@ -201,7 +204,7 @@ unchanged. No generated-kernel hooks, additional code unloading, source embeddin
 or address serialization are introduced. Instrumentation-OFF layouts and callable
 selection remain unchanged.
 
-At most 65,536 observed compute versions may be registered per capture. Exceeding
+At most 65,536 code-version and composite-selection records combined may be registered per capture. Exceeding
 this limit reports a save error and produces no bundle, rather than silently
 truncating metadata. Registry and serialization allocations are additional to the
 event-buffer budget. Version tracking has not certified the performance targets.
@@ -214,6 +217,59 @@ additional object fields and manifest-declared payloads. Old native readers
 explicitly reject new compute-version captures; the original browser reader can
 display/export them but does not interpret shader metadata. No extra payloads or
 manifest fields were added.
+
+### Graphics, mesh and content identities
+
+Shader schema v2 retains the v1 compute rules and adds graphics entries with
+`stage` and required `entryRole`: `vertex`, `pixel`, `geometry`, `domain`, `mesh`,
+`amplification`, or stage `hull` with `hull-control-point`/`hull-patch-constant`.
+The unique identity is `(pipelineId, entryRole, version)`; hull entries therefore
+remain distinct even when they share a shader and publication number.
+Graphics versions are monotonically numbered per native entry, starting at 1.
+Independent stage promotion/cache selection is preserved, including a Tier-1
+vertex cache hit combined with a newly compiled pixel entry. Unknown tier/cache
+values remain explicit rather than being inferred from another stage.
+
+Optional `shaderId` is a lowercase SHA-256 digest of the exact supplied shader
+bytecode bytes (including its DXContainer), not a source filename or PSO hash.
+It is retained before cache lookup, including for execution-only captures.
+Optional `artifactId` is SHA-256 of the complete native object bytes supplied to
+the JIT. Several entries may share one object digest. Tier-1 IR compilation does
+not expose an object buffer here, so its artifact ID is omitted; optimized and
+disk/memory-cache entries retain the actual object's digest. Digests identify
+content, not anonymized source or relocatable function addresses. No object,
+source, resource, or path is embedded.
+
+Optional `codeSelections` contains consecutive one-based selection `id`,
+`pipelineId`, and up to eight unique `codeVersionIds`. Trace `codeSelectionId`
+references a draw's or geometry region's observed entries. Children contribute
+to their enclosing selection, including old versions executed after promotion;
+capture draining completes this metadata before serialization. An empty
+selection explicitly represents no observed entry. Exact-entry spans may also
+reference a selection, and must reference one of its entries. Composite spans
+omit `codeVersionId` and use tier 0/cache `unknown`, not a fabricated latest tier.
+Extended VS/HS/DS/GS work remains one coarse composite region; it is not
+instruction-exclusive per-stage timing. Vertex/pixel/mesh regions also include
+fixed-function work and must not be read as isolated shader CPU samples.
+
+Instrumentation-ON graphics callables and metadata are published as one
+immutable record at each existing selection boundary. Retained records live
+with the PSO, and native object identity bookkeeping lives with the existing JIT;
+both use additional memory outside the bounded event pool. No draw-wide freezing,
+per-invocation hooks, or change to quad/wave/threadgroup execution is introduced.
+OFF builds keep their atomic callable fields and exclude all identity state.
+The existing event-buffer byte cap is unchanged; extra identity fields reduce
+the number of events fitting a given byte budget.
+
+Current native/browser readers accept `[]`, v1 and v2. Older strict native readers
+reject the new trace/schema fields explicitly. v1 producers remain readable;
+neither manifest schema nor the three-entry bundle contract changes. Native
+readers still reject extra entries/unknown fields, while browser readers tolerate
+manifest-declared additional entries and unknown object fields. Unsupported
+schema versions, roles, digests and inconsistent selection references are errors.
+Static/shared tests cover cold, promoted, memory/disk-cache, mixed cache outcomes,
+SIMD 4/8, mesh/amplification, tessellation/geometry roles and output checks.
+This does not certify the overhead budgets, instruction timing, or debugging.
 
 Captures include compile/import/lowering/optimization, draw/compute/mesh
 dispatch, and coarse worker spans. They do not instrument generated kernels,

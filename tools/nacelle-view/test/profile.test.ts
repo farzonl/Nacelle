@@ -167,7 +167,7 @@ describe('transport-independent loading and presentation', () => {
     stage: 'compute', simdWidth: 8, version: 1, tier: 2, cache: 'hit',
   };
   function codeFixture(metadata: unknown = { schemaVersion: 1, codeVersions: [code] },
-    args = { ...code, codeVersionId: 1 }) {
+    args: Record<string, unknown> = { ...code, codeVersionId: 1 }) {
     return fixture({}, trace([span({ args })]), (entries, manifest) => {
       entries['shaders.json'] = strToU8(JSON.stringify(metadata));
       manifest.entries[1].uncompressedSize = entries['shaders.json'].length;
@@ -183,7 +183,7 @@ describe('transport-independent loading and presentation', () => {
   });
 
   it.each([
-    { schemaVersion: 2, codeVersions: [code] },
+    { schemaVersion: 3, codeVersions: [code] },
     { schemaVersion: 1, codeVersions: [{ ...code, id: 2 }] },
     { schemaVersion: 1, codeVersions: [{ ...code, pipelineId: 0 }] },
     { schemaVersion: 1, codeVersions: [{ ...code, tier: 0 }] },
@@ -196,6 +196,53 @@ describe('transport-independent loading and presentation', () => {
       { ...code, id: 2, version: 2, cache: 'miss', simdWidth: 4 }] },
   ])('rejects invalid versioned compute metadata %j', async metadata => {
     await expect(loadProfile(open(codeFixture(metadata)))).rejects.toThrow(/metadata/);
+  });
+
+  it('accepts schema-v2 mixed-stage versions while preserving legacy compute readers', async () => {
+    const vertex = { ...code, stage: 'vertex', entryRole: 'vertex', shaderId: 'a'.repeat(64) };
+    const pixel = { ...vertex, id: 2, stage: 'pixel', entryRole: 'pixel',
+      tier: 1, cache: 'hit', shaderId: 'b'.repeat(64) };
+    const metadata = { schemaVersion: 2, codeVersions: [vertex, pixel, { ...code, id: 3, pipelineId: 2 }] };
+    const loaded = await loadProfile(open(codeFixture(metadata, { ...vertex, codeVersionId: 1 })));
+    expect(loaded.shaders.codeVersions).toEqual(metadata.codeVersions);
+    expect(loaded.shaders.schemaVersion).toBe(2);
+    expect((await loadProfile(open(codeFixture()))).shaders.schemaVersion).toBe(1);
+  });
+
+  it('resolves composite selections and distinguishes hull entry roles with the same version', async () => {
+    const control = { ...code, stage: 'hull', entryRole: 'hull-control-point' };
+    const patch = { ...control, id: 2, entryRole: 'hull-patch-constant' };
+    const metadata = { schemaVersion: 2, codeVersions: [control, patch],
+      codeSelections: [{ id: 1, pipelineId: 1, codeVersionIds: [1, 2] }] };
+    const loaded = await loadProfile(open(codeFixture(metadata,
+      { ...control, codeVersionId: 1, codeSelectionId: 1 })));
+    expect(loaded.shaders.codeSelections).toEqual(metadata.codeSelections);
+    expect(loaded.shaders.codeVersions[1].entryRole).toBe('hull-patch-constant');
+  });
+
+  it.each([
+    { id: 2, pipelineId: 1, codeVersionIds: [1] },
+    { id: 1, pipelineId: 2, codeVersionIds: [1] },
+    { id: 1, pipelineId: 1, codeVersionIds: [0] },
+    { id: 1, pipelineId: 1, codeVersionIds: [1, 1] },
+  ])('rejects malformed composite selections %j', async selection => {
+    const vertex = { ...code, stage: 'vertex', entryRole: 'vertex' };
+    await expect(loadProfile(open(codeFixture({ schemaVersion: 2,
+      codeVersions: [vertex], codeSelections: [selection] }, { ...vertex, codeVersionId: 1 }))))
+      .rejects.toThrow(/selection/);
+  });
+
+  it.each([
+    { stage: 'pixel' },
+    { stage: 'pixel', entryRole: 'vertex' },
+    { stage: 'pixel', entryRole: 'pixel', shaderId: '/private/shader.hlsl' },
+    { stage: 'pixel', entryRole: 'pixel', artifactId: 'pointer-0x1234' },
+    { stage: 'pixel', entryRole: 'pixel', version: 0 },
+    { stage: 'pixel', entryRole: 'pixel', tier: 3 },
+  ])('rejects invalid schema-v2 stage metadata %j', async fields => {
+    const invalid = { ...code, ...fields };
+    await expect(loadProfile(open(codeFixture({ schemaVersion: 2, codeVersions: [invalid] }))))
+      .rejects.toThrow(/metadata/);
   });
 
   it.each([
