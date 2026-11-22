@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <ranges>
 #include <set>
 #include <sstream>
 
@@ -132,34 +133,43 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         return false;
     }
 
-    Trace trace;
-    trace.traceEvents.reserve(static_cast<size_t>(session.eventCount));
-    constexpr const char* stages[] = {"unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing"};
-    constexpr const char* caches[] = {"unknown", "hit", "miss"};
-    for (size_t i = 0; i < std::min(session.capacity, session.nextBlock.load()); ++i) {
-        const auto& event = session.events[i];
-        if (event.id == 0) continue;
-        TraceEvent item;
-        item.name = event.name;
-        item.cat = event.attributes.tier && !event.attributes.codeVersionId ? "jit" : "runtime";
-        item.ts = static_cast<double>(event.startNs) / 1000.0;
-        item.dur = static_cast<double>(event.durationNs) / 1000.0;
-        item.tid = event.thread;
-        item.args = {event.id, event.parent,
-                     formatProfileHash(event.attributes.hashLo, event.attributes.hashHi),
-                     stages[static_cast<unsigned>(event.attributes.stage)],
-                     event.attributes.simdWidth, event.attributes.tier,
-                     caches[static_cast<unsigned>(event.attributes.cache)]};
-        if (event.attributes.codeVersionId) {
-            item.args.pipelineId = event.attributes.pipelineId;
-            item.args.codeVersionId = event.attributes.codeVersionId;
-        }
-        trace.traceEvents.push_back(std::move(item));
-    }
-    std::sort(trace.traceEvents.begin(), trace.traceEvents.end(),
-              [](const auto& a, const auto& b) { return a.ts < b.ts; });
     std::string traceJson;
-    if (!toJson(trace, traceJson, error)) return false;
+    {
+        std::vector<const Event*> ordered;
+        ordered.reserve(static_cast<size_t>(session.eventCount));
+        for (size_t i = 0; i < std::min(session.capacity, session.nextBlock.load()); ++i) {
+            if (session.events[i].id != 0) ordered.push_back(&session.events[i]);
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const Event* a, const Event* b) {
+            return static_cast<double>(a->startNs) / 1000.0 <
+                   static_cast<double>(b->startNs) / 1000.0;
+        });
+        // Glaze consumes one temporary event at a time instead of a second full object graph.
+        const auto events = ordered | std::views::transform([](const Event* event) {
+            constexpr const char* stages[] =
+                {"unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing"};
+            constexpr const char* caches[] = {"unknown", "hit", "miss"};
+            TraceEvent item;
+            item.name = event->name;
+            item.cat = event->attributes.tier && !event->attributes.codeVersionId ? "jit" : "runtime";
+            item.ts = static_cast<double>(event->startNs) / 1000.0;
+            item.dur = static_cast<double>(event->durationNs) / 1000.0;
+            item.tid = event->thread;
+            item.args = {event->id, event->parent,
+                         formatProfileHash(event->attributes.hashLo, event->attributes.hashHi),
+                         stages[static_cast<unsigned>(event->attributes.stage)],
+                         event->attributes.simdWidth, event->attributes.tier,
+                         caches[static_cast<unsigned>(event->attributes.cache)]};
+            if (event->attributes.codeVersionId) {
+                item.args.pipelineId = event->attributes.pipelineId;
+                item.args.codeVersionId = event->attributes.codeVersionId;
+            }
+            return item;
+        });
+        const Trace defaults;
+        if (!toJson(glz::obj{"traceEvents", events, "displayTimeUnit", defaults.displayTimeUnit},
+                    traceJson, error)) return false;
+    }
     if (traceJson.size() > maxProfileBytes - shadersJson.size()) {
         error = "Profile trace exceeds the 256 MiB uncompressed format limit";
         return false;

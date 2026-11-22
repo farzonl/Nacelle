@@ -64,6 +64,6 @@ endfunction()
 function(nacelle_add_profile_tests)
     add_executable(instrumentation_test "${NACELLE_PROFILE_ROOT}/tests/instrumentation_test.cpp")
     target_link_libraries(instrumentation_test PRIVATE
-        nacelle_profile_capture nacelle_profile_io nacelle_profile_miniz)
+        nacelle_profile_capture nacelle_profile_io nacelle_profile_miniz libzstd_static)
     add_test(NAME instrumentation_test COMMAND instrumentation_test)
 endfunction()

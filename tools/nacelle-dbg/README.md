@@ -229,6 +229,39 @@ includes JSON escaping. Oversized metadata returns a save error without creating
 a bundle; it is not silently discarded or truncated. This check does not bound
 metadata allocations made earlier during capture or total serialization RSS.
 
+### Lower-memory trace serialization
+
+The writer sorts pointers to completed event slots and lets Glaze serialize a
+lazy range of individual typed events. It no longer materializes a second
+`TraceEvent` vector with per-event strings before constructing JSON. The pointer
+index is released before compression; its storage is at most
+`recordedEvents * sizeof(Event*)`. Capture buffers, chronological trace ordering,
+JSON field names/encoding, zstd/ZIP format, limits, exclusive output creation,
+and retry behavior are unchanged. This is not streaming file I/O: full JSON,
+compression, and archive buffers still exist.
+
+A fresh-process comparison used Clang 21.1.8 `-O3` on Linux x86_64, three
+sequentially interleaved processes per writer/workload, with reverse-ordered
+synthetic compute events carrying valid code-version references:
+
+| Workload | Event budget | Recorded / dropped | Previous save peak RSS | Lazy save peak RSS | Previous / lazy save time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Nearly full | 1 MiB | 8,179 / 0 | 14.21 MiB | 11.39 MiB | 11.12 / 8.98 ms |
+| Nearly full | 16 MiB | 131,059 / 0 | 162.84 MiB | 116.84 MiB | 181.42 / 148.90 ms |
+| Nearly full | 64 MiB | 524,275 / 0 | 640.34 MiB | 456.33 MiB | 752.57 / 605.96 ms |
+| Overflow | 64 MiB | 524,288 / 4,096 | 640.34 MiB | 456.33 MiB | 714.68 / 600.40 ms |
+
+Numbers are medians; save peaks are process-lifetime high-water marks sampled
+immediately after serialization/write, before reader validation. Recording RSS
+was about 67.7 MiB for both 64 MiB variants. Every saved bundle passed native
+validation with exact completeness and counts. Raw samples, diagnostic source,
+and reproduction instructions are published under
+[#212](https://github.com/farzonl/Nacelle/issues/212).
+These code-version workloads are not comparable to the earlier smaller-event
+measurements. Metadata admission bounds, separate serialization-stage memory
+attribution, allocation-failure stress, and a total serialization-memory bound
+remain open; the event limit is still not a process RSS guarantee.
+
 Keep application captures private. Only viewer assets, never captures, are
 staged by the Pages publishers. The accepted measurement targets are no OFF
 regressions, at most 1% ON-idle median wall-time overhead and 5% active coarse
