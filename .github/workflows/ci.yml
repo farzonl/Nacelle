@@ -519,3 +519,20 @@ jobs:
       - name: Build profile viewer
         working-directory: tools/nacelle-view
         run: npm run build
+
+      - name: Export native trace for browser verification
+        run: |
+          build-profile/tools/nacelle-dbg/nacelle-dbg \
+            build-profile/tests/static.nacelle-profile \
+            --trace build-profile/tests/static-trace.json
+
+      - name: Install Chromium for offline viewer tests
+        working-directory: tools/nacelle-view
+        run: npx playwright install --with-deps chromium
+
+      - name: Test offline browser upload, rendering, and downloads
+        working-directory: tools/nacelle-view
+        env:
+          NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
+          NACELLE_NATIVE_TRACE: "${{ github.workspace }}/build-profile/tests/static-trace.json"
+        run: npm run test:browser

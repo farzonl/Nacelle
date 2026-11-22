@@ -71,6 +71,28 @@ npm run build
 npm run stage -- ../../_site
 ```
 
+The dedicated Linux profiling CI job also runs production assets in offline
+Chromium with Playwright. It uploads the real native static runtime-test capture,
+checks span rendering and filtering, and compares downloaded Chrome trace bytes
+against the native CLI export. It exercises filtered Speedscope downloads,
+incomplete/empty captures, malformed uploads, and recovery. The browser network
+is disabled; the harness serves only built viewer assets from local disk and
+rejects any other request, including profile uploads or external services.
+Native captures and downloads are not published.
+
+To reproduce with an existing native capture (the trace output must not exist):
+
+```sh
+../../build/profile/tools/nacelle-dbg/nacelle-dbg \
+  ../../build/profile/tests/static.nacelle-profile \
+  --trace ../../build/profile/tests/static-trace.json
+npx playwright install chromium
+npm run build
+NACELLE_NATIVE_PROFILE="$PWD/../../build/profile/tests/static.nacelle-profile" \
+NACELLE_NATIVE_TRACE="$PWD/../../build/profile/tests/static-trace.json" \
+  npm run test:browser
+```
+
 Serve `dist/` or the staged `viewer/` directory with a local static HTTP server;
 ES modules are not reliably supported via `file://`. Once served, no network
 access is required. Assets are bundled locally, with no CDN, uploads, telemetry,
