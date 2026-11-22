@@ -61,8 +61,11 @@ interoperability tests and the viewer build.
 
 The integration tests use fresh caches and exercise compute/graphics output
 checks and asynchronous Tier-2 capture. Captures remain temporary CI workspace
-data, not Pages assets. These jobs do not certify performance budgets, run a real
-browser, or guarantee a separate ARM64 runner. Platform coverage is only verified
+data, not Pages assets. The Linux profiling job also runs offline Chromium upload/render/download tests,
+comparing Chrome trace downloads with the native CLI export. Only production
+viewer assets are served from local disk; all other requests are rejected.
+These jobs do not certify performance budgets or guarantee a separate ARM64
+runner. Platform coverage is only verified
 when the corresponding instrumented job actually passes.
 
 ## Application API
