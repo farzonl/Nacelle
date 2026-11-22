@@ -4,10 +4,12 @@
 #include "compiler/shader_compiler.h"
 
 #include <miniz.h>
+#include <zstd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -40,22 +42,29 @@ nacelle::profile::Profile read(const std::filesystem::path& path) {
     return result;
 }
 
-uint64_t manifestSize(const std::filesystem::path& path) {
+std::string zipEntry(const std::filesystem::path& path, const char* name) {
     std::ifstream input(path, std::ios::binary);
-    require(static_cast<bool>(input), "Open profile for manifest inspection");
+    require(static_cast<bool>(input), "Open profile for ZIP inspection");
     const std::string bytes((std::istreambuf_iterator<char>(input)),
                             std::istreambuf_iterator<char>());
-    require(!input.bad(), "Read profile for manifest inspection");
+    require(!input.bad(), "Read profile for ZIP inspection");
     mz_zip_archive zip{};
     require(mz_zip_reader_init_mem(&zip, bytes.data(), bytes.size(), 0),
-            "Open ZIP for manifest inspection");
-    const int index = mz_zip_reader_locate_file(&zip, "manifest.json", nullptr, 0);
+            "Open ZIP for entry inspection");
+    const int index = mz_zip_reader_locate_file(&zip, name, nullptr, 0);
     mz_zip_archive_file_stat stat{};
     const bool found = index >= 0 &&
         mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(index), &stat);
+    std::string entry(found ? static_cast<size_t>(stat.m_uncomp_size) : 0, '\0');
+    const bool extracted = found && mz_zip_reader_extract_to_mem(
+        &zip, static_cast<mz_uint>(index), entry.data(), entry.size(), 0);
     mz_zip_reader_end(&zip);
-    require(found, "Find manifest for size inspection");
-    return stat.m_uncomp_size;
+    require(extracted, "Extract profile ZIP entry");
+    return entry;
+}
+
+uint64_t manifestSize(const std::filesystem::path& path) {
+    return zipEntry(path, "manifest.json").size();
 }
 }
 
@@ -359,6 +368,63 @@ int main(int argc, char** argv) {
             require(NacelleEndProfileCapture(capture.value, retry.string().c_str(), &summary) == S_OK,
                     "Stopped capture can retry output");
             require(read(retry).manifest.recordedEvents == 1, "Repeated sessions have no stale records");
+        }
+        {
+            nacelle::profile::Session session(8 * sizeof(nacelle::profile::Event));
+            auto& late = session.events[0];
+            late.id = 3;
+            late.startNs = 2501;
+            late.durationNs = 999;
+            late.thread = 2;
+            late.attributes = {0, 0, 4, nacelle::profile::Stage::Pixel};
+            std::strcpy(late.name, "Quote \" slash \\ newline \n");
+            auto& early = session.events[4];
+            early.id = 1;
+            early.startNs = 1000;
+            early.durationNs = 1501;
+            early.thread = 1;
+            early.attributes = {1, 2, 8, nacelle::profile::Stage::Compute, 1,
+                                nacelle::profile::Cache::Miss};
+            std::strcpy(early.name, "First event");
+            auto& middle = session.events[7];
+            middle = early;
+            middle.id = 2;
+            middle.parent = 1;
+            middle.startNs = 2000;
+            middle.durationNs = 0;
+            middle.attributes.tier = 2;
+            middle.attributes.cache = nacelle::profile::Cache::Hit;
+            middle.attributes.pipelineId = middle.attributes.codeVersionId = 1;
+            std::strcpy(middle.name, "Versioned event");
+            session.shaders.codeVersions.push_back({
+                1, 1, "00000000000000020000000000000001", "compute", 8, 1, 2, "hit"});
+            session.nextBlock = session.capacity;
+            session.wait();
+            const auto path = directory / "lazy-trace.nacelle-profile";
+            std::string error;
+            require(nacelle::profile::writeProfile(path.string(), session, error), error.c_str());
+            const auto profile = read(path);
+            const auto& events = profile.trace.traceEvents;
+            require(events.size() == 3 && events[0].args.id == 1 &&
+                    events[1].args.id == 2 && events[2].args.id == 3,
+                    "Lazy serialization sorts sparse completed event slots");
+            require(events[2].name == late.name && events[2].ts == 2.501 &&
+                    events[2].dur == 0.999 && events[1].dur == 0 &&
+                    events[1].args.codeVersionId == 1,
+                    "Lazy serialization preserves escaping, fractional units and version references");
+            const auto compressed = zipEntry(path, "trace.json.zst");
+            const auto size = ZSTD_getFrameContentSize(compressed.data(), compressed.size());
+            require(size != ZSTD_CONTENTSIZE_ERROR && size != ZSTD_CONTENTSIZE_UNKNOWN,
+                    "Trace frame declares its decoded size");
+            std::string decoded(static_cast<size_t>(size), '\0');
+            require(ZSTD_decompress(decoded.data(), decoded.size(),
+                                    compressed.data(), compressed.size()) == decoded.size(),
+                    "Decompress serialized trace");
+            const auto exported = directory / "lazy-trace.json";
+            require(nacelle::profile::exportTrace(exported.string(), profile.trace, error), error.c_str());
+            std::ifstream input(exported, std::ios::binary);
+            require(decoded == std::string(std::istreambuf_iterator<char>(input), {}),
+                    "Lazy trace bytes match ordinary typed Trace serialization exactly");
         }
         {
             constexpr uint64_t manifestLimit = 1024 * 1024;
