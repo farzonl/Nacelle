@@ -205,71 +205,6 @@ jobs:
             -DNM_TOOL="${{ github.workspace }}/.toolchains/llvm/bin/llvm-nm" \
             -P cmake/CheckProfileIsolation.cmake
 
-      - name: Checkout profiling submodules (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          git submodule update --init --depth 1 \
-            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
-
-      - name: Configure instrumented capture tests (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          echo "Instrumented runner: ${RUNNER_OS}/${RUNNER_ARCH}"
-          cmake -S . -B build-profile -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNACELLE_FETCH_SDL3=OFF \
-            -DNACELLE_ENABLE_INSTRUMENTATION=ON \
-            -DNACELLE_BUILD_PROFILE_TOOLS=ON \
-            -DNACELLE_BUILD_PROFILE_TESTS=ON \
-            -DNACELLE_CLANGXX="${{ github.workspace }}/.toolchains/llvm/bin/clang++" \
-            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
-            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
-            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
-            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
-            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
-
-      - name: Build instrumented capture tests (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          cmake --build build-profile --target \
-            instrumentation_test profile_runtime_static_test profile_runtime_shared_test nacelle-dbg \
-            --parallel
-
-      - name: Run instrumented capture tests (macOS)
-        if: runner.os == 'macOS'
-        env:
-          DYLD_LIBRARY_PATH: "${{ github.workspace }}/build-profile:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
-        run: |
-          ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
-
-      - name: Set up Node for native profile interoperability (macOS)
-        if: runner.os == 'macOS'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: tools/nacelle-view/package-lock.json
-
-      - name: Install profile viewer dependencies (macOS)
-        if: runner.os == 'macOS'
-        working-directory: tools/nacelle-view
-        run: npm ci
-
-      - name: Test native profile interoperability (macOS)
-        if: runner.os == 'macOS'
-        working-directory: tools/nacelle-view
-        env:
-          NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
-          NACELLE_NATIVE_CODE_VERSIONS: "1"
-          NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
-        run: npm test
-
-      - name: Build profile viewer (macOS)
-        if: runner.os == 'macOS'
-        working-directory: tools/nacelle-view
-        run: npm run build
-
   build-and-test-windows:
     name: Build & Test (windows-latest)
     runs-on: windows-latest
@@ -419,70 +354,28 @@ jobs:
             -DNM_TOOL="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/llvm-nm.exe" `
             -P cmake/CheckProfileIsolation.cmake
 
-      - name: Checkout profiling submodules (Windows)
-        run: |
-          git submodule update --init --depth 1 `
-            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
-
-      - name: Configure instrumented capture tests (Windows)
-        run: |
-          Write-Output "Instrumented runner: $env:RUNNER_OS/$env:RUNNER_ARCH"
-          cmake -S . -B build-profile -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
-            -DCMAKE_CXX_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
-            -DCMAKE_C_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
-            -DCMAKE_CXX_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
-            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
-            -DNACELLE_FETCH_SDL3=OFF `
-            -DNACELLE_ENABLE_INSTRUMENTATION=ON `
-            -DNACELLE_BUILD_PROFILE_TOOLS=ON `
-            -DNACELLE_BUILD_PROFILE_TESTS=ON `
-            -DNACELLE_CLANGXX="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang++.exe" `
-            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
-            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
-            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
-            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
-            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
-
-      - name: Build instrumented capture tests (Windows)
-        run: |
-          cmake --build build-profile --target `
-            instrumentation_test profile_runtime_static_test profile_runtime_shared_test nacelle-dbg `
-            --parallel
-
-      - name: Run instrumented capture tests (Windows)
-        run: |
-          $env:PATH = "$env:GITHUB_WORKSPACE\build-profile;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\openblas\bin;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
-          ctest --test-dir build-profile --no-tests=error `
-            -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
-
-      - name: Set up Node for native profile interoperability (Windows)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: tools/nacelle-view/package-lock.json
-
-      - name: Install profile viewer dependencies (Windows)
-        working-directory: tools/nacelle-view
-        run: npm ci
-
-      - name: Test native profile interoperability (Windows)
-        working-directory: tools/nacelle-view
-        env:
-          NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
-          NACELLE_NATIVE_CODE_VERSIONS: "1"
-          NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
-        run: npm test
-
-      - name: Build profile viewer (Windows)
-        working-directory: tools/nacelle-view
-        run: npm run build
-
   build-and-test-profiling:
-    name: Build & Test Profiling (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: Build & Test Profiling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sdk-key: dxc1.9.2609-vk1.4.357.0
+            exe: ""
+            dxc: bin/dxc
+          - os: macos-latest
+            sdk-key: dxc1.9.2609-vk1.4.357.0
+            exe: ""
+            dxc: bin/dxc
+          - os: windows-latest
+            sdk-key: dxc1.9.2609-openblas0.3.29
+            exe: ".exe"
+            dxc: bin/x64/dxc.exe
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout repository
@@ -494,6 +387,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -505,6 +399,18 @@ jobs:
             zlib1g-dev \
             libzstd-dev \
             libopenblas-dev
+
+      - name: Ensure build tools are installed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+          command -v cmake >/dev/null 2>&1 || brew install cmake
+
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Checkout third_party and profiling submodules
         run: |
@@ -524,20 +430,49 @@ jobs:
         run: |
           LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
           echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+          echo "LLVM_CACHE_PREFIX=nacelle-llvm-${{ runner.os }}-${{ runner.os == 'Windows' && 'x64' || runner.arch }}" >> "$GITHUB_ENV"
 
       - name: Restore DXC / GPU SDK cache
         id: cache-sdk
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.os == 'Windows' && 'x64' || runner.arch }}-${{ matrix.sdk-key }}
 
       - name: Install DirectXShaderCompiler (Linux)
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        if: runner.os == 'Linux' && steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p .sdk
           curl -fsSL https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz \
             | tar -xzf - -C .sdk ./bin ./include ./lib
+
+      - name: Install DirectXShaderCompiler via Vulkan SDK (macOS)
+        if: runner.os == 'macOS' && steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/include .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/include/dxc .sdk/include/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+      - name: Install DirectXShaderCompiler & OpenBLAS (Windows)
+        if: runner.os == 'Windows' && steps.cache-sdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .sdk
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -OutFile dxc.zip
+          Expand-Archive -Path dxc.zip -DestinationPath .sdk -Force
+          Remove-Item dxc.zip
+          New-Item -ItemType Directory -Force -Path .sdk/openblas
+          Invoke-WebRequest -Uri "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.29/OpenBLAS-0.3.29_x64.zip" -OutFile openblas.zip
+          Expand-Archive -Path openblas.zip -DestinationPath .sdk/openblas -Force
+          Remove-Item openblas.zip
 
       - name: Save DXC / GPU SDK cache
         if: always() && steps.cache-sdk.outputs.cache-hit != 'true'
@@ -545,7 +480,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: nacelle-sdk-${{ runner.os }}-${{ runner.arch }}-dxc1.9.2609-vk1.4.357.0
+          key: nacelle-sdk-${{ runner.os }}-${{ runner.os == 'Windows' && 'x64' || runner.arch }}-${{ matrix.sdk-key }}
 
       - name: Restore third_party LLVM/MLIR binaries cache
         id: cache-llvm
@@ -553,16 +488,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .toolchains/llvm
-          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          key: ${{ env.LLVM_CACHE_PREFIX }}-${{ steps.submodule-rev.outputs.llvm }}
           restore-keys: |
-            nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-
+            ${{ env.LLVM_CACHE_PREFIX }}-
 
       - name: Fail if LLVM cache restore timed out
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          KEY="nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}"
+          KEY="${LLVM_CACHE_PREFIX}-${{ steps.submodule-rev.outputs.llvm }}"
           COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=${KEY}" --jq '.total_count')
           if [ "${COUNT:-0}" -gt 0 ]; then
             echo "Error: LLVM cache (${KEY}) exists but restore failed or timed out; aborting instead of rebuilding."
@@ -573,6 +508,10 @@ jobs:
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
           git submodule update --init --depth 1 third_party/llvm-project
+          args=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            args+=(-DLLVM_USE_CRT_RELEASE=MD)
+          fi
           cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.toolchains/llvm" \
@@ -584,7 +523,8 @@ jobs:
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DMLIR_INCLUDE_TESTS=OFF \
-            -DCLANG_INCLUDE_TESTS=OFF
+            -DCLANG_INCLUDE_TESTS=OFF \
+            "${args[@]}"
           cmake --build build-llvm --parallel
           cmake --install build-llvm
           rm -rf build-llvm
@@ -595,22 +535,34 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .toolchains/llvm
-          key: nacelle-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+          key: ${{ env.LLVM_CACHE_PREFIX }}-${{ steps.submodule-rev.outputs.llvm }}
 
       - name: Configure instrumented capture tests
         run: |
+          echo "Instrumented runner: ${RUNNER_OS}/${RUNNER_ARCH}"
+          args=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            args+=(
+              "-DCMAKE_C_COMPILER=$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe"
+              "-DCMAKE_CXX_COMPILER=$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe"
+              "-DCMAKE_C_FLAGS_RELEASE=/clang:-O3 /Ob2 /DNDEBUG"
+              "-DCMAKE_CXX_FLAGS_RELEASE=/clang:-O3 /Ob2 /DNDEBUG"
+              "-DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/.sdk/openblas"
+            )
+          fi
           cmake -S . -B build-profile -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DNACELLE_FETCH_SDL3=OFF \
             -DNACELLE_ENABLE_INSTRUMENTATION=ON \
             -DNACELLE_BUILD_PROFILE_TOOLS=ON \
             -DNACELLE_BUILD_PROFILE_TESTS=ON \
-            -DNACELLE_CLANGXX="${{ github.workspace }}/.toolchains/llvm/bin/clang++" \
+            -DNACELLE_CLANGXX="${{ github.workspace }}/.toolchains/llvm/bin/clang++${{ matrix.exe }}" \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
-            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
-            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
-            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/${{ matrix.dxc }}" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck${{ matrix.exe }}" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file${{ matrix.exe }}" \
+            "${args[@]}"
 
       - name: Build instrumented capture tests
         run: |
@@ -621,7 +573,11 @@ jobs:
       - name: Run instrumented capture tests
         env:
           LD_LIBRARY_PATH: "${{ github.workspace }}/build-profile:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+          DYLD_LIBRARY_PATH: "${{ github.workspace }}/build-profile:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
+          fi
           ctest --test-dir build-profile --no-tests=error \
             -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
 
@@ -649,16 +605,19 @@ jobs:
         run: npm run build
 
       - name: Export native trace for browser verification
+        if: runner.os == 'Linux'
         run: |
           build-profile/tools/nacelle-dbg/nacelle-dbg \
             build-profile/tests/static.nacelle-profile \
             --trace build-profile/tests/static-trace.json
 
       - name: Install Chromium for offline viewer tests
+        if: runner.os == 'Linux'
         working-directory: tools/nacelle-view
         run: npx playwright install --with-deps chromium
 
       - name: Test offline browser upload, rendering, and downloads
+        if: runner.os == 'Linux'
         working-directory: tools/nacelle-view
         env:
           NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"

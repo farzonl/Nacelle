@@ -54,15 +54,18 @@ This standalone build also needs the initialized DirectX-Headers submodule.
 The Linux, macOS, and Windows CI jobs retain their normal OFF build and test
 run, checking OFF compile commands, build targets, and static-library symbols
 for instrumentation leakage using the repository-built `llvm-nm` without
-fetching profiling dependencies. A dedicated Linux (`ubuntu-latest`) profiling
-job runs concurrently to build `build-profile/` with instrumentation enabled,
+fetching profiling dependencies. A dedicated profiling matrix on Linux,
+macOS, and Windows runs concurrently with the normal OFF jobs to build
+`build-profile/` with instrumentation enabled,
 run the recorder and real static/shared capture tests, and run native-to-viewer
 interoperability tests and the viewer build.
-After their OFF isolation checks, the existing macOS and Windows jobs also
-initialize only the pinned profiling submodules and run a separate instrumented
-recorder/static/shared capture build plus native-to-viewer tests. They reuse
-their existing repository LLVM/MLIR/Clang and DXC SDKs, without another toolchain
-build or Pages publisher. Windows adds the instrumented runtime directory to
+The matrix shares dependency checkout, toolchain cache restoration/build,
+capture configuration/build/tests, and native-to-viewer validation. SDK installs
+and Windows compiler options are platform-specific. Profiling jobs reuse the
+normal jobs' OS/architecture-specific LLVM/MLIR/Clang and DXC SDK cache keys;
+on a cache miss they install the same pinned toolchains independently.
+Profiling failures do not affect the normal OFF job results, and no new Pages
+publisher is added. Windows adds the instrumented runtime directory to
 the DLL search path, exercising shared API exports as well as static linkage.
 The instrumented configure steps report the actual runner OS/architecture.
 
