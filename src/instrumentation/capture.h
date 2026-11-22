@@ -52,10 +52,12 @@ struct Session {
     size_t capacity;
     std::unique_ptr<Event[]> events;
     std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
-    std::atomic<size_t> nextBlock{0};
+    alignas(64) std::atomic<size_t> nextBlock{0};
     uint64_t eventCount = 0; // Finalized only after all writers drain.
-    std::atomic<uint64_t> dropped{0}, nextId{1}, outstanding{0};
-    std::atomic<uint32_t> nextThread{1};
+    alignas(64) std::atomic<uint64_t> dropped{0};
+    alignas(64) std::atomic<uint64_t> nextId{1};
+    alignas(64) std::atomic<uint64_t> outstanding{0};
+    alignas(64) std::atomic<uint32_t> nextThread{1};
     std::mutex waitMutex;
     std::condition_variable drained;
     std::mutex metadataMutex;
@@ -98,7 +100,8 @@ public:
 
 private:
     void begin(const char* name);
-    std::shared_ptr<Session> session_;
+    Session* session_ = nullptr;
+    std::shared_ptr<Session> rootSession_;
     std::shared_ptr<Work> work_;
     bool ownsWork_ = false;
     Event event_;

@@ -108,6 +108,12 @@ the event budget is not a total-process RSS limit.
 Event IDs are reserved in per-thread blocks and need not be contiguous or
 chronologically ordered. Exact recorded-event counts are finalized from completed
 buffer slots after captured work drains, avoiding shared per-event count updates.
+Nested synchronous scopes borrow the session held by their live stack parent,
+without shared ownership updates. Root scopes retain the session; asynchronous
+scopes retain their owning work context. Exporting a context from any nesting
+depth acquires independent ownership, so it may safely outlive the original root
+and continue recording while capture end waits for it. Worker coverage, event
+counts, and draining semantics are unchanged.
 
 ### Memory validation
 
@@ -287,3 +293,31 @@ drops. End-to-end changes were within shared-host variability: paired pixel
 overhead ranged from -9.0% to +16.9% for the original recorder. These samples do
 not demonstrate a reliable shader speedup or certify the performance budgets;
 further isolation and controlled-host measurements remain necessary.
+
+A subsequent recorder diagnostic separately evaluated scope ownership and
+counter false sharing (Clang 21.1.8, Linux x86_64, `-O3`, 12 balanced sequential
+rounds per variant/thread count, 10,000 nested scope pairs per worker):
+
+| Threads | Baseline | Borrowed scopes only | Borrowed scopes + counter alignment |
+| --- | ---: | ---: | ---: |
+| 1 | 1.4381 ms | 1.3887 ms | 1.4583 ms |
+| 8 | 13.0082 ms | 2.7754 ms | 1.8525 ms |
+
+Every run retained all events with zero drops (20,002 for one worker, 160,009
+for eight). The timed region covers barrier release, recording, and worker join,
+not event allocation, final count scanning, or serialization. Individual
+eight-worker samples ranged from 11.2588-14.3048 ms (baseline),
+2.2250-4.5322 ms (ownership only), and 1.4936-3.2550 ms (aligned counters).
+The single-worker differences are within host variability.
+
+The recorder retains both changes: nested scopes borrow their live owning
+ancestor, async scopes retain Work without a redundant Session reference, and
+shared counters use the runtime's existing 64-byte alignment convention.
+On this build, Session grows from 480 to 768 bytes per capture and Scope from
+176 to 184 bytes per live scope; Event size and the 64 MiB event pool are unchanged.
+Exporting a deeply nested context walks its owning scope chain before acquiring
+independent ownership. Raw samples and the reproducible diagnostic are published
+under [#211](https://github.com/farzonl/Nacelle/issues/211).
+These are recorder-contention measurements, not matched-hash shader acceptance
+or a portable promise about cache-line sizes. Controlled OFF/idle/active shader
+budget certification remains open.

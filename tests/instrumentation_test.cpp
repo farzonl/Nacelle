@@ -168,6 +168,52 @@ int main(int argc, char** argv) {
         }
         {
             Capture capture;
+            capture.begin();
+            nacelle::profile::Context escaped;
+            {
+                nacelle::profile::Scope root("Ownership root");
+                root.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute, 1,
+                                    nacelle::profile::Cache::Miss});
+                const auto owner = root.context();
+                const auto references = owner.work->session.use_count();
+                nacelle::profile::Scope middle("Ownership middle");
+                nacelle::profile::Scope leaf("Ownership leaf");
+                require(owner.work->session.use_count() == references,
+                        "Nested scopes borrow the root without session reference-count traffic");
+                escaped = leaf.context();
+            }
+            {
+                const auto work = escaped.work;
+                const auto references = work->session.use_count();
+                nacelle::profile::Scope async(escaped, "Ownership async");
+                escaped = {};
+                require(work->session.use_count() == references,
+                        "Async scope retains Work without a redundant session reference");
+                nacelle::profile::Scope nested("Ownership async nested");
+                const auto descendant = nested.context();
+                require(descendant.work->session == work->session,
+                        "Nested async context retains the original session after its root exits");
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory / "scope-ownership.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                    "Save escaped nested context after owning roots exit");
+            const auto profile = read(path);
+            require(summary.recorded_events == 5 && summary.dropped_events == 0,
+                    "Borrowing preserves every nested and escaped event");
+            const auto& events = profile.trace.traceEvents;
+            for (const auto& event : events) {
+                require(event.args.pso == "00000000000000020000000000000001" &&
+                        event.args.stage == "compute", "Borrowed scopes preserve attributes");
+                if (event.args.parent) {
+                    require(std::any_of(events.begin(), events.end(), [&](const auto& parent) {
+                        return parent.args.id == event.args.parent;
+                    }), "Escaped nested contexts preserve parent correlation");
+                }
+            }
+        }
+        {
+            Capture capture;
             capture.begin(sizeof(nacelle::profile::Event));
             for (int i = 0; i < 10; ++i) {
                 NACELLE_PROFILE_SCOPE("Overflow test");

@@ -103,7 +103,8 @@ Scope::Scope(const char* name) {
         session_ = currentScope->session_;
     } else if (recording.load(std::memory_order_acquire)) {
         std::lock_guard lock(activeMutex);
-        session_ = activeSession;
+        rootSession_ = activeSession;
+        session_ = rootSession_.get();
         if (session_) {
             session_->outstanding.fetch_add(1);
             ownsWork_ = true;
@@ -121,7 +122,7 @@ Scope::Scope(const char* name) {
 Scope::Scope(const Context& context, const char* name, uint8_t tier) {
     if (!context.work) return;
     work_ = context.work;
-    session_ = context.work->session;
+    session_ = work_->session.get();
     begin(name);
     event_.parent = context.parent;
     event_.attributes = context.attributes;
@@ -150,7 +151,11 @@ Scope::~Scope() {
 
 Context Scope::context() const {
     if (!session_) return {};
-    return {std::make_shared<Work>(session_), event_.id, event_.attributes};
+    // Nested scopes borrow their live stack parent; only roots and async scopes own the session.
+    const Scope* owner = this;
+    while (!owner->rootSession_ && !owner->work_) owner = owner->previous_;
+    const auto& session = owner->rootSession_ ? owner->rootSession_ : owner->work_->session;
+    return {std::make_shared<Work>(session), event_.id, event_.attributes};
 }
 
 void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache) {
