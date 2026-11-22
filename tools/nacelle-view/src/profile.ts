@@ -106,54 +106,110 @@ export interface CodeVersion {
   id: number;
   pipelineId: number;
   pso: string;
-  stage: 'compute';
+  stage: 'compute' | 'vertex' | 'pixel' | 'geometry' | 'hull' | 'domain' | 'mesh' | 'amplification';
   simdWidth: number;
-  version: 1 | 2;
-  tier: 1 | 2;
-  cache: 'hit' | 'miss';
+  version: number;
+  tier: 0 | 1 | 2;
+  cache: 'hit' | 'miss' | 'unknown';
+  entryRole?: 'vertex' | 'pixel' | 'geometry' | 'hull-control-point' | 'hull-patch-constant'
+    | 'domain' | 'mesh' | 'amplification';
+  shaderId?: string;
+  artifactId?: string;
+}
+
+export interface CodeSelection {
+  id: number;
+  pipelineId: number;
+  codeVersionIds: number[];
 }
 
 export interface ShaderMetadata {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   codeVersions: CodeVersion[];
+  codeSelections?: CodeSelection[];
 }
 
 export function validateShaderMetadata(value: unknown, trace: Trace): ShaderMetadata {
   if (Array.isArray(value) && value.length === 0) value = { schemaVersion: 1, codeVersions: [] };
-  requireValid(object(value) && value.schemaVersion === 1 && Array.isArray(value.codeVersions)
+  requireValid(object(value) && (value.schemaVersion === 1 || value.schemaVersion === 2) && Array.isArray(value.codeVersions)
     && value.codeVersions.length <= LIMITS.codeVersions, 'Unsupported shader metadata schema or code-version count.');
+  requireValid(value.codeSelections === undefined || (value.schemaVersion === 2 && Array.isArray(value.codeSelections)
+    && value.codeSelections.length + value.codeVersions.length <= LIMITS.codeVersions),
+  'Invalid code-selection metadata or count.');
   const identities = new Set<string>();
   const pipelines = new Map<number, string>();
   for (const [index, code] of value.codeVersions.entries()) {
+    requireValid(object(code), 'Invalid code-version metadata.');
+    const compute = code.stage === 'compute';
+    const graphics = value.schemaVersion === 2
+      && ((typeof code.stage === 'string' &&
+        ['vertex', 'pixel', 'geometry', 'domain', 'mesh', 'amplification'].includes(code.stage)
+        && code.entryRole === code.stage)
+        || (code.stage === 'hull' && (code.entryRole === 'hull-control-point' || code.entryRole === 'hull-patch-constant')));
     requireValid(object(code) && code.id === index + 1
       && Number.isSafeInteger(code.pipelineId) && (code.pipelineId as number) > 0
       && (code.pipelineId as number) <= LIMITS.codeVersions
       && typeof code.pso === 'string' && /^[0-9a-f]{32}$/.test(code.pso)
-      && code.stage === 'compute' && Number.isSafeInteger(code.simdWidth)
+      && (compute || graphics) && Number.isSafeInteger(code.simdWidth)
       && (code.simdWidth as number) > 0 && (code.simdWidth as number) <= 0xffffffff
-      && (code.version === 1 || code.version === 2) && (code.tier === 1 || code.tier === 2)
-      && (code.cache === 'hit' || code.cache === 'miss')
-      && (code.cache !== 'hit' || (code.tier === 2 && code.version === 1))
-      && (code.version !== 2 || code.tier === 2), 'Invalid compute code-version metadata.');
-    const identity = `${code.pipelineId}:${code.version}`;
+      && Number.isSafeInteger(code.version) && (code.version as number) > 0
+      && (code.version as number) <= 0xffffffff && (code.tier === 0 || code.tier === 1 || code.tier === 2)
+      && (code.cache === 'hit' || code.cache === 'miss' || code.cache === 'unknown')
+      && (code.shaderId === undefined || (value.schemaVersion === 2
+        && typeof code.shaderId === 'string' && /^[0-9a-f]{64}$/.test(code.shaderId)))
+      && (code.artifactId === undefined || (value.schemaVersion === 2
+        && typeof code.artifactId === 'string' && /^[0-9a-f]{64}$/.test(code.artifactId)))
+      && (!compute || (code.entryRole === undefined && (code.version === 1 || code.version === 2)
+        && code.tier !== 0 && code.cache !== 'unknown'
+        && (code.cache !== 'hit' || (code.tier === 2 && code.version === 1))
+        && (code.version !== 2 || code.tier === 2))), 'Invalid code-version metadata.');
+    const identity = `${code.pipelineId}:${code.entryRole ?? code.stage}:${code.version}`;
     const signature = `${code.pso}:${code.simdWidth}`;
     const pipeline = code.pipelineId as number;
     requireValid(!identities.has(identity)
       && (!pipelines.has(pipeline) || pipelines.get(pipeline) === signature),
-    'Inconsistent compute pipeline or duplicate code-version metadata.');
+    'Inconsistent pipeline or duplicate code-version metadata.');
     identities.add(identity);
     pipelines.set(pipeline, signature);
   }
   const shaders = value as unknown as ShaderMetadata;
+  for (const [index, selection] of (shaders.codeSelections ?? []).entries()) {
+    requireValid(object(selection) && selection.id === index + 1
+      && Number.isSafeInteger(selection.pipelineId) && selection.pipelineId > 0
+      && selection.pipelineId <= LIMITS.codeVersions && Array.isArray(selection.codeVersionIds)
+      && selection.codeVersionIds.length <= 8, 'Invalid code-selection metadata.');
+    const references = new Set<number>();
+    for (const id of selection.codeVersionIds) {
+      requireValid(Number.isSafeInteger(id) && id > 0 && id <= shaders.codeVersions.length
+        && !references.has(id) && shaders.codeVersions[id - 1].pipelineId === selection.pipelineId
+        && shaders.codeVersions[id - 1].stage !== 'compute', 'Invalid code-selection entry reference.');
+      references.add(id);
+    }
+  }
   for (const { args } of trace.traceEvents) {
-    if (args.pipelineId === undefined && args.codeVersionId === undefined) continue;
+    let selection: CodeSelection | undefined;
+    if (args.codeSelectionId !== undefined) {
+      requireValid(Number.isSafeInteger(args.codeSelectionId) && (args.codeSelectionId as number) > 0
+        && (args.codeSelectionId as number) <= (shaders.codeSelections?.length ?? 0),
+      'Invalid trace code-selection reference.');
+      selection = shaders.codeSelections?.[(args.codeSelectionId as number) - 1];
+      requireValid(selection && args.pipelineId === selection.pipelineId,
+        'Trace does not match referenced code selection.');
+      for (const id of selection.codeVersionIds) {
+        const code = shaders.codeVersions[id - 1];
+        requireValid(args.pso === code.pso && args.simdWidth === code.simdWidth,
+          'Trace does not match selected pipeline.');
+      }
+    }
+    if (args.codeVersionId === undefined && (args.pipelineId === undefined || selection)) continue;
     requireValid(Number.isSafeInteger(args.codeVersionId) && (args.codeVersionId as number) > 0
       && (args.codeVersionId as number) <= shaders.codeVersions.length, 'Invalid trace code-version reference.');
     const code = shaders.codeVersions[(args.codeVersionId as number) - 1];
-    requireValid(args.pipelineId === code.pipelineId && args.pso === code.pso
+    requireValid((!selection || selection.codeVersionIds.includes(code.id))
+      && args.pipelineId === code.pipelineId && args.pso === code.pso
       && args.stage === code.stage && args.simdWidth === code.simdWidth
       && args.tier === code.tier && args.cache === code.cache,
-    'Trace does not match referenced compute code version.');
+    'Trace does not match referenced code version.');
   }
   return shaders;
 }

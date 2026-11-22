@@ -110,7 +110,7 @@ bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::s
 
 bool writeProfile(const std::string& path, const Session& session, std::string& error) {
     if (session.shaderMetadataOverflow) {
-        error = "Profile exceeds the 65536 compute code-version metadata limit";
+        error = "Profile exceeds the 65536 code-version/selection metadata limit or 8-entry selection limit";
         return false;
     }
     Manifest manifest;
@@ -126,7 +126,8 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     // Reject oversized metadata before allocating trace objects and compression buffers.
     if (!manifestToJson(manifest, manifestJson, error)) return false;
     std::string shadersJson = "[]";
-    if (!session.shaders.codeVersions.empty() && !toJson(session.shaders, shadersJson, error))
+    if ((!session.shaders.codeVersions.empty() || session.shaders.codeSelections) &&
+        !toJson(session.shaders, shadersJson, error))
         return false;
     if (shadersJson.size() > maxProfileBytes) {
         error = "Profile shader metadata exceeds the 256 MiB format limit";
@@ -146,8 +147,9 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         });
         // Glaze consumes one temporary event at a time instead of a second full object graph.
         const auto events = ordered | std::views::transform([](const Event* event) {
-            constexpr const char* stages[] =
-                {"unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing"};
+            constexpr const char* stages[] = {
+                "unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing",
+                "geometry", "hull", "domain", "amplification"};
             constexpr const char* caches[] = {"unknown", "hit", "miss"};
             TraceEvent item;
             item.name = event->name;
@@ -160,10 +162,13 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
                          stages[static_cast<unsigned>(event->attributes.stage)],
                          event->attributes.simdWidth, event->attributes.tier,
                          caches[static_cast<unsigned>(event->attributes.cache)]};
-            if (event->attributes.codeVersionId) {
+            if (event->attributes.codeVersionId || event->attributes.codeSelectionId) {
                 item.args.pipelineId = event->attributes.pipelineId;
+            }
+            if (event->attributes.codeVersionId) {
                 item.args.codeVersionId = event->attributes.codeVersionId;
             }
+            if (event->attributes.codeSelectionId) item.args.codeSelectionId = event->attributes.codeSelectionId;
             return item;
         });
         const Trace defaults;
@@ -325,44 +330,102 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
             error = "Invalid shader metadata: " + glz::format_error(ec, json);
             return false;
         }
-        if (parsed.shaders.schemaVersion != 1 || parsed.shaders.codeVersions.size() > maxCodeVersions) {
+        if ((parsed.shaders.schemaVersion != 1 && parsed.shaders.schemaVersion != 2) ||
+            (parsed.shaders.schemaVersion == 1 && parsed.shaders.codeSelections) ||
+            parsed.shaders.codeVersions.size() +
+                (parsed.shaders.codeSelections ? parsed.shaders.codeSelections->size() : 0) > maxCodeVersions) {
             error = "Unsupported shader metadata schema or code-version count";
             return false;
         }
         uint64_t expectedId = 1;
-        std::set<std::pair<uint64_t, uint32_t>> identities;
+        std::set<std::tuple<uint64_t, std::string, uint32_t>> identities;
         std::map<uint64_t, std::pair<std::string, uint32_t>> pipelines;
         for (const auto& code : parsed.shaders.codeVersions) {
+            const bool compute = code.stage == "compute";
+            const bool graphics = parsed.shaders.schemaVersion == 2 &&
+                (((code.stage == "vertex" || code.stage == "pixel" || code.stage == "geometry" ||
+                   code.stage == "domain" || code.stage == "mesh" || code.stage == "amplification") &&
+                  code.entryRole == code.stage) ||
+                 (code.stage == "hull" && (code.entryRole == "hull-control-point" ||
+                                         code.entryRole == "hull-patch-constant")));
             if (code.id != expectedId++ || !code.pipelineId || code.pipelineId > maxCodeVersions ||
                 code.pso.size() != 32 || code.pso.find_first_not_of("0123456789abcdef") != std::string::npos ||
-                code.stage != "compute" || !code.simdWidth || code.version < 1 || code.version > 2 ||
-                code.tier < 1 || code.tier > 2 || (code.cache != "hit" && code.cache != "miss") ||
-                (code.cache == "hit" && (code.tier != 2 || code.version != 1)) ||
-                (code.version == 2 && code.tier != 2)) {
-                error = "Invalid compute code-version metadata";
+                (!compute && !graphics) || !code.simdWidth || code.version < 1 ||
+                code.tier > 2 || (code.cache != "hit" && code.cache != "miss" && code.cache != "unknown") ||
+                (code.shaderId && (code.shaderId->size() != 64 ||
+                 code.shaderId->find_first_not_of("0123456789abcdef") != std::string::npos)) ||
+                (code.artifactId && (code.artifactId->size() != 64 ||
+                 code.artifactId->find_first_not_of("0123456789abcdef") != std::string::npos)) ||
+                (parsed.shaders.schemaVersion == 1 && (code.shaderId || code.artifactId)) ||
+                (compute && (code.entryRole ||
+                 code.version > 2 || code.tier < 1 ||
+                 code.cache == "unknown" || (code.cache == "hit" && (code.tier != 2 || code.version != 1)) ||
+                 (code.version == 2 && code.tier != 2)))) {
+                error = "Invalid code-version metadata";
                 return false;
             }
             const auto signature = std::make_pair(code.pso, code.simdWidth);
             const auto pipeline = pipelines.try_emplace(code.pipelineId, signature).first;
-            if (!identities.emplace(code.pipelineId, code.version).second ||
+            if (!identities.emplace(code.pipelineId, code.entryRole.value_or(code.stage), code.version).second ||
                 pipeline->second != signature) {
-                error = "Inconsistent compute pipeline or duplicate code-version identity";
+                error = "Inconsistent pipeline or duplicate code-version identity";
                 return false;
+            }
+        }
+        if (parsed.shaders.codeSelections) {
+            expectedId = 1;
+            for (const auto& selection : *parsed.shaders.codeSelections) {
+                if (selection.id != expectedId++ || !selection.pipelineId ||
+                    selection.pipelineId > maxCodeVersions || selection.codeVersionIds.size() > maxSelectionEntries) {
+                    error = "Invalid code-selection metadata";
+                    return false;
+                }
+                std::set<uint64_t> references;
+                for (const auto id : selection.codeVersionIds) {
+                    if (!id || id > parsed.shaders.codeVersions.size() || !references.insert(id).second ||
+                        parsed.shaders.codeVersions[id - 1].pipelineId != selection.pipelineId ||
+                        parsed.shaders.codeVersions[id - 1].stage == "compute") {
+                        error = "Invalid code-selection entry reference";
+                        return false;
+                    }
+                }
             }
         }
     }
     for (const auto& event : parsed.trace.traceEvents) {
         const auto& args = event.args;
-        if (!args.pipelineId && !args.codeVersionId) continue;
+        const CodeSelection* selection = nullptr;
+        if (args.codeSelectionId) {
+            if (!parsed.shaders.codeSelections || !*args.codeSelectionId ||
+                *args.codeSelectionId > parsed.shaders.codeSelections->size()) {
+                error = "Invalid trace code-selection reference";
+                return false;
+            }
+            selection = &parsed.shaders.codeSelections->at(*args.codeSelectionId - 1);
+            if (args.pipelineId != selection->pipelineId) {
+                error = "Trace does not match referenced code selection";
+                return false;
+            }
+            for (const auto id : selection->codeVersionIds) {
+                const auto& code = parsed.shaders.codeVersions[id - 1];
+                if (args.pso != code.pso || args.simdWidth != code.simdWidth) {
+                    error = "Trace does not match selected pipeline";
+                    return false;
+                }
+            }
+        }
+        if (!args.codeVersionId && (!args.pipelineId || selection)) continue;
         if (!args.pipelineId || !args.codeVersionId || *args.codeVersionId == 0 ||
             *args.codeVersionId > parsed.shaders.codeVersions.size()) {
             error = "Invalid trace code-version reference";
             return false;
         }
         const auto& code = parsed.shaders.codeVersions[*args.codeVersionId - 1];
-        if (*args.pipelineId != code.pipelineId || args.pso != code.pso || args.stage != code.stage ||
+        if ((selection && std::find(selection->codeVersionIds.begin(), selection->codeVersionIds.end(),
+                                   *args.codeVersionId) == selection->codeVersionIds.end()) ||
+            *args.pipelineId != code.pipelineId || args.pso != code.pso || args.stage != code.stage ||
             args.simdWidth != code.simdWidth || args.tier != code.tier || args.cache != code.cache) {
-            error = "Trace does not match referenced compute code version";
+            error = "Trace does not match referenced code version";
             return false;
         }
     }

@@ -158,15 +158,23 @@ Context Scope::context() const {
     return {std::make_shared<Work>(session), event_.id, event_.attributes};
 }
 
-void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache) {
+void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache,
+                              const std::string& shaderId, const std::string& artifactId) {
+    if (session_) event_.attributes.codeSelectionId = 0;
+    setGraphicsVersion(pipeline, Stage::Compute, version, tier, cache, shaderId, EntryRole::Default, artifactId);
+}
+
+void Scope::setGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
+                               uint8_t tier, Cache cache, const std::string& shaderId, EntryRole role,
+                               const std::string& artifactId) {
     if (!session_) return;
     auto& session = *session_;
     std::lock_guard lock(session.metadataMutex);
     auto& attributes = event_.attributes;
-    const auto key = std::make_pair(pipeline, version);
+    const auto key = std::make_tuple(pipeline, stage, role, version);
     auto found = session.codeVersionIds.find(key);
     if (found == session.codeVersionIds.end()) {
-        if (session.shaders.codeVersions.size() == maxCodeVersions) {
+        if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() == maxCodeVersions) {
             session.shaderMetadataOverflow = true;
             return;
         }
@@ -174,17 +182,71 @@ void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier,
             session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first;
         const uint64_t id = session.shaders.codeVersions.size() + 1;
         constexpr const char* caches[] = {"unknown", "hit", "miss"};
-        session.shaders.codeVersions.push_back({
+        constexpr const char* stages[] = {
+            "unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing",
+            "geometry", "hull", "domain", "amplification"};
+        const char* stageName = stages[static_cast<unsigned>(stage)];
+        CodeVersion code{
             id, pipelineIt->second, formatProfileHash(attributes.hashLo, attributes.hashHi),
-            "compute", attributes.simdWidth, version, tier, caches[static_cast<unsigned>(cache)]});
+            stageName, attributes.simdWidth, version, tier, caches[static_cast<unsigned>(cache)]};
+        if (stage != Stage::Compute) {
+            code.entryRole = role == EntryRole::HullControlPoint ? "hull-control-point" :
+                             role == EntryRole::HullPatchConstant ? "hull-patch-constant" : stageName;
+            session.shaders.schemaVersion = 2;
+        }
+        if (!shaderId.empty()) code.shaderId = shaderId;
+        if (!artifactId.empty()) code.artifactId = artifactId;
+        if (code.shaderId || code.artifactId) session.shaders.schemaVersion = 2;
+        session.shaders.codeVersions.push_back(std::move(code));
         found = session.codeVersionIds.emplace(key, id).first;
     }
     attributes.pipelineId = session.shaders.codeVersions[found->second - 1].pipelineId;
     attributes.codeVersionId = found->second;
+    attributes.stage = stage;
     attributes.tier = tier;
     attributes.cache = cache;
+    for (auto selection = attributes.codeSelectionId; selection;
+         selection = session.codeSelectionParents[selection - 1]) {
+        auto& ids = session.shaders.codeSelections->at(selection - 1).codeVersionIds;
+        if (std::find(ids.begin(), ids.end(), found->second) == ids.end()) {
+            if (ids.size() == maxSelectionEntries) session.shaderMetadataOverflow = true;
+            else ids.push_back(found->second);
+        }
+    }
 }
 
+void Scope::beginGraphicsSelection(uint64_t pipeline) {
+    if (!session_) return;
+    auto& session = *session_;
+    std::lock_guard lock(session.metadataMutex);
+    if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() == maxCodeVersions) {
+        session.shaderMetadataOverflow = true;
+        return;
+    }
+    const auto pipelineId = session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first->second;
+    if (!session.shaders.codeSelections) session.shaders.codeSelections.emplace();
+    const auto id = session.codeSelectionParents.size() + 1;
+    session.shaders.codeSelections->push_back({id, pipelineId, {}});
+    const auto parent = event_.attributes.codeSelectionId;
+    session.codeSelectionParents.push_back(parent &&
+        session.shaders.codeSelections->at(parent - 1).pipelineId == pipelineId ? parent : 0);
+    session.shaders.schemaVersion = 2;
+    event_.attributes.pipelineId = pipelineId;
+    event_.attributes.codeVersionId = 0;
+    event_.attributes.codeSelectionId = id;
+}
+
+void Scope::observeGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
+                                   uint8_t tier, Cache cache, const std::string& shaderId, EntryRole role,
+                                   const std::string& artifactId) {
+    const auto originalStage = attributes().stage;
+    setGraphicsVersion(pipeline, stage, version, tier, cache, shaderId, role, artifactId);
+    if (!session_) return;
+    event_.attributes.stage = originalStage;
+    event_.attributes.codeVersionId = 0;
+    event_.attributes.tier = 0;
+    event_.attributes.cache = Cache::Unknown;
+}
 Context captureContext() { return currentScope ? currentScope->context() : Context{}; }
 
 void setCompilerConfiguration(const std::string& hash, const std::string& triple,

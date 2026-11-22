@@ -368,12 +368,23 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                 "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}.nacelle-profile"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
-        foreach(stage IN ITEMS compute graphics tier1 promoted cached disk)
+        foreach(stage IN ITEMS compute graphics tier1 promoted cached disk
+                               graphics-tier1 graphics-promoted graphics-cached graphics-disk graphics-mixed-cache
+                               graphics-extended graphics-extended-promoted graphics-extended-cached
+                               graphics-mesh graphics-mesh-promoted graphics-mesh-cached)
             add_test(NAME profile_runtime_${linkage}_preexisting_${stage}_test
                 COMMAND "${CMAKE_COMMAND}"
                     "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                     "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-preexisting-${stage}.nacelle-profile"
                     "-DCAPTURE_MODE=${stage}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
+        foreach(width IN ITEMS 4 8)
+            add_test(NAME profile_runtime_${linkage}_graphics_simd${width}_test
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-graphics-simd${width}.nacelle-profile"
+                    -DCAPTURE_MODE=graphics "-DSIMD_WIDTH=${width}"
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
         endforeach()
     endforeach()

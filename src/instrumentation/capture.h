@@ -9,12 +9,17 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 #include "profile_format.h"
 
 namespace nacelle::profile {
 
-enum class Stage : uint8_t { Unknown, Compute, Graphics, Vertex, Pixel, Mesh, Raytracing };
+enum class Stage : uint8_t {
+    Unknown, Compute, Graphics, Vertex, Pixel, Mesh, Raytracing,
+    Geometry, Hull, Domain, Amplification
+};
+enum class EntryRole : uint8_t { Default, HullControlPoint, HullPatchConstant };
 enum class Cache : uint8_t { Unknown, Hit, Miss };
 
 struct Attributes {
@@ -26,6 +31,7 @@ struct Attributes {
     Cache cache;
     uint64_t pipelineId = 0;
     uint64_t codeVersionId = 0;
+    uint64_t codeSelectionId = 0;
 };
 
 uint64_t allocatePipelineIdentity();
@@ -65,7 +71,8 @@ struct Session {
     std::string compilerHash, targetTriple, cpu;
     std::vector<std::string> cpuFeatures;
     std::map<uint64_t, uint64_t> pipelineIds;
-    std::map<std::pair<uint64_t, uint32_t>, uint64_t> codeVersionIds;
+    std::map<std::tuple<uint64_t, Stage, EntryRole, uint32_t>, uint64_t> codeVersionIds;
+    std::vector<uint64_t> codeSelectionParents;
     ShaderMetadata shaders;
     bool shaderMetadataOverflow = false;
 };
@@ -89,8 +96,21 @@ public:
     ~Scope();
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
-    void setAttributes(Attributes attributes) { if (session_) event_.attributes = attributes; }
-    void setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache);
+    void setAttributes(Attributes attributes) {
+        if (session_) {
+            attributes.codeSelectionId = event_.attributes.codeSelectionId;
+            event_.attributes = attributes;
+        }
+    }
+    void setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache,
+                           const std::string& shaderId = {}, const std::string& artifactId = {});
+    void setGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
+                            uint8_t tier, Cache cache, const std::string& shaderId = {},
+                            EntryRole role = EntryRole::Default, const std::string& artifactId = {});
+    void beginGraphicsSelection(uint64_t pipeline);
+    void observeGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
+                                uint8_t tier, Cache cache, const std::string& shaderId,
+                                EntryRole role = EntryRole::Default, const std::string& artifactId = {});
     Attributes attributes() const { return session_ ? event_.attributes : Attributes{}; }
     bool enabled() const { return static_cast<bool>(session_); }
     bool needsCompilerConfiguration() const {
@@ -122,8 +142,13 @@ void setCompilerConfiguration(const std::string& hash, const std::string& triple
     , nacelleProfileContext = ::nacelle::profile::captureContext()
 #define NACELLE_PROFILE_ASYNC_SCOPE(name) \
     ::nacelle::profile::Scope NACELLE_PROFILE_JOIN(nacelleProfileScope, __LINE__)(nacelleProfileContext, name, 2)
+#define NACELLE_STORE_GRAPHICS_ENTRY(entry, fn, tier, cache) \
+    (entry).store(fn, std::memory_order_release, tier, ::nacelle::profile::Cache::cache, \
+                 ::nacelle::profileNativeObjectIdentity(reinterpret_cast<uintptr_t>(fn)))
 #else
 #define NACELLE_PROFILE_SCOPE(name)
 #define NACELLE_PROFILE_CAPTURE_CONTEXT
 #define NACELLE_PROFILE_ASYNC_SCOPE(name)
+#define NACELLE_STORE_GRAPHICS_ENTRY(entry, fn, tier, cache) \
+    (entry).store(fn, std::memory_order_release)
 #endif

@@ -887,10 +887,20 @@ void rasterizeTiles(
     const auto& compiled = state.pso->graphicsPSO();
     if (!compiled) return;
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    auto* pixelEntry = compiled->psFn.snapshot();
+    CompiledPixelQuadFn psFn = pixelEntry ? pixelEntry->fn : nullptr;
+#else
     CompiledPixelQuadFn psFn = compiled->psFn.load(std::memory_order_acquire);
+#endif
     if (!psFn) {
         waitForAllAsyncJITTasks();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        pixelEntry = compiled->psFn.snapshot();
+        psFn = pixelEntry ? pixelEntry->fn : nullptr;
+#else
         psFn = compiled->psFn.load(std::memory_order_acquire);
+#endif
     }
     if (!psFn) return;
 
@@ -904,6 +914,14 @@ void rasterizeTiles(
         if (!bins[i].triIndices.empty()) activeTiles.push_back(i);
     }
     if (activeTiles.empty()) return;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::Scope pixelProfile("Pixel raster");
+    pixelProfile.setAttributes({compiled->cacheHashLo, compiled->cacheHashHi, compiled->simdWidth,
+                                profile::Stage::Pixel});
+    pixelProfile.setGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Pixel,
+                                    pixelEntry->version, pixelEntry->tier, pixelEntry->cache,
+                                    compiled->profilePixelShaderId, profile::EntryRole::Default, pixelEntry->artifactId);
+#endif
 
     const uint32_t W = std::clamp<uint32_t>(compiled->simdWidth, 4, kMaxSimdWidth);
     const uint32_t quadsPerBatch = std::max<uint32_t>(1, W / 4);
@@ -1271,6 +1289,7 @@ void executeRasterDrawCall(
         const auto& pso = *state.pso->graphicsPSO();
         drawProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
                                    profile::Stage::Graphics});
+        drawProfile.beginGraphicsSelection(pso.profilePipelineIdentity);
         if (drawProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     }
 #endif
@@ -1292,6 +1311,7 @@ void executeRasterMeshDispatch(
         const auto& pso = *state.pso->graphicsPSO();
         dispatchProfile.setAttributes({pso.cacheHashLo, pso.cacheHashHi, pso.simdWidth,
                                        profile::Stage::Mesh});
+        dispatchProfile.beginGraphicsSelection(pso.profilePipelineIdentity);
         if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     }
 #endif

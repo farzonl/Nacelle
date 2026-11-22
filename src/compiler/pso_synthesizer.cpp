@@ -4268,6 +4268,16 @@ bool compileGraphicsPSO(
     outPSO.cacheHashHi = hi;
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto shaderIdentity = [](const D3D12_SHADER_BYTECODE& shader) {
+        return profileContentIdentity(shader.pShaderBytecode, shader.BytecodeLength);
+    };
+    outPSO.profileVertexShaderId = shaderIdentity(desc.VS);
+    outPSO.profilePixelShaderId = shaderIdentity(desc.PS);
+    outPSO.profileGeometryShaderId = shaderIdentity(desc.GS);
+    outPSO.profileHullShaderId = shaderIdentity(desc.HS);
+    outPSO.profileDomainShaderId = shaderIdentity(desc.DS);
+    outPSO.profileAmplificationShaderId = shaderIdentity(meshStages.AS);
+    outPSO.profileMeshShaderId = shaderIdentity(meshStages.MS);
     profile::Scope compileProfile("Compile graphics PSO");
     compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Graphics, 1, profile::Cache::Miss});
     if (compileProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
@@ -4353,12 +4363,19 @@ bool compileGraphicsPSO(
 
         CachedVSMeta vsMeta{};
         CompiledVertexFn cachedVSFn = nullptr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        uint8_t cachedVSTier = 0;
+#endif
         std::vector<DxilSigRecord> vsOutputRecs;
         if (tryLoadVertexStageFromCache(
                 vsHashLo, vsHashHi, vsSym, vsMeta, cachedVSFn,
-                &outPSO.vsInputs, &outPSO.vsOutputs, &vsOutputRecs)) {
+                &outPSO.vsInputs, &outPSO.vsOutputs, &vsOutputRecs
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                , &cachedVSTier
+#endif
+                )) {
             outPSO.vsSymbolName = vsSym;
-            outPSO.vsFn.store(cachedVSFn, std::memory_order_release);
+            NACELLE_STORE_GRAPHICS_ENTRY(outPSO.vsFn, cachedVSFn, cachedVSTier, Hit);
         } else {
             std::unique_ptr<llvm::LLVMContext> vsLlvmCtx;
             std::unique_ptr<llvm::Module> vsLinkedMod;

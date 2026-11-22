@@ -11,6 +11,7 @@ namespace nacelle::profile {
 inline constexpr uint64_t maxProfileBytes = 256ull * 1024 * 1024;
 inline constexpr uint64_t maxManifestBytes = 1024ull * 1024;
 inline constexpr std::size_t maxCodeVersions = 65536;
+inline constexpr std::size_t maxSelectionEntries = 8;
 std::string formatProfileHash(uint64_t lo, uint64_t hi);
 
 struct Entry {
@@ -60,6 +61,7 @@ struct TraceArgs {
     std::string cache;
     std::optional<uint64_t> pipelineId;
     std::optional<uint64_t> codeVersionId;
+    std::optional<uint64_t> codeSelectionId;
 };
 
 struct CodeVersion {
@@ -71,11 +73,21 @@ struct CodeVersion {
     uint32_t version = 0;
     uint8_t tier = 0;
     std::string cache;
+    std::optional<std::string> entryRole;
+    std::optional<std::string> shaderId;
+    std::optional<std::string> artifactId;
+};
+
+struct CodeSelection {
+    uint64_t id = 0;
+    uint64_t pipelineId = 0;
+    std::vector<uint64_t> codeVersionIds;
 };
 
 struct ShaderMetadata {
     uint32_t schemaVersion = 1;
     std::vector<CodeVersion> codeVersions;
+    std::optional<std::vector<CodeSelection>> codeSelections;
 };
 
 struct TraceEvent {

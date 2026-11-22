@@ -6,6 +6,7 @@
 #include <array>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -112,11 +113,16 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
         require(actual[i] == a[i] + b[i], "Capture changed compute output");
 }
 
-void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture = nullptr) {
+void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture = nullptr,
+          const std::string& mode = "all", const std::string& outputPath = {}) {
     D3D12_ROOT_SIGNATURE_DESC signatureDesc{};
     auto signature = createSignature(runtime, signatureDesc);
-    auto vs = testutil::loadShaderBytes("raster_basic_vs.dxil");
-    auto ps = testutil::loadShaderBytes("raster_basic_ps.dxil");
+    const bool extended = mode.starts_with("graphics-extended");
+    const bool mesh = mode.starts_with("graphics-mesh");
+    auto vs = testutil::loadShaderBytes(extended ? "gfx_tess_point_vs.dxil" : "raster_basic_vs.dxil");
+    auto ps = testutil::loadShaderBytes(extended ? "gfx_tess_point_ps.dxil" :
+                                      mesh ? "mesh_solid_red_ps.dxil" : "raster_basic_ps.dxil");
+    std::vector<uint8_t> hs, ds, gs, as, ms;
     const D3D12_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -136,8 +142,62 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     desc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     desc.DepthStencilState.DepthEnable = FALSE;
     desc.DepthStencilState.StencilEnable = FALSE;
-    ComPtr<ID3D12PipelineState> pso;
-    testutil::checkHR(runtime.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Graphics PSO");
+    if (extended) {
+        hs = testutil::loadShaderBytes("gfx_tess_point_hs.dxil");
+        ds = testutil::loadShaderBytes("gfx_tess_point_ds.dxil");
+        gs = testutil::loadShaderBytes("gfx_tess_point_gs.dxil");
+        desc.HS = {hs.data(), hs.size()};
+        desc.DS = {ds.data(), ds.size()};
+        desc.GS = {gs.data(), gs.size()};
+        desc.InputLayout = {};
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+    }
+    const auto createPipeline = [&] {
+        ComPtr<ID3D12PipelineState> pipeline;
+        if (mesh) {
+            ComPtr<ID3D12Device2> device;
+            testutil::checkHR(runtime.device.As(&device), "Mesh-capable device");
+            as = testutil::loadShaderBytes("mesh_payload_as.dxil");
+            ms = testutil::loadShaderBytes("mesh_payload_ms.dxil");
+            CD3DX12_PIPELINE_MESH_STATE_STREAM stream;
+            stream.pRootSignature = signature.Get();
+            stream.AS = D3D12_SHADER_BYTECODE{as.data(), as.size()};
+            stream.MS = D3D12_SHADER_BYTECODE{ms.data(), ms.size()};
+            stream.PS = desc.PS;
+            stream.RasterizerState = CD3DX12_RASTERIZER_DESC(desc.RasterizerState);
+            stream.BlendState = CD3DX12_BLEND_DESC(desc.BlendState);
+            CD3DX12_DEPTH_STENCIL_DESC1 depth(D3D12_DEFAULT);
+            depth.DepthEnable = FALSE;
+            depth.StencilEnable = FALSE;
+            stream.DepthStencilState = depth;
+            stream.SampleMask = UINT32_MAX;
+            stream.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            D3D12_RT_FORMAT_ARRAY formats{};
+            formats.NumRenderTargets = 1;
+            formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            stream.RTVFormats = formats;
+            stream.SampleDesc = desc.SampleDesc;
+            D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{sizeof(stream), &stream};
+            testutil::checkHR(device->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&pipeline)), "Mesh PSO");
+        } else {
+            testutil::checkHR(runtime.device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Graphics PSO");
+        }
+        return pipeline;
+    };
+    auto pso = createPipeline();
+    if (mode == "graphics-mixed-cache") {
+        ps = testutil::loadShaderBytes("mesh_solid_red_ps.dxil");
+        desc.PS = {ps.data(), ps.size()};
+        pso = createPipeline();
+    }
+    if (mode.ends_with("promoted") || mode.ends_with("cached")) {
+        NacelleProfileSummary summary;
+        testutil::checkHR(NacelleEndProfileCapture(*executionCapture,
+            (outputPath + ".warmup").c_str(), &summary), "Drain graphics promotion");
+        NacelleDestroyProfileCapture(*executionCapture);
+        *executionCapture = nullptr;
+    }
+    if (mode.ends_with("cached")) pso = createPipeline();
     const float vertices[][7] = {
         {-1, -1, 0.5f, 1, 0, 0, 1}, {-1, 3, 0.5f, 1, 0, 0, 1}, {3, -1, 0.5f, 1, 0, 0, 1},
     };
@@ -165,9 +225,18 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     runtime.cmdList->RSSetViewports(1, &viewport);
     runtime.cmdList->RSSetScissorRects(1, &scissor);
     runtime.cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    runtime.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    runtime.cmdList->IASetPrimitiveTopology(extended ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST :
+                                                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     runtime.cmdList->IASetVertexBuffers(0, 1, &vb);
-    runtime.cmdList->DrawInstanced(3, 1, 0, 0);
+    const float clear[4]{0, 0, 0, 1};
+    runtime.cmdList->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    if (mesh) {
+        ComPtr<ID3D12GraphicsCommandList6> commands;
+        testutil::checkHR(runtime.cmdList.As(&commands), "Mesh command list");
+        commands->DispatchMesh(4, 1, 1);
+    } else {
+        runtime.cmdList->DrawInstanced(3, 1, 0, 0);
+    }
     runtime.executeAndWait();
     auto readback = runtime.createBuffer(width * width * 4, D3D12_HEAP_TYPE_READBACK);
     D3D12_TEXTURE_COPY_LOCATION destination{};
@@ -184,8 +253,15 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     testutil::checkHR(readback->Map(0, nullptr, &data), "Map graphics result");
     const auto* pixels = static_cast<const uint8_t*>(data);
     const size_t center = (width / 2 * width + width / 2) * 4;
-    const bool correct = pixels[center] == 255 && pixels[center + 1] == 0 &&
-                         pixels[center + 2] == 0 && pixels[center + 3] == 255;
+    bool correct = pixels[center] == 255 && pixels[center + 1] == 0 &&
+                   pixels[center + 2] == 0 && pixels[center + 3] == 255;
+    if (extended) {
+        correct = false;
+        for (size_t i = 0; i < width * width * 4; i += 4) {
+            if (pixels[i] == 0 && pixels[i + 1] == 255 && pixels[i + 2] == 0 && pixels[i + 3] == 255)
+                correct = true;
+        }
+    }
     readback->Unmap(0, nullptr);
     require(correct, "Capture changed graphics output");
 }
@@ -194,24 +270,31 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
 int main(int argc, char** argv) {
     if (argc != 2 && argc != 3) {
         std::cerr << "Usage: profile_runtime_test <new-profile-path> "
-                     "[all|compute|graphics|tier1|promoted|cached|disk]\n";
+                     "[all|compute|graphics|tier1|promoted|cached|disk|"
+                     "graphics-tier1|graphics-promoted|graphics-cached|graphics-disk]\n";
         return 1;
     }
     const std::string mode = argc == 3 ? argv[2] : "all";
     if (mode != "all" && mode != "compute" && mode != "graphics" && mode != "tier1" &&
-        mode != "promoted" && mode != "cached" && mode != "disk") {
+        mode != "promoted" && mode != "cached" && mode != "disk" &&
+        mode != "graphics-tier1" && mode != "graphics-promoted" &&
+        mode != "graphics-cached" && mode != "graphics-disk" && mode != "graphics-mixed-cache" &&
+        mode != "graphics-extended" && mode != "graphics-extended-promoted" && mode != "graphics-extended-cached" &&
+        mode != "graphics-mesh" && mode != "graphics-mesh-promoted" && mode != "graphics-mesh-cached") {
         std::cerr << "Invalid capture mode: " << mode << '\n';
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
     try {
-        if (mode == "all" || mode == "promoted" || mode == "cached") beginCapture(&capture);
+        const bool graphicsOnly = mode.starts_with("graphics");
+        if (mode == "all" || mode == "promoted" || mode == "cached" ||
+            (graphicsOnly && (mode.ends_with("promoted") || mode.ends_with("cached")))) beginCapture(&capture);
         testutil::TestRuntime runtime;
         initialize(runtime);
-        if (mode != "graphics")
+        if (!graphicsOnly)
             compute(runtime, mode == "all" ? nullptr : &capture, mode, argv[1]);
-        if (mode == "all" || mode == "graphics")
-            draw(runtime, mode == "graphics" ? &capture : nullptr);
+        if (mode == "all" || graphicsOnly)
+            draw(runtime, graphicsOnly ? &capture : nullptr, mode, argv[1]);
         NacelleProfileSummary summary;
         testutil::checkHR(NacelleEndProfileCapture(capture, argv[1], &summary), "End profile");
         NacelleDestroyProfileCapture(capture);
@@ -230,16 +313,21 @@ int main(int argc, char** argv) {
         } else {
             require(!hasSpan("Compile compute PSO") && !hasSpan("Compile graphics PSO"),
                     "Execution-only capture must not require pipeline creation");
-            require(hasSpan(mode == "graphics" ? "Graphics draw" : "Compute dispatch"),
+            require(hasSpan(mode.starts_with("graphics-mesh") ? "Mesh dispatch" :
+                            graphicsOnly ? "Graphics draw" : "Compute dispatch"),
                     "Pre-existing pipeline execution recorded");
         }
-        if (mode != "graphics") {
+        if (!graphicsOnly) {
             require(!profile.shaders.codeVersions.empty(), "Executed compute version metadata exists");
             for (const auto& event : profile.trace.traceEvents) {
                 if (event.name != "Compute dispatch" && event.name != "Compute worker") continue;
                 require(event.args.pipelineId && event.args.codeVersionId,
                         "Compute dispatches and workers identify the selected native entry");
                 const auto& code = profile.shaders.codeVersions.at(*event.args.codeVersionId - 1);
+                require(code.shaderId && code.shaderId->size() == 64, "Compute identifies exact input bytecode content");
+                if (mode == "tier1") require(!code.artifactId, "IR-compiled Tier 1 object content is unavailable");
+                if (mode == "promoted" || mode == "cached" || mode == "disk")
+                    require(code.artifactId && code.artifactId->size() == 64, "Tier 2 identifies actual object content");
                 if (mode == "tier1")
                     require(code.version == 1 && code.tier == 1 && code.cache == "miss",
                             "Cold Tier-1 execution");
@@ -250,8 +338,63 @@ int main(int argc, char** argv) {
                     require(code.version == 1 && code.tier == 2 && code.cache == "hit",
                             "Cached native entry is Tier 2 on a new pipeline");
             }
-        } else {
-            require(profile.shaders.codeVersions.empty(), "Graphics versions remain explicitly unavailable");
+        }
+        if (mode == "all" || graphicsOnly) {
+            const bool extended = mode.starts_with("graphics-extended");
+            const bool mesh = mode.starts_with("graphics-mesh");
+            require(profile.shaders.schemaVersion == 2 &&
+                    hasSpan(extended ? "Extended geometry" : mesh ? "Mesh geometry" : "Vertex geometry") &&
+                    hasSpan("Pixel raster"),
+                    "Graphics stage execution metadata available");
+            std::optional<uint64_t> graphicsPipeline;
+            for (const auto& event : profile.trace.traceEvents) {
+                if (event.name == "Graphics draw" || event.name == "Mesh dispatch") {
+                    require(!event.args.codeVersionId, "A draw does not pretend to execute one combined version");
+                    require(event.args.codeSelectionId && profile.shaders.codeSelections,
+                            "Draw references observed entry selections");
+                    const auto& selection = profile.shaders.codeSelections->at(*event.args.codeSelectionId - 1);
+                    require(selection.codeVersionIds.size() == (extended ? 6 : mesh ? 3 : 2),
+                            "Draw selection includes precisely the participating stage entries");
+                }
+                if (event.name != "Vertex geometry" && event.name != "Pixel raster" &&
+                    event.name != "Mesh geometry" && event.name != "Amplification stage") continue;
+                require(event.args.pipelineId && event.args.codeVersionId, "Graphics region selects an immutable entry");
+                const auto& code = profile.shaders.codeVersions.at(*event.args.codeVersionId - 1);
+                require(code.entryRole == code.stage && code.shaderId && code.shaderId->size() == 64,
+                        "Graphics entries identify stage roles and exact bytecode content");
+                if (const auto* width = std::getenv("NACELLE_SIMD_WIDTH"))
+                    require(code.simdWidth == std::stoul(width), "Graphics metadata matches the selected SIMD width");
+                require(!graphicsPipeline || graphicsPipeline == code.pipelineId,
+                        "Vertex and pixel versions share the same capture-local pipeline");
+                graphicsPipeline = code.pipelineId;
+                if (mode == "graphics-tier1")
+                    require(code.tier == 1 && code.cache == "miss", "Graphics cold Tier 1");
+                if (mode == "graphics-tier1" || mode == "graphics-mixed-cache")
+                    require(!code.artifactId, "Graphics Tier 1 does not invent native object content");
+                if (mode == "graphics-mixed-cache")
+                    require(code.version == 1 && code.tier == 1 &&
+                            code.cache == (code.stage == "vertex" ? "hit" : "miss"),
+                            "Independent graphics stages preserve mixed Tier-1 cache outcomes");
+                if (mode.ends_with("promoted"))
+                    require(code.version >= 2 && code.tier == 2 && code.cache == "miss",
+                            "Original graphics entry promoted without changing old snapshots");
+                if (mode.ends_with("cached") || mode == "graphics-disk")
+                    require(code.version == 1 && code.tier == 2 && code.cache == "hit",
+                            "Graphics cache-hit entries start at version 1");
+                if (mode.ends_with("promoted") || mode.ends_with("cached") || mode == "graphics-disk")
+                    require(code.artifactId && code.artifactId->size() == 64,
+                            "Graphics cache/promoted entries identify actual native object content");
+            }
+            if (extended) {
+                std::set<std::string> roles;
+                for (const auto& code : profile.shaders.codeVersions) {
+                    require(code.entryRole.has_value(), "Extended native entries have explicit roles");
+                    roles.insert(*code.entryRole);
+                }
+                require(roles == std::set<std::string>{"vertex", "pixel", "geometry", "domain",
+                                                     "hull-control-point", "hull-patch-constant"},
+                        "Tessellation control-point and patch-constant entries are distinct");
+            }
         }
         const auto& build = profile.manifest.build;
         require(!build.compilerHash.empty() && !build.targetTriple.empty() && !build.cpu.empty(),

@@ -125,10 +125,13 @@ and invalid/truncated captures show an explicit error; `complete: false` remains
 viewable but is prominently marked incomplete. Dropped events warn of data loss.
 Counters are reported as recorded, not assumed equal to Chrome event counts.
 Shader JSON accepts legacy `[]`, or an independently versioned
-`{ "schemaVersion": 1, "codeVersions": [...] }` object. The loader exposes typed
-metadata as `Profile.shaders` and validates compute pipeline/code IDs,
-PSO/stage/SIMD/tier/cache fields, unique pipeline/version pairs and trace
-references. Unsupported shader versions and inconsistent references are explicit
+`{ "schemaVersion": 1, "codeVersions": [...] }` object, or schema v2 with graphics
+entry roles, optional shader/native-object content digests and composite
+`codeSelections`. The loader exposes typed metadata as `Profile.shaders` and
+validates pipeline/code IDs, PSO/stage/SIMD/tier/cache fields, unique
+pipeline/entry-role/version identities, and exact/composite trace references.
+Draw/extended-geometry selections do not imply one latest tier or isolated
+per-stage CPU time. Unsupported shader versions and inconsistent references are explicit
 errors. Unknown object fields remain forward-compatible. Metadata is available
 through the data-source boundary; shader/code-view panes are not implemented.
 See the [native format guide](../nacelle-dbg/README.md#compute-entry-metadata) for
@@ -136,7 +139,8 @@ identity, promotion, privacy and old-reader compatibility rules.
 
 Limits (reject rather than silently truncate): 256 MiB archive, 16 ZIP entries,
 1 MiB manifest, 256 MiB decoded per entry / zstd window, 256 MiB decoded total,
-1,000,000 trace events, and 65,536 compute code-version records. Paths must be relative ASCII components without `.` or
+1,000,000 trace events, 65,536 code-version/selection records combined, and eight
+entry references per composite selection. Paths must be relative ASCII components without `.` or
 `..`, backslashes, URLs, or empty components. No files are extracted to disk.
 Large profiles are decoded synchronously and may briefly occupy the browser;
 these conservative limits are intended for initial offline inspection.
