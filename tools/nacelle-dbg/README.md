@@ -58,6 +58,13 @@ fetching profiling dependencies. A dedicated Linux (`ubuntu-latest`) profiling
 job runs concurrently to build `build-profile/` with instrumentation enabled,
 run the recorder and real static/shared capture tests, and run native-to-viewer
 interoperability tests and the viewer build.
+After their OFF isolation checks, the existing macOS and Windows jobs also
+initialize only the pinned profiling submodules and run a separate instrumented
+recorder/static/shared capture build plus native-to-viewer tests. They reuse
+their existing repository LLVM/MLIR/Clang and DXC SDKs, without another toolchain
+build or Pages publisher. Windows adds the instrumented runtime directory to
+the DLL search path, exercising shared API exports as well as static linkage.
+The instrumented configure steps report the actual runner OS/architecture.
 
 The integration tests use fresh caches and exercise compute/graphics output
 checks and asynchronous Tier-2 capture. Captures remain temporary CI workspace
@@ -65,7 +72,8 @@ data, not Pages assets. The Linux profiling job also runs offline Chromium uploa
 comparing Chrome trace downloads with the native CLI export. Only production
 viewer assets are served from local disk; all other requests are rejected.
 These jobs do not certify performance budgets or guarantee a separate ARM64
-runner. Platform coverage is only verified
+runner. An ARM64 runner must actually pass the instrumented tests before ARM64
+coverage is claimed; an OS label alone is not certification. Platform coverage is only verified
 when the corresponding instrumented job actually passes.
 
 ## Application API

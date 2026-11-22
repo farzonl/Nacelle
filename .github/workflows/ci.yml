@@ -205,6 +205,71 @@ jobs:
             -DNM_TOOL="${{ github.workspace }}/.toolchains/llvm/bin/llvm-nm" \
             -P cmake/CheckProfileIsolation.cmake
 
+      - name: Checkout profiling submodules (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
+
+      - name: Configure instrumented capture tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "Instrumented runner: ${RUNNER_OS}/${RUNNER_ARCH}"
+          cmake -S . -B build-profile -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNACELLE_FETCH_SDL3=OFF \
+            -DNACELLE_ENABLE_INSTRUMENTATION=ON \
+            -DNACELLE_BUILD_PROFILE_TOOLS=ON \
+            -DNACELLE_BUILD_PROFILE_TESTS=ON \
+            -DNACELLE_CLANGXX="${{ github.workspace }}/.toolchains/llvm/bin/clang++" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="${{ github.workspace }}/.toolchains/llvm/bin/split-file"
+
+      - name: Build instrumented capture tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake --build build-profile --target \
+            instrumentation_test profile_runtime_static_test profile_runtime_shared_test nacelle-dbg \
+            --parallel
+
+      - name: Run instrumented capture tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          DYLD_LIBRARY_PATH: "${{ github.workspace }}/build-profile:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+        run: |
+          ctest --test-dir build-profile --no-tests=error \
+            -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
+
+      - name: Set up Node for native profile interoperability (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/nacelle-view/package-lock.json
+
+      - name: Install profile viewer dependencies (macOS)
+        if: runner.os == 'macOS'
+        working-directory: tools/nacelle-view
+        run: npm ci
+
+      - name: Test native profile interoperability (macOS)
+        if: runner.os == 'macOS'
+        working-directory: tools/nacelle-view
+        env:
+          NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
+          NACELLE_NATIVE_CODE_VERSIONS: "1"
+          NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
+        run: npm test
+
+      - name: Build profile viewer (macOS)
+        if: runner.os == 'macOS'
+        working-directory: tools/nacelle-view
+        run: npm run build
+
   build-and-test-windows:
     name: Build & Test (windows-latest)
     runs-on: windows-latest
@@ -353,6 +418,67 @@ jobs:
             -DLIBRARY_FILE="$env:GITHUB_WORKSPACE/build/nacelle.lib" `
             -DNM_TOOL="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/llvm-nm.exe" `
             -P cmake/CheckProfileIsolation.cmake
+
+      - name: Checkout profiling submodules (Windows)
+        run: |
+          git submodule update --init --depth 1 `
+            third_party/glaze third_party/zstd third_party/miniz third_party/CLI11
+
+      - name: Configure instrumented capture tests (Windows)
+        run: |
+          Write-Output "Instrumented runner: $env:RUNNER_OS/$env:RUNNER_ARCH"
+          cmake -S . -B build-profile -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_CXX_COMPILER="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe" `
+            -DCMAKE_C_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
+            -DCMAKE_CXX_FLAGS_RELEASE="/clang:-O3 /Ob2 /DNDEBUG" `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/.sdk/openblas" `
+            -DNACELLE_FETCH_SDL3=OFF `
+            -DNACELLE_ENABLE_INSTRUMENTATION=ON `
+            -DNACELLE_BUILD_PROFILE_TOOLS=ON `
+            -DNACELLE_BUILD_PROFILE_TESTS=ON `
+            -DNACELLE_CLANGXX="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/clang++.exe" `
+            -DLLVM_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/llvm" `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/.toolchains/llvm/lib/cmake/mlir" `
+            -DDXC_EXECUTABLE="$env:GITHUB_WORKSPACE/.sdk/bin/x64/dxc.exe" `
+            -DFILECHECK_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/FileCheck.exe" `
+            -DSPLIT_FILE_EXECUTABLE="$env:GITHUB_WORKSPACE/.toolchains/llvm/bin/split-file.exe"
+
+      - name: Build instrumented capture tests (Windows)
+        run: |
+          cmake --build build-profile --target `
+            instrumentation_test profile_runtime_static_test profile_runtime_shared_test nacelle-dbg `
+            --parallel
+
+      - name: Run instrumented capture tests (Windows)
+        run: |
+          $env:PATH = "$env:GITHUB_WORKSPACE\build-profile;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\openblas\bin;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH"
+          ctest --test-dir build-profile --no-tests=error `
+            -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
+
+      - name: Set up Node for native profile interoperability (Windows)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/nacelle-view/package-lock.json
+
+      - name: Install profile viewer dependencies (Windows)
+        working-directory: tools/nacelle-view
+        run: npm ci
+
+      - name: Test native profile interoperability (Windows)
+        working-directory: tools/nacelle-view
+        env:
+          NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
+          NACELLE_NATIVE_CODE_VERSIONS: "1"
+          NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
+        run: npm test
+
+      - name: Build profile viewer (Windows)
+        working-directory: tools/nacelle-view
+        run: npm run build
 
   build-and-test-profiling:
     name: Build & Test Profiling (ubuntu-latest)
@@ -514,6 +640,8 @@ jobs:
         working-directory: tools/nacelle-view
         env:
           NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
+          NACELLE_NATIVE_CODE_VERSIONS: "1"
+          NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
         run: npm test
 
       - name: Build profile viewer
