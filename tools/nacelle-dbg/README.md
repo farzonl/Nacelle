@@ -54,10 +54,20 @@ This standalone build also needs the initialized DirectX-Headers submodule.
 The Linux, macOS, and Windows CI jobs retain their normal OFF build and test
 run, checking OFF compile commands, build targets, and static-library symbols
 for instrumentation leakage using the repository-built `llvm-nm` without
-fetching profiling dependencies. A dedicated Linux (`ubuntu-latest`) profiling
-job runs concurrently to build `build-profile/` with instrumentation enabled,
+fetching profiling dependencies. A dedicated profiling matrix on Linux,
+macOS, and Windows runs concurrently with the normal OFF jobs to build
+`build-profile/` with instrumentation enabled,
 run the recorder and real static/shared capture tests, and run native-to-viewer
 interoperability tests and the viewer build.
+The matrix shares dependency checkout, toolchain cache restoration/build,
+capture configuration/build/tests, and native-to-viewer validation. SDK installs
+and Windows compiler options are platform-specific. Profiling jobs reuse the
+normal jobs' OS/architecture-specific LLVM/MLIR/Clang and DXC SDK cache keys;
+on a cache miss they install the same pinned toolchains independently.
+Profiling failures do not affect the normal OFF job results, and no new Pages
+publisher is added. Windows adds the instrumented runtime directory to
+the DLL search path, exercising shared API exports as well as static linkage.
+The instrumented configure steps report the actual runner OS/architecture.
 
 The integration tests use fresh caches and exercise compute/graphics output
 checks and asynchronous Tier-2 capture. Captures remain temporary CI workspace
@@ -65,7 +75,8 @@ data, not Pages assets. The Linux profiling job also runs offline Chromium uploa
 comparing Chrome trace downloads with the native CLI export. Only production
 viewer assets are served from local disk; all other requests are rejected.
 These jobs do not certify performance budgets or guarantee a separate ARM64
-runner. Platform coverage is only verified
+runner. An ARM64 runner must actually pass the instrumented tests before ARM64
+coverage is claimed; an OS label alone is not certification. Platform coverage is only verified
 when the corresponding instrumented job actually passes.
 
 ## Application API
