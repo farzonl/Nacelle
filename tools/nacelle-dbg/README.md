@@ -809,6 +809,111 @@ They require `E_OUTOFMEMORY`, no partial output or stale active session, and a
 successful retry of the stopped capture with identical event/drop counts. No
 allocation-failure hooks or global allocator replacement enter the runtime.
 
+### Reproducible coarse-capture performance acceptance
+
+The recorder contention improvements above are not shader-overhead acceptance.
+Use [the comparison harness](../../scripts/measure_profile_overhead.py) for
+paired, sequential fresh-process comparisons of a pre-change OFF worker,
+current OFF, ON-idle, and active **coarse-only** capture. It runs the existing
+1024x1024 raymarch compute and eight-tap textured graphics workloads, with the
+same DXIL, SIMD width, inputs, and full worker coverage. Every output checksum
+must agree. Every active archive must pass the native reader, be complete, have
+zero drops, and identify the expected instrumented compiler. Source retention,
+spatial data, replay, source/native debugging, and hardware counters are not
+enabled or certified by this test.
+
+Build both variants in Release using the same host compiler, LLVM installation,
+flags, and compiler/ABI/runtime-bitcode inputs. The harness verifies all common
+input SHA-256 values against the generated compiler stamps, rejecting stale
+headers or unexpected differences. Since native/source debugging was added,
+the ON stamp additionally covers seven debugger-only files; both complete
+cache fingerprints and those extra inputs are reported, **not made equal or
+overridden**. A separate matching ordinary-input digest identifies the common
+compiler implementation. Cache namespaces and compiler/cache-key behavior are
+unchanged.
+
+Before making a recorder change, preserve the statically linked OFF worker from
+the baseline revision. After rebuilding both current variants:
+
+```sh
+python3 scripts/measure_profile_overhead.py \
+  --off-build build/runtime-off --on-build build/runtime-check \
+  --baseline-off-worker /absolute/path/to/baseline-off-worker \
+  --baseline-revision BASELINE_GIT_SHA \
+  --shader-dir build/runtime-check/tests/shaders \
+  --inspector build/runtime-check/tools/nacelle-dbg/nacelle-dbg \
+  --output-dir /absolute/path/to/new-measurement-directory
+```
+
+The output directory must not exist. Ambient `NACELLE_*` settings are removed
+from workers; all variants warm the private disk cache before recorded rounds.
+All 24 four-variant permutations occur once per 24-round block in seeded
+random order, balancing position and adjacent-variant effects. There are 240
+timed iterations per process by default; `--iters` changes repetition count,
+not work size, capture coverage, or the workload's short/long checks.
+Do not run builds or other benchmarks concurrently.
+
+`identity.json` records build inputs/flags, both full compiler fingerprints,
+the common-input digest, baseline revision, harness/worker/DXIL hashes,
+parameters and platform. `runs.jsonl` retains every warmup and timed result,
+commands and complete active manifests; individual logs and captures remain
+local. `summary.json` reports median paired ratios, observed ranges, and
+20,000-resample paired bootstrap 95% intervals. Ratios compare **same-round**
+per-process medians, not unpaired aggregate medians or pooled iterations.
+The intervals are estimates for these workloads/host, not universal bounds.
+
+An idle/active comparison passes only when its entire interval is at or below
+1.01/1.05. Intervals crossing a threshold are **inconclusive**, not passes.
+OFF regression is excluded by an identical pre-change/current static worker
+binary, or otherwise requires a paired interval at or below 1.00. Identical
+binary evidence does not erase the reported scheduling variability or turn a
+negative timing estimate into proof of zero cost.
+
+A shared development host is always non-certifying. Only on an exclusively used
+benchmark environment add `--controlled-host`; this is an explicit operator
+attestation, not automatic host reservation. Exit codes are 0 for accepted
+controlled measurements, 1 for invalid evidence/exceeded budgets, and 2 for
+inconclusive evidence. Preserve the report even when a run is not accepted.
+
+The CI workflow's manual **Run controlled Linux coarse-capture performance
+acceptance** input enables this separately from ordinary correctness CI:
+
+```sh
+gh workflow run ci.yml --ref YOUR_BRANCH -f profile_performance=true
+```
+
+After all correctness/browser work finishes, the Linux runner sequentially
+builds the first-parent OFF baseline and current OFF in the same source/build
+paths, verifies OFF isolation, then measures with 24 rounds and 60 iterations
+per process. No build/test runs concurrently with timing within that runner.
+The `coarse-profile-performance` artifact retains identity, raw results,
+summary and logs on success or failure; it contains no source/resource payloads.
+An unavailable or noisy runner leaves acceptance open. Normal CI does not
+silently convert inconclusive performance into success.
+
+The [controlled Linux x86_64 run on 2026-11-23](https://github.com/farzonl/Nacelle/actions/runs/45268760467)
+passed all coarse performance gates on the first measurement attempt, using
+1024x1024, SIMD8, 96 raymarch steps, 24 rounds and 60 iterations per process.
+Its independently built first-parent/current OFF workers are byte-identical.
+All 200 fresh-process outputs matched; all 50 active archives were complete,
+zero-drop and native-reader validated. The ordinary compiler/ABI/bitcode
+digest matched between variants; both distinct full debug-policy fingerprints
+are preserved in the report.
+
+| Workload | Paired idle overhead (95% interval) | Paired active overhead (95% interval) |
+| --- | ---: | ---: |
+| Raymarch compute | +0.041% [-0.145%, +0.153%] | +0.044% [-0.083%, +0.352%] |
+| Textured graphics | -0.249% [-0.282%, -0.222%] | -0.243% [-0.291%, -0.205%] |
+
+Negative estimates are not claims of zero cost or speedups. These qualified
+results meet the coarse idle/active thresholds; they do not certify every
+shader/host, other-platform performance, optional observation modes or
+serialization memory. Both this run and normal PR CI passed all six
+Linux/macOS/Windows normal/profiling jobs; Linux ran 288 native capture tests.
+Raw results and identity evidence are retained as the run's
+`coarse-profile-performance` artifact and published under
+[#211](https://github.com/farzonl/Nacelle/issues/211).
+
 ## Format and current scope
 
 ### Profile reader fuzzing
@@ -1037,7 +1142,9 @@ pipeline, memory/disk cache hits, delayed selection across publication, repeated
 captures, metadata limits and invalid references. Linux static/shared execution
 has been checked at SIMD widths 4 and 8.
 
-Performance acceptance remains open. A shared-host sample using Release builds
+The historical shared-host samples below did not establish performance
+acceptance; the controlled run above supplies the current qualified evidence.
+A shared-host sample using Release builds
 with identical compiler hashes, randomized sequential interleaving, 11 runs per
 configuration, and 240 iterations per run produced these median wall times
 (1024x1024, SIMD width 8):
@@ -1074,7 +1181,7 @@ Outputs and recorded-event counts matched between active versions, with no
 drops. End-to-end changes were within shared-host variability: paired pixel
 overhead ranged from -9.0% to +16.9% for the original recorder. These samples do
 not demonstrate a reliable shader speedup or certify the performance budgets;
-further isolation and controlled-host measurements remain necessary.
+they are superseded for acceptance by the controlled measurements above.
 
 A subsequent recorder diagnostic separately evaluated scope ownership and
 counter false sharing (Clang 21.1.8, Linux x86_64, `-O3`, 12 balanced sequential

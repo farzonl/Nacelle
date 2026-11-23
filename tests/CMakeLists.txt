@@ -672,6 +672,13 @@ add_test(
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_nacelle_bench_harness.py"
             --nacelle-bench $<TARGET_FILE:nacelle-bench>
 )
+add_test(
+    NAME profile_overhead_harness_test
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_profile_overhead.py"
+)
+set_tests_properties(profile_overhead_harness_test PROPERTIES
+    ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+)
 
 # Viewer smoke tests (headless + SDL3 dummy driver when SDL3 is enabled)
 add_test(
