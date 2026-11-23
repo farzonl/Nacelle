@@ -54,9 +54,58 @@ struct NacelleSourceDebugCommand {
     uint64_t session = 0, stop = 0;
     uint32_t action = UINT32_MAX;
 };
+enum NacelleSourceDebugMapping : uint32_t {
+    NACELLE_SOURCE_MAPPING_EXACT = 1, NACELLE_SOURCE_MAPPING_MERGED = 2,
+    NACELLE_SOURCE_MAPPING_UNAVAILABLE = 3
+};
+enum NacelleSourceDebugAvailability : uint32_t {
+    NACELLE_SOURCE_VALUE_AVAILABLE = 1, NACELLE_SOURCE_VALUE_UNAVAILABLE = 2,
+    NACELLE_SOURCE_VALUE_OPTIMIZED_OUT = 3, NACELLE_SOURCE_VALUE_OUT_OF_SCOPE = 4,
+    NACELLE_SOURCE_VALUE_UNSUPPORTED = 5, NACELLE_SOURCE_VALUE_PARTIAL = 6
+};
+struct NacelleOptimizedSourceDebugOptions {
+    uint32_t struct_size = sizeof(NacelleOptimizedSourceDebugOptions), version = 1;
+    uint32_t enabled = 0, consent = 0;
+    uint64_t source_bytes = 8ull * 1024 * 1024, metadata_bytes = 16ull * 1024 * 1024;
+};
+struct NacelleOptimizedSourceDebugOrigin {
+    uint32_t line = 0, column = 0, discriminator = 0, inline_depth = 0;
+    char source_id[65]{};
+    NacelleSourceDebugInlineFrame frames[8]{};
+};
+struct NacelleOptimizedSourceDebugSite {
+    uint32_t struct_size = sizeof(NacelleOptimizedSourceDebugSite), version = 1;
+    NacelleSourceDebugSite site;
+    uint64_t compilation = 0, entry_version = 0;
+    uint32_t tier = 0, mapping = NACELLE_SOURCE_MAPPING_UNAVAILABLE;
+    uint32_t origin_count = 0;
+    NacelleOptimizedSourceDebugOrigin origins[8]{};
+    NacelleNativeDebugCode code;
+};
+struct NacelleOptimizedSourceDebugSnapshot {
+    uint32_t struct_size = sizeof(NacelleOptimizedSourceDebugSnapshot), version = 1;
+    NacelleSourceDebugSnapshot snapshot;
+    uint64_t compilation = 0, entry_version = 0;
+    uint32_t tier = 0, mapping = NACELLE_SOURCE_MAPPING_UNAVAILABLE;
+    uint32_t origin_count = 0;
+    NacelleOptimizedSourceDebugOrigin origins[8]{};
+    uint32_t valid_mask[64]{}, availability[64]{};
+};
+struct NacelleOptimizedSourceDebugStatus {
+    uint32_t struct_size = sizeof(NacelleOptimizedSourceDebugStatus), version = 1;
+    uint32_t compilation_failed = 0;
+    uint64_t tier1_compilations = 0, tier2_compilations = 0;
+    uint64_t retained_source_bytes = 0, retained_metadata_bytes = 0;
+};
 static_assert(sizeof(NacelleSourceDebugSnapshot) <= 64 * 1024);
+static_assert(sizeof(NacelleOptimizedSourceDebugSnapshot) <= 64 * 1024);
 extern "C" {
 NACELLE_PROFILE_API HRESULT NacelleConfigureSourceDebug(const NacelleSourceDebugOptions* options);
+// Explicit opt-in; V1 source/native configuration retains its pinned compilation policy.
+NACELLE_PROFILE_API HRESULT NacelleConfigureOptimizedSourceDebug(const NacelleOptimizedSourceDebugOptions* options);
+NACELLE_PROFILE_API HRESULT NacelleGetOptimizedSourceDebugSite(uint32_t id, NacelleOptimizedSourceDebugSite* site);
+NACELLE_PROFILE_API HRESULT NacelleGetOptimizedSourceDebugSnapshot(uint64_t session, NacelleOptimizedSourceDebugSnapshot* snapshot);
+NACELLE_PROFILE_API HRESULT NacelleGetOptimizedSourceDebugStatus(NacelleOptimizedSourceDebugStatus* status);
 // Enumerate site IDs from 1 until S_FALSE. Sources are embedded, never read from paths.
 NACELLE_PROFILE_API HRESULT NacelleGetSourceDebugSite(uint32_t id, NacelleSourceDebugSite* site);
 NACELLE_PROFILE_API HRESULT NacelleGetSourceDebugLocal(uint32_t site, uint32_t index, NacelleSourceDebugLocal* local);
@@ -69,5 +118,7 @@ NACELLE_PROFILE_API HRESULT NacelleEndSourceDebug(uint64_t session, NacelleSourc
 // LLDB all-stop breakpoint target. Returns immediately without a debugger.
 NACELLE_PROFILE_API void nacelle_source_debug_stop(
     const NacelleSourceDebugSnapshot* snapshot, NacelleSourceDebugCommand* command);
+NACELLE_PROFILE_API void nacelle_optimized_source_debug_stop(
+    const NacelleOptimizedSourceDebugSnapshot* snapshot, NacelleSourceDebugCommand* command);
 }
 #endif

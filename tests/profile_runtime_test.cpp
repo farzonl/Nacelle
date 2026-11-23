@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -22,12 +23,18 @@
 namespace {
 void require(bool condition, const char* message);
 uint64_t sourceSession = 0;
+uint32_t optimizedSourceTier = 2;
+bool optimizedSourceMode() { return std::getenv("NACELLE_TEST_SOURCE_OPTIMIZED_MODE") != nullptr; }
 bool nativeSourceCost() {
     const auto* cost = std::getenv("NACELLE_TEST_SOURCE_COST");
     return cost && std::string_view(cost) == "native";
 }
+bool ordinarySourceCost() {
+    const auto* cost = std::getenv("NACELLE_TEST_SOURCE_COST");
+    return cost && std::string_view(cost) == "ordinary";
+}
 void armSourceDebug(uint32_t stage) {
-    if (nativeSourceCost()) return;
+    if (nativeSourceCost() || ordinarySourceCost()) return;
     if (std::getenv("NACELLE_TEST_SOURCE_HELPER")) {
         bool mappedHelper = false;
         for (uint32_t id = 1; ; ++id) {
@@ -46,7 +53,12 @@ void armSourceDebug(uint32_t stage) {
         const auto status = NacelleGetSourceDebugSite(id, &site);
         if (status == S_FALSE) break;
         require(status == S_OK, "Enumerate source sites");
-        if (site.stage != stage) continue;
+        if (site.stage != stage || (optimizedSourceMode() && !site.available)) continue;
+        if (optimizedSourceMode()) {
+            NacelleOptimizedSourceDebugSite detail;
+            require(NacelleGetOptimizedSourceDebugSite(id, &detail) == S_OK, "Optimized site query");
+            if (detail.tier != optimizedSourceTier) continue;
+        }
         uint64_t size = 0;
         require(NacelleGetSourceDebugSource(site.source_id, nullptr, &size) == S_OK, "Source size");
         std::string source(size, '\0');
@@ -54,7 +66,7 @@ void armSourceDebug(uint32_t stage) {
         const auto start = source.find(stage == NACELLE_SOURCE_COMPUTE ?
             (std::getenv("NACELLE_TEST_SOURCE_LOOP") ? "value += iteration" :
              (std::getenv("NACELLE_TEST_SOURCE_HELPER") ? "value -= 1.0; // SOURCE_HELPER" : "sharedValues[index] = value;")) :
-            "float restored = value;");
+            (optimizedSourceMode() ? "uint pixelY = uint(input.pos.y);" : "float restored = value;"));
         require(start != std::string::npos, "Fixture source breakpoint text");
         line = 1 + std::count(source.begin(), source.begin() + start, '\n');
         if (site.line == line) { selected = site; break; }
@@ -63,7 +75,7 @@ void armSourceDebug(uint32_t stage) {
     NacelleSourceDebugSelection selection;
     std::strcpy(selection.shader_id, selected.shader_id);
     selection.xyz[0] = std::getenv("NACELLE_TEST_SOURCE_MISSING") ? UINT32_MAX : 5;
-    selection.xyz[1] = stage == NACELLE_SOURCE_PIXEL ? 4 : 0;
+    selection.xyz[1] = stage == NACELLE_SOURCE_PIXEL ? (optimizedSourceMode() ? 5 : 4) : 0;
     require(NacelleBeginSourceDebug(&selection, &sourceSession) == S_OK, "Begin source session");
     require(NacelleSourceDebugBreakpoint(sourceSession, selected.source_id, line) == S_OK, "Source breakpoint");
     std::cout << "SOURCE DEBUG READY session=" << sourceSession << " line=" << line <<
@@ -71,7 +83,7 @@ void armSourceDebug(uint32_t stage) {
 }
 
 void finishSourceDebug() {
-    if (nativeSourceCost()) return;
+    if (nativeSourceCost() || ordinarySourceCost()) return;
     if (std::getenv("NACELLE_TEST_SOURCE_MISSING") || std::getenv("NACELLE_TEST_SOURCE_ZERO")) {
         NacelleSourceDebugSnapshot missing;
         require(NacelleGetSourceDebugSnapshot(sourceSession, &missing) == S_FALSE, "Missing target fabricated stop");
@@ -87,6 +99,61 @@ void finishSourceDebug() {
         "Source snapshot native identity");
     require(snapshot.selected_lane < snapshot.width &&
         snapshot.xyz[snapshot.selected_lane][0] == 5, "Selected lane mapping");
+    if (optimizedSourceMode()) {
+        NacelleOptimizedSourceDebugSnapshot detail;
+        require(NacelleGetOptimizedSourceDebugSnapshot(sourceSession, &detail) == S_OK &&
+            detail.tier == optimizedSourceTier && detail.entry_version == optimizedSourceTier && detail.compilation &&
+            detail.snapshot.code.code_version == snapshot.code.code_version,
+            "Source stop did not execute real promoted Tier-2 code");
+        bool available = false;
+        for (uint32_t local = 0; local < snapshot.site.local_count; ++local) {
+            if (!snapshot.locals[local].kind) {
+                require(!detail.valid_mask[local] && snapshot.locals[local].reason[0],
+                    "Unavailable optimized value has no explicit validity/reason");
+                continue;
+            }
+            require(detail.valid_mask[local] == snapshot.active_mask,
+                "Optimized local validity does not match actual executing lanes");
+            const auto name = std::string_view(snapshot.locals[local].name);
+            if (snapshot.site.stage == NACELLE_SOURCE_PIXEL) {
+                if (name != "pixelX" && name != "pixelY") continue;
+                require(snapshot.locals[local].kind == NACELLE_SOURCE_UNSIGNED && snapshot.locals[local].bits == 32,
+                    "Optimized pixel coordinate local type does not match HLSL");
+                for (uint32_t lane = 0; lane < snapshot.width; ++lane)
+                    if (detail.valid_mask[local] & (1u << lane))
+                        require(snapshot.values[local][lane] == snapshot.xyz[lane][name == "pixelX" ? 0 : 1],
+                            "Optimized pixel scalar does not match the shader's actual coordinate");
+                available = true;
+                continue;
+            }
+            if (name != "value") continue;
+            require(snapshot.locals[local].kind == NACELLE_SOURCE_FLOAT && snapshot.locals[local].bits == 32,
+                "Optimized scalar type does not match HLSL");
+            for (uint32_t lane = 0; lane < snapshot.width; ++lane) {
+                if (!(detail.valid_mask[local] & (1u << lane))) continue;
+                const auto x = snapshot.xyz[lane][0];
+                const float expected = float(3 * x + 1) + ((x & 1) ? 1.f : -1.f);
+                require(snapshot.values[local][lane] == std::bit_cast<uint32_t>(expected),
+                    "Optimized per-lane scalar does not match actual shader value");
+            }
+            available = true;
+        }
+        require(available || !std::getenv("NACELLE_TEST_SOURCE_UNATTENDED"),
+            "The optimized first observation has no supported scalar value");
+        NacelleOptimizedSourceDebugStatus compilation;
+        require(NacelleGetOptimizedSourceDebugStatus(&compilation) == S_OK &&
+            compilation.tier1_compilations && (optimizedSourceTier == 1 || compilation.tier2_compilations),
+            "Asynchronous optimized compilation failed or was disabled");
+        NacelleSourceDebugSummary summary;
+        require(NacelleEndSourceDebug(sourceSession, &summary) == S_FALSE &&
+            summary.target_seen && summary.cancelled &&
+            summary.stops == (std::getenv("NACELLE_TEST_SOURCE_UNATTENDED") ? 1 : 2),
+            "Optimized source step/cancellation did not preserve original work");
+        sourceSession = 0;
+        std::cout << "OPTIMIZED SOURCE TIER" << optimizedSourceTier <<
+            (std::getenv("NACELLE_TEST_SOURCE_UNATTENDED") ? " OBSERVATION PASS" : " LOCAL STEP PASS") << std::endl;
+        return;
+    }
     bool foundValue = false;
     for (uint32_t local = 0; local < snapshot.site.local_count; ++local) {
         if (std::string_view(snapshot.locals[local].name) != "value") continue;
@@ -181,6 +248,33 @@ void initialize(testutil::TestRuntime& runtime) {
         IID_PPV_ARGS(&runtime.fence)), "Fence");
 }
 
+void finishOptimizedPromotion(testutil::TestRuntime& runtime, uint32_t stage, ID3D12PipelineState* pipeline) {
+    NacelleOptimizedSourceDebugSnapshot initial;
+    require(NacelleGetOptimizedSourceDebugSnapshot(sourceSession, &initial) == S_OK && initial.tier == 1,
+        "Earlier work did not execute its selected Tier-1 entry");
+    finishSourceDebug();
+    testutil::checkHR(NacelleWaitForReplayCompilation(), "Await asynchronous promotion after selected Tier-1 work");
+    const auto* state = static_cast<nacelle::NacellePipelineState*>(pipeline);
+    const auto address = stage == NACELLE_SOURCE_COMPUTE ?
+        reinterpret_cast<uint64_t>(state->computePSO()->fn.load(std::memory_order_acquire)) :
+        reinterpret_cast<uint64_t>(state->graphicsPSO()->psFn.load(std::memory_order_acquire));
+    NacelleNativeDebugCode promoted, retained;
+    require(NacelleGetNativeDebugCode(address, &promoted) == S_OK &&
+        NacelleGetNativeDebugCode(initial.snapshot.code.begin, &retained) == S_OK &&
+        retained.code_version == initial.snapshot.code.code_version &&
+        promoted.code_version != retained.code_version && promoted.begin != retained.begin,
+        "Asynchronous promotion overwrote the earlier native entry or failed to install new code");
+    optimizedSourceTier = 2;
+    armSourceDebug(stage);
+    ID3D12CommandList* lists[]{runtime.cmdList.Get()};
+    runtime.queue->ExecuteCommandLists(1, lists);
+    testutil::checkHR(runtime.queue->Signal(runtime.fence.Get(), ++runtime.fenceVal), "Signal promoted work");
+    if (runtime.fence->GetCompletedValue() < runtime.fenceVal)
+        testutil::checkHR(runtime.fence->SetEventOnCompletion(runtime.fenceVal, nullptr), "Await promoted work");
+    finishSourceDebug();
+    std::cout << "OPTIMIZED SOURCE ASYNCHRONOUS ENTRY ISOLATION PASS" << std::endl;
+}
+
 void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCapture,
              const std::string& mode, const std::string& outputPath) {
     D3D12_ROOT_PARAMETER parameters[4]{};
@@ -200,7 +294,9 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     const bool volume = spatialMode && std::string_view(spatialMode) == "volume";
     auto shader = testutil::loadShaderBytes(mode == "source-compute" ?
         (std::getenv("NACELLE_TEST_SOURCE_STRIPPED") ? "vec_add.dxil" :
-         std::getenv("NACELLE_TEST_SOURCE_OPTIMIZED") ? "source_debug_optimized_cs.dxil" : "source_debug_cs.dxil") :
+         (std::getenv("NACELLE_TEST_SOURCE_OPTIMIZED") ||
+          (optimizedSourceMode() && !std::getenv("NACELLE_TEST_SOURCE_INPUT_O0"))) ?
+             "source_debug_optimized_cs.dxil" : "source_debug_cs.dxil") :
         artifactMode && (std::string_view(artifactMode) == "source" ||
         std::string_view(artifactMode) == "no-source")
         ? "vec_add_debug.dxil" : volume ? "vec_add_volume.dxil" : "vec_add.dxil");
@@ -264,6 +360,10 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     uint32_t constants[3]{0, 0, static_cast<uint32_t>(a.size())};
     std::memcpy(&constants[0], &scale, sizeof(scale));
     runtime.cmdList->SetComputeRoot32BitConstants(3, 3, constants, 0);
+    const auto promotionStart = std::chrono::steady_clock::now();
+    if (optimizedSourceMode() && optimizedSourceTier == 2)
+        testutil::checkHR(NacelleWaitForReplayCompilation(), "Await actual asynchronous Tier-2 publication");
+    const auto promotionTime = std::chrono::steady_clock::now() - promotionStart;
     if (mode == "source-compute") armSourceDebug(NACELLE_SOURCE_COMPUTE);
     if (mode == "source-compute" && std::getenv("NACELLE_TEST_SOURCE_ZERO"))
         runtime.cmdList->Dispatch(0, 1, 1);
@@ -272,7 +372,9 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     const auto executionStart = std::chrono::steady_clock::now();
     runtime.executeAndWait();
     const auto executionTime = std::chrono::steady_clock::now() - executionStart;
-    if (mode == "source-compute") finishSourceDebug();
+    if (optimizedSourceMode() && optimizedSourceTier == 1)
+        finishOptimizedPromotion(runtime, NACELLE_SOURCE_COMPUTE, pso.Get());
+    else if (mode == "source-compute") finishSourceDebug();
     if (std::getenv("NACELLE_TEST_SOURCE_COST")) {
         uint64_t sites = 0, metadata = 0, sourceBytes = 0;
         std::set<std::string> sources;
@@ -290,12 +392,19 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
                 sourceBytes += size;
             }
         }
-        std::cout << "SOURCE DEBUG COST native=" << nativeSourceCost() <<
+        NacelleOptimizedSourceDebugStatus optimized;
+        if (optimizedSourceMode() && !nativeSourceCost() && !ordinarySourceCost())
+            require(NacelleGetOptimizedSourceDebugStatus(&optimized) == S_OK, "Diagnostic optimized compiler status");
+        std::cout << "SOURCE DEBUG COST native=" << nativeSourceCost() << " ordinary=" << ordinarySourceCost() <<
             " compile_ms=" << std::chrono::duration<double, std::milli>(compileTime).count() <<
+            " promotion_wait_ms=" << std::chrono::duration<double, std::milli>(promotionTime).count() <<
             " execution_ms=" << std::chrono::duration<double, std::milli>(executionTime).count() <<
             " sites=" << sites << " metadata_payload_bytes=" << metadata <<
             " source_payload_bytes=" << sourceBytes <<
-            " snapshot_bytes=" << sizeof(NacelleSourceDebugSnapshot) << std::endl;
+            " snapshot_bytes=" << sizeof(NacelleSourceDebugSnapshot) <<
+            " retained_source_bytes=" << optimized.retained_source_bytes <<
+            " retained_metadata_bytes=" << optimized.retained_metadata_bytes <<
+            " optimized_snapshot_bytes=" << sizeof(NacelleOptimizedSourceDebugSnapshot) << std::endl;
     }
     const auto bytes = runtime.readbackBuffer(output.Get(), sizeof(a));
     std::array<float, 1024> actual{};
@@ -317,7 +426,11 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     auto vs = testutil::loadShaderBytes(extended ? "gfx_tess_point_vs.dxil" : "raster_basic_vs.dxil");
     auto ps = testutil::loadShaderBytes(extended ? "gfx_tess_point_ps.dxil" :
                                       mesh ? "mesh_solid_red_ps.dxil" :
-                                      mode == "source-graphics" ? "source_debug_ps.dxil" :
+                                      mode == "source-graphics" ?
+                                          (optimizedSourceMode() ?
+                                              (std::getenv("NACELLE_TEST_SOURCE_INPUT_O0") ?
+                                                  "source_debug_pixel_o0.dxil" : "source_debug_optimized_ps.dxil") :
+                                              "source_debug_ps.dxil") :
                                       derivatives ? "raster_quad_coverage_ps.dxil" : "raster_basic_ps.dxil");
     std::vector<uint8_t> hs, ds, gs, as, ms;
     const D3D12_INPUT_ELEMENT_DESC layout[] = {
@@ -447,9 +560,23 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     } else {
         runtime.cmdList->DrawInstanced(3, 1, 0, 0);
     }
+    if (optimizedSourceMode() && optimizedSourceTier == 2)
+        testutil::checkHR(NacelleWaitForReplayCompilation(), "Await actual asynchronous pixel Tier-2 publication");
+    if (std::getenv("NACELLE_TEST_SOURCE_MIXED")) {
+        const auto& compiled = static_cast<nacelle::NacellePipelineState*>(pso.Get())->graphicsPSO();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (compiled->vsFn.snapshot()->tier != 2) {
+            require(std::chrono::steady_clock::now() < deadline, "Independent vertex promotion did not complete");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(compiled->psFn.snapshot()->tier == 1, "Mixed-stage test did not preserve the earlier pixel entry");
+        std::cout << "OPTIMIZED SOURCE MIXED VS2 PS1 READY" << std::endl;
+    }
     if (mode == "source-graphics") armSourceDebug(NACELLE_SOURCE_PIXEL);
     runtime.executeAndWait();
-    if (mode == "source-graphics") finishSourceDebug();
+    if (optimizedSourceMode() && optimizedSourceTier == 1)
+        finishOptimizedPromotion(runtime, NACELLE_SOURCE_PIXEL, pso.Get());
+    else if (mode == "source-graphics") finishSourceDebug();
     auto readback = runtime.createBuffer(rowPitch * height, D3D12_HEAP_TYPE_READBACK);
     D3D12_TEXTURE_COPY_LOCATION destination{};
     destination.pResource = readback.Get();
@@ -525,10 +652,18 @@ int main(int argc, char** argv) {
             NacelleSourceDebugOptions options;
             options.enabled = 1;
             options.consent = 3;
-            if (nativeSourceCost()) {
+            if (ordinarySourceCost()) {
+                std::cout << "SOURCE DEBUG COST ordinary runtime policy" << std::endl;
+            } else if (nativeSourceCost()) {
                 NacelleNativeDebugOptions native;
                 native.enabled = 1;
                 testutil::checkHR(NacelleConfigureNativeDebug(&native), "Enable matched native-debug cost baseline");
+            } else if (optimizedSourceMode()) {
+                if (std::getenv("NACELLE_TEST_SOURCE_ASYNC")) optimizedSourceTier = 1;
+                NacelleOptimizedSourceDebugOptions optimized;
+                optimized.enabled = 1;
+                optimized.consent = 3;
+                testutil::checkHR(NacelleConfigureOptimizedSourceDebug(&optimized), "Enable optimized source debugging");
             } else testutil::checkHR(NacelleConfigureSourceDebug(&options), "Enable source debug");
             testutil::TestRuntime runtime;
             initialize(runtime);

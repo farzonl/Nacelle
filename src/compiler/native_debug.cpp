@@ -112,6 +112,7 @@ private:
 }
 
 bool enabled() { return state()->enabled.load(std::memory_order_acquire); }
+bool pinned() { return enabled() && !source_debug::optimized(); }
 
 bool freeze() {
     source_debug::freeze();
@@ -208,6 +209,8 @@ extern "C" HRESULT NacelleConfigureNativeDebug(const NacelleNativeDebugOptions* 
     if (!options || options->struct_size != sizeof(*options) || options->version != 1 ||
         options->enabled > 1 || !options->object_bytes || options->object_bytes > 64ull * 1024 * 1024)
         return fail("Invalid configuration or object budget");
+    if (nacelle::source_debug::optimized())
+        return fail("Optimized source policy must not be changed through pinned native configuration");
 #if !defined(__linux__) || !defined(__x86_64__)
     if (options->enabled) return fail("Native debugging currently supports Linux x86_64 with LLDB only");
 #endif

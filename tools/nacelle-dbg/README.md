@@ -101,8 +101,9 @@ typedef/const wrappers. Unsupported debug expressions, aggregates/vector
 fragments, inlined locals, missing reaching definitions and out-of-scope
 information are unavailable, never reconstructed. No arbitrary pointer
 dereference, expression evaluation or resource-memory inspector is added.
-Optimized input, call step-in/out, MSAA, non-compute/pixel source selections and
-other platforms remain unsupported; native instruction debugging is separate.
+This pinned workflow rejects optimized input. Call step-in/out, MSAA,
+non-compute/pixel source selections and other platforms remain unsupported;
+native instruction debugging is separate.
 
 To cancel at a stop, use `hlsl-arm-cancel`, then `continue`. From a running
 controlling host thread, use `NacelleControlSourceDebug(session, 0,
@@ -141,6 +142,151 @@ payload and 1,618 embedded source bytes; the snapshot is 23,176 bytes.
 Payload excludes registry/allocator slack and compiler/native object storage.
 These small-host observations are not a benchmark certification, a total-memory
 bound, or evidence that #211/#212 are complete.
+
+## Optimized HLSL source and lane inspection
+
+The separately versioned optimized configuration retains ordinary Tier-1
+optimization and asynchronous Tier-2 O3 promotion. It does **not** make the
+pinned configuration above accept optimized inputs. In a fresh instrumented
+Linux x86_64 process, configure before pipeline compilation/cache admission:
+
+```cpp
+NacelleOptimizedSourceDebugOptions options;
+options.enabled = 1;
+options.consent = 3;
+HRESULT status = NacelleConfigureOptimizedSourceDebug(&options);
+```
+
+Check the HRESULT. Do not additionally enable pinned native debugging.
+Use DXC `-O3 -Zi -Qembed_debug`, or compare the same workflow with
+`-Od -Zi -Qembed_debug`. Both require compatible embedded source/debug
+information matching the executable; stripped inputs are not supported.
+Native object registration is enabled, but registration no longer implies
+pinning. Ordinary PSO/disk-cache reuse is bypassed, private debug objects are
+not written to disk, and the optimized policy has distinct compiler/replay
+fingerprints. The normal runtime and existing pinned APIs retain their behavior.
+
+Use the same host selection/breakpoint APIs and submission/draining rules.
+`NacelleGetOptimizedSourceDebugSite` supplements the shared site inventory with
+the actual compilation identity, tier, executed-entry version, native object
+identity and mapping classification. Inventory can include unavailable sites
+and multiple compilations of the same shader. An `available` site belongs to a
+successfully materialized, still-live native entry; it does not promise that
+the next submission will choose that compilation or reach that line.
+
+Load the first-party optimized aliases instead of the pinned aliases:
+
+```text
+(lldb) command source tools/nacelle-dbg/optimized-source-debug.lldb
+(lldb) run
+(lldb) hlsl-location
+(lldb) hlsl-lanes
+(lldb) hlsl-values
+(lldb) hlsl-code
+(lldb) hlsl-arm-step
+(lldb) continue
+```
+
+The native all-stop target is `nacelle_optimized_source_debug_stop`.
+`hlsl-arm-cancel` followed by `continue` cancels observations, not the workload.
+As above, read the immutable snapshot and write its generation-tagged mailbox;
+do not call lock-taking runtime APIs from an all-stopped debugger.
+
+Optimized stops are **surviving observation points**, not promises to stop
+before the original HLSL operation or its side effects. Optimization may delete,
+move, merge, duplicate or unroll source operations. Lines can disappear, repeat
+or jump; source stepping is not monotonically increasing line numbers. Mapping
+classification distinguishes exact, merged and unavailable provenance.
+Merged mappings include all proven origins (at most eight), each with its
+source identity, line/discriminator and complete bounded inline chain; use
+`hlsl-origins` to inspect them. Origin-cap exhaustion or missing origins cannot
+be presented as a convenient single exact line. Breakpoints match the preserved
+origins, and step-over uses their shallowest represented inline depth.
+An unmapped breakpoint is rejected rather than moved silently to another line.
+Step-over retains the bounded inline chain and cannot switch to another
+invocation, primitive or compilation when an entry is promoted.
+
+Non-observing debug provenance is carried through lowering and optimization;
+executable observation calls are inserted only after normal Tier-1 passes or
+the full Tier-2 O3 pipeline. Dead calculations are not resurrected, and missing
+values are not recomputed to make a debugger display plausible data. Source
+execution masks and invocation coordinates must remain provable; a host block
+where an expression was hoisted is not sufficient evidence of source execution.
+For pixel entry context, late identity reads may use the known immutable
+internal runtime ABI and a surviving batch index. This is not a shader-memory
+or general debug-expression dereferencer. An entry helper mask is recovered
+only with explicit entry-context provenance; it never substitutes for an
+unknown branch/discard predicate. Killed indices, invalid/padding batches,
+unprovable primitive identity and multisample fallback remain unavailable.
+
+`NacelleGetOptimizedSourceDebugSnapshot` adds per-slot `valid_mask` and
+availability classifications to the shared snapshot. Interpret raw bits only
+where the slot is available and the lane's validity bit is set. Bounded scalar
+fragments can occupy separate slots. Optimized-out, out-of-scope, unsupported,
+partial or otherwise unavailable bindings have explicit reasons, not fabricated
+zeros or values from a different branch. Unsupported expressions/conversions
+and inlined locals remain unavailable. Arbitrary dereferencing, source
+expression evaluation and aggregate reconstruction are not supported.
+
+The executed-entry version is distinct from the process-wide native
+registration generation. In-flight Tier-1 work retains its original code and
+metadata while subsequent work may select Tier 2. Vertex/pixel entry versions
+remain independent. Native identity checks reject stale/unloaded objects.
+`NacelleGetOptimizedSourceDebugStatus` reports retained source/metadata charges,
+bound Tier-1/Tier-2 compilation counts and sticky process-wide compilation
+failure. Compiler failures are logged explicitly; a failed asynchronous
+compilation does not count as a successful optimized entry, status returns
+`S_FALSE`, and session End cannot certify success. Restart for a clean status.
+
+The source/site/snapshot/native-object budgets above also apply here; they do
+not bound transient compiler RSS. Debug observation calls, spills and extended
+live ranges can change optimized machine code and timing. This is not a claim
+of byte-identical uninstrumented code or #211/#212 performance certification.
+The optimized LLDB acceptance requires real O0/O3-input compute/pixel stepping,
+per-lane values, unchanged full outputs and actual native Tier-2 entry versions.
+Its promotion cases suspend compiler threads **in the test debugger only** to
+select Tier 1 deterministically, then resume normal asynchronous compilation
+and verify a separate Tier-2 submission without replacing the earlier entry.
+The mixed graphics cases additionally execute VS version 2 with PS version 1,
+then verify PS version 2. Compute checks inspect live floating-point values;
+pixel checks inspect live unsigned coordinate locals while derivative/discard
+outputs are checked over the complete image. Other values can legitimately be
+optimized out; a constant-looking final color is not proof of a surviving
+source-local binding.
+
+### Debug-only compute cost diagnostic
+
+The static fixture can compare the same DXIL with ordinary compilation and
+optimized source debugging. Use `NACELLE_SIMD_WIDTH=4`,
+`NACELLE_DISABLE_TIER2=0`, `NACELLE_TEST_SOURCE_OPTIMIZED_MODE=1`,
+`NACELLE_TEST_SOURCE_UNATTENDED=1` and a fresh `NACELLE_CACHE_DIR` per process.
+Pass `unused source-compute`, first with
+`NACELLE_TEST_SOURCE_COST=ordinary`, then `NACELLE_TEST_SOURCE_COST=source`.
+Set `NACELLE_TEST_SOURCE_INPUT_O0=1` for the O0-input pair; **unset** it for
+the O3-input pair. Both still execute actual runtime Tier-2 code. Each process
+checks every output; source mode records one unattended stop and explicitly
+cancels further observations. These timings exclude interactive debugger pauses.
+
+Five fresh-process Linux x86_64 samples gave these medians:
+
+| DXC input | Runtime policy | First PSO (ms) | Remaining Tier-2 wait (ms) | Submission (ms) | Peak process RSS (KiB) |
+|---|---|---:|---:|---:|---:|
+| O0 | Ordinary | 18.61 | 49.75 | 0.827 | 88,064 |
+| O0 | Optimized source | 44.61 | 173.92 | 2.183 | 111,856 |
+| O3 | Ordinary | 17.49 | 37.75 | 0.622 | 88,064 |
+| O3 | Optimized source | 39.68 | 156.88 | 1.847 | 109,252 |
+
+The fixture creates two PSOs. Source mode bypasses ordinary caches and can
+compile both; first-PSO time does not include the second creation. The wait
+column measures only the remaining asynchronous drain after fixture setup,
+not total O3 compiler CPU time. Source inventories include original unavailable
+sites and separate surviving Tier-1/Tier-2 sites: 534/458 records for O0/O3
+input, with 1,910,904/1,640,456 charged metadata bytes and 1,780 charged source
+bytes (1,618 source-content bytes). The optimized snapshot type is 35,664 bytes.
+RSS includes compiler/process memory and is not inferred from retention budgets.
+These diagnostics use DXC 1.10 (`5201-3e6e1485`), LLVM 24.0.0git, LLDB 21.1.8
+and GCC 13.3. They are small-workload observations, not #211/#212 certification
+or a supported-compiler matrix beyond the actual acceptance tests.
 
 Instrumentation is opt-in. The normal runtime remains C++20; the private Glaze
 serialization target uses C++23. Dependencies are pinned submodules:

@@ -29,9 +29,11 @@ supports same-environment, fresh-state output checks. Opt-in
 [native shader debugging with LLDB](tools/nacelle-dbg/README.md#native-shader-debugging-lldb)
 supports Linux x86_64 instruction breakpoints, stepping and frames.
 Separately consented [HLSL source/lane debugging](tools/nacelle-dbg/README.md#hlsl-source-and-lane-inspection-linux-x86_64-lldb)
-adds unoptimized compute/pixel source breakpoints, stepping and scalar locals
-without independently executing selected lanes. Optimized HLSL debugging,
-graphics replay, and differential testing are not yet included.
+supports pinned O0 and separately opted-in optimized compute/pixel breakpoints,
+stepping and scalar locals without independently executing selected lanes.
+Optimized mode preserves asynchronous promotion and reports missing values or
+imprecise mappings explicitly. Graphics replay and differential testing are
+not yet included.
 
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 

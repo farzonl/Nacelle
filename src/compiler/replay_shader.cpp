@@ -64,8 +64,8 @@ Environment currentEnvironment() {
         } else result.compilerOptions.push_back(std::string(name) + "=" + (value && value[0] == '1' ? "1" : "0"));
     }
 
-    if (native_debug::enabled()) result.compilerOptions.push_back("native-debug-pinned-v1");
-    if (source_debug::enabled()) result.compilerOptions.push_back("source-debug-sites-v1");
+    if (native_debug::enabled()) result.compilerOptions.push_back(source_debug::optimized() ? "native-debug-registered-v1" : "native-debug-pinned-v1");
+    if (source_debug::enabled()) result.compilerOptions.push_back(source_debug::optimized() ? "source-debug-optimized-v1" : "source-debug-sites-v1");
     return result;
 }
 

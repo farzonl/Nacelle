@@ -36,7 +36,7 @@ execute_process(COMMAND "${NM_TOOL}" --demangle "${LIBRARY_FILE}"
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "Cannot inspect OFF library symbols: ${error}")
 endif()
-if(symbols MATCHES "Nacelle(Begin|End|Destroy)ProfileCapture|Nacelle(ConfigureNativeDebug|GetNativeDebugCode)|Nacelle[A-Za-z]*SourceDebug|nacelle_source_debug|Nacelle(ConfigureReplay|WaitForReplayCompilation|BeginReplayCapture|EndReplayCapture|DestroyReplayCapture|ReplayBundle)|nacelle::(profile|replay|native_debug|source_debug)::")
+if(symbols MATCHES "Nacelle(Begin|End|Destroy)ProfileCapture|Nacelle(ConfigureNativeDebug|GetNativeDebugCode)|Nacelle[A-Za-z]*SourceDebug|nacelle_(optimized_)?source_debug|Nacelle(ConfigureReplay|WaitForReplayCompilation|BeginReplayCapture|EndReplayCapture|DestroyReplayCapture|ReplayBundle)|nacelle::(profile|replay|native_debug|source_debug)::")
     message(FATAL_ERROR "Capture symbols or references leaked into the OFF library")
 endif()
 

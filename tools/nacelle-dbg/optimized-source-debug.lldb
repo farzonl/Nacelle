@@ -1,0 +1,12 @@
+settings set symbols.enable-external-lookup false
+settings set symbols.enable-lldb-index-cache false
+settings set plugin.jit-loader.gdb.enable on
+breakpoint set --name nacelle_optimized_source_debug_stop
+command alias hlsl-location frame variable snapshot->snapshot.site snapshot->mapping snapshot->origin_count snapshot->tier snapshot->compilation snapshot->entry_version
+command alias hlsl-origins frame variable -D 3 snapshot->origins
+command alias hlsl-lanes frame variable snapshot->snapshot.width snapshot->snapshot.xyz snapshot->snapshot.active_mask snapshot->snapshot.real_mask snapshot->snapshot.selected_lane
+command alias hlsl-values frame variable snapshot->snapshot.locals snapshot->snapshot.values snapshot->valid_mask snapshot->availability
+command alias hlsl-code frame variable snapshot->snapshot.code
+command alias hlsl-arm-step expression -- command->action = 1
+command alias hlsl-arm-continue expression -- command->action = 0
+command alias hlsl-arm-cancel expression -- command->action = 2
