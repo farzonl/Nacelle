@@ -3,6 +3,7 @@
 
 #include <glaze/glaze.hpp>
 #include <miniz.h>
+#define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 
 #include <algorithm>
@@ -233,22 +234,54 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
         error = "Could not read complete profile archive";
         return false;
     }
+    return readProfileBytes(archive, profile, error);
+}
+
+bool readProfileBytes(std::span<const char> archive, Profile& profile, std::string& error) {
+    if (archive.size() < 22 || archive.size() > maxProfileBytes) {
+        error = "Profile archive is truncated or exceeds 256 MiB";
+        return false;
+    }
+    const auto u16 = [&](size_t offset) {
+        return static_cast<uint16_t>(static_cast<unsigned char>(archive[offset]) |
+            static_cast<unsigned char>(archive[offset + 1]) << 8);
+    };
+    const auto u32 = [&](size_t offset) {
+        return static_cast<uint32_t>(u16(offset)) | static_cast<uint32_t>(u16(offset + 2)) << 16;
+    };
+    size_t endDirectory = archive.size() - 22;
+    const size_t minimum = endDirectory > 65535 ? endDirectory - 65535 : 0;
+    while (u32(endDirectory) != 0x06054b50 ||
+           endDirectory + 22 + u16(endDirectory + 20) != archive.size()) {
+        if (endDirectory == minimum) {
+            error = "Missing or corrupt profile ZIP end directory";
+            return false;
+        }
+        --endDirectory;
+    }
+    if (u16(endDirectory + 4) || u16(endDirectory + 6) ||
+        u16(endDirectory + 8) != u16(endDirectory + 10) ||
+        static_cast<uint64_t>(u32(endDirectory + 16)) + u32(endDirectory + 12) != endDirectory) {
+        error = "Unsupported multi-disk or corrupt profile ZIP directory bounds";
+        return false;
+    }
     Zip zip;
     if (!mz_zip_reader_init_mem(&zip.archive, archive.data(), archive.size(), 0)) {
         error = "Invalid profile ZIP archive";
         return false;
     }
     const auto count = mz_zip_reader_get_num_files(&zip.archive);
-    if (count != 3) {
-        error = "Profile v1 requires exactly manifest.json, trace.json.zst, and shaders.json";
+    if (count != 3 || mz_zip_is_zip64(&zip.archive)) {
+        error = "Profile v1 requires a non-ZIP64 archive with exactly manifest.json, trace.json.zst, and shaders.json";
         return false;
     }
     uint64_t total = 0;
     std::vector<std::string> names;
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
     for (mz_uint i = 0; i < count; ++i) {
         mz_zip_archive_file_stat stat{};
         if (!mz_zip_reader_file_stat(&zip.archive, i, &stat) || !safePath(stat.m_filename) ||
-            stat.m_method != 0 || stat.m_is_encrypted || stat.m_is_directory ||
+            stat.m_method != 0 || (stat.m_bit_flag & ~0x808) || stat.m_is_encrypted || stat.m_is_directory ||
             stat.m_uncomp_size > maxProfileBytes ||
             total > maxProfileBytes - stat.m_uncomp_size ||
             std::find(names.begin(), names.end(), stat.m_filename) != names.end()) {
@@ -257,6 +290,42 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
         }
         total += stat.m_uncomp_size;
         names.emplace_back(stat.m_filename);
+        if (!mz_zip_validate_file(&zip.archive, i, MZ_ZIP_FLAG_VALIDATE_HEADERS_ONLY)) {
+            error = "Profile ZIP directory and local header disagree";
+            return false;
+        }
+        const auto local = stat.m_local_header_ofs;
+        const auto directory = zip.archive.m_central_directory_file_ofs;
+        if (local > directory || directory - local < 30) {
+            error = "Invalid profile ZIP local header bounds";
+            return false;
+        }
+        if (u16(local + 6) != stat.m_bit_flag || u16(local + 8) != stat.m_method) {
+            error = "Profile ZIP local flags or method disagree";
+            return false;
+        }
+        const uint64_t end = local + 30 + u16(local + 26) + u16(local + 28) + stat.m_comp_size;
+        uint64_t rangeEnd = end;
+        if (stat.m_bit_flag & 8) {
+            if (end > directory || directory - end < 12) {
+                error = "Missing profile ZIP data descriptor";
+                return false;
+            }
+            const auto descriptor = u32(end) == 0x08074b50 ? end + 4 : end;
+            if (directory - descriptor < 12 || u32(descriptor) != stat.m_crc32 ||
+                u32(descriptor + 4) != stat.m_comp_size || u32(descriptor + 8) != stat.m_uncomp_size) {
+                error = "Profile ZIP data descriptor disagrees";
+                return false;
+            }
+            rangeEnd = descriptor + 12;
+        }
+        if (rangeEnd > directory || std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+                return local < range.second && rangeEnd > range.first;
+            })) {
+            error = "Overlapping or out-of-bounds profile ZIP entry";
+            return false;
+        }
+        ranges.emplace_back(local, rangeEnd);
     }
     std::string json;
     if (!extract(zip, "manifest.json", maxManifestBytes, json, error)) return false;
@@ -292,9 +361,12 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
     std::string compressed;
     if (!extract(zip, "trace.json.zst", maxProfileBytes, compressed, error)) return false;
     const auto frameSize = ZSTD_getFrameContentSize(compressed.data(), compressed.size());
+    ZSTD_frameHeader header{};
     if (frameSize != traceEntry->uncompressedSize ||
         ZSTD_findFrameCompressedSize(compressed.data(), compressed.size()) != compressed.size() ||
-        ZSTD_getDictID_fromFrame(compressed.data(), compressed.size()) != 0) {
+        ZSTD_getDictID_fromFrame(compressed.data(), compressed.size()) != 0 ||
+        ZSTD_getFrameHeader(&header, compressed.data(), compressed.size()) != 0 ||
+        header.windowSize > maxProfileBytes) {
         error = "zstd frame size does not match profile manifest";
         return false;
     }
@@ -308,13 +380,13 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
         error = "Invalid Chrome trace: " + glz::format_error(ec, json);
         return false;
     }
-    if (parsed.trace.traceEvents.size() != manifest.recordedEvents) {
-        error = "Trace event count does not match manifest";
+    if (parsed.trace.displayTimeUnit != "ms" || parsed.trace.traceEvents.size() != manifest.recordedEvents) {
+        error = "Trace display unit or event count does not match profile format";
         return false;
     }
     for (const auto& event : parsed.trace.traceEvents) {
         if (event.ph != "X" || !std::isfinite(event.ts) || !std::isfinite(event.dur) ||
-            event.ts < 0 || event.dur < 0 || !event.tid) {
+            event.ts < 0 || event.dur < 0 || !std::isfinite(event.ts + event.dur) || !event.tid) {
             error = "Invalid timing span";
             return false;
         }

@@ -595,6 +595,27 @@ int main(int argc, char** argv) {
                     "Reject corrupt archive explicitly");
         }
         {
+            Capture capture;
+            capture.begin();
+            { NACELLE_PROFILE_SCOPE("ZIP header validation"); }
+            NacelleProfileSummary summary;
+            const auto path = directory / "zip-headers.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                    "Save ZIP header fixture");
+            std::ifstream input(path, std::ios::binary);
+            const std::string original(std::istreambuf_iterator<char>(input), {});
+            nacelle::profile::Profile profile;
+            std::string error;
+            require(nacelle::profile::readProfileBytes(original, profile, error), error.c_str());
+            for (const auto offset : {6, 8, 14, 30}) {
+                auto corrupt = original;
+                corrupt[offset] ^= 1;
+                error.clear();
+                require(!nacelle::profile::readProfileBytes(corrupt, profile, error) && !error.empty(),
+                        "Reject local ZIP flag, method, CRC and name conflicts before decoding");
+            }
+        }
+        {
             nacelle::profile::Session session(1024);
             session.shaders.codeVersions.push_back({
                 2, 1, std::string(32, 'a'), "compute", 8, 1, 1, "miss"});

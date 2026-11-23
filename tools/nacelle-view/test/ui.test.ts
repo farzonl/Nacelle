@@ -56,6 +56,7 @@ describe('offline viewer DOM', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(251);
     expect(document.querySelector<HTMLButtonElement>('#more')!.hidden).toBe(true);
     loaded.traceBytes = new TextEncoder().encode(JSON.stringify(trace([]))).buffer;
+    loaded.manifest.recordedEvents = 0;
     chooseFile();
     await vi.waitFor(() => expect(document.querySelector('#threads')!.textContent).toContain('No timing spans'));
     expect(document.querySelector<HTMLButtonElement>('#export-speedscope')!.disabled).toBe(true);
@@ -73,6 +74,22 @@ describe('offline viewer DOM', () => {
     await vi.waitFor(() => expect(document.querySelector('#status')!.textContent).toContain('Invalid profile: Corrupt ZIP'));
     expect(document.querySelector<HTMLElement>('#profile')!.hidden).toBe(true);
     expect(document.querySelectorAll('tbody tr')).toHaveLength(0);
+  });
+
+  it('closes a superseded source and prevents cancelled work from replacing the next capture', async () => {
+    const loaded = await profile();
+    const stale = source(loaded);
+    let finish: (value: ProfileDataSource) => void = () => { throw new Error('No pending load'); };
+    const pending = new Promise<ProfileDataSource>(resolve => { finish = resolve; });
+    mountViewer(document, vi.fn().mockReturnValueOnce(pending).mockResolvedValueOnce(source(loaded)));
+    chooseFile();
+    document.querySelector<HTMLButtonElement>('#cancel-load')!.click();
+    expect(document.querySelector('#status')!.getAttribute('data-state')).toBe('cancelled');
+    chooseFile();
+    await vi.waitFor(() => expect(document.querySelector('#status')!.getAttribute('data-state')).toBe('complete'));
+    finish(stale);
+    await vi.waitFor(() => expect(stale.close).toHaveBeenCalledOnce());
+    expect(document.querySelector('#status')!.getAttribute('data-state')).toBe('complete');
   });
 
   it('applies filters, resets pagination, rejects invalid windows and leaves the original export available', async () => {

@@ -56,6 +56,8 @@ export function validateManifest(value: unknown): ProfileManifest {
     requireValid(Number.isSafeInteger(value[key]) && (value[key] as number) >= 0,
       `Invalid manifest ${key}.`);
   }
+  requireValid((value.recordedEvents as number) <= LIMITS.events &&
+    value.complete === (value.droppedEvents === 0), 'Inconsistent capture completeness or event count.');
   requireValid(object(value.build) && object(value.captureOptions), 'Invalid capture metadata.');
   requireValid(Array.isArray(value.entries) && value.entries.length > 0
     && value.entries.length <= LIMITS.entries, 'Invalid manifest entry count.');
@@ -222,7 +224,10 @@ export function validateTrace(value: unknown): Trace {
     requireValid(object(event) && typeof event.name === 'string' && typeof event.cat === 'string'
       && (event.ph === 'X' || event.ph === 'M') && object(event.args)
       && Number.isSafeInteger(event.pid) && Number.isSafeInteger(event.tid)
+      && (event.pid as number) >= 0 && (event.pid as number) <= 0xffffffff
+      && (event.tid as number) >= 0 && (event.tid as number) <= 0xffffffff
       && typeof event.ts === 'number' && Number.isFinite(event.ts)
+      && event.ts >= 0 && (event.ph !== 'X' || (event.tid as number) > 0)
       && typeof event.dur === 'number' && Number.isFinite(event.dur) && event.dur >= 0
       && Number.isFinite(event.ts + event.dur), 'Invalid Chrome trace event.');
   }
@@ -235,6 +240,8 @@ export async function loadProfile(source: ProfileDataSource): Promise<Profile> {
     const manifest = validateManifest(await source.readManifest());
     const traceBytes = await source.readEntry('trace.json.zst');
     const trace = validateTrace(parseJson(traceBytes));
+    requireValid(trace.traceEvents.reduce((count, event) => count + Number(event.ph === 'X'), 0) === manifest.recordedEvents,
+      'Trace event count disagrees with manifest.');
     const shaders = validateShaderMetadata(parseJson(await source.readEntry('shaders.json')), trace);
     return { manifest, trace, traceBytes, shaders };
   } finally {

@@ -22,7 +22,8 @@ export function fixture(
   };
   const manifest: ProfileManifest = {
     schemaVersion: 1, kind: 'profile', replayable: false, complete: true,
-    recordedEvents: 1, droppedEvents: 0, clock: 'monotonic', timestampUnit: 'ns',
+    recordedEvents: (document as Trace).traceEvents?.filter(event => event.ph === 'X').length ?? 0,
+    droppedEvents: 0, clock: 'monotonic', timestampUnit: 'ns',
     build: { version: 'test' }, captureOptions: {},
     entries: [
       { path: 'trace.json.zst', encoding: 'zstd', uncompressedSize: json.length },

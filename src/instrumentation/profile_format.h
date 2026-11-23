@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -113,6 +114,7 @@ struct Profile {
 };
 
 bool readProfile(const std::string& path, Profile& profile, std::string& error);
+bool readProfileBytes(std::span<const char> archive, Profile& profile, std::string& error);
 bool exportTrace(const std::string& path, const Trace& trace, std::string& error);
 bool writeProfile(const std::string& path, const struct Session& session, std::string& error);
 

@@ -166,6 +166,39 @@ allocation-failure hooks or global allocator replacement enter the runtime.
 
 ## Format and current scope
 
+### Profile reader fuzzing
+
+The offline reader accepts a bounded in-memory span through `readProfileBytes`;
+the file API uses the same parser. It validates stored ZIP local/directory
+headers, names, flags/methods, descriptors, bounds/overlaps and CRCs before
+accepting payloads. Native v1 remains exactly three entries, non-ZIP64. Zstd
+requires one dictionary-free frame with matching content size, a window no
+larger than 256 MiB, and valid decompression/checksum. No new runtime hooks,
+payload schemas, or producer behavior are introduced.
+
+Build the opt-in, standalone Clang libFuzzer entry with coverage and sanitizers
+on the reader and its dependencies:
+
+```sh
+cmake -S tools/nacelle-dbg -B build/profile-reader-fuzz -G Ninja \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNACELLE_BUILD_PROFILE_FUZZER=ON \
+  -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build/profile-reader-fuzz --target profile_reader_fuzz
+build/profile-reader-fuzz/profile_reader_fuzz build/profile-fuzz-corpus \
+  -runs=10000 -max_len=65536 -rss_limit_mb=2048 -timeout=10
+```
+
+Generate the sanitized shared corpus using the
+[viewer instructions](../nacelle-view/README.md#compatibility-parser-parity-and-fuzzing).
+The fuzz option exists only in the standalone tools configure and defaults OFF;
+normal runtime/OFF builds do not acquire fuzz dependencies. Keep corpus/crash
+files local and out of Pages artifacts. A finite successful run is not exhaustive
+parser certification. Reader and browser object graphs still use memory beyond
+the bounded 256 MiB payload; see the viewer's memory/retention documentation.
+
 A `.nacelle-profile` is a stored ZIP containing:
 
 * `manifest.json`: schema version 1, capture options, completeness/event counts,

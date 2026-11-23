@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>Nacelle — Profile Viewer</title>
   </head>
   <body class="min-h-screen antialiased selection:bg-sky-500/25">
@@ -90,6 +90,7 @@
           </div>
 
           <p id="status" role="status" aria-live="polite" data-state="idle" class="font-mono-tabular rounded-lg px-3.5 py-2.5 text-xs">No profile loaded.</p>
+          <button id="cancel-load" type="button" hidden class="profiler-btn px-3 py-2 text-xs">Cancel loading</button>
         </div>
       </section>
 

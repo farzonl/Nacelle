@@ -75,7 +75,10 @@ The dedicated Linux profiling CI job also runs production assets in offline
 Chromium with Playwright. It uploads the real native static runtime-test capture,
 checks span rendering and filtering, and compares downloaded Chrome trace bytes
 against the native CLI export. It exercises filtered Speedscope downloads,
-incomplete/empty captures, malformed uploads, and recovery. The browser network
+incomplete/empty captures, malformed uploads, cancellation/recovery, checksummed
+zstd input, and an 80,000-span capture larger than 8 MiB decoded. That test
+requires a real worker and at least two main-thread heartbeats while loading.
+The browser network
 is disabled; the harness serves only built viewer assets from local disk and
 rejects any other request, including profile uploads or external services.
 Native captures and downloads are not published.
@@ -112,7 +115,79 @@ There is no additional deployment workflow.
 a fresh `ArrayBuffer` of **decoded** bytes (including zstd entries). `close()` is
 idempotent and subsequent reads fail. `loadProfile()` always closes its source,
 including on failure. `FileProfileDataSource.open(file)` adapts browser files;
-no server endpoint or URL input is used.
+no server endpoint or URL input is used. Production local-file and explicitly
+enabled preloaded-benchmark loads perform ZIP/zstd/JSON decoding and metadata
+validation in a dedicated module worker using that same contract. Only one load
+is active: selecting another file/benchmark or **Cancel loading** aborts the
+previous fetch/worker and discards its result. Worker errors are explicit; there
+is no synchronous decode fallback. The decoded trace buffer is transferred,
+not cloned, to preserve exact export bytes.
+
+Stored ZIP payloads are bounded views of the archive, not full extraction
+copies. The zstd decoder allocates one declared-size output buffer without a
+second decoded-buffer copy. Archive and aggregate decoded payload limits remain
+256 MiB, the manifest limit is 1 MiB, timing spans are capped at 1,000,000,
+and shader versions/selections share a 65,536-record cap. These are **payload
+bounds, not a 256 MiB browser RSS guarantee**: JSON strings/objects, the decoder
+window, structured-cloned metadata/event objects during worker handoff, grouping,
+and timeline/export structures use additional memory. A maximum-size archive and
+maximum-size decoded trace can coexist. Completed worker state is released;
+the UI retains the parsed profile and original trace bytes until replacement.
+Preloaded downloads are bounded while streaming, not only after full download.
+Rendering and Speedscope conversion/export remain main-thread work.
+
+### Compatibility, parser parity and fuzzing
+
+Manifest v1 and shader metadata `[]`/v1/v2 remain supported. Unsupported schema
+versions fail explicitly; required fields and reference/completeness/size rules
+are not relaxed. Native v1 readers require exactly the three defined files and
+reject unknown JSON fields. Browser readers tolerate unknown object fields and
+bounded, manifest-declared extra payloads as opaque extensions; they do not
+interpret them as sources, resources, or replay data. A new required capability
+must use an approved versioned schema, not silently change v1 semantics.
+
+The shared synthetic corpus in `test/profile-corpus.ts` covers local/directory
+flags, names, methods, CRC and size conflicts, overlaps, unsafe paths, corrupt
+payloads, dictionary/concatenated/truncated/oversized-window zstd frames,
+checksummed frames, and manifest/trace/shader inconsistencies. Native and browser
+accept/reject decisions on the same bytes are checked in all profiling CI jobs:
+
+```sh
+NACELLE_NATIVE_READER="$PWD/../../build/profile/tools/nacelle-dbg/nacelle-dbg" \
+  npm test -- test/parser-parity.test.ts
+NACELLE_FUZZ_ROUNDS=10000 npm test -- test/parser-parity.test.ts
+```
+
+`fuzzProfileBytes()` is the reusable browser parser entry; mutation tests reject
+unexpected bounds exceptions and report rejected inputs explicitly. Export
+only these synthetic seeds for the native libFuzzer entry:
+
+```sh
+mkdir -p ../../build/profile-fuzz-corpus
+NACELLE_FUZZ_CORPUS="$PWD/../../build/profile-fuzz-corpus" \
+  npm test -- test/parser-parity.test.ts
+```
+
+See the [native fuzz build instructions](../nacelle-dbg/README.md#profile-reader-fuzzing).
+Finite mutation runs are regression evidence, not proof that all malformed
+inputs are safe. CRC32/zstd checksums detect corruption, not authenticity.
+The pinned `xxhash-wasm` dependency verifies zstd's optional checksum locally;
+CSP permits local module workers and WebAssembly compilation, not JavaScript
+evaluation, remote scripts, or uploads.
+
+### Privacy boundaries and retention
+
+Treat archives and all contained labels as untrusted. Readers never extract
+archive paths to disk, and presentation uses text rather than untrusted HTML.
+Safe entry names do not sanitize arbitrary text inside a trace.
+
+| Boundary | Current policy |
+| --- | --- |
+| Sources/resources | Neither is embedded by current producers. Any future embedding needs separate explicit opt-ins, size budgets, sanitized relative references, and schema/design approval. Debug metadata must never authorize arbitrary host-file reads. Hashes do not anonymize content. |
+| Imports/exports | File selection and downloads are explicit and local. Chrome export preserves original trace bytes, including potentially sensitive application strings. Filtering is not redaction. Keep exports private. |
+| Network/remote access | No upload, telemetry, CDN, remote-capture endpoint, or credential handoff. Default CSP disallows connections. Explicit benchmark builds may fetch only same-origin synthetic profiles; this is not permission to upload user captures. Future remote transport needs separate authentication/authorization and threat review. |
+| Retention | Capture bytes and decoded objects remain in memory until replacement/cancellation or page close; no capture is put in localStorage, IndexedDB, or a service worker. Theme preference alone uses localStorage. Downloads and original files remain the user's responsibility. Worker termination/garbage collection is not a secure-memory-wipe guarantee. |
+| Publication | Stage only viewer assets and explicitly generated benchmark fixtures. Never stage uploaded files, private sources/resources, production captures, fuzz inputs from applications, or downloaded traces. |
 
 Accepted native format: a single-disk, non-ZIP64 **stored ZIP**, with
 `manifest.json`, `trace.json.zst`, and `shaders.json`. The manifest must declare
@@ -131,7 +206,9 @@ entry roles, optional shader/native-object content digests and composite
 validates pipeline/code IDs, PSO/stage/SIMD/tier/cache fields, unique
 pipeline/entry-role/version identities, and exact/composite trace references.
 Draw/extended-geometry selections do not imply one latest tier or isolated
-per-stage CPU time. Unsupported shader versions and inconsistent references are explicit
+per-stage CPU time. Capture completeness must agree with drops; the timing-span
+count must agree with recorded events (`M` metadata is not a recorded timing
+event). Unsupported shader versions and inconsistent references are explicit
 errors. Unknown object fields remain forward-compatible. Metadata is available
 through the data-source boundary; shader/code-view panes are not implemented.
 See the [native format guide](../nacelle-dbg/README.md#compute-entry-metadata) for

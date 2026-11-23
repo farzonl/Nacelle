@@ -2,6 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 import { fixture, trace } from '../test/fixtures';
+import { profileCorpus } from '../test/profile-corpus';
 
 const origin = 'http://127.0.0.1:4173';
 const dist = resolve('dist');
@@ -122,3 +123,50 @@ test('rejects malformed uploads and recovers on the next valid local file', asyn
   await expect(page.locator('#threads')).toContainText('dispatch');
   await expect(page.locator('#export')).toBeEnabled();
 });
+
+test('keeps the UI responsive while a large profile is decoded in a worker', async ({ page }) => {
+    const events = Array.from({ length: 80_000 }, (_, ts) => ({
+      name: 'Large capture dispatch', cat: 'compute', ph: 'X' as const,
+      ts, dur: 1, pid: 1, tid: 1, args: { stage: 'compute' },
+    }));
+    expect(Buffer.byteLength(JSON.stringify(trace(events)))).toBeGreaterThan(8 * 1024 * 1024);
+    let workers = 0;
+    page.on('worker', () => workers++);
+    await page.evaluate(() => {
+      const status = document.querySelector('#status')!;
+      status.setAttribute('data-heartbeats', '0');
+      const timer = setInterval(() => {
+        if (status.getAttribute('data-state') === 'loading')
+          status.setAttribute('data-heartbeats', String(Number(status.getAttribute('data-heartbeats')) + 1));
+        else if (status.getAttribute('data-state') !== 'idle') clearInterval(timer);
+      }, 10);
+    });
+    await page.locator('#profile-file').setInputFiles({
+      name: 'large.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(fixture({}, trace(events))),
+    });
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+    expect(workers).toBe(1);
+    expect(Number(await page.locator('#status').getAttribute('data-heartbeats'))).toBeGreaterThanOrEqual(2);
+    await expect(page.locator('#summary')).toContainText('Trace events: 80000');
+    await expect(page.locator('#cancel-load')).toBeHidden();
+  });
+
+test('cancels decoding, discards its result, and loads the next checksummed file offline', async ({ page }) => {
+    await page.evaluate(() => {
+      document.querySelector('#profile-file')!.addEventListener('change', () => {
+        document.querySelector<HTMLButtonElement>('#cancel-load')!.click();
+      }, { once: true });
+    });
+    await page.locator('#profile-file').setInputFiles({
+      name: 'cancel.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(fixture()),
+    });
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'cancelled');
+    await expect(page.locator('#export')).toBeDisabled();
+    await expect(page.locator('#profile')).toBeHidden();
+    const checksum = profileCorpus().find(entry => entry.name === 'zstd-checksum-valid')!;
+    await page.locator('#profile-file').setInputFiles({
+      name: 'checksum.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(checksum.bytes),
+    });
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+    await expect(page.locator('#summary')).toContainText('Trace events: 1');
+  });
