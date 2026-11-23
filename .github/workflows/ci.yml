@@ -17,6 +17,11 @@ on:
       - "scripts/**"
       - "**.md"
   workflow_dispatch:
+    inputs:
+      profile_performance:
+        description: Run controlled Linux coarse-capture performance acceptance
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -592,7 +597,7 @@ jobs:
             export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
           fi
           ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
+            -R '^(instrumentation_test|profile_overhead_harness_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
 
       - name: Set up Node for native profile interoperability
         uses: actions/setup-node@v4
@@ -643,3 +648,58 @@ jobs:
           NACELLE_NATIVE_PROFILE: "${{ github.workspace }}/build-profile/tests/static.nacelle-profile"
           NACELLE_NATIVE_TRACE: "${{ github.workspace }}/build-profile/tests/static-trace.json"
         run: npm run test:browser
+
+      - name: Build baseline and current OFF performance controls
+        if: runner.os == 'Linux' && inputs.profile_performance
+        run: |
+          head=$(git rev-parse HEAD)
+          git fetch --no-tags --depth=2 origin "$head"
+          base=$(git rev-parse "$head^1")
+          echo "NACELLE_PERF_BASELINE=$base" >> "$GITHUB_ENV"
+          git switch --detach "$base"
+          cmake -S . -B build-profile-off -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DNACELLE_FETCH_SDL3=OFF \
+            -DNACELLE_ENABLE_INSTRUMENTATION=OFF \
+            -DNACELLE_BUILD_PROFILE_TOOLS=OFF \
+            -DNACELLE_BUILD_PROFILE_TESTS=OFF \
+            -DNACELLE_CLANGXX="$PWD/.toolchains/llvm/bin/clang++" \
+            -DLLVM_DIR="$PWD/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="$PWD/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="$PWD/.sdk/bin/dxc" \
+            -DFILECHECK_EXECUTABLE="$PWD/.toolchains/llvm/bin/FileCheck" \
+            -DSPLIT_FILE_EXECUTABLE="$PWD/.toolchains/llvm/bin/split-file"
+          cmake --build build-profile-off --target bench-worker-nacelle --parallel 2
+          cp build-profile-off/bench-worker-nacelle "$RUNNER_TEMP/baseline-off-worker"
+          git switch --detach "$head"
+          cmake --build build-profile-off --target bench-worker-nacelle --parallel 2
+          cmake --build build-profile --target bench-worker-nacelle --parallel 2
+          cmake -DBUILD_DIR="$PWD/build-profile-off" \
+            -DLIBRARY_FILE="$PWD/build-profile-off/libnacelle.a" \
+            -DNM_TOOL="$PWD/.toolchains/llvm/bin/llvm-nm" \
+            -P cmake/CheckProfileIsolation.cmake
+
+      - name: Measure coarse capture performance on the dedicated runner
+        if: runner.os == 'Linux' && inputs.profile_performance
+        timeout-minutes: 45
+        run: |
+          python3 scripts/measure_profile_overhead.py \
+            --off-build build-profile-off --on-build build-profile \
+            --baseline-off-worker "$RUNNER_TEMP/baseline-off-worker" \
+            --baseline-revision "$NACELLE_PERF_BASELINE" \
+            --shader-dir build-profile/tests/shaders \
+            --inspector build-profile/tools/nacelle-dbg/nacelle-dbg \
+            --output-dir profile-overhead-results --rounds 24 --iters 60 --controlled-host
+
+      - name: Retain coarse performance acceptance evidence
+        if: always() && runner.os == 'Linux' && inputs.profile_performance
+        uses: actions/upload-artifact@v4
+        with:
+          name: coarse-profile-performance
+          path: |
+            profile-overhead-results/identity.json
+            profile-overhead-results/runs.jsonl
+            profile-overhead-results/summary.json
+            profile-overhead-results/*.log
+          if-no-files-found: warn
