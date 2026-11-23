@@ -4,6 +4,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { fixture, trace } from '../test/fixtures';
 import { profileCorpus } from '../test/profile-corpus';
 import { artifactFixture } from '../test/artifact-fixtures';
+import { spatialFixture } from '../test/spatial-fixtures';
 
 const origin = 'http://127.0.0.1:4173';
 const dist = resolve('dist');
@@ -177,6 +178,7 @@ test('navigates offline read-only shader panes by exact version and preserved so
   await page.locator('#profile-file').setInputFiles({
     name: 'shader-artifacts.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(await artifactFixture()),
   });
+
   await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
   await expect(page.locator('#shader-artifacts')).toBeVisible();
   await expect(page.locator('[data-artifact-kind="assembly"]')).toContainText('Unavailable');
@@ -195,5 +197,33 @@ test('navigates offline read-only shader panes by exact version and preserved so
     await expect(page.locator('[data-artifact-kind="hlsl"] .cm-content')).toContainText('CSMain');
     await expect(page.locator('[data-artifact-kind="assembly"]')).toContainText('0:');
     await expect(page.locator('#artifact-status')).toContainText('native: available');
+  }
+});
+
+test('decodes typed spatial observations offline and warns separately about spatial loss', async ({ page }) => {
+  await page.locator('#profile-file').setInputFiles({
+    name: 'spatial.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(await spatialFixture()),
+  });
+  await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+  await expect(page.locator('#summary')).toContainText('Spatial observations: 2; skipped: 4; dropped: 0');
+  await page.locator('#profile-file').setInputFiles({
+    name: 'spatial-incomplete.nacelle-profile', mimeType: 'application/zip',
+    buffer: Buffer.from(await spatialFixture(metadata => {
+      metadata.complete = false;
+      metadata.dropped = 1;
+      const operation = metadata.operations[0];
+      operation.complete = false;
+      operation.dropped = 1;
+      operation.missingStatus = 'dropped-or-unsampled';
+      for (const cell of operation.cells) cell.status = 'partial';
+    })),
+  });
+  await expect(page.locator('#status')).toHaveAttribute('data-state', 'incomplete');
+  await expect(page.locator('#status')).toContainText('1 dropped spatial observations');
+  const capture = process.env.NACELLE_NATIVE_SPATIAL_PROFILE;
+  if (capture) {
+    await page.locator('#profile-file').setInputFiles(capture);
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+    await expect(page.locator('#summary')).toContainText('Spatial wall time: host entry-call ns per tile/threadgroup');
   }
 });

@@ -627,6 +627,7 @@ void testMultisample4xRenderAndResolve(testutil::TestRuntime& rt, ID3D12RootSign
 } // namespace
 
 int main() {
+    testutil::SpatialTestCapture spatial;
     testutil::TestRuntime rt;
     rt.init();
 
@@ -641,6 +642,7 @@ int main() {
     testByteAddressBufferLoad4InVS(rt);
     testMultisample4xRenderAndResolve(rt, rs.Get());
 
+    spatial.finish();
     std::printf("graphics_features_test PASSED\n");
     return 0;
 }

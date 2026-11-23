@@ -205,7 +205,7 @@ export function mountViewer(
     if (kpiDropped) {
       kpiDropped.textContent = profile.manifest.droppedEvents > 0
         ? `${profile.manifest.droppedEvents.toLocaleString()} dropped`
-        : '0 dropped · Complete';
+        : profile.manifest.complete ? '0 dropped · Complete' : '0 event drops · Spatial data incomplete';
     }
 
     const pids = new Set(threadGroups.map(g => g.pid));

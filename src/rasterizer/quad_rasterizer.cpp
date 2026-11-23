@@ -465,6 +465,11 @@ inline bool triangleCoversRect(const SetupTriangle& tri, int32_t bx, int32_t by,
 }
 
 struct QuadBatchEmitter {
+ #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    profile::SpatialState* spatial = nullptr;
+    uint64_t spatialOperation = 0;
+    std::array<uint32_t, 3> spatialXYZ{};
+ #endif
     static constexpr uint32_t kMaxBatchGroups = 64;
     static constexpr uint32_t kMaxQuads = kMaxBatchGroups * (kMaxSimdWidth / 4);
     CompiledPixelQuadFn psFn = nullptr;
@@ -601,7 +606,28 @@ struct QuadBatchEmitter {
             args.quadTriIndices = quadTriIndices;
         }
         args.sampleCoverageMasks = (sampleCount > 1) ? sampleCoverageMasks : nullptr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        auto* observation = spatialOperation ? spatial->reserve(spatialOperation, spatialXYZ) : nullptr;
+        if (observation) {
+            const auto width = quadsPerBatch * 4;
+            observation->invocations = uint64_t(batchCount) * width;
+            for (uint32_t batch = 0; batch < batchCount; ++batch) {
+                const auto mask = coverageMasks[batch];
+                for (uint32_t lane = 0; lane < width; ++lane) {
+                    if (mask & (1u << lane)) ++observation->covered[lane];
+                    else if (mask & (15u << ((lane / 4) * 4))) ++observation->companion[lane];
+                    else ++observation->padding[lane];
+                }
+            }
+        }
+        const auto started = observation ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
         psFn(&args);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (observation)
+            observation->wallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+#endif
         batchCount = 0;
         qCount = 0;
         triDataCount = 0;
@@ -921,6 +947,20 @@ void rasterizeTiles(
     pixelProfile.setGraphicsVersion(compiled->profilePipelineIdentity, profile::Stage::Pixel,
                                     pixelEntry->version, pixelEntry->tier, pixelEntry->cache,
                                     compiled->profilePixelShaderId, profile::EntryRole::Default, pixelEntry->artifactId);
+    auto* spatial = pixelProfile.spatial();
+    uint64_t spatialOperation = 0;
+    if (spatial && (spatial->options.flags & NACELLE_PROFILE_SPATIAL_PIXEL)) {
+        profile::SpatialOperation operation;
+        operation.stage = "pixel";
+        operation.laneLayout = "quad-major-xy";
+        operation.dimensions = {scene.numTilesX, (scene.fbHeight + kTileSize - 1) / kTileSize, 1};
+        operation.extent = {scene.fbWidth, scene.fbHeight, 1};
+        operation.cellExtent = {kTileSize, kTileSize, 1};
+        operation.granularity = "raster-tile";
+        operation.orientation = "top-left-y-down";
+        operation.availability = "available";
+        spatialOperation = pixelProfile.addSpatialOperation(std::move(operation));
+    }
 #endif
 
     const uint32_t W = std::clamp<uint32_t>(compiled->simdWidth, 4, kMaxSimdWidth);
@@ -992,6 +1032,11 @@ void rasterizeTiles(
             }
 
             QuadBatchEmitter emitter;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            emitter.spatial = spatial;
+            emitter.spatialOperation = spatialOperation;
+            emitter.spatialXYZ = {txTile, tyTile, 0};
+#endif
             emitter.psFn = psFn;
             emitter.quadsPerBatch = quadsPerBatch;
             emitter.sampleCount = sampleCount;
@@ -1146,6 +1191,11 @@ void rasterizeTiles(
             }
 
             QuadBatchEmitter emitter;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            emitter.spatial = spatial;
+            emitter.spatialOperation = spatialOperation;
+            emitter.spatialXYZ = {txTile, tyTile, 0};
+#endif
             emitter.psFn = psFn;
             emitter.quadsPerBatch = quadsPerBatch;
             emitter.sampleOffsetX = static_cast<float>(dx16) / 16.0f;

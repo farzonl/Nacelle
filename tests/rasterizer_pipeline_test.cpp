@@ -96,6 +96,7 @@ std::vector<uint8_t> readbackTex2D(testutil::TestRuntime& rt, ID3D12Resource* te
 } // namespace
 
 int main() {
+    testutil::SpatialTestCapture spatial(4);
     testutil::TestRuntime rt;
     rt.init();
 
@@ -893,6 +894,7 @@ int main() {
         std::printf("  [PackedTri] Multi-triangle depth packing PASSED\n");
     }
 
+    spatial.finish();
     std::printf("rasterizer_pipeline_test PASSED\n");
 
     return 0;

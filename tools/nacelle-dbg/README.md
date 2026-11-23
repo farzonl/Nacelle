@@ -98,7 +98,7 @@ if (SUCCEEDED(status)) {
 ```
 
 Check `status == S_OK` for a complete saved capture: `S_FALSE` explicitly reports
-event loss. Errors are returned and logged to stderr. After a write failure the
+event or spatial-observation loss. Errors are returned and logged to stderr. After a write failure the
 stopped handle can retry a different output path. Destroying a session without
 ending cancels it, waits for captured work, and writes nothing.
 
@@ -187,6 +187,115 @@ payloads, unsafe labels, checksum/size changes, absent source consent, mapping
 bounds and declared text-budget violations. Both archive/decoded aggregate
 limits remain 256 MiB. Updated readers accept versions 1 and 2; old readers
 reject version 2 rather than silently dropping artifacts.
+
+### Opt-in spatial and submitted-lane capture
+
+Spatial collection is independently **OFF** by default, including when coarse
+capture or shader text retention is enabled. Configure before Begin, not during
+an active session:
+
+```cpp
+NacelleProfileSpatialOptions spatial;
+spatial.flags = NACELLE_PROFILE_SPATIAL_COMPUTE | NACELLE_PROFILE_SPATIAL_PIXEL;
+spatial.sample_stride = 1; // Observe every eligible coordinate.
+HRESULT status = NacelleConfigureProfileSpatial(&spatial);
+```
+
+Check the HRESULT. Invalid flags, struct/version, stride, half-open ROI or budget
+are logged and rejected. `flags = 0` disables future spatial captures. Sessions
+own their settings and preallocated pool; allocation failure admits no capture.
+The default pool is 8 MiB, configurable from 424 bytes through 16 MiB. Each
+admitted entry call occupies one 424-byte record before post-drain aggregation:
+8 MiB admits 19,784 calls and 16 MiB admits 39,568. The additional 131,072-cell
+limit is not an independent allocation entitlement. At most 4,096 operations
+are represented. The pool excludes preallocated operation counters/metadata,
+strings, aggregation indices/cells, JSON, compression and browser objects;
+**neither the pool nor the archive limit is a total-process RSS guarantee**.
+
+ROI uses `min_xyz` (inclusive) and `max_xyz` (exclusive) in **cell coordinates**,
+not pixel coordinates. A coordinate is selected when every axis is in range
+and `(coordinate - minimum) % sample_stride == 0`. Pixel cells are global
+32-by-32 raster tiles, top-left origin with Y downward; compute cells are group
+XYZ with logical threads-per-group. Selection only suppresses observations:
+all original shader calls, companion work, barriers and output writes still run.
+Hot observations reserve a shared fixed-pool slot atomically and update bounded
+operation counters; no per-call heap allocation, map or mutex is introduced.
+Aggregation runs only after captured work drains.
+
+Metrics intentionally describe **host entry submission**, not shader instruction
+execution:
+
+- `wallNs` sums wall time enclosing the actual entry function calls. A pixel
+  batch's full time belongs to its tile, never divided into per-pixel estimates.
+  It includes host scheduling/preemption and is not CPU cycles or GPU timing.
+- `calls` counts observed entry calls. Compute `invocations` counts logical
+  launched threads, not instruction activity. A dispatch-wide entry ABI reports
+  `dispatch-wide-entry-unavailable` rather than inventing per-group observations.
+- Pixel `invocations` includes every submitted SIMD slot, including padding.
+  One entry call may submit multiple SIMD batches; lane totals count those
+  batches, not just calls.
+  Covered/quad-companion/padding counts classify coverage **before** depth and
+  shader discard; they do not measure surviving fragments, dynamic divergence
+  or lane values. Packing is quad-major, with lane `(y & 1) * 2 + (x & 1)`
+  inside each quad. MSAA, overdraw and repeated calls count repeated submissions.
+  Compute lane layout and instruction/source-lane precision remain unavailable.
+
+Operations retain exact pipeline/PSO/stage/code-version and event identities,
+including cached or asynchronously promoted entries. Separate raster calls or
+dispatches remain separate operations; no cross-version averaging occurs.
+The sparse payload preserves observed numeric zero. A missing cell is **not
+zero**: it may have no submission, be outside ROI/sampling, or have lost records.
+Without losses its conservative missing status is `unsampled`; with losses it
+is `dropped-or-unsampled`. Dropped coordinates are not retained, so every retained
+cell in that operation is conservatively `partial`, not claimed complete.
+Unsupported operations use `unavailable` and no fabricated cells.
+
+Pool exhaustion records exact observation-drop counts, preserves execution and
+saves an explicitly incomplete bundle (`S_FALSE` / CLI exit 2), even with zero
+event drops. Event drops remain separate in `NacelleProfileSummary`. Operation
+metadata overflow or aggregation beyond the exact JSON integer range
+(`2^53 - 1`) fails saving explicitly, without output. A stopped overflowed
+capture cannot be repaired by reconfiguration; begin a new capture.
+
+Spatial captures use manifest **version 3**, declaring checksummed `spatial.json`
+(spatial schema 1), with optional artifact data. Native and browser readers
+validate identities, event references when event recording is complete,
+dimensions/ROI/stride, per-slot submission counts, capacity, exact integers and
+combined completeness without dense allocation from dimensions. Legacy
+versions 1/2 remain supported; older readers reject the required new capability.
+The 256 MiB archive/decoded aggregate bounds remain unchanged.
+Spatial opt-in embeds no resource contents, source files or host addresses.
+Coordinates and counts can disclose private workload structure; keep captures
+and exports private. No uploads, telemetry or external assets are added.
+
+The instrumented benchmark worker supports `NACELLE_PROFILE_SPATIAL=1` together
+with `NACELLE_PROFILE_OUTPUT`; it explicitly reserves the 16 MiB maximum for
+repeated benchmark submissions. `0` leaves spatial collection disabled. Invalid
+values or enabling without an output path fail explicitly. Its stderr reports
+End's final drain/aggregation/serialization/write time separately from kernel
+samples; stdout benchmark JSON is unchanged.
+
+#### Spatial cost diagnostic
+
+Six alternating-order matched pairs per workload used the same instrumented
+Linux x86_64 executable, fresh per-process caches, SIMD 8, 256-by-256 output,
+64 raymarch steps and five hot samples after Tier-2 warmup/drain. Coarse event
+capture was active in both modes. All 24 processes produced complete captures;
+each matched pair preserved its output checksum. Values are medians of six
+process results. End includes final drain, not isolated serializer time.
+
+| Workload | Spatial OFF / ON kernel | Change | OFF / ON End | OFF / ON peak RSS | ON spatial JSON |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compute raymarch | 0.2555 / 0.2733 ms | +6.97% | 0.970 / 15.412 ms | 156,776 / 173,262 KiB | 1,529,662 bytes |
+| State-heavy pixel | 6.8113 / 6.8736 ms | +0.91% | 0.645 / 5.769 ms | 186,392 / 203,354 KiB | 153,265 bytes |
+
+ON archives were approximately 1.54 MB / 0.167 MB respectively. The 16 MiB
+benchmark pool is a separate spatial budget, not an increase to the 64 MiB
+event budget. This shared-host diagnostic measures the separately opted-in
+mode; it does **not** certify or relax #211's coarse idle/active thresholds or
+#212's bookkeeping/RSS acceptance. OFF contains no spatial hooks/state or
+profiling dependencies. Cross-platform correctness requires passing the
+dedicated profiling matrix; these timings are Linux-only diagnostics.
 
 ### Memory validation
 

@@ -1,7 +1,8 @@
 import { validateArtifacts, type ArtifactMetadata } from './artifacts';
+import { validateSpatial, type SpatialMetadata } from './spatial';
 
 export interface ProfileManifest {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   kind: 'profile';
   replayable: false;
   complete: boolean;
@@ -50,7 +51,7 @@ export function parseJson(data: ArrayBuffer | Uint8Array): unknown {
 
 export function validateManifest(value: unknown): ProfileManifest {
   requireValid(object(value), 'Manifest must be an object.');
-  requireValid((value.schemaVersion === 1 || value.schemaVersion === 2) && value.kind === 'profile'
+  requireValid((value.schemaVersion === 1 || value.schemaVersion === 2 || value.schemaVersion === 3) && value.kind === 'profile'
     && value.replayable === false && typeof value.complete === 'boolean'
     && value.clock === 'monotonic' && value.timestampUnit === 'ns',
   'Unsupported or invalid profile manifest schema.');
@@ -59,7 +60,7 @@ export function validateManifest(value: unknown): ProfileManifest {
       `Invalid manifest ${key}.`);
   }
   requireValid((value.recordedEvents as number) <= LIMITS.events &&
-    value.complete === (value.droppedEvents === 0), 'Inconsistent capture completeness or event count.');
+    (value.schemaVersion === 3 || value.complete === (value.droppedEvents === 0)), 'Inconsistent capture completeness or event count.');
   requireValid(object(value.build) && object(value.captureOptions), 'Invalid capture metadata.');
   requireValid(Array.isArray(value.entries) && value.entries.length > 0
     && value.entries.length <= LIMITS.entries, 'Invalid manifest entry count.');
@@ -80,10 +81,11 @@ export function validateManifest(value: unknown): ProfileManifest {
   requireValid(value.entries.some(e => e.path === 'trace.json.zst' && e.encoding === 'zstd')
     && value.entries.some(e => e.path === 'shaders.json' && e.encoding === 'json'),
   'Manifest must declare trace.json.zst and shaders.json with the correct encodings.');
-  if (value.schemaVersion === 2) {
+  if (value.schemaVersion === 2 || value.schemaVersion === 3 && paths.has('artifacts.json')) {
     const artifacts = value.entries.find(entry => entry.path === 'artifacts.json');
     requireValid(artifacts?.encoding === 'json' && typeof artifacts.digest === 'string'
-      && /^[0-9a-f]{16}$/.test(artifacts.digest) && value.entries.length === 3,
+      && /^[0-9a-f]{16}$/.test(artifacts.digest) &&
+      (value.schemaVersion === 3 || value.entries.length === 3),
     'Artifact manifest requires one declared checksummed artifacts.json.');
     const options = value.captureOptions;
     requireValid(typeof options.embeddedSources === 'boolean' &&
@@ -92,6 +94,16 @@ export function validateManifest(value: unknown): ProfileManifest {
       Number.isSafeInteger(options.sourceBytes) && (options.sourceBytes as number) > 0 &&
       (options.sourceBytes as number) <= 16 * 1024 * 1024,
     'Invalid artifact/source budgets or consent.');
+  }
+  if (value.schemaVersion === 3) {
+    const spatial = value.entries.find(entry => entry.path === 'spatial.json');
+    requireValid(spatial?.encoding === 'json' && typeof spatial.digest === 'string' &&
+      /^[0-9a-f]{16}$/.test(spatial.digest) && value.entries.length === (paths.has('artifacts.json') ? 4 : 3) &&
+      value.entries.every(entry => ['trace.json.zst', 'shaders.json', 'artifacts.json', 'spatial.json'].includes(entry.path)) &&
+      Number.isSafeInteger(value.captureOptions.spatialBytes) &&
+      (value.captureOptions.spatialBytes as number) >= 424 &&
+      (value.captureOptions.spatialBytes as number) <= 16 * 1024 * 1024,
+    'Invalid spatial manifest declaration or budget.');
   }
   return value as unknown as ProfileManifest;
 }
@@ -118,6 +130,7 @@ export interface Profile {
   traceBytes: ArrayBuffer;
   shaders: ShaderMetadata;
   artifacts?: ArtifactMetadata;
+  spatial?: SpatialMetadata;
 }
 
 export interface CodeVersion {
@@ -259,9 +272,25 @@ export async function loadProfile(source: ProfileDataSource): Promise<Profile> {
     requireValid(trace.traceEvents.reduce((count, event) => count + Number(event.ph === 'X'), 0) === manifest.recordedEvents,
       'Trace event count disagrees with manifest.');
     const shaders = validateShaderMetadata(parseJson(await source.readEntry('shaders.json')), trace);
-    const artifacts = manifest.schemaVersion === 2
+    const artifacts = manifest.schemaVersion >= 2 && manifest.entries.some(entry => entry.path === 'artifacts.json')
       ? await validateArtifacts(await source.readEntry('artifacts.json'), manifest, shaders) : undefined;
-    return { manifest, trace, traceBytes, shaders, artifacts };
+    const spatial = manifest.schemaVersion === 3
+      ? await validateSpatial(await source.readEntry('spatial.json'), manifest, shaders) : undefined;
+    if (spatial) {
+      const references = new Map(spatial.operations.map(operation => [operation.eventId, operation]));
+      requireValid(references.size === spatial.operations.length, 'Duplicate spatial operation event.');
+      for (const event of trace.traceEvents) {
+        const operation = references.get(Number(event.args.id));
+        if (!operation) continue;
+        requireValid(operation.codeVersionId === event.args.codeVersionId && operation.pipelineId === event.args.pipelineId,
+          'Spatial operation disagrees with its recorded span.');
+        references.delete(operation.eventId);
+      }
+      requireValid(manifest.droppedEvents > 0 || !references.size, 'Spatial operation references a missing span.');
+    }
+    requireValid(!spatial || manifest.complete === (manifest.droppedEvents === 0 && spatial.complete),
+      'Spatial/event completeness disagrees with manifest.');
+    return { manifest, trace, traceBytes, shaders, artifacts, spatial };
   } finally {
     source.close();
   }

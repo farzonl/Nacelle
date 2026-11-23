@@ -14,6 +14,7 @@ std::shared_ptr<nacelle::profile::Session> activeSession;
 std::atomic<bool> recording{false};
 std::atomic<uint64_t> generation{1};
 thread_local nacelle::profile::Scope* currentScope = nullptr;
+NacelleProfileSpatialOptions spatialOptions;
 
 HRESULT fail(HRESULT code, const char* message) {
     std::fprintf(stderr, "[NacelleProfile] %s\n", message);
@@ -158,6 +159,16 @@ Context Scope::context() const {
     return {std::make_shared<Work>(session), event_.id, event_.attributes};
 }
 
+uint64_t Scope::addSpatialOperation(SpatialOperation operation) const {
+    if (!spatial() || !event_.attributes.codeVersionId) return 0;
+    operation.eventId = event_.id;
+    operation.pipelineId = event_.attributes.pipelineId;
+    operation.codeVersionId = event_.attributes.codeVersionId;
+    operation.pso = formatProfileHash(event_.attributes.hashLo, event_.attributes.hashHi);
+    operation.simdWidth = event_.attributes.simdWidth;
+    return spatial()->addOperation(std::move(operation));
+}
+
 void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier, Cache cache,
                               const std::string& shaderId, const std::string& artifactId) {
     if (session_) event_.attributes.codeSelectionId = 0;
@@ -265,6 +276,20 @@ void setCompilerConfiguration(const std::string& hash, const std::string& triple
 
 } // namespace nacelle::profile
 
+extern "C" HRESULT NacelleConfigureProfileSpatial(const NacelleProfileSpatialOptions* options) {
+    if (!options || options->struct_size != sizeof(*options) || options->version != 1 ||
+        (options->flags & ~3u) || options->record_bytes < sizeof(nacelle::profile::SpatialRecord) ||
+        options->record_bytes > 16ull * 1024 * 1024 || !options->sample_stride)
+        return fail(E_INVALIDARG, "Invalid spatial options (record budget must be <=16 MiB)");
+    for (size_t axis = 0; axis < 3; ++axis)
+        if (options->min_xyz[axis] >= options->max_xyz[axis])
+            return fail(E_INVALIDARG, "Spatial ROI must be nonempty and half-open");
+    std::lock_guard lock(activeMutex);
+    if (activeSession) return fail(E_UNEXPECTED, "Configure spatial observation before Begin");
+    spatialOptions = *options;
+    return S_OK;
+}
+
 extern "C" HRESULT NacelleBeginProfileCapture(
     const NacelleProfileOptions* options, NacelleProfileCapture** capture) {
     if (!capture) return fail(E_INVALIDARG, "Capture output is null");
@@ -280,12 +305,14 @@ extern "C" HRESULT NacelleBeginProfileCapture(
         auto handle = std::make_unique<NacelleProfileCapture>();
         handle->session = std::make_shared<nacelle::profile::Session>(options->event_buffer_bytes);
         handle->session->retainedArtifacts = nacelle::profile::artifactStore();
+        if (spatialOptions.flags)
+            handle->session->spatial = std::make_unique<nacelle::profile::SpatialState>(spatialOptions);
         activeSession = handle->session;
         *capture = handle.release();
         recording.store(true, std::memory_order_release);
         return S_OK;
     } catch (const std::bad_alloc&) {
-        return fail(E_OUTOFMEMORY, "Could not allocate profile event buffers");
+        return fail(E_OUTOFMEMORY, "Could not allocate profile capture buffers");
     }
 }
 
@@ -309,7 +336,10 @@ extern "C" HRESULT NacelleEndProfileCapture(
     capture->session->wait();
     summary->recorded_events = capture->session->eventCount;
     summary->dropped_events = capture->session->dropped.load();
-    summary->complete = summary->dropped_events == 0;
+    summary->complete = summary->dropped_events == 0 &&
+        (!capture->session->spatial || capture->session->spatial->complete());
+    if (capture->session->spatial && !capture->session->spatial->complete())
+        std::fprintf(stderr, "[NacelleProfile] Spatial observations incomplete; inspect spatial drop counters\n");
     std::string error;
     try {
         if (!nacelle::profile::writeProfile(path, *capture->session, error))

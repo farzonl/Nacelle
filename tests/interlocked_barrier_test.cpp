@@ -250,6 +250,7 @@ void runInterlockedBarrierForWidth(uint32_t simdWidth) {
 } // namespace
 
 int main() {
+    testutil::SpatialTestCapture spatial;
     if (auto envW = nacelle::getEnv("NACELLE_SIMD_WIDTH"); envW && !envW->empty()) {
         runInterlockedBarrierForWidth(static_cast<uint32_t>(std::stoul(*envW)));
     } else {
@@ -258,6 +259,7 @@ int main() {
         runInterlockedBarrierForWidth(0);
     }
     nacelle::setSimdWidthOverride(0);
+    spatial.finish();
     std::printf("interlocked_barrier_test PASSED\n");
     return 0;
 }

@@ -11,6 +11,22 @@
 
 struct NacelleProfileCapture;
 
+enum NacelleProfileSpatialFlags : uint32_t {
+    NACELLE_PROFILE_SPATIAL_COMPUTE = 1,
+    NACELLE_PROFILE_SPATIAL_PIXEL = 2,
+};
+
+struct NacelleProfileSpatialOptions {
+    uint32_t struct_size = sizeof(NacelleProfileSpatialOptions);
+    uint32_t version = 1;
+    uint32_t flags = 0;
+    uint64_t record_bytes = 8ull * 1024 * 1024;
+    uint32_t sample_stride = 1;
+    // Half-open ROI in tile/threadgroup coordinates; defaults include all cells.
+    uint32_t min_xyz[3]{0, 0, 0};
+    uint32_t max_xyz[3]{UINT32_MAX, UINT32_MAX, UINT32_MAX};
+};
+
 enum NacelleProfileArtifactFlags : uint32_t {
     NACELLE_PROFILE_RETAIN_SHADER_TEXT = 1,
     NACELLE_PROFILE_EMBED_SHADER_SOURCES = 2,
@@ -41,6 +57,9 @@ struct NacelleProfileSummary {
 
 // End/Destroy must be called outside captured work, and serialized for each handle.
 extern "C" {
+// Configure before Begin. Selection limits observation only, never shader execution.
+NACELLE_PROFILE_API HRESULT NacelleConfigureProfileSpatial(
+    const NacelleProfileSpatialOptions* options);
 // Configure before creating pipelines. Sources are private; both opt-ins default OFF.
 // Disabling/reconfiguring releases retained data; captured sessions retain their snapshot.
 NACELLE_PROFILE_API HRESULT NacelleConfigureProfileArtifacts(
