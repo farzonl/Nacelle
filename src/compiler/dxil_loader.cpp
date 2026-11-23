@@ -1,4 +1,5 @@
 #include "dxil_loader.h"
+#include "jit_engine.h"
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -829,6 +830,10 @@ bool loadAndUpgradeDXILImpl(
     }
     for (auto* nmd : mdToDrop) mod->eraseNamedMetadata(nmd);
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (profile::artifactStore())
+        mod->setModuleIdentifier(profileContentIdentity(bytecode.pShaderBytecode, bytecode.BytecodeLength));
+#endif
     outShader.module = std::move(mod);
     return true;
 }

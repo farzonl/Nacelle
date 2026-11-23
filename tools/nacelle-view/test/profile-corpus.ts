@@ -4,7 +4,7 @@ import { FileProfileDataSource } from '../src/file-source';
 import { LIMITS, loadProfile, type ProfileManifest } from '../src/profile';
 import { centralOffsets, fixture, span, trace } from './fixtures';
 
-const nativeManifest: Partial<ProfileManifest> = {
+export const nativeManifest: Partial<ProfileManifest> = {
   build: { compiler: '', operatingSystem: '', architecture: '', revision: '',
     compilerHash: '', targetTriple: '', cpu: '', cpuFeatures: [] },
   captureOptions: { eventBufferBytes: 1024, embeddedSources: false, resourceSnapshots: false },

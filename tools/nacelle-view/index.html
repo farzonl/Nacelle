@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'nonce-nacelle-editor'; style-src-attr 'unsafe-inline'; connect-src 'none'; img-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>Nacelle — Profile Viewer</title>
   </head>
   <body class="min-h-screen antialiased selection:bg-sky-500/25">
@@ -136,6 +136,13 @@
             <p class="max-w-xl text-xs text-[var(--muted)]">Speedscope export is for a locally installed viewer, not an upload. Chrome export always preserves the entire unchanged trace.</p>
           </div>
           <p id="export-status" role="status" aria-live="polite" class="font-mono-tabular mt-2.5 text-xs text-[var(--muted)] empty:hidden"></p>
+          <section id="shader-artifacts" hidden class="mt-4">
+            <h2>Shader artifacts (private, offline)</h2>
+            <label for="artifact-version">Executed entry/version</label>
+            <select id="artifact-version"></select>
+            <p id="artifact-status" role="status" aria-live="polite"></p>
+            <div id="artifact-panes" class="grid grid-cols-1 gap-3 lg:grid-cols-2"></div>
+          </section>
 
           <details class="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-elevated)]/60">
             <summary class="cursor-pointer select-none px-3.5 py-2 text-xs font-semibold uppercase tracking-wider text-[var(--muted)] transition hover:text-[var(--text)]">

@@ -157,6 +157,86 @@ int main(int argc, char** argv) {
             }
         }
         {
+                NacelleProfileArtifactOptions options;
+                options.flags = NACELLE_PROFILE_RETAIN_SHADER_TEXT | NACELLE_PROFILE_EMBED_SHADER_SOURCES;
+                require(NacelleConfigureProfileArtifacts(&options) == S_OK, "Explicit artifact/source retention");
+                const auto store = nacelle::profile::artifactStore();
+                const std::string owner(64, 'a');
+                nacelle::profile::TextArtifact source;
+                source.kind = "hlsl";
+                source.label = "source-1.hlsl";
+                source.text = "float value = 1;\n";
+                const auto sourceId = owner + "-hlsl-" + nacelle::profile::artifactDigest(source.text);
+                nacelle::profile::TextArtifact dxil;
+                dxil.kind = "dxil";
+                dxil.label = "shader.dxil";
+                dxil.text = "%value = fadd float 0.0, 1.0\n";
+                dxil.mappings.push_back({1, 1, sourceId});
+                nacelle::profile::retainArtifacts(store, owner, {source, dxil});
+                const std::string nativeOwner(64, 'b');
+                nacelle::profile::TextArtifact assembly;
+                assembly.kind = "assembly";
+                assembly.label = "text-1.asm";
+                assembly.text = "0: ret\n";
+                assembly.mappings.push_back({1, 0, "", 0, 1});
+                nacelle::profile::retainArtifacts(store, nativeOwner, {assembly});
+                Capture capture;
+                capture.begin();
+                const auto pipeline = nacelle::profile::allocatePipelineIdentity();
+                {
+                    nacelle::profile::Scope scope("Artifact entry selection");
+                    scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute, 1});
+                    scope.setComputeVersion(pipeline, 1, 1,
+                        nacelle::profile::Cache::Miss, owner);
+                }
+                {
+                    nacelle::profile::Scope scope("Promoted artifact entry selection");
+                    scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute, 2});
+                    scope.setComputeVersion(pipeline, 2, 2, nacelle::profile::Cache::Miss, owner, nativeOwner);
+                }
+                options.flags = 0;
+                require(NacelleConfigureProfileArtifacts(&options) == S_OK, "Disable retention without invalidating capture snapshot");
+                NacelleProfileSummary summary;
+                const auto path = directory / "source-artifacts.nacelle-profile";
+                require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_OK,
+                        "Save selected source/IR artifacts after store reset");
+                auto profile = read(path);
+                require(profile.manifest.schemaVersion == 2 && profile.artifacts &&
+                        profile.artifacts->payloads.size() == 3 && profile.artifacts->selections.size() == 2 &&
+                        profile.artifacts->selections[0].nativeAvailability == "tier1-unavailable" &&
+                        profile.artifacts->selections[1].nativeAvailability == "available",
+                        "Declared artifact payloads resolve exact selected entry");
+                std::string error;
+                profile.artifacts->payloads[1].mappings.front().sourceLine = 999;
+                require(!nacelle::profile::validateArtifacts(*profile.artifacts, profile.shaders,
+                    profile.manifest.captureOptions, error),
+                        "Reject source mappings outside embedded source");
+                profile.artifacts->payloads[1].mappings.front().sourceLine = 1;
+                profile.manifest.captureOptions.embeddedSources = false;
+                require(!nacelle::profile::validateArtifacts(*profile.artifacts, profile.shaders,
+                    profile.manifest.captureOptions, error),
+                        "Reject source payloads without explicit consent");
+                options.flags = NACELLE_PROFILE_RETAIN_SHADER_TEXT;
+                options.artifact_bytes = 1024;
+                require(NacelleConfigureProfileArtifacts(&options) == S_OK, "Configure downward retention budget");
+                const auto bounded = nacelle::profile::artifactStore();
+                dxil.mappings.clear();
+                const auto identityBytes = owner.size() * 2 + dxil.kind.size() * 2 + 2 + 16 + dxil.label.size();
+                dxil.text.assign(1024 - identityBytes, 'a');
+                nacelle::profile::retainArtifacts(bounded, owner, {dxil});
+                require(!bounded->overflow && bounded->artifactBytes == 1024 && bounded->groups.size() == 1,
+                        "Exact retention budget is admitted");
+                nacelle::profile::retainArtifacts(bounded, nativeOwner, {dxil});
+                require(bounded->overflow && bounded->groups.size() == 1, "Overflow admits no additional payload");
+                Capture overflow;
+                overflow.begin();
+                const auto failed = directory / "artifact-overflow.nacelle-profile";
+                require(FAILED(NacelleEndProfileCapture(overflow.value, failed.string().c_str(), &summary)) &&
+                        !std::filesystem::exists(failed), "Retention overflow is explicit and creates no partial output");
+                options.flags = 0;
+                require(NacelleConfigureProfileArtifacts(&options) == S_OK, "Clear test retention");
+        }
+        {
             NacelleProfileOptions options;
             options.event_buffer_bytes = 1024 * 1024;
             const auto eventBytes = options.event_buffer_bytes / sizeof(nacelle::profile::Event) *

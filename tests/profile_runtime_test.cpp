@@ -67,7 +67,10 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     signatureDesc.NumParameters = 4;
     signatureDesc.pParameters = parameters;
     auto signature = createSignature(runtime, signatureDesc);
-    auto shader = testutil::loadShaderBytes("vec_add.dxil");
+    const auto* artifactMode = std::getenv("NACELLE_TEST_ARTIFACTS");
+    auto shader = testutil::loadShaderBytes(artifactMode && (std::string_view(artifactMode) == "source" ||
+        std::string_view(artifactMode) == "no-source")
+        ? "vec_add_debug.dxil" : "vec_add.dxil");
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = signature.Get();
     desc.CS = {shader.data(), shader.size()};
@@ -93,7 +96,14 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     auto output = runtime.createBuffer(sizeof(a), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     runtime.uploadBuffer(inputA.Get(), a.data(), sizeof(a));
     runtime.uploadBuffer(inputB.Get(), b.data(), sizeof(b));
-    if (executionCapture) beginCapture(executionCapture);
+    if (executionCapture) {
+        if (artifactMode && std::string_view(artifactMode) == "missing") {
+            NacelleProfileArtifactOptions options;
+            options.flags = NACELLE_PROFILE_RETAIN_SHADER_TEXT;
+            testutil::checkHR(NacelleConfigureProfileArtifacts(&options), "Enable late retention");
+        }
+        beginCapture(executionCapture);
+    }
     runtime.resetCmd();
     runtime.cmdList->SetComputeRootSignature(signature.Get());
     runtime.cmdList->SetPipelineState(executionCapture && mode != "promoted" ? cached.Get() : pso.Get());
@@ -286,6 +296,13 @@ int main(int argc, char** argv) {
     }
     NacelleProfileCapture* capture = nullptr;
     try {
+        const auto* artifactMode = std::getenv("NACELLE_TEST_ARTIFACTS");
+        if (artifactMode && std::string_view(artifactMode) != "missing") {
+            NacelleProfileArtifactOptions options;
+            options.flags = NACELLE_PROFILE_RETAIN_SHADER_TEXT;
+            if (std::string_view(artifactMode) == "source") options.flags |= NACELLE_PROFILE_EMBED_SHADER_SOURCES;
+            testutil::checkHR(NacelleConfigureProfileArtifacts(&options), "Configure retained artifacts");
+        }
         const bool graphicsOnly = mode.starts_with("graphics");
         if (mode == "all" || mode == "promoted" || mode == "cached" ||
             (graphicsOnly && (mode.ends_with("promoted") || mode.ends_with("cached")))) beginCapture(&capture);
@@ -301,7 +318,8 @@ int main(int argc, char** argv) {
         capture = nullptr;
         nacelle::profile::Profile profile;
         std::string error;
-        require(nacelle::profile::readProfile(argv[1], profile, error), error.c_str());
+        const auto parsed = nacelle::profile::readProfile(argv[1], profile, error);
+        require(parsed, error.c_str());
         const auto hasSpan = [&](const char* name) {
             return std::any_of(profile.trace.traceEvents.begin(), profile.trace.traceEvents.end(),
                 [&](const auto& event) { return event.name == name; });
@@ -397,6 +415,32 @@ int main(int argc, char** argv) {
             }
         }
         const auto& build = profile.manifest.build;
+        if (artifactMode) {
+            require(profile.manifest.schemaVersion == 2 && profile.artifacts.has_value(),
+                    "Opt-in capture contains versioned declared artifacts");
+            const auto& artifacts = *profile.artifacts;
+            const auto hasKind = [&](const char* kind) {
+                return std::any_of(artifacts.payloads.begin(), artifacts.payloads.end(),
+                    [&](const auto& payload) { return payload.kind == kind; });
+            };
+            if (std::string_view(artifactMode) == "missing") {
+                require(artifacts.payloads.empty() && artifacts.selections.front().shaderAvailability == "not-retained",
+                        "Pre-existing pipelines without retention do not recompile or invent artifacts");
+            } else {
+                require(hasKind("dxil") && (mode == "all" || hasKind("assembly")),
+                        "Cache-hit entries retain exact shader and native text");
+                require(hasKind("hlsl") == (std::string_view(artifactMode) == "source"),
+                        "Source embedding is explicit and stripped/no-consent input has no source text");
+                if (std::string_view(artifactMode) == "source") {
+                    require(std::any_of(artifacts.payloads.begin(), artifacts.payloads.end(),
+                        [](const auto& payload) { return payload.kind == "dxil" && !payload.mappings.empty(); }),
+                        "Real embedded DXC source/debug locations produce preserved HLSL-to-DXIL mappings");
+                }
+            }
+            for (const auto& payload : artifacts.payloads)
+                require(payload.label.find('/') == std::string::npos && payload.label.find('\\') == std::string::npos,
+                        "Artifact labels never expose host paths");
+        }
         require(!build.compilerHash.empty() && !build.targetTriple.empty() && !build.cpu.empty(),
                 "Compiler and CPU metadata available without requiring pipeline creation");
         require(std::is_sorted(build.cpuFeatures.begin(), build.cpuFeatures.end()),

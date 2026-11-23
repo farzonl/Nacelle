@@ -1,4 +1,5 @@
 #include "mlir_pipeline.h"
+#include "profile_artifacts.h"
 #include "../instrumentation/capture.h"
 
 #include <llvm/IR/Module.h>
@@ -161,6 +162,9 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
     const std::string& extraEntryName) {
     NACELLE_PROFILE_SCOPE("Import and lift DXIL to MLIR");
     configureNacelleMLIRContext(mlirCtx);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto profileIdentity = llvmModule->getModuleIdentifier();
+#endif
 
     auto mlirMod = mlir::translateLLVMIRToModule(std::move(llvmModule), &mlirCtx);
     if (!mlirMod) {
@@ -192,6 +196,9 @@ mlir::OwningOpRef<mlir::ModuleOp> importAndLiftDXILToSCF(
         outError = "MLIR module verification failed after ControlFlowToSCF";
         return nullptr;
     }
+#endif
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    retainProfileMLIR(*mlirMod, profileIdentity);
 #endif
     return mlirMod;
 }

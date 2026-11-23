@@ -351,9 +351,15 @@ endfunction()
 add_nacelle_test(d3d12_api_test d3d12_api_test.cpp)
 add_nacelle_test(compute_dispatch_test compute_dispatch_test.cpp)
 if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
+    add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Od -Zi -Qembed_debug
+            -Fo "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl")
+    add_custom_target(profile_debug_shaders DEPENDS "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil")
     foreach(linkage IN ITEMS static shared)
         add_executable(profile_runtime_${linkage}_test profile_runtime_test.cpp)
         add_dependencies(profile_runtime_${linkage}_test nacelle_test_shaders)
+        add_dependencies(profile_runtime_${linkage}_test profile_debug_shaders)
         target_compile_definitions(profile_runtime_${linkage}_test PRIVATE
             NACELLE_SHADER_BIN_DIR="${NACELLE_SHADER_BIN_DIR}")
         target_include_directories(profile_runtime_${linkage}_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -368,6 +374,21 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                 "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}.nacelle-profile"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        foreach(artifacts IN ITEMS source stripped no-source missing)
+            add_test(NAME profile_runtime_${linkage}_artifacts_${artifacts}_test
+                COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_ARTIFACTS=${artifacts}"
+                    "${CMAKE_COMMAND}"
+                    "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-artifacts-${artifacts}.nacelle-profile"
+                    -DCAPTURE_MODE=cached -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
+        foreach(cache IN ITEMS promoted disk graphics-cached graphics-extended-cached graphics-mesh-cached)
+            add_test(NAME profile_runtime_${linkage}_artifacts_${cache}_test
+                COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_ARTIFACTS=stripped"
+                    "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-artifacts-${cache}.nacelle-profile"
+                    "-DCAPTURE_MODE=${cache}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
         foreach(stage IN ITEMS compute graphics tier1 promoted cached disk
                                graphics-tier1 graphics-promoted graphics-cached graphics-disk graphics-mixed-cache
                                graphics-extended graphics-extended-promoted graphics-extended-cached

@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 import { fixture, trace } from '../test/fixtures';
 import { profileCorpus } from '../test/profile-corpus';
+import { artifactFixture } from '../test/artifact-fixtures';
 
 const origin = 'http://127.0.0.1:4173';
 const dist = resolve('dist');
@@ -157,6 +158,7 @@ test('cancels decoding, discards its result, and loads the next checksummed file
         document.querySelector<HTMLButtonElement>('#cancel-load')!.click();
       }, { once: true });
     });
+
     await page.locator('#profile-file').setInputFiles({
       name: 'cancel.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(fixture()),
     });
@@ -170,3 +172,28 @@ test('cancels decoding, discards its result, and loads the next checksummed file
     await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
     await expect(page.locator('#summary')).toContainText('Trace events: 1');
   });
+
+test('navigates offline read-only shader panes by exact version and preserved source mappings', async ({ page }) => {
+  await page.locator('#profile-file').setInputFiles({
+    name: 'shader-artifacts.nacelle-profile', mimeType: 'application/zip', buffer: Buffer.from(await artifactFixture()),
+  });
+  await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+  await expect(page.locator('#shader-artifacts')).toBeVisible();
+  await expect(page.locator('[data-artifact-kind="assembly"]')).toContainText('Unavailable');
+  await expect(page.locator('[data-artifact-kind="hlsl"] .cm-content')).toHaveAttribute('contenteditable', 'false');
+  expect(await page.locator('[data-artifact-kind="hlsl"] img').count()).toBe(0);
+  await page.locator('[data-artifact-kind="hlsl"] .cm-line').nth(1).click();
+  await expect(page.locator('#artifact-status')).toContainText('source line 2');
+  await expect(page.locator('[data-artifact-kind="dxil"] .cm-activeLine')).toContainText('%b');
+  await page.locator('#artifact-version').selectOption('1');
+  await expect(page.locator('[data-artifact-kind="assembly"] .cm-content')).toContainText('0: ret');
+  await expect(page.locator('#artifact-status')).toContainText('native: available');
+  const capture = process.env.NACELLE_NATIVE_ARTIFACT_PROFILE;
+  if (capture) {
+    await page.locator('#profile-file').setInputFiles(capture);
+    await expect(page.locator('#status')).toHaveAttribute('data-state', 'complete');
+    await expect(page.locator('[data-artifact-kind="hlsl"] .cm-content')).toContainText('CSMain');
+    await expect(page.locator('[data-artifact-kind="assembly"]')).toContainText('0:');
+    await expect(page.locator('#artifact-status')).toContainText('native: available');
+  }
+});
