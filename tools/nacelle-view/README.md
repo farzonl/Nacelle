@@ -59,6 +59,24 @@ Speedscope's documented offline CLI and evented format were selected for this
 bounded increment. Bundled offline UI integration remains future work; neither
 hosted Perfetto nor hosted Speedscope is contacted by this viewer.
 
+## Shader artifact panes
+
+Opt-in version-2 captures expose five pinned, locally bundled CodeMirror
+read-only panes: HLSL, DXIL, MLIR, optimized LLVM and native assembly. The
+pipeline/stage/version/Tier/cache/SIMD selector resolves the **captured** version,
+not the latest promoted entry. Missing panes explicitly say unavailable.
+Clicking an HLSL/DXIL line synchronizes only genuinely retained source mappings;
+optimized/unmapped panes stay unchanged. Lane data is unavailable. Source text
+is rendered as text, never HTML or executable code; editor styles use a fixed
+CSP nonce. No source lookup, uploads, external assets or telemetry are added.
+
+See [collection and privacy details](../nacelle-dbg/README.md#opt-in-shader-text-and-source-retention)
+for the separate default-OFF text/source flags, supported DXC debug options,
+bounded retention and exact artifact identities. Legacy captures remain
+supported and do not show the artifact section. Worker decoding validates
+declared checksums, source consent, owner references and mapping/text budgets
+before presenting any panes. Editors are destroyed on profile replacement.
+
 ## Build and test
 
 Requires Node.js 22 and npm:

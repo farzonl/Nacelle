@@ -12,6 +12,7 @@
 #include <tuple>
 #include <vector>
 #include "profile_format.h"
+#include "artifacts.h"
 
 namespace nacelle::profile {
 
@@ -75,6 +76,7 @@ struct Session {
     std::vector<uint64_t> codeSelectionParents;
     ShaderMetadata shaders;
     bool shaderMetadataOverflow = false;
+    std::shared_ptr<ArtifactStore> retainedArtifacts;
 };
 
 struct Work {

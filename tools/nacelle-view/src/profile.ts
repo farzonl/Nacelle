@@ -1,5 +1,7 @@
+import { validateArtifacts, type ArtifactMetadata } from './artifacts';
+
 export interface ProfileManifest {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   kind: 'profile';
   replayable: false;
   complete: boolean;
@@ -9,7 +11,7 @@ export interface ProfileManifest {
   timestampUnit: 'ns';
   build: Record<string, unknown>;
   captureOptions: Record<string, unknown>;
-  entries: { path: string; encoding: 'json' | 'zstd'; uncompressedSize: number }[];
+  entries: { path: string; encoding: 'json' | 'zstd'; uncompressedSize: number; digest?: string }[];
 }
 
 /** Entry buffers contain decoded bytes, regardless of storage encoding. */
@@ -48,7 +50,7 @@ export function parseJson(data: ArrayBuffer | Uint8Array): unknown {
 
 export function validateManifest(value: unknown): ProfileManifest {
   requireValid(object(value), 'Manifest must be an object.');
-  requireValid(value.schemaVersion === 1 && value.kind === 'profile'
+  requireValid((value.schemaVersion === 1 || value.schemaVersion === 2) && value.kind === 'profile'
     && value.replayable === false && typeof value.complete === 'boolean'
     && value.clock === 'monotonic' && value.timestampUnit === 'ns',
   'Unsupported or invalid profile manifest schema.');
@@ -78,6 +80,19 @@ export function validateManifest(value: unknown): ProfileManifest {
   requireValid(value.entries.some(e => e.path === 'trace.json.zst' && e.encoding === 'zstd')
     && value.entries.some(e => e.path === 'shaders.json' && e.encoding === 'json'),
   'Manifest must declare trace.json.zst and shaders.json with the correct encodings.');
+  if (value.schemaVersion === 2) {
+    const artifacts = value.entries.find(entry => entry.path === 'artifacts.json');
+    requireValid(artifacts?.encoding === 'json' && typeof artifacts.digest === 'string'
+      && /^[0-9a-f]{16}$/.test(artifacts.digest) && value.entries.length === 3,
+    'Artifact manifest requires one declared checksummed artifacts.json.');
+    const options = value.captureOptions;
+    requireValid(typeof options.embeddedSources === 'boolean' &&
+      Number.isSafeInteger(options.artifactBytes) && (options.artifactBytes as number) > 0 &&
+      (options.artifactBytes as number) <= 64 * 1024 * 1024 &&
+      Number.isSafeInteger(options.sourceBytes) && (options.sourceBytes as number) > 0 &&
+      (options.sourceBytes as number) <= 16 * 1024 * 1024,
+    'Invalid artifact/source budgets or consent.');
+  }
   return value as unknown as ProfileManifest;
 }
 
@@ -102,6 +117,7 @@ export interface Profile {
   trace: Trace;
   traceBytes: ArrayBuffer;
   shaders: ShaderMetadata;
+  artifacts?: ArtifactMetadata;
 }
 
 export interface CodeVersion {
@@ -243,7 +259,9 @@ export async function loadProfile(source: ProfileDataSource): Promise<Profile> {
     requireValid(trace.traceEvents.reduce((count, event) => count + Number(event.ph === 'X'), 0) === manifest.recordedEvents,
       'Trace event count disagrees with manifest.');
     const shaders = validateShaderMetadata(parseJson(await source.readEntry('shaders.json')), trace);
-    return { manifest, trace, traceBytes, shaders };
+    const artifacts = manifest.schemaVersion === 2
+      ? await validateArtifacts(await source.readEntry('artifacts.json'), manifest, shaders) : undefined;
+    return { manifest, trace, traceBytes, shaders, artifacts };
   } finally {
     source.close();
   }

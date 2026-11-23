@@ -599,6 +599,7 @@ jobs:
           NACELLE_NATIVE_CODE_VERSIONS: "1"
           NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
           NACELLE_NATIVE_READER: "${{ github.workspace }}/build-profile/tools/nacelle-dbg/nacelle-dbg${{ matrix.exe }}"
+          NACELLE_NATIVE_ARTIFACT_PROFILE: "${{ github.workspace }}/build-profile/tests/static-artifacts-source.nacelle-profile"
         run: npm test
 
       - name: Build profile viewer

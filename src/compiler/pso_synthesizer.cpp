@@ -1,4 +1,5 @@
 #include "pso_synthesizer.h"
+#include "profile_artifacts.h"
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -4269,7 +4270,9 @@ bool compileGraphicsPSO(
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     const auto shaderIdentity = [](const D3D12_SHADER_BYTECODE& shader) {
-        return profileContentIdentity(shader.pShaderBytecode, shader.BytecodeLength);
+        auto identity = profileContentIdentity(shader.pShaderBytecode, shader.BytecodeLength);
+        retainProfileShader(shader, identity);
+        return identity;
     };
     outPSO.profileVertexShaderId = shaderIdentity(desc.VS);
     outPSO.profilePixelShaderId = shaderIdentity(desc.PS);

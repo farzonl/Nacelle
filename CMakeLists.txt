@@ -176,6 +176,8 @@ set(NACELLE_COMPILER_HASH_INPUTS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/dxil_loader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/jit_engine.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/profile_artifacts.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/profile_artifacts.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/mlir_pipeline.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/pso_synthesizer.cpp"
@@ -476,11 +478,21 @@ endif()
 
 # 5. CLI Tools
 if(NACELLE_ENABLE_INSTRUMENTATION)
+    target_sources(nacelle_objs PRIVATE src/compiler/profile_artifacts.cpp)
+    target_sources(nacelle_d3d12 PRIVATE src/compiler/profile_artifacts.cpp)
+    if(NOT LLVM_ENABLE_RTTI)
+        if(MSVC)
+            set_source_files_properties(src/compiler/profile_artifacts.cpp PROPERTIES COMPILE_OPTIONS "/GR-")
+        else()
+            set_source_files_properties(src/compiler/profile_artifacts.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+        endif()
+    endif()
     target_compile_definitions(nacelle_objs PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
     target_compile_definitions(nacelle_d3d12 PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
     target_link_libraries(nacelle PUBLIC nacelle_profile_capture)
     target_link_libraries(nacelle_d3d12 PUBLIC nacelle_profile_capture)
     target_compile_definitions(nacelle_profile_capture PRIVATE NACELLE_PROFILE_EXPORTS=1)
+    target_compile_definitions(nacelle_profile_io PRIVATE NACELLE_PROFILE_EXPORTS=1)
 endif()
 if(NACELLE_BUILD_PROFILE_TESTS)
     enable_testing()
