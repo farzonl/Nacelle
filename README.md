@@ -25,8 +25,10 @@ Optional [offline shader/runtime profiling](tools/nacelle-dbg/README.md) provide
 local `.nacelle-profile` capture, Chrome Trace export, and a
 [static profile viewer](tools/nacelle-view/README.md). Instrumentation is OFF by
 default. Separately consented [compute/buffer replay](tools/nacelle-replay/README.md)
-supports same-environment, fresh-state output checks. Debugger stepping, graphics
-replay, heatmaps, and differential testing are not yet included.
+supports same-environment, fresh-state output checks. Opt-in
+[native shader debugging with LLDB](tools/nacelle-dbg/README.md#native-shader-debugging-lldb)
+supports Linux x86_64 instruction breakpoints, stepping and frames.
+HLSL source/lane stepping, graphics replay, and differential testing are not yet included.
 
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 

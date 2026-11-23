@@ -189,6 +189,12 @@ set(NACELLE_COMPILER_HASH_INPUTS
     "${MATH_SIMD_BC}"
     "${RAYQUERY_RT_BC}"
 )
+if(NACELLE_ENABLE_INSTRUMENTATION)
+    list(APPEND NACELLE_COMPILER_HASH_INPUTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/native_debug.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/native_debug.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nacelle/native_debug.h")
+endif()
 string(JOIN "\n" COMPILER_HASH_MANIFEST_CONTENT
     "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}"
     ${NACELLE_COMPILER_HASH_INPUTS}
@@ -478,18 +484,23 @@ endif()
 
 # 5. CLI Tools
 if(NACELLE_ENABLE_INSTRUMENTATION)
+    if(NOT LLVM_LINK_LLVM_DYLIB)
+        llvm_map_components_to_libnames(native_debug_llvm_libs RuntimeDyld)
+        target_link_libraries(nacelle PRIVATE ${native_debug_llvm_libs})
+        target_link_libraries(nacelle_d3d12 PRIVATE ${native_debug_llvm_libs})
+    endif()
     set(replay_sources src/instrumentation/replay_capture.cpp src/instrumentation/replay_execute.cpp
         src/compiler/replay_shader.cpp)
-    target_sources(nacelle_objs PRIVATE src/compiler/profile_artifacts.cpp ${replay_sources})
-    target_sources(nacelle_d3d12 PRIVATE src/compiler/profile_artifacts.cpp ${replay_sources})
+    target_sources(nacelle_objs PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${replay_sources})
+    target_sources(nacelle_d3d12 PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${replay_sources})
     get_target_property(replay_build_definitions nacelle_profile_io COMPILE_DEFINITIONS)
     target_compile_definitions(nacelle_objs PRIVATE ${replay_build_definitions} NACELLE_PROFILE_EXPORTS=1)
     target_compile_definitions(nacelle_d3d12 PRIVATE ${replay_build_definitions} NACELLE_PROFILE_EXPORTS=1)
     if(NOT LLVM_ENABLE_RTTI)
         if(MSVC)
-            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "/GR-")
+            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "/GR-")
         else()
-            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
         endif()
     endif()
     target_compile_definitions(nacelle_objs PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)

@@ -1,5 +1,6 @@
 #include "jit_engine.h"
 #include "profile_artifacts.h"
+#include "native_debug.h"
 #include "../instrumentation/capture.h"
 #include "../rasterizer/raytracing_bvh.h"
 
@@ -438,6 +439,7 @@ struct JitRuntime {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     std::mutex profileObjectMutex;
     std::unordered_map<uint64_t, std::string> profileObjectIds;
+    std::shared_ptr<llvm::JITEventListener> nativeDebugListener;
 #endif
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::unordered_map<std::string, InMemCacheEntry> memCache;
@@ -576,14 +578,21 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
     }
 #endif
 
-    auto jitOrErr = llvm::orc::LLJITBuilder()
-                        .setJITTargetMachineBuilder(std::move(*jtmbOrErr))
-                        .create();
+    llvm::orc::LLJITBuilder builder;
+    builder.setJITTargetMachineBuilder(std::move(*jtmbOrErr));
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze() && !native_debug::configureBuilder(builder, rt.nativeDebugListener, outError))
+        return;
+#endif
+    auto jitOrErr = builder.create();
     if (!jitOrErr) {
         outError = llvm::toString(jitOrErr.takeError());
         return;
     }
     rt.jit = std::move(*jitOrErr);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::enabled()) native_debug::installObjectAdmission(*rt.jit);
+#endif
 
     {
         auto& es = rt.jit->getExecutionSession();
@@ -748,6 +757,12 @@ bool emitObjectBytesO3(
 
 void runTier1Optimize(llvm::Module& mod) {
     NACELLE_PROFILE_SCOPE("Optimize Tier 1");
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::enabled()) {
+        native_debug::prepareModule(mod);
+        return;
+    }
+#endif
     llvm::FunctionAnalysisManager fam;
 
 #if LLVM_VERSION_MAJOR >= 24
@@ -766,6 +781,14 @@ void runTier1Optimize(llvm::Module& mod) {
             fpm.run(fn, fam);
         }
     }
+}
+
+bool shouldScheduleTier2() {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) return false;
+#endif
+    const char* disabled = std::getenv("NACELLE_DISABLE_TIER2");
+    return !(disabled && disabled[0] == '1');
 }
 
 bool writeFileAtomic(const std::filesystem::path& dst, const void* data, size_t size, uint64_t tmpId) {
@@ -1005,6 +1028,7 @@ std::string profileContentIdentity(const void* bytes, size_t size) {
 }
 
 std::string profileNativeObjectIdentity(uint64_t address) {
+    if (native_debug::enabled()) return native_debug::objectIdentity(address);
     auto& runtime = getJitRuntime();
     std::lock_guard lock(runtime.profileObjectMutex);
     const auto entry = runtime.profileObjectIds.find(address);
@@ -1019,6 +1043,9 @@ void computeComputePSOHash(
     uint64_t& outLo,
     uint64_t& outHi) {
     HashFeed feed;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+#endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
     feed.add(simdWidth);
@@ -1040,6 +1067,9 @@ void computeGraphicsPSOHash(
     uint64_t& outHi,
     const MeshShaderStages& meshStages) {
     HashFeed feed;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+#endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
     feed.add(simdWidth);
@@ -1120,6 +1150,9 @@ void computeVertexStageHash(
     uint64_t& outLo,
     uint64_t& outHi) {
     HashFeed feed;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+#endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
     feed.add(simdWidth);
@@ -1610,6 +1643,9 @@ bool tryLoadComputePSOFromCache(
     uint64_t hashLo, uint64_t hashHi,
     const std::string& symbolName,
     CompiledComputePSO& outPSO) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) return false;
+#endif
     JitRuntime& rt = getJitRuntime();
     std::filesystem::path dir = getCacheDirectory();
     std::string key = cacheKeyFor(dir, hashLo, hashHi);
@@ -1663,6 +1699,9 @@ bool tryLoadVertexStageFromCache(
     , uint8_t* outProfileTier
 #endif
     ) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) return false;
+#endif
     JitRuntime& rt = getJitRuntime();
     std::filesystem::path dir = getCacheDirectory();
     std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
@@ -1733,6 +1772,9 @@ bool tryLoadGraphicsPSOFromCache(
     const std::string& vsSym,
     const std::string& psSym,
     CompiledGraphicsPSO& outPSO) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) return false;
+#endif
     JitRuntime& rt = getJitRuntime();
     std::filesystem::path dir = getCacheDirectory();
     std::string key = cacheKeyFor(dir, hashLo, hashHi);
@@ -1838,8 +1880,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
     CompiledComputePSO& outPSO,
     std::string& outError) {
     JitRuntime& rt = getJitRuntime();
-    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
-    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+    const bool scheduleTier2 = shouldScheduleTier2();
 
     // Snapshot unoptimized IR bitcode before Tier-1 mutates `llvmMod`.
     std::string bcStr;
@@ -1872,6 +1913,9 @@ bool jitCompileComputeTier1AndScheduleTier2(
             return false;
         }
         tier1Addr = symOrErr->getValue();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (!native_debug::verifyEntry(tier1Addr, outError)) return false;
+#endif
     }
 
     outPSO.symbolName = symbolName;
@@ -1944,9 +1988,14 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     const CachedPSOMeta& meta,
     CompiledGraphicsPSO& outPSO,
     std::string& outError) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze() && (meta.hasGS || meta.hasTess || meta.hasMS || meta.hasAS)) {
+        outError = "Native debug currently supports compute and VS/PS pipelines only";
+        return false;
+    }
+#endif
     JitRuntime& rt = getJitRuntime();
-    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
-    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+    const bool scheduleTier2 = shouldScheduleTier2();
 
     std::string bcStr;
     if (scheduleTier2) {
@@ -1985,6 +2034,9 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
                 return false;
             }
             outAddr = r->getValue();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (!native_debug::verifyEntry(outAddr, outError)) return false;
+#endif
             return true;
         };
         if (meta.hasMS) {
@@ -2101,8 +2153,7 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
     std::string& outError) {
     g_vertexStageCompileCount.fetch_add(1, std::memory_order_relaxed);
     JitRuntime& rt = getJitRuntime();
-    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
-    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+    const bool scheduleTier2 = shouldScheduleTier2();
 
     std::string bcStr;
     if (scheduleTier2) {
@@ -2150,6 +2201,9 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
                 return false;
             }
             vsAddr = symOrErr->getValue();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (!native_debug::verifyEntry(vsAddr, outError)) return false;
+#endif
 
             InMemVSCacheEntry entry;
             entry.meta = vsMeta;
@@ -2242,8 +2296,7 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
     CompiledGraphicsPSO& outPSO,
     std::string& outError) {
     JitRuntime& rt = getJitRuntime();
-    const char* noT2 = std::getenv("NACELLE_DISABLE_TIER2");
-    const bool scheduleTier2 = !(noT2 && noT2[0] == '1');
+    const bool scheduleTier2 = shouldScheduleTier2();
 
     std::string bcStr;
     if (scheduleTier2) {
@@ -2287,6 +2340,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
             return false;
         }
         psAddr = symOrErr->getValue();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (!native_debug::verifyEntry(psAddr, outError)) return false;
+#endif
 
         auto vsIt = rt.vsMemCache.find(vsKey);
         if (vsIt != rt.vsMemCache.end()) {
@@ -2510,6 +2566,12 @@ uint64_t getVertexStageCompileCount() {
 
 bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>& outBlob) {
     outBlob.clear();
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) {
+        std::fprintf(stderr, "native-debug: Debug objects are not exportable optimized cache blobs\n");
+        return false;
+    }
+#endif
     std::filesystem::path dir = getCacheDirectory();
     std::string hex = hashToHex128(hashLo, hashHi);
     std::string key = (dir / hex).string();
@@ -2566,6 +2628,12 @@ bool exportCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, std::vector<uint8_t>&
 }
 
 bool importCachedPSOBlob(uint64_t hashLo, uint64_t hashHi, const uint8_t* data, size_t size) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) {
+        std::fprintf(stderr, "native-debug: Optimized cache blob import is disabled\n");
+        return false;
+    }
+#endif
     if (!data || size < sizeof(CachedPSOMeta) + sizeof(uint32_t)) return false;
     CachedPSOMeta meta{};
     std::memcpy(&meta, data, sizeof(CachedPSOMeta));
@@ -2611,6 +2679,12 @@ bool compileDxrShader(
     DxrShaderFn& outFn,
     std::string& outError) {
     outFn = nullptr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (native_debug::freeze()) {
+        outError = "Native debug does not support raytracing pipelines";
+        return false;
+    }
+#endif
     const std::string symbolName = "nacelle_dxr_" + exportName;
 
     HashFeed feed;

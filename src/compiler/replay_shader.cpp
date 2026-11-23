@@ -1,6 +1,7 @@
 #include "../instrumentation/replay_capture.h"
 #include "dxil_loader.h"
 #include "jit_engine.h"
+#include "native_debug.h"
 #include "../common/fp_env.h"
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -62,6 +63,7 @@ Environment currentEnvironment() {
         } else result.compilerOptions.push_back(std::string(name) + "=" + (value && value[0] == '1' ? "1" : "0"));
     }
 
+    if (native_debug::enabled()) result.compilerOptions.push_back("native-debug-pinned-v1");
     return result;
 }
 
