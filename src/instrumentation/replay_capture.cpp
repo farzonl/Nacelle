@@ -502,10 +502,12 @@ void observeCommand(const RecordedCommand& command, const ExecutionState& state)
                 for (const auto& barrier : value.barriers) {
                     if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
                         capture.command("barrier", {0, capture.resource(static_cast<NacelleResource*>(barrier.Transition.pResource)),
-                            barrier.Transition.Subresource, barrier.Transition.StateBefore, barrier.Transition.StateAfter, barrier.Flags});
+                            barrier.Transition.Subresource, static_cast<uint32_t>(barrier.Transition.StateBefore),
+                            static_cast<uint32_t>(barrier.Transition.StateAfter), static_cast<uint32_t>(barrier.Flags)});
                     else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
                         capture.command("barrier", {1, barrier.UAV.pResource ?
-                            capture.resource(static_cast<NacelleResource*>(barrier.UAV.pResource)) : 0, 0, 0, 0, barrier.Flags});
+                            capture.resource(static_cast<NacelleResource*>(barrier.UAV.pResource)) : 0, 0, 0, 0,
+                            static_cast<uint32_t>(barrier.Flags)});
                     else capture.fail("Replay aliasing barriers are unsupported");
                 }
             } else capture.fail("Unsupported command in compute replay transaction");
