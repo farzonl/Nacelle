@@ -8,6 +8,36 @@
 #include <vector>
 
 int main() {
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC first{};
+        first.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        first.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+        auto second = first;
+        const auto poisonPadding = [](auto& value, size_t begin, size_t end) {
+            auto* bytes = reinterpret_cast<unsigned char*>(&value);
+            std::memset(bytes + begin, 0xa5, end - begin);
+        };
+        poisonPadding(second.DepthStencilState,
+            offsetof(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + sizeof(UINT8),
+            offsetof(D3D12_DEPTH_STENCIL_DESC, FrontFace));
+        for (auto& target : second.BlendState.RenderTarget) {
+            poisonPadding(target,
+                offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + sizeof(UINT8),
+                sizeof(target));
+        }
+        nacelle::RootSignatureLayout layout;
+        uint64_t firstLo, firstHi, secondLo, secondHi;
+        nacelle::computeGraphicsPSOHash(first, layout, 8, firstLo, firstHi);
+        nacelle::computeGraphicsPSOHash(second, layout, 8, secondLo, secondHi);
+        assert(firstLo == secondLo && firstHi == secondHi);
+        second.DepthStencilState.StencilReadMask ^= 1;
+        nacelle::computeGraphicsPSOHash(second, layout, 8, secondLo, secondHi);
+        assert(firstLo != secondLo || firstHi != secondHi);
+        second = first;
+        second.BlendState.RenderTarget[0].RenderTargetWriteMask ^= 1;
+        nacelle::computeGraphicsPSOHash(second, layout, 8, secondLo, secondHi);
+        assert(firstLo != secondLo || firstHi != secondHi);
+    }
     // 0. Verify build-time compiler SHA-256 stamp
     {
         const char* buildHash = nacelle::getCompilerBuildHash();
