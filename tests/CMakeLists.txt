@@ -359,6 +359,24 @@ endfunction()
 add_nacelle_test(d3d12_api_test d3d12_api_test.cpp)
 add_nacelle_test(compute_dispatch_test compute_dispatch_test.cpp)
 if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        find_program(NACELLE_LLDB_EXECUTABLE NAMES lldb lldb-21 lldb-20 lldb-19 lldb-18)
+        if(NOT NACELLE_LLDB_EXECUTABLE)
+            message(FATAL_ERROR "Native-debug acceptance requires LLDB; set NACELLE_LLDB_EXECUTABLE")
+        endif()
+        add_nacelle_test(native_debug_test native_debug_test.cpp)
+        target_include_directories(native_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+        target_link_libraries(native_debug_test PRIVATE ${NACELLE_LLVM_LIBS})
+        if(NOT LLVM_ENABLE_RTTI)
+            target_compile_options(native_debug_test PRIVATE -fno-rtti)
+        endif()
+        add_test(NAME native_debug_budget_test COMMAND native_debug_test budget)
+        add_test(NAME native_debug_lldb_unload_test
+            COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:native_debug_test>"
+                "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DSTAGE=lifetime -DLINKAGE=static
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_native_debug_test.cmake")
+        set_tests_properties(native_debug_lldb_unload_test PROPERTIES TIMEOUT 150 RESOURCE_LOCK native_debugger)
+    endif()
     add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil"
         COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Od -Zi -Qembed_debug
             -Fo "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl"
@@ -396,6 +414,8 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             endforeach()
         endforeach()
         add_executable(profile_runtime_${linkage}_test profile_runtime_test.cpp)
+        target_include_directories(profile_runtime_${linkage}_test PRIVATE
+            "${CMAKE_SOURCE_DIR}/third_party/thread-pool/include")
         add_dependencies(profile_runtime_${linkage}_test nacelle_test_shaders)
         add_dependencies(profile_runtime_${linkage}_test profile_debug_shaders)
         target_compile_definitions(profile_runtime_${linkage}_test PRIVATE
@@ -406,6 +426,18 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         else()
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle_d3d12 nacelle_profile_io)
             target_compile_definitions(profile_runtime_${linkage}_test PRIVATE NACELLE_PROFILE_SHARED_RUNTIME=1)
+        endif()
+        if(NACELLE_LLDB_EXECUTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+           CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+            foreach(stage IN ITEMS cs vs ps)
+                add_test(NAME native_debug_lldb_${linkage}_${stage}_test
+                    COMMAND "${CMAKE_COMMAND}"
+                        "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                        "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DSTAGE=${stage}" "-DLINKAGE=${linkage}"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/run_native_debug_test.cmake")
+                set_tests_properties(native_debug_lldb_${linkage}_${stage}_test PROPERTIES
+                    TIMEOUT 300 RESOURCE_LOCK native_debugger)
+            endforeach()
         endif()
         add_test(NAME profile_runtime_${linkage}_test
             COMMAND "${CMAKE_COMMAND}"

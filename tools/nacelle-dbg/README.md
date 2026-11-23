@@ -53,6 +53,188 @@ Separately consented [compute/buffer replay](../nacelle-replay/README.md) uses a
 different `.nacelle-replay` format and runtime-linked CLI. The standalone reader,
 ordinary profile files, and browser viewer do not execute captured code.
 
+## Native shader debugging (LLDB)
+
+LLDB is the primary supported native shader debugger, with first-party
+breakpoint, instruction-step, stack/frame, code-unload and output-preservation
+tests. The initial verified platform is **Linux x86_64**, using the
+repository-pinned LLVM 24 runtime toolchain. This is native debugging of the
+lowered compute/VS/PS entry points, not HLSL source/lane/local-variable debugging.
+macOS, Windows, other architectures, geometry/tessellation/mesh/raytracing
+pipelines and optimized source debugging are not supported by this mode.
+Unsupported configuration/pipelines fail explicitly.
+
+Build the instrumented runtime as above, with LLDB installed. Linux runtime
+profile-test configuration requires `lldb` (override its path with
+`-DNACELLE_LLDB_EXECUTABLE=/path/to/lldb`); a missing debugger is not an acceptance
+pass. The standalone offline reader still needs no debugger or LLVM.
+
+Include [native_debug.h](../../include/nacelle/native_debug.h) in the application
+and configure **before any pipeline compilation, hash or cache lookup**:
+
+```cpp
+NacelleNativeDebugOptions debug;
+debug.enabled = 1;
+HRESULT status = NacelleConfigureNativeDebug(&debug);
+// Check status before creating pipelines; failures are also logged.
+```
+
+The mode is OFF by default, even with instrumentation ON. Configuration freezes
+on first compiler use, including ordinary compilation; late changes and disabling
+afterward are rejected. Restart the process to change policy. It applies to one
+linked runtime instance; do not mix static/shared Nacelle runtimes.
+
+The debug path skips the Tier-1 cleanup optimizer, uses native O0 emission,
+retains frame pointers/unwind tables and pins code without asynchronous O3
+promotion. Required DXIL/MLIR lowering and SIMD packetization still occur:
+this is not a promise of DXC/HLSL O0 source mappings. Group/quad/wave execution
+and scheduling are unchanged; the debugger stops real host threads, not an
+independently executed selected shader lane. Host-thread selection is not HLSL
+lane selection. Pausing all threads can delay application fences/timeouts.
+
+Optimized disk/PSO caches and cached-blob import/export are bypassed/rejected;
+debug objects are never written into them. Debug VS sharing is only between
+pinned entries created in the same debug runtime. Pipeline hashes include the
+debug policy and replay environment metadata identifies it explicitly.
+Ordinary replay currently requires Tier 2 and therefore rejects pinned Tier-1
+debug entries; do not treat native debugging as a replay guarantee.
+
+### Launch, break, step, inspect, continue
+
+The existing runtime fixture gives a reproducible repository-built workload:
+
+```sh
+cmake --build build/profile --target profile_runtime_static_test \
+  profile_runtime_shared_test native_debug_test
+lldb --no-lldbinit -- build/profile/tests/profile_runtime_static_test unused native-compute
+```
+
+Inside LLDB:
+
+```text
+settings set symbols.enable-external-lookup false
+settings set symbols.enable-lldb-index-cache false
+settings set target.disable-aslr false
+settings set plugin.jit-loader.gdb.enable on
+breakpoint set --func-regex ^nacelle_cs_
+run
+frame info
+register read pc
+thread step-inst
+thread step-inst
+thread backtrace
+breakpoint disable
+continue
+```
+
+A pending breakpoint before compilation is expected. On registration, LLDB adds
+the JIT entry location; it must then stop in `JIT(...)` at the named shader.
+The fixture must finish with `NATIVE DEBUG OUTPUT PASS` and exit 0.
+Use `native-graphics` instead of `native-compute` and `^nacelle_vs_` or
+`^nacelle_ps_` to reproduce VS/PS debugging. These fixtures use stripped DXIL,
+demonstrating that native symbol debugging does not pretend HLSL information
+exists. `frame variable` cannot provide unavailable HLSL locals or lane values.
+
+External symbol lookup is disabled to keep the workflow local (and avoid
+external-symbol-fetch failures in the tested distro LLDB 21). Index caching is
+disabled to avoid persisting private JIT symbols. `target.disable-aslr false`
+avoids requiring permission to change process ASLR; no host security setting
+needs to be relaxed.
+
+For **attach**, the same fixture can wait after compilation and before shader
+execution, printing its PID:
+
+```sh
+NACELLE_TEST_NATIVE_ATTACH=1 build/profile/tests/profile_runtime_static_test unused native-compute
+```
+
+In another terminal start `lldb --no-lldbinit`, apply the same symbol/cache/JIT-loader settings,
+then `process attach --pid <application-pid>`. LLDB discovers existing JIT
+registrations. Use `image lookup -rn '^nacelle_cs_'` to find live entries and
+`breakpoint set --name <exact-symbol>` (or `breakpoint set --address <address>`)
+before continuing, then press Enter in the application terminal. Break, step,
+inspect frames and continue as in the launch workflow. For a different
+application, use an application-controlled safe point with compiled pipelines
+still alive. Attach is subject to normal OS ptrace permissions;
+launch the application under LLDB if attach is prohibited. Do not change
+system-wide ptrace policy just for this workflow.
+The local attach check was blocked by the shared host's `ptrace_scope=1`;
+that policy was left unchanged. Launch, real shader stepping and unregister
+acceptance passed with LLDB 21.1.8; attach is not claimed as locally verified.
+
+The standard LLVM **`lldb-dap`** adapter can use the same LLDB settings as
+initialization commands when launching/attaching to a configured application;
+no custom adapter/protocol is introduced. CLI LLDB is the automated acceptance
+surface here; a VS Code extension/editor integration is separate work.
+GDB's standard JIT interface is compatible with the registration mechanism,
+but GDB is secondary and is not substituted for LLDB acceptance.
+
+### Identity, lifetime, limits and privacy
+
+`NacelleGetNativeDebugCode(address, &code)` returns the live, half-open code range,
+entry symbol, object SHA-256 and monotonically increasing code version. The
+entry name contains its logical pipeline/stage hash; existing profile metadata
+correlates shader identities and native object IDs. Interior-address queries
+resolve to the same entry. `S_FALSE` explicitly means no live debug shader
+range is available and clears the output; invalid queries return/log an error.
+Addresses and versions are local-process data, not portable replay identities.
+
+Registration uses LLVM's ORC RuntimeDyld layer and its standard JIT event
+listener. LLDB's built-in `jit-loader.gdb` plugin handles this interface: its
+name does **not** make LLDB support dependent on running GDB. The pinned LLVM
+ELF JITLink plugin does not implement unregister notifications, so it is not
+used for this opt-in path. Normal compilation/linking remains unchanged.
+
+Registrations/backing debug objects follow ORC resource lifetime.
+Nacelle currently retains JIT code for process lifetime: releasing a PSO or
+clearing lookup caches is **not** code unload. No new per-PSO eviction is added.
+Actual ORC removal unregisters symbols before releasing their memory and
+invalidates live address records; replacement code gets a new version even if
+an address is reused. Tests remove an isolated, quiescent resource and verify
+that LLDB marks its old breakpoint unresolved. Never invoke an unloaded address;
+an unresolved version breakpoint is not authorization to retarget it silently.
+JIT teardown follows draining of outstanding compilation.
+
+Object/registration accounting defaults to **32 MiB**, capped at **64 MiB** and
+configurable downward via `object_bytes`. Admission conservatively charges
+twice the raw ELF object size, twice the symbol-record storage and 4 KiB
+overhead per object, including linked helper objects. Reservations follow the
+runtime memory manager through success, failure and actual unload. A failed
+materialization before memory-manager creation conservatively retains its
+reservation until process teardown. Exhaustion fails compilation explicitly;
+live registrations are never silently evicted or replaced by undebuggable
+code. This bounds accounted retained objects/metadata, not compiler transient
+memory or total process RSS, and is separate from the event-buffer budget.
+
+Native debug emission strips inherited debug/source locations and replaces the
+object source filename with a synthetic label. It does not read original source
+paths, embed HLSL, dump objects to disk, upload data or open a remote listener.
+Separately enabled profile artifacts retain their existing source-consent
+rules. A debugger has trusted-local access to all application memory, not a
+sandbox; OS debugger settings/third-party adapters remain the user's boundary.
+
+Run the first-party checks:
+
+```sh
+ctest --test-dir build/profile -R '^native_debug_' --output-on-failure
+```
+
+The Linux profiling CI job runs real LLDB compute/VS/PS tests against both
+static and shared runtimes, with exact PC-range/instruction-advancement,
+caller-frame and output checks. Tests prepopulate optimized caches and verify
+their files/digests remain unchanged. Configuration/budget failures and actual
+ORC removal/replacement are covered separately. Normal OFF builds contain no
+native-debug configuration, state, registration listener or API references.
+Debugger-enabled costs are separate from profiler/performance certification.
+
+A single shared Linux x86_64 host observation of the small fixture, **without
+LLDB attached**, measured 0.05 s / 67.5 MiB peak RSS for native compute (two PSO
+creations plus execution) and 0.04 s / 67.5 MiB for native graphics. These are
+whole-process synthetic measurements, not isolated compiler overhead or
+representative application benchmarks. Real LLDB startup/symbol/stop costs are
+additional and highly debugger/host dependent. No profiler performance or
+memory acceptance is certified by these observations.
+
 ## CI coverage
 
 The Linux, macOS, and Windows CI jobs retain their normal OFF build and test

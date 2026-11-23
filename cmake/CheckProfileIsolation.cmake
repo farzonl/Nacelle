@@ -18,7 +18,7 @@ if(NOT EXISTS "${BUILD_DIR}/compile_commands.json")
     message(FATAL_ERROR "Profile isolation check requires CMAKE_EXPORT_COMPILE_COMMANDS=ON")
 endif()
 file(READ "${BUILD_DIR}/compile_commands.json" compile_commands)
-if(compile_commands MATCHES "NACELLE_ENABLE_INSTRUMENTATION|nacelle_profile_|replay_(capture|execute|shader|format)|profile-zstd|profile-glaze")
+if(compile_commands MATCHES "NACELLE_ENABLE_INSTRUMENTATION|nacelle_profile_|native_debug|replay_(capture|execute|shader|format)|profile-zstd|profile-glaze")
     message(FATAL_ERROR "Instrumentation definitions or support sources leaked into the OFF build")
 endif()
 
@@ -36,7 +36,7 @@ execute_process(COMMAND "${NM_TOOL}" --demangle "${LIBRARY_FILE}"
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "Cannot inspect OFF library symbols: ${error}")
 endif()
-if(symbols MATCHES "Nacelle(Begin|End|Destroy)ProfileCapture|Nacelle(ConfigureReplay|WaitForReplayCompilation|BeginReplayCapture|EndReplayCapture|DestroyReplayCapture|ReplayBundle)|nacelle::(profile|replay)::")
+if(symbols MATCHES "Nacelle(Begin|End|Destroy)ProfileCapture|Nacelle(ConfigureNativeDebug|GetNativeDebugCode)|Nacelle(ConfigureReplay|WaitForReplayCompilation|BeginReplayCapture|EndReplayCapture|DestroyReplayCapture|ReplayBundle)|nacelle::(profile|replay|native_debug)::")
     message(FATAL_ERROR "Capture symbols or references leaked into the OFF library")
 endif()
 

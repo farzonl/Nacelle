@@ -1,5 +1,8 @@
 #include "test_common.h"
 #include <nacelle/instrumentation.h>
+#include <nacelle/native_debug.h>
+#include <nacelle/replay.h>
+#include "api/pipeline.h"
 #include "instrumentation/profile_format.h"
 
 #include <algorithm>
@@ -9,6 +12,9 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 namespace {
 #if defined(NACELLE_PROFILE_SHARED_RUNTIME)
@@ -21,6 +27,30 @@ constexpr auto serializeRootSignature = &NacelleSerializeRootSignature;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void checkNativeCode(uint64_t address) {
+    NacelleNativeDebugCode code;
+    require(NacelleGetNativeDebugCode(address, &code) == S_OK, "Missing native debug code");
+    require(code.begin == address && code.end > address && code.code_version &&
+            std::strlen(code.object_sha256) == 64 && code.symbol[0], "Invalid native debug identity");
+    std::cout << "NATIVE DEBUG READY address=" << address << " end=" << code.end <<
+        " symbol=" << code.symbol << std::endl;
+    const auto version = code.code_version;
+    require(NacelleGetNativeDebugCode(address + 1, &code) == S_OK && code.code_version == version,
+            "Interior address lost native code version");
+    require(NacelleGetNativeDebugCode(UINT64_MAX, &code) == S_FALSE && !code.begin && !code.symbol[0],
+            "Unknown native address did not clear output");
+}
+
+void pauseForNativeAttach() {
+    if (!std::getenv("NACELLE_TEST_NATIVE_ATTACH")) return;
+#if defined(__linux__)
+    std::cout << "NATIVE DEBUG ATTACH pid=" << getpid() << "; press Enter after attaching" << std::endl;
+    require(std::getchar() != EOF, "Attach fixture requires terminal input");
+#else
+    require(false, "Native debug attach fixture is supported on Linux only");
+#endif
 }
 
 void beginCapture(NacelleProfileCapture** capture) {
@@ -88,6 +118,14 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     // A second creation exercises the same capture's cache metadata.
     ComPtr<ID3D12PipelineState> cached;
     testutil::checkHR(runtime.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&cached)), "Cached compute PSO");
+    if (mode == "native-compute") {
+        const auto& compiled = static_cast<nacelle::NacellePipelineState*>(pso.Get())->computePSO();
+        const auto entry = compiled->fn.load();
+        checkNativeCode(reinterpret_cast<uint64_t>(entry));
+        testutil::checkHR(NacelleWaitForReplayCompilation(), "Drain native debug compilation");
+        require(compiled->fn.load() == entry && !compiled->asyncBox, "Native debug code was promoted");
+        pauseForNativeAttach();
+    }
     std::array<float, 1024> a{}, b{};
     for (size_t i = 0; i < a.size(); ++i) {
         a[i] = static_cast<float>(i);
@@ -203,6 +241,17 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
         return pipeline;
     };
     auto pso = createPipeline();
+    if (mode == "native-graphics") {
+        const auto& compiled = static_cast<nacelle::NacellePipelineState*>(pso.Get())->graphicsPSO();
+        const auto vertex = compiled->vsFn.load(std::memory_order_acquire);
+        const auto pixel = compiled->psFn.load(std::memory_order_acquire);
+        checkNativeCode(reinterpret_cast<uint64_t>(vertex));
+        checkNativeCode(reinterpret_cast<uint64_t>(pixel));
+        testutil::checkHR(NacelleWaitForReplayCompilation(), "Drain native graphics compilation");
+        require(compiled->vsFn.load(std::memory_order_acquire) == vertex &&
+                compiled->psFn.load(std::memory_order_acquire) == pixel, "Native graphics code was promoted");
+        pauseForNativeAttach();
+    }
     if (mode == "graphics-mixed-cache") {
         ps = testutil::loadShaderBytes("mesh_solid_red_ps.dxil");
         desc.PS = {ps.data(), ps.size()};
@@ -301,7 +350,8 @@ int main(int argc, char** argv) {
     if (argc != 2 && argc != 3) {
         std::cerr << "Usage: profile_runtime_test <new-profile-path> "
                      "[all|compute|graphics|tier1|promoted|cached|disk|"
-                     "graphics-tier1|graphics-promoted|graphics-cached|graphics-disk]\n";
+                     "graphics-tier1|graphics-promoted|graphics-cached|graphics-disk|"
+                     "native-compute|native-graphics]\n";
         return 1;
     }
     const std::string mode = argc == 3 ? argv[2] : "all";
@@ -310,12 +360,25 @@ int main(int argc, char** argv) {
         mode != "graphics-tier1" && mode != "graphics-promoted" &&
         mode != "graphics-cached" && mode != "graphics-disk" && mode != "graphics-mixed-cache" &&
         mode != "graphics-extended" && mode != "graphics-extended-promoted" && mode != "graphics-extended-cached" &&
-        mode != "graphics-mesh" && mode != "graphics-mesh-promoted" && mode != "graphics-mesh-cached") {
+        mode != "graphics-mesh" && mode != "graphics-mesh-promoted" && mode != "graphics-mesh-cached" &&
+        mode != "native-compute" && mode != "native-graphics") {
         std::cerr << "Invalid capture mode: " << mode << '\n';
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
     try {
+        if (mode.starts_with("native-")) {
+            NacelleNativeDebugOptions options;
+            options.enabled = 1;
+            testutil::checkHR(NacelleConfigureNativeDebug(&options), "Enable native debug");
+            testutil::TestRuntime runtime;
+            initialize(runtime);
+            if (mode == "native-compute") compute(runtime, nullptr, mode, argv[1]);
+            else draw(runtime, nullptr, mode, argv[1]);
+            require(FAILED(NacelleConfigureNativeDebug(&options)), "Late debug configuration accepted");
+            std::cout << "NATIVE DEBUG OUTPUT PASS" << std::endl;
+            return 0;
+        }
         const auto* spatialMode = std::getenv("NACELLE_TEST_SPATIAL");
         if (spatialMode) {
             NacelleProfileSpatialOptions options;
