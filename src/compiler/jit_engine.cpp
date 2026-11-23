@@ -604,6 +604,8 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
         };
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
         if (source_debug::enabled()) addSym("nacelle_source_debug_observe", &nacelle_source_debug_observe);
+        if (source_debug::optimized())
+            addSym("nacelle_source_debug_read_pixel_context", &nacelle_source_debug_read_pixel_context);
 #endif
         addSym("nacelle_rayquery_alloc", &nacelle_rayquery_alloc);
         addSym("nacelle_rayquery_trace_inline", &nacelle_rayquery_trace_inline);
@@ -731,6 +733,12 @@ bool emitObjectBytesO3(
 
     llvm::ModulePassManager mpm = pb.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
     mpm.run(mod, mam);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::optimized()) {
+        if (!source_debug::lowerOptimizedObservations(mod, 2, outError)) return false;
+        native_debug::prepareModule(mod);
+    }
+#endif
 
     if (const char* dumpEnv = std::getenv("NACELLE_DUMP_IR"); dumpEnv && dumpEnv[0] == '1') {
         static std::atomic<uint64_t> postSeq{0};
@@ -759,12 +767,12 @@ bool emitObjectBytesO3(
     return true;
 }
 
-void runTier1Optimize(llvm::Module& mod) {
+bool runTier1Optimize(llvm::Module& mod, std::string& outError) {
     NACELLE_PROFILE_SCOPE("Optimize Tier 1");
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    if (native_debug::enabled()) {
+    if (native_debug::pinned()) {
         native_debug::prepareModule(mod);
-        return;
+        return true;
     }
 #endif
     llvm::FunctionAnalysisManager fam;
@@ -785,11 +793,18 @@ void runTier1Optimize(llvm::Module& mod) {
             fpm.run(fn, fam);
         }
     }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::optimized()) {
+        if (!source_debug::lowerOptimizedObservations(mod, 1, outError)) return false;
+        native_debug::prepareModule(mod);
+    }
+#endif
+    return true;
 }
 
 bool shouldScheduleTier2() {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    if (native_debug::freeze()) return false;
+    if (native_debug::freeze() && native_debug::pinned()) return false;
 #endif
     const char* disabled = std::getenv("NACELLE_DISABLE_TIER2");
     return !(disabled && disabled[0] == '1');
@@ -815,6 +830,16 @@ bool writeFileAtomic(const std::filesystem::path& dst, const void* data, size_t 
         return false;
     }
     return true;
+}
+
+void handleTier2Failure(llvm::Error error) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::optimized()) {
+        source_debug::reportCompilationFailure(llvm::toString(std::move(error)));
+        return;
+    }
+#endif
+    llvm::consumeError(std::move(error));
 }
 
 bool readFileBytes(const std::filesystem::path& src, std::vector<uint8_t>& out) {
@@ -1048,8 +1073,8 @@ void computeComputePSOHash(
     uint64_t& outHi) {
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
-    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
+    if (native_debug::freeze()) feed.addStr(source_debug::optimized() ? "native-debug-registered-v1" : "native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr(source_debug::optimized() ? "source-debug-optimized-v1" : "source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -1073,8 +1098,8 @@ void computeGraphicsPSOHash(
     const MeshShaderStages& meshStages) {
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
-    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
+    if (native_debug::freeze()) feed.addStr(source_debug::optimized() ? "native-debug-registered-v1" : "native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr(source_debug::optimized() ? "source-debug-optimized-v1" : "source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -1157,8 +1182,8 @@ void computeVertexStageHash(
     uint64_t& outHi) {
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
-    if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
-    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
+    if (native_debug::freeze()) feed.addStr(source_debug::optimized() ? "native-debug-registered-v1" : "native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr(source_debug::optimized() ? "source-debug-optimized-v1" : "source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -1643,6 +1668,10 @@ std::unique_ptr<llvm::Module> translateMLIRToLinkedLLVMIR(
         }
     }
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::optimized() && !source_debug::prepareOptimizedModule(*llvmMod, outError))
+        return nullptr;
+#endif
     return llvmMod;
 }
 
@@ -1896,7 +1925,10 @@ bool jitCompileComputeTier1AndScheduleTier2(
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
-    runTier1Optimize(*llvmMod);
+    if (!runTier1Optimize(*llvmMod, outError)) return false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto sourceCompilation = source_debug::optimizedCompilation(*llvmMod);
+#endif
 
     uint64_t tier1Addr = 0;
     {
@@ -1922,6 +1954,7 @@ bool jitCompileComputeTier1AndScheduleTier2(
         tier1Addr = symOrErr->getValue();
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
         if (!native_debug::verifyEntry(tier1Addr, outError)) return false;
+        if (!source_debug::bindCompilation(sourceCompilation, tier1Addr, 1, outError)) return false;
 #endif
     }
 
@@ -1950,18 +1983,28 @@ bool jitCompileComputeTier1AndScheduleTier2(
         buf.reset();
         std::string().swap(bcStr);
         if (!modOrErr) {
-            llvm::consumeError(modOrErr.takeError());
+            handleTier2Failure(modOrErr.takeError());
             return;
         }
         std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
         llvm::SmallVector<char, 0> objBytes;
         std::string err;
-        if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+        if (!emitObjectBytesO3(*mod2, objBytes, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            source_debug::reportCompilationFailure(err);
+#endif
+            return;
+        }
 
         JitRuntime& rt = getJitRuntime();
         uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
-        writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
-        writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (!native_debug::enabled())
+#endif
+        {
+            writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
+            writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+        }
 
         uint64_t addr0 = 0, addr1 = 0;
         {
@@ -1969,6 +2012,9 @@ bool jitCompileComputeTier1AndScheduleTier2(
             std::string key = (cacheDir / hex).string();
             if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
                                          objBytes.size(), key + ".o", symbolName, "", addr0, addr1, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                source_debug::reportCompilationFailure(err);
+#endif
                 return;
             }
             rt.memCache[key] = InMemCacheEntry{meta, addr0, 0, 0, 0, 0, 0, 0, 0};
@@ -1976,6 +2022,11 @@ bool jitCompileComputeTier1AndScheduleTier2(
 
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->cs) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (!source_debug::bindCompilation(source_debug::optimizedCompilation(*mod2), addr0, 2, err)) {
+                source_debug::reportCompilationFailure(err); return;
+            }
+#endif
             box->cs->fn.store(reinterpret_cast<CompiledComputeFn>(addr0), std::memory_order_release);
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
             box->cs->profileEntries.promote(reinterpret_cast<CompiledComputeFn>(addr0),
@@ -2010,7 +2061,10 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
-    runTier1Optimize(*llvmMod);
+    if (!runTier1Optimize(*llvmMod, outError)) return false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto sourceCompilation = source_debug::optimizedCompilation(*llvmMod);
+#endif
 
     uint64_t vsAddr = 0, psAddr = 0, gsAddr = 0, hsAddr = 0, hsPcAddr = 0, dsAddr = 0, msAddr = 0, asAddr = 0;
     std::string gsSym = meta.hasGS ? (vsSym + "_gs") : std::string{};
@@ -2061,6 +2115,9 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
     outPSO.vsSymbolName = vsSym;
     outPSO.psSymbolName = psSym;
     outPSO.gsSymbolName = gsSym;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (!source_debug::bindCompilation(sourceCompilation, psAddr, 1, outError)) return false;
+#endif
     NACELLE_STORE_GRAPHICS_ENTRY(outPSO.vsFn, reinterpret_cast<CompiledVertexFn>(vsAddr), 1, Miss);
     NACELLE_STORE_GRAPHICS_ENTRY(outPSO.psFn, reinterpret_cast<CompiledPixelQuadFn>(psAddr), 1, Miss);
     NACELLE_STORE_GRAPHICS_ENTRY(outPSO.gsFn, reinterpret_cast<CompiledGeometryFn>(gsAddr), 1, Miss);
@@ -2089,18 +2146,28 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
         buf.reset();
         std::string().swap(bcStr);
         if (!modOrErr) {
-            llvm::consumeError(modOrErr.takeError());
+            handleTier2Failure(modOrErr.takeError());
             return;
         }
         std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
         llvm::SmallVector<char, 0> objBytes;
         std::string err;
-        if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+        if (!emitObjectBytesO3(*mod2, objBytes, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            source_debug::reportCompilationFailure(err);
+#endif
+            return;
+        }
 
         JitRuntime& rt = getJitRuntime();
         uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
-        writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
-        writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (!native_debug::enabled())
+#endif
+        {
+            writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
+            writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+        }
 
         uint64_t primaryAddr2 = 0, addr1 = 0, gsAddr2 = 0, hsAddr2 = 0, hsPcAddr2 = 0, dsAddr2 = 0, msAddr2 = 0, asAddr2 = 0;
         std::string primarySym2 = meta.hasMS ? (vsSym + "_ms") : vsSym;
@@ -2116,6 +2183,9 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
                 if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
                                              objBytes.size(), key + ".o", primarySym2, psSym, primaryAddr2, addr1, err,
                                              asSym2, &asAddr2)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                    source_debug::reportCompilationFailure(err);
+#endif
                     return;
                 }
                 msAddr2 = primaryAddr2;
@@ -2123,6 +2193,9 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
                 if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
                                              objBytes.size(), key + ".o", primarySym2, psSym, primaryAddr2, addr1, err,
                                              gsSym2, &gsAddr2, hsSym2, &hsAddr2, hsPcSym2, &hsPcAddr2, dsSym2, &dsAddr2)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                    source_debug::reportCompilationFailure(err);
+#endif
                     return;
                 }
             }
@@ -2133,6 +2206,13 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
 
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->gs) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            const auto* previous = box->gs->psFn.snapshot();
+            if (!source_debug::bindCompilation(source_debug::optimizedCompilation(*mod2), addr1,
+                    previous ? previous->version + 1 : 1, err)) {
+                source_debug::reportCompilationFailure(err); return;
+            }
+#endif
             NACELLE_STORE_GRAPHICS_ENTRY(box->gs->vsFn, reinterpret_cast<CompiledVertexFn>(meta.hasMS ? 0 : primaryAddr2), 2, Miss);
             NACELLE_STORE_GRAPHICS_ENTRY(box->gs->psFn, reinterpret_cast<CompiledPixelQuadFn>(addr1), 2, Miss);
             NACELLE_STORE_GRAPHICS_ENTRY(box->gs->gsFn, reinterpret_cast<CompiledGeometryFn>(gsAddr2), 2, Miss);
@@ -2168,7 +2248,7 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
-    runTier1Optimize(*llvmMod);
+    if (!runTier1Optimize(*llvmMod, outError)) return false;
 
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
@@ -2243,18 +2323,28 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
             buf.reset();
             std::string().swap(bcStr);
             if (!modOrErr) {
-                llvm::consumeError(modOrErr.takeError());
+                handleTier2Failure(modOrErr.takeError());
                 return;
             }
             std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
             llvm::SmallVector<char, 0> objBytes;
             std::string err;
-            if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+            if (!emitObjectBytesO3(*mod2, objBytes, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                source_debug::reportCompilationFailure(err);
+#endif
+                return;
+            }
 
             JitRuntime& rt = getJitRuntime();
             uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
-            writeFileAtomic(cacheDir / (vsHex + ".vso"), objBytes.data(), objBytes.size(), tId);
-            writeFileAtomic(cacheDir / (vsHex + ".vsmeta"), &vsMeta, sizeof(CachedVSMeta), tId);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (!native_debug::enabled())
+#endif
+            {
+                writeFileAtomic(cacheDir / (vsHex + ".vso"), objBytes.data(), objBytes.size(), tId);
+                writeFileAtomic(cacheDir / (vsHex + ".vsmeta"), &vsMeta, sizeof(CachedVSMeta), tId);
+            }
 
             uint64_t tier2VSAddr = 0, dummy = 0;
             std::vector<std::shared_ptr<PsoUpdateBox>> waiters;
@@ -2262,6 +2352,9 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
                 std::lock_guard<std::mutex> lock(rt.mu);
                 if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
                                              objBytes.size(), vsKey + ".vso", vsSym, "", tier2VSAddr, dummy, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                    source_debug::reportCompilationFailure(err);
+#endif
                     return;
                 }
                 auto& entry = rt.vsMemCache[vsKey];
@@ -2311,7 +2404,10 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         llvm::WriteBitcodeToFile(*llvmMod, bcOS);
     }
 
-    runTier1Optimize(*llvmMod);
+    if (!runTier1Optimize(*llvmMod, outError)) return false;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto sourceCompilation = source_debug::optimizedCompilation(*llvmMod);
+#endif
 
     std::filesystem::path cacheDir = getCacheDirectory();
     std::string vsHex = hashToHex128(vsHashLo, vsHashHi);
@@ -2349,6 +2445,7 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         psAddr = symOrErr->getValue();
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
         if (!native_debug::verifyEntry(psAddr, outError)) return false;
+        if (!source_debug::bindCompilation(sourceCompilation, psAddr, 1, outError)) return false;
 #endif
 
         auto vsIt = rt.vsMemCache.find(vsKey);
@@ -2383,18 +2480,28 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
         buf.reset();
         std::string().swap(bcStr);
         if (!modOrErr) {
-            llvm::consumeError(modOrErr.takeError());
+            handleTier2Failure(modOrErr.takeError());
             return;
         }
         std::unique_ptr<llvm::Module> mod2 = std::move(*modOrErr);
         llvm::SmallVector<char, 0> objBytes;
         std::string err;
-        if (!emitObjectBytesO3(*mod2, objBytes, err)) return;
+        if (!emitObjectBytesO3(*mod2, objBytes, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            source_debug::reportCompilationFailure(err);
+#endif
+            return;
+        }
 
         JitRuntime& rt = getJitRuntime();
         uint64_t tId = rt.tmpSeq.fetch_add(1, std::memory_order_relaxed);
-        writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
-        writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (!native_debug::enabled())
+#endif
+        {
+            writeFileAtomic(cacheDir / (hex + ".o"), objBytes.data(), objBytes.size(), tId);
+            writeFileAtomic(cacheDir / (hex + ".meta"), &meta, sizeof(CachedPSOMeta), tId);
+        }
 
         uint64_t tier2PSAddr = 0, dummy = 0;
         uint64_t curVSAddr = 0;
@@ -2406,6 +2513,9 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
             std::string key = (cacheDir / hex).string();
             if (!loadObjectIntoJitLocked(rt, reinterpret_cast<const uint8_t*>(objBytes.data()),
                                          objBytes.size(), key + ".o", psSym, "", tier2PSAddr, dummy, err)) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                source_debug::reportCompilationFailure(err);
+#endif
                 return;
             }
             auto vsIt = rt.vsMemCache.find(vsKey);
@@ -2421,6 +2531,13 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
 
         std::lock_guard<std::mutex> psoLock(box->mu);
         if (box->gs) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            const auto* previous = box->gs->psFn.snapshot();
+            if (!source_debug::bindCompilation(source_debug::optimizedCompilation(*mod2), tier2PSAddr,
+                    previous ? previous->version + 1 : 1, err)) {
+                source_debug::reportCompilationFailure(err); return;
+            }
+#endif
             if (curVSAddr != 0) {
                 NACELLE_STORE_GRAPHICS_ENTRY(box->gs->vsFn, reinterpret_cast<CompiledVertexFn>(curVSAddr), curVSTier, Miss);
             }

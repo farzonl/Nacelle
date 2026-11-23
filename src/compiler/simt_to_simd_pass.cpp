@@ -985,6 +985,61 @@ private:
     bool packetizeOp(mlir::Operation& op, mlir::Value execMask, mlir::Value& realMask, std::string& outError) {
         mlir::Location loc = op.getLoc();
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (auto debug = llvm::dyn_cast<mlir::LLVM::DbgValueOp>(&op)) {
+            if (!source_debug::optimized() ||
+                !debug.getVarInfo().getName().getValue().starts_with("nacelle.site.")) return true;
+            auto mapped = getMapped(loc, debug.getValue());
+            if (mapped.kind == SimdVal::Kind::Vector || mapped.kind == SimdVal::Kind::Lanes) {
+                auto packet = asVec(loc, mapped);
+                if (packet)
+                    mlir::LLVM::DbgValueOp::create(b_, loc, packet, debug.getVarInfo(),
+                        debug.getLocationExpr());
+            }
+            return true;
+        }
+        if (auto debug = llvm::dyn_cast<mlir::LLVM::DbgLabelOp>(&op)) {
+            const auto label = debug.getLabel();
+            if (!source_debug::optimized() ||
+                !label.getName().getValue().starts_with("nacelle.site.")) return true;
+            if (W_ > 16 || hooks_.threadId.size() != 3 ||
+                (hooks_.isPixelShader && !hooks_.sourceInvocation)) {
+                outError = "Optimized source site has no bounded lane/invocation provenance";
+                return false;
+            }
+            const auto bind = [&](llvm::StringRef suffix, mlir::Value value) {
+                auto variable = mlir::LLVM::DILocalVariableAttr::get(label.getScope(),
+                    (label.getName().getValue() + suffix).str(), label.getFile(),
+                    label.getLine(), 0, 0, {}, mlir::LLVM::DIFlags::Zero);
+                mlir::LLVM::DbgValueOp::create(b_, loc, value, variable,
+                    mlir::LLVM::DIExpressionAttr::get(ctx_));
+            };
+            bind(".exec", execMask);
+            bind(".real", realMask);
+            if (hooks_.isPixelShader) {
+                bind(".exec.entry", cInt(loc, i32Ty(), execMask == hooks_.sourceEntryExec));
+                bind(".real.entry", cInt(loc, i32Ty(), realMask == hooks_.sourceEntryReal));
+            }
+            for (unsigned dimension = 0; dimension < 3; ++dimension) {
+                auto coordinate = hooks_.threadId[dimension];
+                if (!hooks_.isPixelShader)
+                    for (const auto& [original, mapped] : valueMap_) {
+                        auto call = original.getDefiningOp<mlir::LLVM::CallOp>();
+                        if (!call || !call.getCallee() ||
+                            !call.getCallee()->starts_with("dx.op.threadId.") ||
+                            call.getNumOperands() != 2 ||
+                            getConstIntValue(call.getOperand(1)) != dimension) continue;
+                        if (mapped.kind == SimdVal::Kind::Vector && mapped.vec)
+                            coordinate = mapped.vec;
+                    }
+                bind(".coord." + std::to_string(dimension), coordinate);
+            }
+            if (hooks_.sourceInvocation) bind(".invocation", hooks_.sourceInvocation);
+            mlir::LLVM::DbgLabelOp::create(b_, loc, label);
+            return true;
+        }
+        if (op.getName().getStringRef().starts_with("llvm.intr.dbg.")) return true;
+#endif
         // Constants / Undef / Poison / Casts
         if (llvm::isa<mlir::LLVM::ConstantOp, mlir::arith::ConstantOp,
                       mlir::LLVM::UndefOp, mlir::LLVM::PoisonOp,
@@ -9837,6 +9892,12 @@ bool packetizeRegionWithHooks(
     std::string& outError) {
     (void)loc;
     if (srcRegion.empty()) return true;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::optimized() && hooks.isPixelShader) {
+        hooks.sourceEntryExec = initExecMask;
+        hooks.sourceEntryReal = inoutRealMask;
+    }
+#endif
     SimdPacketizer pkt(builder, mod, shader, rootLayout, simdWidth, rootCtxPtr, hooks);
     return pkt.packetizeBlock(srcRegion.front(), initExecMask, inoutRealMask, outError);
 }

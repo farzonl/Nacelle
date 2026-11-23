@@ -366,6 +366,8 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         endif()
         add_nacelle_test(native_debug_test native_debug_test.cpp)
         add_nacelle_test(source_debug_test source_debug_test.cpp)
+        add_test(NAME source_debug_optimized_policy_test COMMAND source_debug_test optimized)
+        add_test(NAME source_debug_optimized_compiler_test COMMAND source_debug_test optimized-compiler)
         target_include_directories(source_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
         if(NOT MSVC)
             target_compile_options(source_debug_test PRIVATE -fno-rtti)
@@ -410,6 +412,20 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug.hlsl")
     add_custom_target(source_debug_optimized_shader DEPENDS "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_cs.dxil")
     add_dependencies(profile_debug_shaders source_debug_optimized_shader)
+    add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_ps.dxil"
+        COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -O3 -Zi -Qembed_debug
+            -Fo "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_ps.dxil"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug_pixel.hlsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug_pixel.hlsl")
+    add_custom_target(source_debug_optimized_pixel_shader DEPENDS "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_ps.dxil")
+    add_dependencies(profile_debug_shaders source_debug_optimized_pixel_shader)
+    add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/source_debug_pixel_o0.dxil"
+        COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E PSMain -Od -Zi -Qembed_debug
+            -Fo "${NACELLE_SHADER_BIN_DIR}/source_debug_pixel_o0.dxil"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug_pixel.hlsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug_pixel.hlsl")
+    add_custom_target(source_debug_pixel_o0_shader DEPENDS "${NACELLE_SHADER_BIN_DIR}/source_debug_pixel_o0.dxil")
+    add_dependencies(profile_debug_shaders source_debug_pixel_o0_shader)
     foreach(execution IN ITEMS compute_dispatch interlocked_barrier rasterizer_pipeline graphics_features)
         foreach(width IN ITEMS 4 8 16)
             add_test(NAME spatial_${execution}_simd${width}_test
@@ -471,6 +487,33 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             endforeach()
             foreach(stage IN ITEMS compute graphics)
                 foreach(width IN ITEMS 4 8 16)
+                    foreach(input_o0 IN ITEMS OFF ON)
+                        add_test(NAME source_debug_optimized_lldb_${linkage}_${stage}_simd${width}_input_o0_${input_o0}_test
+                            COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                                "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DMODE=source-${stage}" "-DWIDTH=${width}"
+                                "-DLINKAGE=${linkage}" "-DINPUT_O0=${input_o0}"
+                                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_optimized_source_debug_test.cmake")
+                        set_tests_properties(source_debug_optimized_lldb_${linkage}_${stage}_simd${width}_input_o0_${input_o0}_test
+                            PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+                    endforeach()
+                    if(width EQUAL 4)
+                        add_test(NAME source_debug_optimized_async_lldb_${linkage}_${stage}_test
+                            COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                                "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DMODE=source-${stage}" "-DWIDTH=${width}"
+                                "-DLINKAGE=${linkage}" "-DASYNC=ON"
+                                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_optimized_source_debug_test.cmake")
+                        set_tests_properties(source_debug_optimized_async_lldb_${linkage}_${stage}_test
+                            PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+                        if(stage STREQUAL graphics)
+                            add_test(NAME source_debug_optimized_mixed_lldb_${linkage}_graphics_test
+                                COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                                    "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DMODE=source-${stage}" "-DWIDTH=${width}"
+                                    "-DLINKAGE=${linkage}" "-DASYNC=ON" "-DMIXED=ON"
+                                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_optimized_source_debug_test.cmake")
+                            set_tests_properties(source_debug_optimized_mixed_lldb_${linkage}_graphics_test
+                                PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+                        endif()
+                    endif()
                     add_test(NAME source_debug_lldb_${linkage}_${stage}_simd${width}_test
                         COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                             "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DMODE=source-${stage}" "-DWIDTH=${width}"
@@ -481,6 +524,10 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 foreach(failure IN ITEMS UNATTENDED MISSING)
                     add_test(NAME source_debug_${linkage}_${stage}_${failure}_test
                         COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SOURCE_${failure}=1" NACELLE_SIMD_WIDTH=4
+                            "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused "source-${stage}")
+                    add_test(NAME source_debug_optimized_${linkage}_${stage}_${failure}_test
+                        COMMAND "${CMAKE_COMMAND}" -E env NACELLE_TEST_SOURCE_OPTIMIZED_MODE=1
+                            "NACELLE_TEST_SOURCE_${failure}=1" NACELLE_SIMD_WIDTH=4
                             "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused "source-${stage}")
                 endforeach()
             endforeach()
@@ -506,6 +553,10 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             endforeach()
             add_test(NAME source_debug_${linkage}_zero_dispatch_test
                 COMMAND "${CMAKE_COMMAND}" -E env NACELLE_TEST_SOURCE_ZERO=1 NACELLE_SIMD_WIDTH=4
+                    "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused source-compute)
+            add_test(NAME source_debug_optimized_${linkage}_zero_dispatch_test
+                COMMAND "${CMAKE_COMMAND}" -E env NACELLE_TEST_SOURCE_OPTIMIZED_MODE=1
+                    NACELLE_TEST_SOURCE_ZERO=1 NACELLE_SIMD_WIDTH=4
                     "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused source-compute)
         endif()
         add_test(NAME profile_runtime_${linkage}_test

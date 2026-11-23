@@ -15,6 +15,7 @@ class LLJITBuilder;
 
 namespace nacelle::native_debug {
 bool enabled();
+bool pinned();
 bool freeze();
 void prepareModule(llvm::Module& module);
 bool configureBuilder(llvm::orc::LLJITBuilder& builder,
