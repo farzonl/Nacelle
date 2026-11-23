@@ -1052,10 +1052,36 @@ void computeGraphicsPSOHash(
     addShader(meshStages.AS);
     addShader(meshStages.MS);
 
-    feed.add(desc.BlendState);
+    // Hash semantic fields, not padding left unspecified by pipeline-stream conversions.
+    feed.add(desc.BlendState.AlphaToCoverageEnable);
+    feed.add(desc.BlendState.IndependentBlendEnable);
+    for (const auto& target : desc.BlendState.RenderTarget) {
+        feed.add(target.BlendEnable);
+        feed.add(target.LogicOpEnable);
+        feed.add(target.SrcBlend);
+        feed.add(target.DestBlend);
+        feed.add(target.BlendOp);
+        feed.add(target.SrcBlendAlpha);
+        feed.add(target.DestBlendAlpha);
+        feed.add(target.BlendOpAlpha);
+        feed.add(target.LogicOp);
+        feed.add(target.RenderTargetWriteMask);
+    }
     feed.add(desc.SampleMask);
     feed.add(desc.RasterizerState);
-    feed.add(desc.DepthStencilState);
+    const auto& depth = desc.DepthStencilState;
+    feed.add(depth.DepthEnable);
+    feed.add(depth.DepthWriteMask);
+    feed.add(depth.DepthFunc);
+    feed.add(depth.StencilEnable);
+    feed.add(depth.StencilReadMask);
+    feed.add(depth.StencilWriteMask);
+    for (const auto* face : {&depth.FrontFace, &depth.BackFace}) {
+        feed.add(face->StencilFailOp);
+        feed.add(face->StencilDepthFailOp);
+        feed.add(face->StencilPassOp);
+        feed.add(face->StencilFunc);
+    }
     feed.add(desc.IBStripCutValue);
     feed.add(desc.PrimitiveTopologyType);
     feed.add(desc.NumRenderTargets);
