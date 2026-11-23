@@ -580,7 +580,7 @@ jobs:
             rasterizer_pipeline_test graphics_features_test \
             --parallel
           if [ "$RUNNER_OS" = Linux ]; then
-            cmake --build build-profile --target native_debug_test --parallel
+            cmake --build build-profile --target native_debug_test source_debug_test --parallel
           fi
 
       - name: Run instrumented capture tests
@@ -592,7 +592,7 @@ jobs:
             export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
           fi
           ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|native_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
+            -R '^(instrumentation_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
 
       - name: Set up Node for native profile interoperability
         uses: actions/setup-node@v4

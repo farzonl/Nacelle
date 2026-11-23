@@ -365,6 +365,13 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             message(FATAL_ERROR "Native-debug acceptance requires LLDB; set NACELLE_LLDB_EXECUTABLE")
         endif()
         add_nacelle_test(native_debug_test native_debug_test.cpp)
+        add_nacelle_test(source_debug_test source_debug_test.cpp)
+        target_include_directories(source_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+        if(NOT MSVC)
+            target_compile_options(source_debug_test PRIVATE -fno-rtti)
+        endif()
+        add_test(NAME source_debug_source_budget_test COMMAND source_debug_test source-budget)
+        add_test(NAME source_debug_metadata_budget_test COMMAND source_debug_test metadata-budget)
         target_include_directories(native_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
         target_link_libraries(native_debug_test PRIVATE ${NACELLE_LLVM_LIBS})
         if(NOT LLVM_ENABLE_RTTI)
@@ -382,6 +389,27 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             -Fo "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl")
     add_custom_target(profile_debug_shaders DEPENDS "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil")
+    foreach(stage IN ITEMS cs ps)
+        if(stage STREQUAL "cs")
+            set(entry CSMain)
+        else()
+            set(entry PSMain)
+        endif()
+        add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/source_debug_${stage}.dxil"
+            COMMAND "${DXC_EXECUTABLE}" -T "${stage}_6_0" -E "${entry}" -Od -Zi -Qembed_debug
+                -Fo "${NACELLE_SHADER_BIN_DIR}/source_debug_${stage}.dxil"
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug.hlsl"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug.hlsl")
+        add_custom_target(source_debug_${stage}_shader DEPENDS "${NACELLE_SHADER_BIN_DIR}/source_debug_${stage}.dxil")
+        add_dependencies(profile_debug_shaders source_debug_${stage}_shader)
+    endforeach()
+    add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_cs.dxil"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -O3 -Zi -Qembed_debug
+            -Fo "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_cs.dxil"
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug.hlsl"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/source_debug.hlsl")
+    add_custom_target(source_debug_optimized_shader DEPENDS "${NACELLE_SHADER_BIN_DIR}/source_debug_optimized_cs.dxil")
+    add_dependencies(profile_debug_shaders source_debug_optimized_shader)
     foreach(execution IN ITEMS compute_dispatch interlocked_barrier rasterizer_pipeline graphics_features)
         foreach(width IN ITEMS 4 8 16)
             add_test(NAME spatial_${execution}_simd${width}_test
@@ -421,6 +449,9 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         target_compile_definitions(profile_runtime_${linkage}_test PRIVATE
             NACELLE_SHADER_BIN_DIR="${NACELLE_SHADER_BIN_DIR}")
         target_include_directories(profile_runtime_${linkage}_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_compile_options(profile_runtime_${linkage}_test PRIVATE -g)
+        endif()
         if(linkage STREQUAL "static")
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle nacelle_profile_io)
         else()
@@ -438,6 +469,44 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                 set_tests_properties(native_debug_lldb_${linkage}_${stage}_test PROPERTIES
                     TIMEOUT 300 RESOURCE_LOCK native_debugger)
             endforeach()
+            foreach(stage IN ITEMS compute graphics)
+                foreach(width IN ITEMS 4 8 16)
+                    add_test(NAME source_debug_lldb_${linkage}_${stage}_simd${width}_test
+                        COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                            "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" "-DMODE=source-${stage}" "-DWIDTH=${width}"
+                            "-DLINKAGE=${linkage}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_source_debug_test.cmake")
+                    set_tests_properties(source_debug_lldb_${linkage}_${stage}_simd${width}_test PROPERTIES
+                        TIMEOUT 180 RESOURCE_LOCK native_debugger)
+                endforeach()
+                foreach(failure IN ITEMS UNATTENDED MISSING)
+                    add_test(NAME source_debug_${linkage}_${stage}_${failure}_test
+                        COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SOURCE_${failure}=1" NACELLE_SIMD_WIDTH=4
+                            "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused "source-${stage}")
+                endforeach()
+            endforeach()
+            add_test(NAME source_debug_lldb_${linkage}_loop_test
+                COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DMODE=source-compute -DWIDTH=4 -DLOOP=ON
+                    "-DLINKAGE=${linkage}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_source_debug_test.cmake")
+            set_tests_properties(source_debug_lldb_${linkage}_loop_test PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+            add_test(NAME source_debug_lldb_${linkage}_helper_test
+                COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DMODE=source-compute -DWIDTH=4 -DHELPER=ON
+                    "-DLINKAGE=${linkage}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_source_debug_test.cmake")
+            set_tests_properties(source_debug_lldb_${linkage}_helper_test PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+            add_test(NAME source_debug_lldb_${linkage}_stale_mailbox_test
+                COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DMODE=source-compute -DWIDTH=4 -DSTALE=ON
+                    "-DLINKAGE=${linkage}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_source_debug_test.cmake")
+            set_tests_properties(source_debug_lldb_${linkage}_stale_mailbox_test PROPERTIES TIMEOUT 180 RESOURCE_LOCK native_debugger)
+            foreach(failure IN ITEMS STRIPPED OPTIMIZED)
+                add_test(NAME source_debug_${linkage}_${failure}_test
+                    COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SOURCE_${failure}=1"
+                        "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused source-compute)
+            endforeach()
+            add_test(NAME source_debug_${linkage}_zero_dispatch_test
+                COMMAND "${CMAKE_COMMAND}" -E env NACELLE_TEST_SOURCE_ZERO=1 NACELLE_SIMD_WIDTH=4
+                    "$<TARGET_FILE:profile_runtime_${linkage}_test>" unused source-compute)
         endif()
         add_test(NAME profile_runtime_${linkage}_test
             COMMAND "${CMAKE_COMMAND}"

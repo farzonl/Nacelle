@@ -1,5 +1,6 @@
 #include "pso_synthesizer.h"
 #include "profile_artifacts.h"
+#include "source_debug.h"
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -3779,6 +3780,47 @@ bool synthesizeGraphicsPSOMLIR(
                 StageHooks psHooks;
                 psHooks.isPixelShader = true;
                 psHooks.entryBlock = entry;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                if (source_debug::enabled()) {
+                    const auto observationCoordinate = [&](mlir::Value coordinate) -> mlir::Value {
+                        auto nonnegative = mlir::LLVM::FCmpOp::create(pb, ploc,
+                            mlir::LLVM::FCmpPredicate::oge, coordinate, ph.splatFlt(0.0));
+                        auto belowLimit = mlir::LLVM::FCmpOp::create(pb, ploc,
+                            mlir::LLVM::FCmpPredicate::olt, coordinate, ph.splatFlt(4294967296.0));
+                        auto valid = mlir::LLVM::AndOp::create(pb, ploc, nonnegative, belowLimit);
+                        // Padded/helper coordinates must not introduce FPToUI poison into observation.
+                        auto safe = mlir::LLVM::SelectOp::create(pb, ploc, valid, coordinate, ph.splatFlt(0.0));
+                        auto integer = mlir::LLVM::FPToUIOp::create(pb, ploc, ph.vecTy(i32Ty), safe);
+                        return mlir::LLVM::SelectOp::create(pb, ploc, valid, integer, ph.splatInt(i32Ty, -1));
+                    };
+                    psHooks.threadId = {
+                        observationCoordinate(pixelX), observationCoordinate(pixelY),
+                        ph.splatInt(i32Ty, 0)};
+                    auto invocation = createScfIfResults(
+                        pb, ploc, mlir::TypeRange{ph.vecTy(ph.i64Ty())}, isUniformTri,
+                        [&](mlir::OpBuilder& tb, mlir::Location tloc) {
+                            IRHelpers th{tb, tloc, simdWidth};
+                            auto pointer = th.loadScalar(ptrTy,
+                                th.gepBytes(argsPtr, offsetof(PixelBatchArgs, triInvW)));
+                            auto token = mlir::LLVM::PtrToIntOp::create(tb, tloc, th.i64Ty(), pointer);
+                            mlir::scf::YieldOp::create(tb, tloc,
+                                mlir::ValueRange{llvmSplat(tb, tloc, th.i64Ty(), token, simdWidth)});
+                        },
+                        [&](mlir::OpBuilder& eb, mlir::Location eloc) {
+                            IRHelpers eh{eb, eloc, simdWidth};
+                            auto pointers = loadQTriPtrs(eb, eloc);
+                            llvm::SmallVector<mlir::Value, 4> tokens(numQuads);
+                            for (uint32_t q = 0; q < numQuads; ++q) {
+                                auto pointer = eh.loadScalar(ptrTy,
+                                    eh.gepBytes(pointers[q], offsetof(PixelTriData, triInvW)));
+                                tokens[q] = mlir::LLVM::PtrToIntOp::create(eb, eloc, eh.i64Ty(), pointer);
+                            }
+                            mlir::scf::YieldOp::create(eb, eloc,
+                                mlir::ValueRange{broadcastQuadScalars(eb, eloc, eh.i64Ty(), tokens)});
+                        });
+                    psHooks.sourceInvocation = invocation.getResult(0);
+                }
+#endif
                 psHooks.loadInput = [&](mlir::OpBuilder& lb, mlir::Location lloc, uint32_t sigId,
                                         const SimdVal& row, uint32_t col, mlir::Type scalarTy, SimdVal& out) -> bool {
                     const DxilSigRecord* sig = psLoaded.findInputSig(sigId);
@@ -4262,6 +4304,12 @@ bool compileGraphicsPSO(
     CompiledGraphicsPSO& outPSO,
     std::string& outError,
     const MeshShaderStages& meshStages) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::enabled() && desc.SampleDesc.Count != 1) {
+        outError = "Source pixel debugging currently requires single-sample rendering";
+        return false;
+    }
+#endif
     uint32_t simdWidth = getTargetSimdWidth();
     uint64_t lo = 0, hi = 0;
     computeGraphicsPSOHash(desc, rootLayout, simdWidth, lo, hi, meshStages);
@@ -4423,8 +4471,12 @@ bool compileGraphicsPSO(
         }
 
         populatePSOFromMeta(meta);
-        return jitCompilePixelStageTier1AndScheduleTier2(
+        const auto ok = jitCompilePixelStageTier1AndScheduleTier2(
             std::move(psLinkedMod), std::move(psLlvmCtx), vsHashLo, vsHashHi, psSym, meta, outPSO, outError);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (ok) source_debug::publishShader(outPSO.profilePixelShaderId);
+#endif
+        return ok;
     }
 
     std::string vsSym = "nacelle_vs_" + hex;

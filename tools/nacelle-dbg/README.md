@@ -1,4 +1,146 @@
-# Offline profiling
+# Offline profiling and local shader debugging
+
+## HLSL source and lane inspection (Linux x86_64, LLDB)
+
+Source debugging is separately opt-in, requires the native-debug build described
+below, and does not change ordinary profiling or native-instruction debugging.
+Include [source_debug.h](../../include/nacelle/source_debug.h), link one
+instrumented runtime, and configure before any pipeline compilation/cache lookup:
+
+```cpp
+NacelleSourceDebugOptions options;
+options.enabled = 1;
+options.consent = 3; // Explicit embedded-source AND local-value consent.
+HRESULT status = NacelleConfigureSourceDebug(&options);
+```
+
+Check exact HRESULTs. Configuration enables the existing pinned native-debug
+policy: no asynchronous optimized replacement and no optimized memory/disk cache
+reuse or writes. Source mode has its own compiler/environment fingerprint.
+Compile the supplied compute/pixel shader with DXC `-Od -Zi -Qembed_debug`.
+Stripped, optimized or incompatible inputs fail explicitly. Debug and executable
+code must agree after removing debug-only information; execution settings,
+resources/signatures and entry metadata come from the executable part, not
+untrusted alternative debug metadata. Shader identity hashes the original entire
+input. Source debug input is limited to 32 MiB.
+
+After successful pipeline creation, enumerate `NacelleGetSourceDebugSite` starting
+at ID 1 until `S_FALSE`. A site's `available` field is set only after successful
+native materialization. Query `NacelleGetSourceDebugSource` first for its size,
+then copy its embedded bytes into a caller-owned buffer. No original source path
+is opened, and nothing is automatically exported to disk.
+`NacelleGetSourceDebugLocal` reports each site's supported value type or explicit
+unavailability reason.
+
+Before submitting work, while the host is quiescent:
+
+1. Fill `NacelleSourceDebugSelection` with the exact compiled `shader_id` and
+   global compute thread XYZ, or pixel XY/sample 0.
+2. Call `NacelleBeginSourceDebug` and retain the returned session generation.
+3. Call `NacelleSourceDebugBreakpoint(session, source_id, line)` for executable
+   lines of that shader. Non-executable/unmapped lines fail explicitly.
+4. Submit the original workload. The session observes only the first matching
+   dispatch/draw of the first admitted submission. Later operations/readbacks
+   are not substituted for a completed target. Concurrent submissions cancel
+   observation with diagnostics but still execute normally.
+5. After work returns, call `NacelleEndSourceDebug` to drain admitted work and
+   inspect the summary. `S_FALSE` means cancelled, unavailable/inactive target,
+   uncompleted source-step or rejected concurrency, **not debugger acceptance**.
+
+Launch or attach LLDB using the native workflow below, then load the shipped
+first-party command aliases:
+
+```text
+(lldb) command source tools/nacelle-dbg/source-debug.lldb
+(lldb) run
+(lldb) hlsl-location
+(lldb) hlsl-lanes
+(lldb) hlsl-values
+(lldb) hlsl-code
+(lldb) hlsl-arm-step
+(lldb) continue
+(lldb) hlsl-arm-continue
+(lldb) continue
+```
+
+The source breakpoint resolves in the application API; LLDB's native breakpoint
+on `nacelle_source_debug_stop` handles all-stop coordination. A snapshot contains
+the exact source identity/line/column/discriminator/site and bounded inline
+chain (leaf first, at most eight frames), native object/range/version,
+coordinates, actual execution/real masks, local metadata and raw local bits for
+all submitted lanes (up to 16). `active_mask & ~real_mask` distinguishes active
+helper/companion lanes. Inactive lane values are invalid, not zero-valued locals.
+Use `locals[i].kind/bits` to interpret `values[i][lane]`; float bits are not an
+integer numerical value. Group XYZ/local thread coordinates can be derived
+from global XYZ and `site.threads_per_group`; the SIMD lane index is the actual
+packet slot, not a fictional independently executed HLSL thread.
+
+The aliases **only write the stop's generation-tagged command mailbox**.
+`continue` resumes the complete original program. Never call lock-taking runtime
+query/control/end functions from LLDB while other host threads are all-stopped:
+another frozen thread may own their mutex. Read the immutable snapshot directly.
+The runtime checks session/stop generations and the mailbox action only after
+LLDB resumes. A missing/detached debugger returns immediately from the rendezvous
+and cancels future observations explicitly; there is no runtime parked-lane wait.
+
+Source-step follows the next dynamic mapped source site for the same selected
+invocation, including loop revisits, rather than native instruction count.
+Site granularity is one source line per original basic block; different
+control-flow paths/discriminators on one line can have distinct sites.
+Source-step skips deeper inlined helper frames; explicit helper breakpoints still
+apply. An overlapping primitive at the same pixel cannot become the stepped
+fragment. Selection filters
+observations only: all waves, barrier phases, shared-memory operations, quad
+helpers, derivatives, divergence, discard and supported wave operations retain
+the existing execution. A selected lane that completes/discards or never reaches
+another site does not cause a different invocation to be stepped instead.
+
+The initial local-value reader supports directly described scalar bool,
+signed/unsigned integer and floating values up to 64 bits, including simple
+typedef/const wrappers. Unsupported debug expressions, aggregates/vector
+fragments, inlined locals, missing reaching definitions and out-of-scope
+information are unavailable, never reconstructed. No arbitrary pointer
+dereference, expression evaluation or resource-memory inspector is added.
+Optimized input, call step-in/out, MSAA, non-compute/pixel source selections and
+other platforms remain unsupported; native instruction debugging is separate.
+
+To cancel at a stop, use `hlsl-arm-cancel`, then `continue`. From a running
+controlling host thread, use `NacelleControlSourceDebug(session, 0,
+NACELLE_SOURCE_CANCEL)` and End. Cancellation disables observation, not original
+shader execution or half a threadgroup. End waits for original work to drain;
+calling End from an observation callback is rejected. While LLDB has the process
+suspended, host cancellation/draining cannot progress until resume/detach.
+
+Embedded source retention defaults to 8 MiB (cap 16 MiB), site/local metadata to
+16 MiB (cap 32 MiB), and breakpoints to 4,096. There is one bounded snapshot of
+at most 64 KiB, at most 64 local slots and 16 lanes. Admission failures are
+explicit; live metadata is not silently evicted. Native object registration keeps
+its separate budget; the event budget remains unchanged. These are retained-data
+limits, **not total compiler/process RSS guarantees**. The opted-in compiler
+does additional parsing, code validation and provenance work. No performance
+certification for coarse capture or optimized-code debugging is implied.
+
+The source-debug acceptance tests exercise real LLDB source stops, source-line
+advancement, loop revisits, raw per-lane scalar values, native identities,
+compute multi-wave barriers/wave operations and pixel derivatives/discard,
+followed by complete output equality. Tests also cover absent debuggers, missing
+targets, stripped/optimized input, budgets, cancellation/draining, stale IDs
+and overlap. See `source_debug_*test` in the profiling test configuration.
+
+For a reproducible **debug-only diagnostic**, run the static fixture with
+`NACELLE_SIMD_WIDTH=4 NACELLE_TEST_SOURCE_COST=native
+NACELLE_TEST_SOURCE_UNATTENDED=1`, then repeat with
+`NACELLE_TEST_SOURCE_COST=source`, passing `unused source-compute`.
+Both run the same unoptimized DXIL and check every output. The source run observes
+one stop and cancels observation when no debugger acknowledges it; this excludes
+interactive debugger pauses and is not the cost of a long stepping session.
+Five fresh-process Linux x86_64 samples gave median first-PSO compilation
+18.36/43.39 ms and submission 0.586/1.042 ms (pinned native/source debug).
+The fixture's two PSO creations retained 40 sites, 105,840 bytes of site/local
+payload and 1,618 embedded source bytes; the snapshot is 23,176 bytes.
+Payload excludes registry/allocator slack and compiler/native object storage.
+These small-host observations are not a benchmark certification, a total-memory
+bound, or evidence that #211/#212 are complete.
 
 Instrumentation is opt-in. The normal runtime remains C++20; the private Glaze
 serialization target uses C++23. Dependencies are pinned submodules:

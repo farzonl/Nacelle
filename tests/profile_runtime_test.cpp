@@ -1,12 +1,15 @@
 #include "test_common.h"
 #include <nacelle/instrumentation.h>
 #include <nacelle/native_debug.h>
+#include <nacelle/source_debug.h>
 #include <nacelle/replay.h>
 #include "api/pipeline.h"
 #include "instrumentation/profile_format.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <set>
@@ -17,6 +20,101 @@
 #endif
 
 namespace {
+void require(bool condition, const char* message);
+uint64_t sourceSession = 0;
+bool nativeSourceCost() {
+    const auto* cost = std::getenv("NACELLE_TEST_SOURCE_COST");
+    return cost && std::string_view(cost) == "native";
+}
+void armSourceDebug(uint32_t stage) {
+    if (nativeSourceCost()) return;
+    if (std::getenv("NACELLE_TEST_SOURCE_HELPER")) {
+        bool mappedHelper = false;
+        for (uint32_t id = 1; ; ++id) {
+            NacelleSourceDebugSite site;
+            const auto status = NacelleGetSourceDebugSite(id, &site);
+            if (status == S_FALSE) break;
+            require(status == S_OK, "Enumerate helper inline frames");
+            mappedHelper |= site.inline_depth && std::string_view(site.frames[0].function) == "addOne";
+        }
+        require(mappedHelper, "Fixture has no real inlined-helper source mappings");
+    }
+    NacelleSourceDebugSite selected;
+    uint32_t line = 0;
+    for (uint32_t id = 1; ; ++id) {
+        NacelleSourceDebugSite site;
+        const auto status = NacelleGetSourceDebugSite(id, &site);
+        if (status == S_FALSE) break;
+        require(status == S_OK, "Enumerate source sites");
+        if (site.stage != stage) continue;
+        uint64_t size = 0;
+        require(NacelleGetSourceDebugSource(site.source_id, nullptr, &size) == S_OK, "Source size");
+        std::string source(size, '\0');
+        require(NacelleGetSourceDebugSource(site.source_id, source.data(), &size) == S_OK, "Source bytes");
+        const auto start = source.find(stage == NACELLE_SOURCE_COMPUTE ?
+            (std::getenv("NACELLE_TEST_SOURCE_LOOP") ? "value += iteration" :
+             (std::getenv("NACELLE_TEST_SOURCE_HELPER") ? "value -= 1.0; // SOURCE_HELPER" : "sharedValues[index] = value;")) :
+            "float restored = value;");
+        require(start != std::string::npos, "Fixture source breakpoint text");
+        line = 1 + std::count(source.begin(), source.begin() + start, '\n');
+        if (site.line == line) { selected = site; break; }
+    }
+    require(selected.id != 0, "Source breakpoint did not resolve");
+    NacelleSourceDebugSelection selection;
+    std::strcpy(selection.shader_id, selected.shader_id);
+    selection.xyz[0] = std::getenv("NACELLE_TEST_SOURCE_MISSING") ? UINT32_MAX : 5;
+    selection.xyz[1] = stage == NACELLE_SOURCE_PIXEL ? 4 : 0;
+    require(NacelleBeginSourceDebug(&selection, &sourceSession) == S_OK, "Begin source session");
+    require(NacelleSourceDebugBreakpoint(sourceSession, selected.source_id, line) == S_OK, "Source breakpoint");
+    std::cout << "SOURCE DEBUG READY session=" << sourceSession << " line=" << line <<
+        " shader=" << selected.shader_id << std::endl;
+}
+
+void finishSourceDebug() {
+    if (nativeSourceCost()) return;
+    if (std::getenv("NACELLE_TEST_SOURCE_MISSING") || std::getenv("NACELLE_TEST_SOURCE_ZERO")) {
+        NacelleSourceDebugSnapshot missing;
+        require(NacelleGetSourceDebugSnapshot(sourceSession, &missing) == S_FALSE, "Missing target fabricated stop");
+        NacelleSourceDebugSummary summary;
+        require(NacelleEndSourceDebug(sourceSession, &summary) == S_FALSE &&
+            !summary.target_seen && !summary.stops, "Missing target looked successful");
+        std::cout << "SOURCE DEBUG TARGET UNAVAILABLE PASS" << std::endl;
+        return;
+    }
+    NacelleSourceDebugSnapshot snapshot;
+    require(NacelleGetSourceDebugSnapshot(sourceSession, &snapshot) == S_OK, "Last source snapshot");
+    require(snapshot.width >= 4 && snapshot.width <= 16 && snapshot.code.code_version && snapshot.code.object_sha256[0],
+        "Source snapshot native identity");
+    require(snapshot.selected_lane < snapshot.width &&
+        snapshot.xyz[snapshot.selected_lane][0] == 5, "Selected lane mapping");
+    bool foundValue = false;
+    for (uint32_t local = 0; local < snapshot.site.local_count; ++local) {
+        if (std::string_view(snapshot.locals[local].name) != "value") continue;
+        require(snapshot.locals[local].kind == NACELLE_SOURCE_FLOAT &&
+            snapshot.locals[local].bits == 32, "Supported float local was not available");
+        for (uint32_t lane = 0; lane < snapshot.width; ++lane) {
+            if (!(snapshot.active_mask & (1u << lane))) continue;
+            const auto x = snapshot.xyz[lane][0];
+            const float expected = snapshot.site.stage == NACELLE_SOURCE_COMPUTE ?
+                float(3 * x + 1) + ((x & 1) ? 1.f : -1.f) +
+                    (std::getenv("NACELLE_TEST_SOURCE_LOOP") ? 1.f : 0.f) : ((x & 1) ? 3.f : 1.f);
+            require(snapshot.values[local][lane] == std::bit_cast<uint32_t>(expected),
+                "Per-lane local does not match the shader's actual value");
+        }
+        foundValue = true;
+    }
+    require(foundValue, "Expected HLSL scalar local is missing");
+    std::cout << "SOURCE DEBUG LOCAL PASS" << std::endl;
+    NacelleSourceDebugSummary summary;
+    const auto status = NacelleEndSourceDebug(sourceSession, &summary);
+    require((status == S_OK || status == S_FALSE) && summary.target_seen && !summary.concurrent_work &&
+        summary.stops == (std::getenv("NACELLE_TEST_SOURCE_UNATTENDED") ? 1 :
+                         std::getenv("NACELLE_TEST_SOURCE_HELPER") ? 4 : 3) &&
+        summary.cancelled, "Source stop, step and cancellation acceptance");
+    sourceSession = 0;
+    std::cout << "SOURCE DEBUG STEP PASS stops=" << summary.stops << std::endl;
+}
+
 #if defined(NACELLE_PROFILE_SHARED_RUNTIME)
 constexpr auto createDevice = &D3D12CreateDevice;
 constexpr auto serializeRootSignature = &D3D12SerializeRootSignature;
@@ -100,14 +198,26 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     const auto* artifactMode = std::getenv("NACELLE_TEST_ARTIFACTS");
     const auto* spatialMode = std::getenv("NACELLE_TEST_SPATIAL");
     const bool volume = spatialMode && std::string_view(spatialMode) == "volume";
-    auto shader = testutil::loadShaderBytes(artifactMode && (std::string_view(artifactMode) == "source" ||
+    auto shader = testutil::loadShaderBytes(mode == "source-compute" ?
+        (std::getenv("NACELLE_TEST_SOURCE_STRIPPED") ? "vec_add.dxil" :
+         std::getenv("NACELLE_TEST_SOURCE_OPTIMIZED") ? "source_debug_optimized_cs.dxil" : "source_debug_cs.dxil") :
+        artifactMode && (std::string_view(artifactMode) == "source" ||
         std::string_view(artifactMode) == "no-source")
         ? "vec_add_debug.dxil" : volume ? "vec_add_volume.dxil" : "vec_add.dxil");
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = signature.Get();
     desc.CS = {shader.data(), shader.size()};
     ComPtr<ID3D12PipelineState> pso;
-    testutil::checkHR(runtime.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)), "Compute PSO");
+    const auto compileStart = std::chrono::steady_clock::now();
+    const auto pipelineStatus = runtime.device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso));
+    const auto compileTime = std::chrono::steady_clock::now() - compileStart;
+    if (mode == "source-compute" &&
+        (std::getenv("NACELLE_TEST_SOURCE_STRIPPED") || std::getenv("NACELLE_TEST_SOURCE_OPTIMIZED"))) {
+        require(FAILED(pipelineStatus) && !pso, "Invalid source debug input produced a pipeline");
+        std::cout << "SOURCE DEBUG REJECTION PASS" << std::endl;
+        return;
+    }
+    testutil::checkHR(pipelineStatus, "Compute PSO");
     if (mode == "promoted" || mode == "cached") {
         NacelleProfileSummary summary;
         testutil::checkHR(NacelleEndProfileCapture(*executionCapture,
@@ -154,9 +264,39 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     uint32_t constants[3]{0, 0, static_cast<uint32_t>(a.size())};
     std::memcpy(&constants[0], &scale, sizeof(scale));
     runtime.cmdList->SetComputeRoot32BitConstants(3, 3, constants, 0);
+    if (mode == "source-compute") armSourceDebug(NACELLE_SOURCE_COMPUTE);
+    if (mode == "source-compute" && std::getenv("NACELLE_TEST_SOURCE_ZERO"))
+        runtime.cmdList->Dispatch(0, 1, 1);
     if (volume) runtime.cmdList->Dispatch(4, 2, 4);
     else runtime.cmdList->Dispatch(16, 1, 1);
+    const auto executionStart = std::chrono::steady_clock::now();
     runtime.executeAndWait();
+    const auto executionTime = std::chrono::steady_clock::now() - executionStart;
+    if (mode == "source-compute") finishSourceDebug();
+    if (std::getenv("NACELLE_TEST_SOURCE_COST")) {
+        uint64_t sites = 0, metadata = 0, sourceBytes = 0;
+        std::set<std::string> sources;
+        for (uint32_t id = 1; ; ++id) {
+            NacelleSourceDebugSite site;
+            const auto status = NacelleGetSourceDebugSite(id, &site);
+            if (status == S_FALSE) break;
+            require(status == S_OK, "Diagnostic site query");
+            ++sites;
+            metadata += sizeof(site) + site.local_count * sizeof(NacelleSourceDebugLocal);
+            if (sources.insert(site.source_id).second) {
+                uint64_t size = 0;
+                require(NacelleGetSourceDebugSource(site.source_id, nullptr, &size) == S_OK,
+                    "Diagnostic source size");
+                sourceBytes += size;
+            }
+        }
+        std::cout << "SOURCE DEBUG COST native=" << nativeSourceCost() <<
+            " compile_ms=" << std::chrono::duration<double, std::milli>(compileTime).count() <<
+            " execution_ms=" << std::chrono::duration<double, std::milli>(executionTime).count() <<
+            " sites=" << sites << " metadata_payload_bytes=" << metadata <<
+            " source_payload_bytes=" << sourceBytes <<
+            " snapshot_bytes=" << sizeof(NacelleSourceDebugSnapshot) << std::endl;
+    }
     const auto bytes = runtime.readbackBuffer(output.Get(), sizeof(a));
     std::array<float, 1024> actual{};
     std::memcpy(actual.data(), bytes.data(), bytes.size());
@@ -177,6 +317,7 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     auto vs = testutil::loadShaderBytes(extended ? "gfx_tess_point_vs.dxil" : "raster_basic_vs.dxil");
     auto ps = testutil::loadShaderBytes(extended ? "gfx_tess_point_ps.dxil" :
                                       mesh ? "mesh_solid_red_ps.dxil" :
+                                      mode == "source-graphics" ? "source_debug_ps.dxil" :
                                       derivatives ? "raster_quad_coverage_ps.dxil" : "raster_basic_ps.dxil");
     std::vector<uint8_t> hs, ds, gs, as, ms;
     const D3D12_INPUT_ELEMENT_DESC layout[] = {
@@ -306,7 +447,9 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     } else {
         runtime.cmdList->DrawInstanced(3, 1, 0, 0);
     }
+    if (mode == "source-graphics") armSourceDebug(NACELLE_SOURCE_PIXEL);
     runtime.executeAndWait();
+    if (mode == "source-graphics") finishSourceDebug();
     auto readback = runtime.createBuffer(rowPitch * height, D3D12_HEAP_TYPE_READBACK);
     D3D12_TEXTURE_COPY_LOCATION destination{};
     destination.pResource = readback.Get();
@@ -341,6 +484,16 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
                 }
         }
     }
+    if (mode == "source-graphics") {
+        correct = true;
+        for (UINT y = 0; y < height; ++y)
+            for (UINT x = 0; x < width; ++x) {
+                const size_t offset = y * rowPitch + x * 4;
+                const uint8_t red = (x + y) % 3 == 0 ? 0 : 255;
+                correct &= pixels[offset] == red && pixels[offset + 1] == 0 &&
+                    pixels[offset + 2] == 0 && pixels[offset + 3] == 255;
+            }
+    }
     readback->Unmap(0, nullptr);
     require(correct, "Capture changed graphics output");
 }
@@ -361,12 +514,30 @@ int main(int argc, char** argv) {
         mode != "graphics-cached" && mode != "graphics-disk" && mode != "graphics-mixed-cache" &&
         mode != "graphics-extended" && mode != "graphics-extended-promoted" && mode != "graphics-extended-cached" &&
         mode != "graphics-mesh" && mode != "graphics-mesh-promoted" && mode != "graphics-mesh-cached" &&
-        mode != "native-compute" && mode != "native-graphics") {
+        mode != "native-compute" && mode != "native-graphics" &&
+        mode != "source-compute" && mode != "source-graphics") {
         std::cerr << "Invalid capture mode: " << mode << '\n';
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
     try {
+        if (mode.starts_with("source-")) {
+            NacelleSourceDebugOptions options;
+            options.enabled = 1;
+            options.consent = 3;
+            if (nativeSourceCost()) {
+                NacelleNativeDebugOptions native;
+                native.enabled = 1;
+                testutil::checkHR(NacelleConfigureNativeDebug(&native), "Enable matched native-debug cost baseline");
+            } else testutil::checkHR(NacelleConfigureSourceDebug(&options), "Enable source debug");
+            testutil::TestRuntime runtime;
+            initialize(runtime);
+            if (mode == "source-compute") compute(runtime, nullptr, mode, argv[1]);
+            else draw(runtime, nullptr, mode, argv[1]);
+            require(FAILED(NacelleConfigureSourceDebug(&options)), "Late source configuration accepted");
+            std::cout << "SOURCE DEBUG OUTPUT PASS" << std::endl;
+            return 0;
+        }
         if (mode.starts_with("native-")) {
             NacelleNativeDebugOptions options;
             options.enabled = 1;

@@ -1,6 +1,7 @@
 #include "command_list.h"
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
 #include "../instrumentation/replay_capture.h"
+#include "../compiler/source_debug.h"
 #endif
 #include "../instrumentation/capture.h"
 
@@ -1040,6 +1041,7 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     if (!state.pso || !state.pso->isCompute() || !state.pso->computePSO()) return;
     const auto& cpso = state.pso->computePSO();
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    source_debug::Operation sourceOperation(cpso->profileShaderId);
     const auto* entry = cpso->profileEntries.load();
     CompiledComputeFn fn = entry ? entry->fn : nullptr;
 #else
@@ -1642,6 +1644,7 @@ void STDMETHODCALLTYPE NacelleCommandQueue::ExecuteCommandLists(
     std::lock_guard<std::mutex> lock(execMutex_);
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     replay::Submission replaySubmission(this);
+    source_debug::Work sourceDebugWork;
 #endif
     ExecutionState state{};
     for (UINT i = 0; i < NumCommandLists; ++i) {

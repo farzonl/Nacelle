@@ -1,6 +1,7 @@
 #include "jit_engine.h"
 #include "profile_artifacts.h"
 #include "native_debug.h"
+#include "source_debug.h"
 #include "../instrumentation/capture.h"
 #include "../rasterizer/raytracing_bvh.h"
 
@@ -601,6 +602,9 @@ void ensureLLJITLocked(JitRuntime& rt, std::string& outError) {
             syms[rt.jit->mangleAndIntern(name)] = llvm::orc::ExecutorSymbolDef(
                 llvm::orc::ExecutorAddr::fromPtr(fn), llvm::JITSymbolFlags::Exported);
         };
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (source_debug::enabled()) addSym("nacelle_source_debug_observe", &nacelle_source_debug_observe);
+#endif
         addSym("nacelle_rayquery_alloc", &nacelle_rayquery_alloc);
         addSym("nacelle_rayquery_trace_inline", &nacelle_rayquery_trace_inline);
         addSym("nacelle_rayquery_proceed", &nacelle_rayquery_proceed);
@@ -1045,6 +1049,7 @@ void computeComputePSOHash(
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -1069,6 +1074,7 @@ void computeGraphicsPSOHash(
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -1152,6 +1158,7 @@ void computeVertexStageHash(
     HashFeed feed;
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     if (native_debug::freeze()) feed.addStr("native-debug-pinned-v1");
+    if (source_debug::enabled()) feed.addStr("source-debug-sites-v1");
 #endif
     feed.addStr(kCompilerBuildHash);
     feed.addStr(getHostTargetTripleString().c_str());
@@ -2533,6 +2540,9 @@ bool compileComputePSO(
 
     bool ok = jitCompileComputeTier1AndScheduleTier2(
         std::move(linkedMod), std::move(outLlvmCtx), symbolName, meta, outPSO, outError);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (ok) source_debug::publishShader(outPSO.profileShaderId);
+#endif
     const auto tTier1 = Clock::now();
 
     if (profileCompile) {
