@@ -35,6 +35,12 @@ Optimized mode preserves asynchronous promotion and reports missing values or
 imprecise mappings explicitly. Graphics replay and differential testing are
 not yet included.
 
+[Coarse-capture performance acceptance](tools/nacelle-dbg/README.md#reproducible-coarse-capture-performance-acceptance)
+passed controlled Linux x86_64 compute/graphics measurements: idle and active
+intervals are below the 1% and 5% budgets, with an unchanged instrumentation-OFF
+binary. This is not an all-host guarantee or acceptance of separately opted-in
+debugging/spatial modes; additional-memory acceptance remains open.
+
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 
 Instead of interpreting bytecode or translating shaders through lossy intermediate APIs (SPIR-V, Metal, or OpenGL), Nacelle ingests native **Shader Model 6.x DXIL** directly, lifts unstructured LLVM 3.7 bitcode into structured **MLIR**, packetizes scalar SIMT threads into wide host SIMD lanes (`AVX-512`, `AVX2`, `ARM64 NEON`), fuses fixed-function graphics state into monolithic **Uber-PSOs**, and JIT-compiles machine code via **LLVM ORC `LLJIT`**.

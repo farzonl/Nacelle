@@ -891,6 +891,29 @@ summary and logs on success or failure; it contains no source/resource payloads.
 An unavailable or noisy runner leaves acceptance open. Normal CI does not
 silently convert inconclusive performance into success.
 
+The [controlled Linux x86_64 run on 2026-11-23](https://github.com/farzonl/Nacelle/actions/runs/45268760467)
+passed all coarse performance gates on the first measurement attempt, using
+1024x1024, SIMD8, 96 raymarch steps, 24 rounds and 60 iterations per process.
+Its independently built first-parent/current OFF workers are byte-identical.
+All 200 fresh-process outputs matched; all 50 active archives were complete,
+zero-drop and native-reader validated. The ordinary compiler/ABI/bitcode
+digest matched between variants; both distinct full debug-policy fingerprints
+are preserved in the report.
+
+| Workload | Paired idle overhead (95% interval) | Paired active overhead (95% interval) |
+| --- | ---: | ---: |
+| Raymarch compute | +0.041% [-0.145%, +0.153%] | +0.044% [-0.083%, +0.352%] |
+| Textured graphics | -0.249% [-0.282%, -0.222%] | -0.243% [-0.291%, -0.205%] |
+
+Negative estimates are not claims of zero cost or speedups. These qualified
+results meet the coarse idle/active thresholds; they do not certify every
+shader/host, other-platform performance, optional observation modes or
+serialization memory. Both this run and normal PR CI passed all six
+Linux/macOS/Windows normal/profiling jobs; Linux ran 288 native capture tests.
+Raw results and identity evidence are retained as the run's
+`coarse-profile-performance` artifact and published under
+[#211](https://github.com/farzonl/Nacelle/issues/211).
+
 ## Format and current scope
 
 ### Profile reader fuzzing
@@ -1119,7 +1142,9 @@ pipeline, memory/disk cache hits, delayed selection across publication, repeated
 captures, metadata limits and invalid references. Linux static/shared execution
 has been checked at SIMD widths 4 and 8.
 
-Performance acceptance remains open. A shared-host sample using Release builds
+The historical shared-host samples below did not establish performance
+acceptance; the controlled run above supplies the current qualified evidence.
+A shared-host sample using Release builds
 with identical compiler hashes, randomized sequential interleaving, 11 runs per
 configuration, and 240 iterations per run produced these median wall times
 (1024x1024, SIMD width 8):
@@ -1156,7 +1181,7 @@ Outputs and recorded-event counts matched between active versions, with no
 drops. End-to-end changes were within shared-host variability: paired pixel
 overhead ranged from -9.0% to +16.9% for the original recorder. These samples do
 not demonstrate a reliable shader speedup or certify the performance budgets;
-further isolation and controlled-host measurements remain necessary.
+they are superseded for acceptance by the controlled measurements above.
 
 A subsequent recorder diagnostic separately evaluated scope ownership and
 counter false sharing (Clang 21.1.8, Linux x86_64, `-O3`, 12 balanced sequential
