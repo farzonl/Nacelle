@@ -284,6 +284,43 @@ int main(int argc, char** argv) {
             profile.spatial->operations[0].cells[0].xyz[0] = 3;
             require(!nacelle::profile::validateSpatial(*profile.spatial, profile.shaders,
                     profile.manifest.captureOptions, error), "Spatial reader rejects out-of-bounds coordinates");
+            {
+                Capture empty;
+                empty.begin();
+                const auto emptyPath = directory / "spatial-empty.nacelle-profile";
+                require(NacelleEndProfileCapture(empty.value, emptyPath.string().c_str(), &summary) == S_OK,
+                        "Empty spatial capture saves completely");
+                const auto emptyProfile = read(emptyPath);
+                require(emptyProfile.spatial && emptyProfile.spatial->operations.empty() &&
+                        emptyProfile.spatial->recorded == 0, "Empty spatial capture invents no cells");
+            }
+            {
+                Capture unavailable;
+                unavailable.begin();
+                {
+                    nacelle::profile::Scope scope("Spatial dispatch-wide entry");
+                    scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute, 1});
+                    scope.setComputeVersion(nacelle::profile::allocatePipelineIdentity(), 1, 1,
+                        nacelle::profile::Cache::Miss);
+                    nacelle::profile::SpatialOperation operation;
+                    operation.stage = "compute";
+                    operation.dimensions = operation.extent = {3, 2, 1};
+                    operation.threadsPerGroup = {4, 2, 1};
+                    operation.granularity = "threadgroup";
+                    operation.orientation = "group-xyz";
+                    operation.availability = "dispatch-wide-entry-unavailable";
+                    require(scope.addSpatialOperation(std::move(operation)) != 0,
+                            "Unsupported group timing retains operation identity");
+                }
+                const auto unavailablePath = directory / "spatial-unavailable.nacelle-profile";
+                require(NacelleEndProfileCapture(unavailable.value, unavailablePath.string().c_str(), &summary) == S_OK,
+                        "Unsupported precision is not a dropped observation");
+                const auto unavailableProfile = read(unavailablePath);
+                require(unavailableProfile.spatial && unavailableProfile.spatial->operations.size() == 1 &&
+                        unavailableProfile.spatial->operations[0].missingStatus == "unavailable" &&
+                        unavailableProfile.spatial->operations[0].cells.empty(),
+                        "Unsupported group timing saves no fabricated zero-valued cells");
+            }
             options.flags = 0;
             require(NacelleConfigureProfileSpatial(&options) == S_OK, "Disable spatial collection");
             options.flags = NACELLE_PROFILE_SPATIAL_COMPUTE;
