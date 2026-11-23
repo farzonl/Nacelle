@@ -49,9 +49,10 @@ export function createSpatialView(root: Document, correlate: (operation: Spatial
     const code = profile?.shaders.codeVersions[selected.codeVersionId - 1];
     const span = profile?.trace.traceEvents.find(event => event.args.id === selected.eventId);
     const lane = metric().endsWith('Lanes') ? Number(laneSelect.value) : -1;
+    const metricAvailable = !metric().endsWith('Lanes') || selected.stage === 'pixel';
     details.textContent = [
       `XYZ ${xyz.join(', ')}: ${coordinateStatus(metadata, selected, xyz, cell)}`,
-      cell ? `${spatialValue(cell, metric(), lane)} ${metricUnits[metric()]}${lane >= 0 ? ` (slot ${lane})` : ''}; ${cell.calls} calls; ${cell.invocations} invocations; ${cell.wallNs} host ns` : 'Value: unavailable, never inferred as zero.',
+      cell && metricAvailable ? `${spatialValue(cell, metric(), lane)} ${metricUnits[metric()]}${lane >= 0 ? ` (slot ${lane})` : ''}; ${cell.calls} calls; ${cell.invocations} invocations; ${cell.wallNs} host ns` : 'Value: unavailable, never inferred as zero.',
       `Pipeline ${selected.pipelineId}; ${selected.stage}; PSO ${selected.pso}; code ID ${selected.codeVersionId}; version ${code?.version}; Tier ${code?.tier}; ${code?.cache}; SIMD ${selected.simdWidth}`,
       `Extent ${selected.extent.join(' x ')}; cells ${selected.dimensions.join(' x ')}; cell extent ${selected.cellExtent.join(' x ')}; ${selected.orientation}`,
       span ? `Captured span ${selected.eventId}: ${span.name}; ${span.dur} us on ${span.pid}:${span.tid}` : `Captured span ${selected.eventId}: unavailable (event recording may have dropped it).`,
@@ -115,14 +116,7 @@ export function createSpatialView(root: Document, correlate: (operation: Spatial
     laneSelect.disabled = selected.stage !== 'pixel' || !metric().endsWith('Lanes');
     const lane = metric().endsWith('Lanes') ? Number(laneSelect.value) : -1;
     const requestedMetric = metric();
-    if (selected.stage !== 'pixel' && requestedMetric.endsWith('Lanes')) {
-      status.textContent = 'Unavailable: compute lane submission layout is not captured.';
-      status.dataset.state = 'ready';
-      legend.textContent = 'Gray: unavailable, no numeric value.';
-      inspectButton.disabled = false;
-      inspect();
-      return;
-    }
+    const unavailableMetric = selected.stage !== 'pixel' && requestedMetric.endsWith('Lanes');
     function prepare(): void {
       if (token !== generation) return;
       const end = Math.min(index + 1000, selected!.cells.length);
@@ -131,7 +125,7 @@ export function createSpatialView(root: Document, correlate: (operation: Spatial
         lookup.set(cell.xyz.join(','), cell);
         if (cell.xyz[sliced] !== layer) continue;
         visible++;
-        if (explicitHigh === undefined) high = Math.max(high, spatialValue(cell, requestedMetric, lane));
+        if (!unavailableMetric && explicitHigh === undefined) high = Math.max(high, spatialValue(cell, requestedMetric, lane));
       }
       if (index < selected!.cells.length) frame = win.requestAnimationFrame(prepare);
       else {
@@ -141,6 +135,7 @@ export function createSpatialView(root: Document, correlate: (operation: Spatial
     }
     function draw(): void {
       if (token !== generation) return;
+      if (unavailableMetric) index = selected!.cells.length;
       const end = Math.min(index + 1000, selected!.cells.length);
       for (; index < end; index++) {
         const cell = selected!.cells[index];
@@ -157,12 +152,14 @@ export function createSpatialView(root: Document, correlate: (operation: Spatial
       else {
         status.dataset.state = 'ready';
         inspectButton.disabled = false;
-        status.textContent = `${visible} observed cells on ${plane().toUpperCase()} slice ${layer}. ${selected!.orientation}. ` +
+        status.textContent = (unavailableMetric ? 'Unavailable: compute lane submission layout is not captured. ' :
+          `${visible} observed cells on ${plane().toUpperCase()} slice ${layer}. ${selected!.orientation}. `) +
           (!profile!.manifest.complete ? 'Warning: capture incomplete; missing coordinates or values may be unreliable. ' : '') +
           `${selected!.recorded} recorded; ${selected!.skipped} skipped; ${selected!.dropped} dropped. ` +
           (selected!.availability !== 'available' ? 'Per-group timing unavailable. ' : '') +
           'Sparse projection only; subpixel cells can overlap. Use exact XYZ inspection, not color, for exact values.';
-        legend.textContent = `Blue to orange: ${low} to ${high} ${metricUnits[requestedMetric]} (${scale.value}; values clipped to range). ` +
+        legend.textContent = unavailableMetric ? 'Gray: unavailable, no numeric value.' :
+          `Blue to orange: ${low} to ${high} ${metricUnits[requestedMetric]} (${scale.value}; values clipped to range). ` +
           'Observed zero is numeric blue at range 0; gray = missing/unsampled/unavailable, not zero; magenta outline = partial. ' +
           `Horizontal ${'XYZ'[horizontal]}, vertical ${'XYZ'[vertical]} increasing downward; fixed ${'XYZ'[sliced]} = ${layer}.`;
         inspect();

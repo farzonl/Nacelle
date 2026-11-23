@@ -329,6 +329,9 @@ test('decodes typed spatial observations offline and warns separately about spat
     await page.locator('#spatial-slice').dispatchEvent('change');
     await page.locator('#spatial-metric').selectOption('coveredLanes');
     await expect(page.locator('#spatial-status')).toContainText('compute lane submission layout is not captured');
+    await expect(page.locator('#spatial-details')).toContainText('Value: unavailable, never inferred as zero.');
+    await expect(page.locator('#spatial-details')).not.toContainText('0 covered submissions');
+    await expect(page.locator('#spatial-details')).toContainText('XYZ 2, 0, 2: Observed');
   });
 
   test('warns about partial and unsupported spatial precision without fabricating values', async ({ page }) => {
