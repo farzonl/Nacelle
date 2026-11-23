@@ -2,6 +2,7 @@ import { cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, join } from 'node:path';
 
+const VIEWER_ALLOWED_ASSET = /^(index-[A-Za-z0-9_-]+\.(js|css)|profile-worker-[A-Za-z0-9_-]+\.js)$/;
 const SPEEDSCOPE_ALLOWED_FILE = /^(index\.html|release\.txt|source-code-pro\.LICENSE\.md|speedscope-[A-Za-z0-9_-]+\.(js|css)|SourceCodePro-[A-Za-z0-9_.-]+\.woff2|jfrview_bg-[A-Za-z0-9_-]+\.wasm|favicon-[A-Za-z0-9_-]+\.(ico|png|js))$/;
 
 const args = process.argv.slice(2);
@@ -31,7 +32,7 @@ if (!files.includes('index.html') || files.some(file => !['index.html', 'assets'
   throw new Error('Unexpected viewer build contents; refusing to publish.');
 }
 for (const name of await readdir(join(dist, 'assets'))) {
-  if (!/^index-[A-Za-z0-9_-]+\.(js|css)$/.test(name)) {
+  if (!VIEWER_ALLOWED_ASSET.test(name)) {
     throw new Error(`Unexpected viewer asset: ${name}`);
   }
 }

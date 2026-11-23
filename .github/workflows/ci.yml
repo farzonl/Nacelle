@@ -609,6 +609,10 @@ jobs:
         working-directory: tools/nacelle-view
         run: npm run build
 
+      - name: Verify profile viewer staging
+        working-directory: tools/nacelle-view
+        run: npm run stage -- ../../build-profile/staged-viewer
+
       - name: Export native trace for browser verification
         if: runner.os == 'Linux'
         run: |
