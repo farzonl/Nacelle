@@ -32,7 +32,7 @@ function(nacelle_add_profile_support)
     target_compile_definitions(nacelle_profile_miniz PUBLIC MINIZ_STATIC_DEFINE)
 
     add_library(nacelle_profile_io STATIC "${root}/src/instrumentation/profile_writer.cpp"
-        "${root}/src/instrumentation/artifacts.cpp")
+        "${root}/src/instrumentation/artifacts.cpp" "${root}/src/instrumentation/spatial.cpp")
     target_include_directories(nacelle_profile_io PRIVATE "${root}/third_party/xxHash")
     target_link_libraries(nacelle_profile_io PRIVATE glaze::glaze nacelle_profile_miniz libzstd_static)
     target_compile_definitions(nacelle_profile_io PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)

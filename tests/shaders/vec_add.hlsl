@@ -14,3 +14,11 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         bufOut[dtid.x] = bufA[dtid.x] * scale + bufB[dtid.x] + bias;
     }
 }
+
+[numthreads(8, 2, 2)]
+void CSVolumeMain(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    uint i = ((gid.z * 2 + gid.y) * 4 + gid.x) * 32 + gi;
+    if (i < count) {
+        bufOut[i] = bufA[i] * scale + bufB[i] + bias;
+    }
+}

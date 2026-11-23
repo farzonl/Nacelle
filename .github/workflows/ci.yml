@@ -568,6 +568,8 @@ jobs:
         run: |
           cmake --build build-profile --target \
             instrumentation_test profile_runtime_static_test profile_runtime_shared_test nacelle-dbg \
+            compute_dispatch_test interlocked_barrier_test \
+            rasterizer_pipeline_test graphics_features_test \
             --parallel
 
       - name: Run instrumented capture tests
@@ -579,7 +581,7 @@ jobs:
             export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
           fi
           ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|profile_runtime_.*_test)$' --output-on-failure
+            -R '^(instrumentation_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
 
       - name: Set up Node for native profile interoperability
         uses: actions/setup-node@v4
@@ -600,6 +602,7 @@ jobs:
           NACELLE_NATIVE_SHADER_DIR: "${{ github.workspace }}/build-profile/tests/shaders"
           NACELLE_NATIVE_READER: "${{ github.workspace }}/build-profile/tools/nacelle-dbg/nacelle-dbg${{ matrix.exe }}"
           NACELLE_NATIVE_ARTIFACT_PROFILE: "${{ github.workspace }}/build-profile/tests/static-artifacts-source.nacelle-profile"
+          NACELLE_NATIVE_SPATIAL_PROFILE: "${{ github.workspace }}/build-profile/tests/static-spatial-dense-simd8.nacelle-profile"
         run: npm test
 
       - name: Build profile viewer

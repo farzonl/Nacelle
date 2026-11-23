@@ -60,7 +60,8 @@ export function groupThreads(trace: Trace): ThreadGroup[] {
 export function captureStatus(profile: Profile): string {
   const { manifest } = profile;
   if (!manifest.complete) {
-    return `Incomplete capture: partial data only. ${manifest.droppedEvents} dropped events.`;
+    return `Incomplete capture: partial data only. ${manifest.droppedEvents} dropped events.` +
+      (profile.spatial && !profile.spatial.complete ? ` ${profile.spatial.dropped} dropped spatial observations.` : '');
   }
   if (manifest.droppedEvents) {
     return `Capture completed with data loss: ${manifest.droppedEvents} dropped events.`;
@@ -75,6 +76,10 @@ export function summaryText(profile: Profile): string {
     `Dropped events: ${manifest.droppedEvents}`,
     `Trace events: ${trace.traceEvents.length}`,
     `Timing spans: ${trace.traceEvents.filter(event => event.ph === 'X').length}`,
+    ...(profile.spatial ? [
+      `Spatial observations: ${profile.spatial.recorded}; skipped: ${profile.spatial.skipped}; dropped: ${profile.spatial.dropped}`,
+      'Spatial wall time: host entry-call ns per tile/threadgroup; lane counts: entry submission only',
+    ] : []),
     `Clock: ${manifest.clock}; manifest timestamp unit: ${manifest.timestampUnit}`,
     'Trace timestamp/duration unit: µs; display unit: ms',
     'Replayable: no',

@@ -13,6 +13,7 @@
 #include <vector>
 #include "profile_format.h"
 #include "artifacts.h"
+#include "spatial.h"
 
 namespace nacelle::profile {
 
@@ -77,6 +78,7 @@ struct Session {
     ShaderMetadata shaders;
     bool shaderMetadataOverflow = false;
     std::shared_ptr<ArtifactStore> retainedArtifacts;
+    std::unique_ptr<SpatialState> spatial;
 };
 
 struct Work {
@@ -119,6 +121,8 @@ public:
         return session_ && !session_->compilerConfigurationRecorded.load(std::memory_order_acquire);
     }
     Context context() const;
+    SpatialState* spatial() const { return session_ ? session_->spatial.get() : nullptr; }
+    uint64_t addSpatialOperation(SpatialOperation operation) const;
 
 private:
     void begin(const char* name);

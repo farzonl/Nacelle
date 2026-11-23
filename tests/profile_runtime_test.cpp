@@ -68,9 +68,11 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     signatureDesc.pParameters = parameters;
     auto signature = createSignature(runtime, signatureDesc);
     const auto* artifactMode = std::getenv("NACELLE_TEST_ARTIFACTS");
+    const auto* spatialMode = std::getenv("NACELLE_TEST_SPATIAL");
+    const bool volume = spatialMode && std::string_view(spatialMode) == "volume";
     auto shader = testutil::loadShaderBytes(artifactMode && (std::string_view(artifactMode) == "source" ||
         std::string_view(artifactMode) == "no-source")
-        ? "vec_add_debug.dxil" : "vec_add.dxil");
+        ? "vec_add_debug.dxil" : volume ? "vec_add_volume.dxil" : "vec_add.dxil");
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = signature.Get();
     desc.CS = {shader.data(), shader.size()};
@@ -114,7 +116,8 @@ void compute(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCa
     uint32_t constants[3]{0, 0, static_cast<uint32_t>(a.size())};
     std::memcpy(&constants[0], &scale, sizeof(scale));
     runtime.cmdList->SetComputeRoot32BitConstants(3, 3, constants, 0);
-    runtime.cmdList->Dispatch(16, 1, 1);
+    if (volume) runtime.cmdList->Dispatch(4, 2, 4);
+    else runtime.cmdList->Dispatch(16, 1, 1);
     runtime.executeAndWait();
     const auto bytes = runtime.readbackBuffer(output.Get(), sizeof(a));
     std::array<float, 1024> actual{};
@@ -129,9 +132,14 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     auto signature = createSignature(runtime, signatureDesc);
     const bool extended = mode.starts_with("graphics-extended");
     const bool mesh = mode.starts_with("graphics-mesh");
+    const auto* spatialMode = std::getenv("NACELLE_TEST_SPATIAL");
+    const bool edges = spatialMode && (std::string_view(spatialMode) == "edges" ||
+                                      std::string_view(spatialMode) == "derivatives");
+    const bool derivatives = spatialMode && std::string_view(spatialMode) == "derivatives";
     auto vs = testutil::loadShaderBytes(extended ? "gfx_tess_point_vs.dxil" : "raster_basic_vs.dxil");
     auto ps = testutil::loadShaderBytes(extended ? "gfx_tess_point_ps.dxil" :
-                                      mesh ? "mesh_solid_red_ps.dxil" : "raster_basic_ps.dxil");
+                                      mesh ? "mesh_solid_red_ps.dxil" :
+                                      derivatives ? "raster_quad_coverage_ps.dxil" : "raster_basic_ps.dxil");
     std::vector<uint8_t> hs, ds, gs, as, ms;
     const D3D12_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -213,9 +221,11 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     };
     auto vertexBuffer = runtime.createBuffer(sizeof(vertices), D3D12_HEAP_TYPE_DEFAULT);
     runtime.uploadBuffer(vertexBuffer.Get(), vertices, sizeof(vertices));
-    constexpr UINT width = 128;
+    const UINT width = edges ? 129 : 128;
+    const UINT height = edges ? 67 : 128;
+    const UINT rowPitch = (width * 4 + 255) & ~255u;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    auto textureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, width, width,
+    auto textureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, width, height,
         1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     ComPtr<ID3D12Resource> target;
     testutil::checkHR(runtime.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &textureDesc,
@@ -226,8 +236,8 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     auto rtv = descriptors->GetCPUDescriptorHandleForHeapStart();
     runtime.device->CreateRenderTargetView(target.Get(), nullptr, rtv);
     D3D12_VERTEX_BUFFER_VIEW vb{vertexBuffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(vertices[0])};
-    D3D12_VIEWPORT viewport{0, 0, width, width, 0, 1};
-    D3D12_RECT scissor{0, 0, width, width};
+    D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    D3D12_RECT scissor{edges ? 1 : 0, edges ? 1 : 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     if (executionCapture) beginCapture(executionCapture);
     runtime.resetCmd();
     runtime.cmdList->SetGraphicsRootSignature(signature.Get());
@@ -248,11 +258,11 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
         runtime.cmdList->DrawInstanced(3, 1, 0, 0);
     }
     runtime.executeAndWait();
-    auto readback = runtime.createBuffer(width * width * 4, D3D12_HEAP_TYPE_READBACK);
+    auto readback = runtime.createBuffer(rowPitch * height, D3D12_HEAP_TYPE_READBACK);
     D3D12_TEXTURE_COPY_LOCATION destination{};
     destination.pResource = readback.Get();
     destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    destination.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, width, 1, width * 4};
+    destination.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, rowPitch};
     D3D12_TEXTURE_COPY_LOCATION source{};
     source.pResource = target.Get();
     source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -262,7 +272,7 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
     void* data = nullptr;
     testutil::checkHR(readback->Map(0, nullptr, &data), "Map graphics result");
     const auto* pixels = static_cast<const uint8_t*>(data);
-    const size_t center = (width / 2 * width + width / 2) * 4;
+    const size_t center = (height / 2 * rowPitch + width / 2 * 4);
     bool correct = pixels[center] == 255 && pixels[center + 1] == 0 &&
                    pixels[center + 2] == 0 && pixels[center + 3] == 255;
     if (extended) {
@@ -270,6 +280,16 @@ void draw(testutil::TestRuntime& runtime, NacelleProfileCapture** executionCaptu
         for (size_t i = 0; i < width * width * 4; i += 4) {
             if (pixels[i] == 0 && pixels[i + 1] == 255 && pixels[i + 2] == 0 && pixels[i + 3] == 255)
                 correct = true;
+        }
+        if (spatialMode && !mesh && !extended) {
+            correct = true;
+            for (UINT y = 0; y < height; ++y)
+                for (UINT x = 0; x < width; ++x) {
+                    const size_t offset = y * rowPitch + x * 4;
+                    const uint8_t red = (edges && (x == 0 || y == 0)) || (derivatives && (x + y) % 3 == 0) ? 0 : 255;
+                    correct &= pixels[offset] == red && pixels[offset + 1] == 0 &&
+                               pixels[offset + 2] == 0 && pixels[offset + 3] == 255;
+                }
         }
     }
     readback->Unmap(0, nullptr);
@@ -296,6 +316,18 @@ int main(int argc, char** argv) {
     }
     NacelleProfileCapture* capture = nullptr;
     try {
+        const auto* spatialMode = std::getenv("NACELLE_TEST_SPATIAL");
+        if (spatialMode) {
+            NacelleProfileSpatialOptions options;
+            options.flags = NACELLE_PROFILE_SPATIAL_COMPUTE | NACELLE_PROFILE_SPATIAL_PIXEL;
+            if (std::string_view(spatialMode) == "overflow") options.record_bytes = 424;
+            if (std::string_view(spatialMode) == "sampled") options.sample_stride = 2;
+            if (std::string_view(spatialMode) == "roi") {
+                options.min_xyz[0] = 1;
+                options.max_xyz[0] = 2;
+            }
+            testutil::checkHR(NacelleConfigureProfileSpatial(&options), "Configure spatial observation");
+        }
         const auto* artifactMode = std::getenv("NACELLE_TEST_ARTIFACTS");
         if (artifactMode && std::string_view(artifactMode) != "missing") {
             NacelleProfileArtifactOptions options;
@@ -415,8 +447,57 @@ int main(int argc, char** argv) {
             }
         }
         const auto& build = profile.manifest.build;
+        if (spatialMode) {
+            require(profile.manifest.schemaVersion == 3 && profile.spatial,
+                    "Explicit spatial capture declares versioned bounded payload");
+            const auto& spatial = *profile.spatial;
+            require(!spatial.operations.empty(), "Spatial capture identifies eligible operations");
+            const bool overflow = std::string_view(spatialMode) == "overflow";
+            require(spatial.complete != overflow && (spatial.dropped > 0) == overflow,
+                    "Spatial overflow is incomplete with exact explicit drop counters");
+            require(spatial.recorded > 0, "Host entry-call observations were captured");
+            if (std::string_view(spatialMode) == "sampled" || std::string_view(spatialMode) == "roi")
+                require(spatial.skipped > 0, "Deterministic sampling skips observations without changing results");
+            for (const auto& operation : spatial.operations) {
+                require(operation.codeVersionId && operation.pipelineId &&
+                        operation.pso == profile.shaders.codeVersions[operation.codeVersionId - 1].pso,
+                        "Spatial cells resolve immutable executed entries");
+                if (const auto* width = std::getenv("NACELLE_SIMD_WIDTH"))
+                    require(operation.simdWidth == std::stoul(width), "Requested SIMD width is actually exercised");
+                if (std::string_view(spatialMode) == "roi")
+                    for (const auto& cell : operation.cells)
+                        require(cell.xyz[0] == 1, "ROI limits only observed coordinates");
+                if (operation.stage == "compute") {
+                    const bool volume = std::string_view(spatialMode) == "volume";
+                    require(operation.dimensions == (volume ? std::array<uint32_t, 3>{4, 2, 4} :
+                                                              std::array<uint32_t, 3>{16, 1, 1}) &&
+                            operation.threadsPerGroup == (volume ? std::array<uint32_t, 3>{8, 2, 2} :
+                                                                  std::array<uint32_t, 3>{64, 1, 1}),
+                            "Compute spatial coordinates preserve logical threadgroups");
+                } else {
+                    require(operation.orientation == "top-left-y-down" &&
+                            (overflow ? operation.cells.empty() && operation.dropped > 0 : !operation.cells.empty()),
+                            "Pixel tile orientation and submitted-lane metrics are explicit");
+                    for (const auto& cell : operation.cells)
+                        require(cell.coveredLanes.size() == operation.simdWidth &&
+                                cell.companionLanes.size() == operation.simdWidth,
+                                "Spatial pixel coverage/companion ABI lanes remain distinguishable");
+                    if (std::string_view(spatialMode) == "edges" || std::string_view(spatialMode) == "derivatives") {
+                        uint64_t companions = 0, covered = 0;
+                        for (const auto& cell : operation.cells)
+                            for (size_t lane = 0; lane < cell.companionLanes.size(); ++lane) {
+                                companions += cell.companionLanes[lane];
+                                covered += cell.coveredLanes[lane];
+                            }
+                        require(companions > 0 && covered == 128 * 66 &&
+                                operation.extent == std::array<uint32_t, 3>{129, 67, 1},
+                                "Odd edges retain real quad companions rather than filtering shader execution");
+                    }
+                }
+            }
+        }
         if (artifactMode) {
-            require(profile.manifest.schemaVersion == 2 && profile.artifacts.has_value(),
+            require(profile.manifest.schemaVersion >= 2 && profile.artifacts.has_value(),
                     "Opt-in capture contains versioned declared artifacts");
             const auto& artifacts = *profile.artifacts;
             const auto hasKind = [&](const char* kind) {
@@ -445,7 +526,9 @@ int main(int argc, char** argv) {
                 "Compiler and CPU metadata available without requiring pipeline creation");
         require(std::is_sorted(build.cpuFeatures.begin(), build.cpuFeatures.end()),
                 "CPU features have stable ordering");
-        require(profile.manifest.complete && summary.recorded_events > (mode == "all" ? 10u : 0u),
+        const bool expectedComplete = !spatialMode || std::string_view(spatialMode) != "overflow";
+        require(profile.manifest.complete == expectedComplete && bool(summary.complete) == expectedComplete &&
+                summary.recorded_events > (mode == "all" ? 10u : 0u),
                 "Complete runtime capture");
         std::cout << mode << " output + runtime profile spans + compiler metadata: PASS ("
                   << summary.recorded_events << " events)\n";

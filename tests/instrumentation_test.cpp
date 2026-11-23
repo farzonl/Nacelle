@@ -237,6 +237,71 @@ int main(int argc, char** argv) {
                 require(NacelleConfigureProfileArtifacts(&options) == S_OK, "Clear test retention");
         }
         {
+            NacelleProfileSpatialOptions options;
+            options.flags = NACELLE_PROFILE_SPATIAL_COMPUTE;
+            options.record_bytes = 2 * sizeof(nacelle::profile::SpatialRecord);
+            options.sample_stride = 2;
+            require(NacelleConfigureProfileSpatial(&options) == S_OK, "Configure bounded spatial capture");
+            Capture capture;
+            capture.begin();
+            require(NacelleConfigureProfileSpatial(&options) == E_UNEXPECTED,
+                    "Spatial settings cannot change during active capture");
+            {
+                nacelle::profile::Scope scope("Spatial synthetic dispatch");
+                scope.setAttributes({1, 2, 8, nacelle::profile::Stage::Compute, 1});
+                scope.setComputeVersion(nacelle::profile::allocatePipelineIdentity(), 1, 1,
+                    nacelle::profile::Cache::Miss);
+                nacelle::profile::SpatialOperation operation;
+                operation.stage = "compute";
+                operation.dimensions = operation.extent = {3, 2, 1};
+                operation.threadsPerGroup = {4, 2, 1};
+                operation.granularity = "threadgroup";
+                operation.orientation = "group-xyz";
+                operation.availability = "available";
+                const auto id = scope.addSpatialOperation(std::move(operation));
+                for (uint32_t y = 0; y < 2; ++y)
+                    for (uint32_t x = 0; x < 3; ++x)
+                        if (auto* record = scope.spatial()->reserve(id, {x, y, 0})) {
+                            record->wallNs = 0; // An observed zero is distinct from a missing cell.
+                            record->invocations = 8;
+                        }
+                require(scope.spatial()->complete(), "Exact record-pool boundary stays complete");
+                require(!scope.spatial()->reserve(id, {0, 0, 0}), "Next selected record explicitly drops");
+            }
+            NacelleProfileSummary summary;
+            const auto path = directory / "spatial-sampled.nacelle-profile";
+            require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == S_FALSE &&
+                    !summary.complete && summary.dropped_events == 0,
+                    "Spatial overflow reports incomplete independently of event drops");
+            auto profile = read(path);
+            require(profile.spatial && !profile.manifest.complete && profile.spatial->recorded == 2 &&
+                    profile.spatial->skipped == 4 && profile.spatial->dropped == 1 &&
+                    profile.spatial->operations[0].cells.size() == 2 &&
+                    profile.spatial->operations[0].cells[0].wallNs == 0 &&
+                    profile.spatial->operations[0].cells[0].status == "partial",
+                    "Sampled sparse cells preserve observed zeros and exact drops");
+            std::string error;
+            profile.spatial->operations[0].cells[0].xyz[0] = 3;
+            require(!nacelle::profile::validateSpatial(*profile.spatial, profile.shaders,
+                    profile.manifest.captureOptions, error), "Spatial reader rejects out-of-bounds coordinates");
+            options.flags = 0;
+            require(NacelleConfigureProfileSpatial(&options) == S_OK, "Disable spatial collection");
+            options.flags = NACELLE_PROFILE_SPATIAL_COMPUTE;
+            options.record_bytes = 16ull * 1024 * 1024;
+            require(NacelleConfigureProfileSpatial(&options) == S_OK, "Configure spatial allocation failure case");
+            allocationFailureMinimum = options.record_bytes / sizeof(nacelle::profile::SpatialRecord) *
+                                       sizeof(nacelle::profile::SpatialRecord);
+            NacelleProfileOptions eventOptions;
+            eventOptions.event_buffer_bytes = 1024 * 1024;
+            NacelleProfileCapture* failed = nullptr;
+            require(NacelleBeginProfileCapture(&eventOptions, &failed) == E_OUTOFMEMORY && !failed,
+                    "Spatial-pool allocation failure leaves no active capture");
+            options.flags = 0;
+            require(NacelleConfigureProfileSpatial(&options) == S_OK, "Reset spatial allocation settings");
+            options.record_bytes = 1;
+            require(NacelleConfigureProfileSpatial(&options) == E_INVALIDARG, "Reject invalid spatial record budget");
+        }
+        {
             NacelleProfileOptions options;
             options.event_buffer_bytes = 1024 * 1024;
             const auto eventBytes = options.event_buffer_bytes / sizeof(nacelle::profile::Event) *

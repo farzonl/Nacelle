@@ -31,6 +31,7 @@ ComPtr<ID3D12PipelineState> createComputePSO(ID3D12Device* dev, ID3D12RootSignat
 } // namespace
 
 int main() {
+    testutil::SpatialTestCapture spatial;
     testutil::TestRuntime rt;
     rt.init();
 
@@ -454,6 +455,7 @@ int main() {
         }
     }
 
+    spatial.finish();
     std::printf("compute_dispatch_test PASSED (vec_add, matmul, divergent_cf_atomics, prefix_sum_groupshared, byte_address_get_dims, uav_counter_dec, group_index_patterns, subwave_group_thread)\n");
     return 0;
 }

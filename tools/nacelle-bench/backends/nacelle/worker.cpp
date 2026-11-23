@@ -3,6 +3,7 @@
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
 #include <nacelle/instrumentation.h>
 #include <cstdlib>
+#include <chrono>
 #endif
 
 #include <cstdint>
@@ -14,7 +15,24 @@ using namespace nacelle_bench;
 int main(int argc, char** argv) {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     const char* profilePath = std::getenv("NACELLE_PROFILE_OUTPUT");
+    const char* spatialMode = std::getenv("NACELLE_PROFILE_SPATIAL");
     NacelleProfileCapture* capture = nullptr;
+    if (spatialMode) {
+        if (std::string(spatialMode) != "0" && std::string(spatialMode) != "1") {
+            std::fprintf(stderr, "[NacelleProfile] NACELLE_PROFILE_SPATIAL must be 0 or 1\n");
+            return 1;
+        }
+        if (std::string(spatialMode) == "1") {
+            if (!profilePath || !*profilePath) {
+                std::fprintf(stderr, "[NacelleProfile] Spatial capture requires NACELLE_PROFILE_OUTPUT\n");
+                return 1;
+            }
+            NacelleProfileSpatialOptions spatial;
+            spatial.flags = NACELLE_PROFILE_SPATIAL_COMPUTE | NACELLE_PROFILE_SPATIAL_PIXEL;
+            spatial.record_bytes = 16ull * 1024 * 1024;
+            if (FAILED(NacelleConfigureProfileSpatial(&spatial))) return 1;
+        }
+    }
     if (profilePath && *profilePath) {
         NacelleProfileOptions options;
         if (FAILED(NacelleBeginProfileCapture(&options, &capture))) return 1;
@@ -57,10 +75,15 @@ int main(int argc, char** argv) {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     if (capture) {
         NacelleProfileSummary summary;
+        const auto started = std::chrono::steady_clock::now();
         const HRESULT status = NacelleEndProfileCapture(capture, profilePath, &summary);
+        if (spatialMode)
+            std::fprintf(stderr, "[NacelleProfile] Capture drain/aggregate/serialize (spatial=%s): %.3f ms\n",
+                spatialMode,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         NacelleDestroyProfileCapture(capture);
         if (status != S_OK) {
-            std::fprintf(stderr, "[NacelleProfile] Capture failed or incomplete (%llu dropped)\n",
+            std::fprintf(stderr, "[NacelleProfile] Capture failed or incomplete (%llu event drops; inspect spatial counters)\n",
                          static_cast<unsigned long long>(summary.dropped_events));
             return 1;
         }

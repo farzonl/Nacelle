@@ -234,6 +234,10 @@ add_hlsl_spirv(textured_pbr_quad.hlsl ps_6_0 PSMain textured_pbr_quad.spv)
 # Graphics shaders (DXIL)
 add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSMain raster_basic_vs.dxil)
 add_hlsl_dxil(raster_basic.hlsl ps_6_0 PSMain raster_basic_ps.dxil)
+if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
+    add_hlsl_dxil(raster_basic.hlsl ps_6_0 PSQuadCoverageMain raster_quad_coverage_ps.dxil)
+    add_hlsl_dxil(vec_add.hlsl cs_6_0 CSVolumeMain vec_add_volume.dxil)
+endif()
 add_hlsl_dxil(raster_basic.hlsl ps_6_0 PSAltTintMain raster_alt_tint_ps.dxil)
 add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSPackedInstMain raster_packed_inst_vs.dxil)
 add_hlsl_dxil(raster_basic.hlsl vs_6_0 VSHeavyTransformMain raster_heavy_transform_vs.dxil)
@@ -356,6 +360,16 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
             -Fo "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vec_add.hlsl")
     add_custom_target(profile_debug_shaders DEPENDS "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil")
+    foreach(execution IN ITEMS compute_dispatch interlocked_barrier rasterizer_pipeline graphics_features)
+        foreach(width IN ITEMS 4 8 16)
+            add_test(NAME spatial_${execution}_simd${width}_test
+                COMMAND "${CMAKE_COMMAND}" -E env
+                    "NACELLE_SPATIAL_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/spatial-${execution}-simd${width}.nacelle-profile"
+                    "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:${execution}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/spatial-${execution}-simd${width}.nacelle-profile"
+                    "-DSIMD_WIDTH=${width}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
+    endforeach()
     foreach(linkage IN ITEMS static shared)
         add_executable(profile_runtime_${linkage}_test profile_runtime_test.cpp)
         add_dependencies(profile_runtime_${linkage}_test nacelle_test_shaders)
@@ -381,6 +395,27 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                     "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
                     "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-artifacts-${artifacts}.nacelle-profile"
                     -DCAPTURE_MODE=cached -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        endforeach()
+        foreach(spatial IN ITEMS dense sampled roi overflow edges derivatives volume)
+            foreach(width IN ITEMS 4 8 16)
+                add_test(NAME profile_runtime_${linkage}_spatial_${spatial}_simd${width}_test
+                    COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SPATIAL=${spatial}"
+                        "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                        "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-spatial-${spatial}-simd${width}.nacelle-profile"
+                        "-DSIMD_WIDTH=${width}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+            endforeach()
+        endforeach()
+        add_test(NAME profile_runtime_${linkage}_spatial_artifacts_test
+            COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SPATIAL=dense" "NACELLE_TEST_ARTIFACTS=source"
+                "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-spatial-artifacts.nacelle-profile"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+        foreach(cache IN ITEMS promoted cached disk graphics-promoted graphics-cached graphics-mesh-cached)
+            add_test(NAME profile_runtime_${linkage}_spatial_${cache}_test
+                COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_SPATIAL=dense"
+                    "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                    "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/${linkage}-spatial-${cache}.nacelle-profile"
+                    "-DCAPTURE_MODE=${cache}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
         endforeach()
         foreach(cache IN ITEMS promoted disk graphics-cached graphics-extended-cached graphics-mesh-cached)
             add_test(NAME profile_runtime_${linkage}_artifacts_${cache}_test

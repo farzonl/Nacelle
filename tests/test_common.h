@@ -2,6 +2,9 @@
 
 #include <nacelle/nacelle.h>
 #include <directx/d3dx12.h>
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include <nacelle/instrumentation.h>
+#endif
 
 #include <cassert>
 #include <cstdio>
@@ -27,6 +30,36 @@ inline void checkHR(HRESULT hr, const char* msg) {
         std::abort();
     }
 }
+
+struct SpatialTestCapture {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    NacelleProfileCapture* capture = nullptr;
+    const char* path = std::getenv("NACELLE_SPATIAL_TEST_OUTPUT");
+    explicit SpatialTestCapture(uint32_t stride = 1) {
+        if (!path) return;
+        NacelleProfileSpatialOptions spatial;
+        spatial.flags = NACELLE_PROFILE_SPATIAL_COMPUTE | NACELLE_PROFILE_SPATIAL_PIXEL;
+        spatial.sample_stride = stride;
+        checkHR(NacelleConfigureProfileSpatial(&spatial), "Configure spatial test capture");
+        NacelleProfileOptions options;
+        checkHR(NacelleBeginProfileCapture(&options, &capture), "Begin spatial test capture");
+    }
+    ~SpatialTestCapture() { NacelleDestroyProfileCapture(capture); }
+    void finish() {
+        if (!capture) return;
+        NacelleProfileSummary summary;
+        const auto result = NacelleEndProfileCapture(capture, path, &summary);
+        checkHR(result, "Save spatial execution-preservation test");
+        if (result != S_OK || !summary.complete) {
+            std::fprintf(stderr, "Spatial execution-preservation capture is incomplete\n");
+            std::abort();
+        }
+    }
+#else
+    explicit SpatialTestCapture(uint32_t = 1) {}
+    void finish() {}
+#endif
+};
 
 inline std::vector<uint8_t> loadShaderBytes(const char* filename) {
     std::string path = std::string(NACELLE_SHADER_BIN_DIR) + "/" + filename;

@@ -1029,6 +1029,19 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
                                       entry->tier, entry->cache, cpso->profileShaderId, entry->artifactId);
     if (dispatchProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();
     const auto dispatchContext = dispatchProfile.context();
+    auto* spatial = dispatchProfile.spatial();
+    uint64_t spatialOperation = 0;
+    if (spatial && (spatial->options.flags & NACELLE_PROFILE_SPATIAL_COMPUTE)) {
+        profile::SpatialOperation operation;
+        operation.stage = "compute";
+        operation.dimensions = {gx, gy, gz};
+        operation.extent = {gx, gy, gz};
+        std::copy_n(cpso->threadGroupSize, 3, operation.threadsPerGroup.begin());
+        operation.granularity = "threadgroup";
+        operation.orientation = "group-xyz";
+        operation.availability = cpso->singleGroupDispatch ? "dispatch-wide-entry-unavailable" : "available";
+        spatialOperation = dispatchProfile.addSpatialOperation(std::move(operation));
+    }
 #endif
     const DriverRootContext ctxSnapshot = state.computeCtx;
     if (cpso->singleGroupDispatch) {
@@ -1056,7 +1069,19 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
             if (cpso->groupSharedBytes > 0) {
                 std::memset(tlScratch.data(), 0, cpso->groupSharedBytes);
             }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            auto* observation = spatialOperation ? spatial->reserve(spatialOperation, {x, y, z}) : nullptr;
+            const auto started = observation ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
             fn(&ctxSnapshot, tlScratch.data(), x, y, z, gx, gy, gz);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+            if (observation) {
+                observation->wallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                observation->invocations = uint64_t(cpso->threadGroupSize[0]) *
+                    cpso->threadGroupSize[1] * cpso->threadGroupSize[2];
+            }
+#endif
             if (++x == gx) {
                 x = 0;
                 if (++y == gy) {

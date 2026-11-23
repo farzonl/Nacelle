@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -54,6 +55,38 @@ struct ArtifactMetadata {
     std::vector<ArtifactSelection> selections;
 };
 
+struct SpatialCell {
+    std::array<uint32_t, 3> xyz{};
+    std::string status = "observed";
+    uint64_t calls = 0, wallNs = 0, invocations = 0;
+    std::vector<uint64_t> coveredLanes, companionLanes, paddingLanes;
+};
+
+struct SpatialOperation {
+    uint64_t id = 0, eventId = 0, pipelineId = 0, codeVersionId = 0;
+    std::string stage, pso, granularity, orientation, availability;
+    std::string timeUnit = "ns";
+    std::string laneSemantics = "entry-submission";
+    std::string laneLayout = "unavailable";
+    std::array<uint32_t, 3> dimensions{}, extent{}, threadsPerGroup{}, cellExtent{1, 1, 1};
+    uint32_t simdWidth = 0;
+    uint64_t recorded = 0, skipped = 0, dropped = 0;
+    bool complete = true;
+    std::string missingStatus = "unsampled";
+    std::vector<SpatialCell> cells;
+};
+
+struct SpatialMetadata {
+    uint32_t schemaVersion = 1;
+    uint32_t flags = 0;
+    uint64_t recordBytes = 0;
+    uint32_t sampleStride = 1;
+    std::array<uint32_t, 3> minXYZ{}, maxXYZ{};
+    bool complete = true;
+    uint64_t recorded = 0, skipped = 0, dropped = 0;
+    std::vector<SpatialOperation> operations;
+};
+
 struct Build {
     std::string compiler;
     std::string operatingSystem;
@@ -71,6 +104,7 @@ struct CaptureOptions {
     bool resourceSnapshots = false;
     std::optional<uint64_t> artifactBytes;
     std::optional<uint64_t> sourceBytes;
+    std::optional<uint64_t> spatialBytes;
 };
 
 struct Manifest {
@@ -147,6 +181,7 @@ struct Profile {
     Trace trace;
     ShaderMetadata shaders;
     std::optional<ArtifactMetadata> artifacts;
+    std::optional<SpatialMetadata> spatial;
 };
 
 bool readProfile(const std::string& path, Profile& profile, std::string& error);

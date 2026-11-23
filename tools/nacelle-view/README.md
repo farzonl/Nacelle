@@ -77,6 +77,39 @@ supported and do not show the artifact section. Worker decoding validates
 declared checksums, source consent, owner references and mapping/text budgets
 before presenting any panes. Editors are destroyed on profile replacement.
 
+## Typed spatial observations
+
+Version-3 captures expose validated `Profile.spatial` through the same
+`ProfileDataSource` and offline decoding worker. The summary reports recorded,
+skipped and dropped spatial observations separately from event drops. Either
+kind of loss makes capture status incomplete. Shader artifacts can coexist
+with spatial data; versions 1/2 remain supported.
+
+This is the #217 collection/data boundary, **not #218's heatmap renderer or lane
+inspector**. The payload describes host entry-call nanoseconds per raster tile
+or threadgroup and submitted pixel coverage/quad-companion/padding counts,
+with exact operation/code-version identities. It does not contain per-pixel
+timings, instruction divergence, source-lane values or replay resources.
+Compute lane layout and dispatch-wide per-group timing can be explicitly
+unavailable. Sparse absent cells must never become numeric zero; sampling,
+no-submission and lost-coordinate ambiguity is preserved. In incomplete
+operations all retained cells are conservatively partial.
+
+See [spatial configuration, semantics, bounds and measured costs](../nacelle-dbg/README.md#opt-in-spatial-and-submitted-lane-capture).
+The default-OFF spatial flag grants no source/resource retention consent.
+Coordinates and workload counts remain private capture data. Decoding validates
+the declared checksum/size, exact integer ranges, dimensions, selection, owners,
+event references, per-slot counts and separate completeness without allocating
+a dense image from dimensions. Parsed/worker/UI objects consume memory beyond
+the record pool and archive limits.
+
+The shared spatial corpus checks observed zeros, sampling, partial loss,
+empty/unsupported operations, malformed attribution/geometry/counts and native
+parser parity. Real static/shared captures exercise SIMD 4/8/16, odd edges,
+derivatives/discard, 3D groups, overflow, cache hits and promotion. The offline
+browser test checks native spatial decoding and separate loss warnings without
+uploads or external requests. Heatmap visualization remains separate work.
+
 ## Build and test
 
 Requires Node.js 22 and npm:
@@ -111,6 +144,7 @@ npx playwright install chromium
 npm run build
 NACELLE_NATIVE_PROFILE="$PWD/../../build/profile/tests/static.nacelle-profile" \
 NACELLE_NATIVE_TRACE="$PWD/../../build/profile/tests/static-trace.json" \
+NACELLE_NATIVE_SPATIAL_PROFILE="$PWD/../../build/profile/tests/static-spatial-dense-simd8.nacelle-profile" \
   npm run test:browser
 ```
 
@@ -129,7 +163,7 @@ There is no additional deployment workflow.
 ## Data-source contract and format
 
 `src/profile.ts` exports the transport-independent `ProfileDataSource` interface.
-`readManifest()` returns a validated schema-v1 manifest; `readEntry(path)` returns
+`readManifest()` returns a validated supported-version manifest; `readEntry(path)` returns
 a fresh `ArrayBuffer` of **decoded** bytes (including zstd entries). `close()` is
 idempotent and subsequent reads fail. `loadProfile()` always closes its source,
 including on failure. `FileProfileDataSource.open(file)` adapts browser files;

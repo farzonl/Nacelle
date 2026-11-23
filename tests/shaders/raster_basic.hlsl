@@ -19,6 +19,14 @@ float4 PSMain(PSIn input) : SV_Target {
     return input.col;
 }
 
+float4 PSQuadCoverageMain(PSIn input) : SV_Target {
+    float dx = ddx(input.pos.x);
+    float dy = ddy(input.pos.y);
+    if ((uint(input.pos.x) + uint(input.pos.y)) % 3 == 0)
+        discard;
+    return float4(dx, 0.0, 0.0, dy);
+}
+
 float4 PSAltTintMain(PSIn input) : SV_Target {
     return float4(1.0 - input.col.rgb, input.col.a);
 }
