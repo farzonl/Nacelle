@@ -1,5 +1,6 @@
 #include "dxil_loader.h"
 #include "jit_engine.h"
+#include "source_debug.h"
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -657,8 +658,17 @@ bool loadAndUpgradeDXILImpl(
     const std::string& hostDL = getHostDataLayoutString();
     const char* rawBytes = static_cast<const char*>(bytecode.pShaderBytecode);
     size_t rawLen = bytecode.BytecodeLength;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::enabled() && rawLen > 32ull * 1024 * 1024) {
+        outError = "Source debug DXIL exceeds the 32 MiB input limit";
+        return false;
+    }
+#endif
 
     llvm::StringRef bitcodeSlice;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    llvm::StringRef executableSlice;
+#endif
     if (rawLen >= 4 && std::memcmp(rawBytes, "DXBC", 4) == 0) {
         llvm::MemoryBufferRef bufRef(llvm::StringRef(rawBytes, rawLen), "dxbc");
         auto containerOrErr = llvm::object::DXContainer::create(bufRef);
@@ -668,6 +678,10 @@ bool loadAndUpgradeDXILImpl(
         }
         auto getDxilPart = [](auto& c) {
             if constexpr (requires { c.getDXIL(false); }) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+                if (source_debug::enabled())
+                    if (auto debug = c.getDXIL(true)) return debug;
+#endif
                 return c.getDXIL(false);
             } else {
                 return c.getDXIL();
@@ -679,6 +693,11 @@ bool loadAndUpgradeDXILImpl(
             return false;
         }
         bitcodeSlice = llvm::StringRef(dxilOpt->second, dxilOpt->first.Bitcode.Size);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (source_debug::enabled())
+            if (auto executable = containerOrErr->getDXIL(false))
+                executableSlice = llvm::StringRef(executable->second, executable->first.Bitcode.Size);
+#endif
         if (auto hashOpt = containerOrErr->getShaderHash()) {
             std::memcpy(outShader.shaderHash, hashOpt->Digest, 16);
         }
@@ -703,9 +722,24 @@ bool loadAndUpgradeDXILImpl(
     }
 
     std::unique_ptr<llvm::Module> mod = std::move(*modOrErr);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    std::unique_ptr<llvm::LLVMContext> executableContext;
+    std::unique_ptr<llvm::Module> executableModule;
+    if (!executableSlice.empty() && executableSlice != bitcodeSlice) {
+        executableContext = std::make_unique<llvm::LLVMContext>();
+        auto executable = llvm::parseBitcodeFile(llvm::MemoryBufferRef(executableSlice, "executable.bc"), *executableContext, callbacks);
+        if (!executable) { outError = llvm::toString(executable.takeError()); return false; }
+        if (!source_debug::sameProgram(**executable, *mod, outError)) return false;
+        executableModule = std::move(*executable);
+    }
+#endif
     mod->setTargetTriple(llvm::Triple(getHostTargetTripleString()));
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    extractDxilMetadata(executableModule ? *executableModule : *mod, outShader, targetExport);
+#else
     extractDxilMetadata(*mod, outShader, targetExport);
+#endif
 
     // Strip target-specific DXIL metadata/attributes that interfere with LLVM/MLIR import, while
     // running DXILUpgradePass first to convert legacy DXIL constructs and typed pointers.
@@ -823,6 +857,13 @@ bool loadAndUpgradeDXILImpl(
         unifyExitBlocks(*pcFn);
     }
 
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (source_debug::enabled() && (outShader.stage == "cs" || outShader.stage == "ps") &&
+        !source_debug::instrument(*mod, profileContentIdentity(bytecode.pShaderBytecode, bytecode.BytecodeLength),
+            outShader.stage == "cs" ? NACELLE_SOURCE_COMPUTE : NACELLE_SOURCE_PIXEL,
+            outShader.threadGroupSize, outError))
+        return false;
+#endif
     // Remove DXIL-specific named metadata (already extracted into DxilLoadedShader)
     llvm::SmallVector<llvm::NamedMDNode*, 8> mdToDrop;
     for (auto& nmd : mod->named_metadata()) {

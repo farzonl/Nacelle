@@ -1,4 +1,5 @@
 #include "native_debug.h"
+#include "source_debug.h"
 #include "jit_engine.h"
 #include <nacelle/native_debug.h>
 
@@ -113,6 +114,7 @@ private:
 bool enabled() { return state()->enabled.load(std::memory_order_acquire); }
 
 bool freeze() {
+    source_debug::freeze();
     const auto data = state();
     std::lock_guard lock(data->mutex);
     data->frozen = true;

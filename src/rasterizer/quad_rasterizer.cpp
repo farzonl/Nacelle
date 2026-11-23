@@ -12,6 +12,7 @@
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
 #include "../compiler/jit_engine.h"
+#include "../compiler/source_debug.h"
 #endif
 
 namespace nacelle {
@@ -1334,6 +1335,8 @@ void executeRasterDrawCall(
     const GraphicsExecutionState& state,
     const DrawCallParams& draw) {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    source_debug::Operation sourceOperation(state.pso && state.pso->graphicsPSO() ?
+        std::string_view(state.pso->graphicsPSO()->profilePixelShaderId) : std::string_view{});
     profile::Scope drawProfile("Graphics draw");
     if (state.pso && state.pso->graphicsPSO()) {
         const auto& pso = *state.pso->graphicsPSO();

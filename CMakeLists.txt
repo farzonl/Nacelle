@@ -193,7 +193,11 @@ if(NACELLE_ENABLE_INSTRUMENTATION)
     list(APPEND NACELLE_COMPILER_HASH_INPUTS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/native_debug.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/native_debug.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/nacelle/native_debug.h")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nacelle/native_debug.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/source_debug.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/source_debug_compiler.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/compiler/source_debug.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nacelle/source_debug.h")
 endif()
 string(JOIN "\n" COMPILER_HASH_MANIFEST_CONTENT
     "LLVM_PACKAGE_VERSION=${LLVM_PACKAGE_VERSION}"
@@ -491,17 +495,21 @@ if(NACELLE_ENABLE_INSTRUMENTATION)
     endif()
     set(replay_sources src/instrumentation/replay_capture.cpp src/instrumentation/replay_execute.cpp
         src/compiler/replay_shader.cpp)
-    target_sources(nacelle_objs PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${replay_sources})
-    target_sources(nacelle_d3d12 PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${replay_sources})
+    set(source_debug_sources src/compiler/source_debug.cpp src/compiler/source_debug_compiler.cpp)
+    target_sources(nacelle_objs PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${source_debug_sources} ${replay_sources})
+    target_sources(nacelle_d3d12 PRIVATE src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp ${source_debug_sources} ${replay_sources})
     get_target_property(replay_build_definitions nacelle_profile_io COMPILE_DEFINITIONS)
     target_compile_definitions(nacelle_objs PRIVATE ${replay_build_definitions} NACELLE_PROFILE_EXPORTS=1)
     target_compile_definitions(nacelle_d3d12 PRIVATE ${replay_build_definitions} NACELLE_PROFILE_EXPORTS=1)
     if(NOT LLVM_ENABLE_RTTI)
         if(MSVC)
-            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "/GR-")
+            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp ${source_debug_sources} PROPERTIES COMPILE_OPTIONS "/GR-")
         else()
-            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+            set_source_files_properties(src/compiler/profile_artifacts.cpp src/compiler/native_debug.cpp src/compiler/replay_shader.cpp ${source_debug_sources} PROPERTIES COMPILE_OPTIONS "-fno-rtti")
         endif()
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set_property(SOURCE src/compiler/source_debug.cpp APPEND PROPERTY COMPILE_OPTIONS -g)
     endif()
     target_compile_definitions(nacelle_objs PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
     target_compile_definitions(nacelle_d3d12 PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)

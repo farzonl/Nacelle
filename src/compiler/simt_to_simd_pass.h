@@ -65,6 +65,9 @@ struct StageHooks {
     llvm::SmallVector<mlir::Value, 3> groupId;         // vector<W x i32>
     llvm::SmallVector<mlir::Value, 3> threadIdInGroup; // vector<W x i32>
     mlir::Value flatGroupId;                           // vector<W x i32> (DXIL op 96: FlattenedThreadIdInGroup / SV_GroupIndex)
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    mlir::Value sourceInvocation;                      // vector<W x i64>, pixel primitive lifetime identity
+#endif
     SimdVal::LanePattern threadIdPattern[3] = {
         SimdVal::LanePattern::Divergent,
         SimdVal::LanePattern::Divergent,

@@ -2,6 +2,7 @@
 #include "dxil_loader.h"
 #include "jit_engine.h"
 #include "native_debug.h"
+#include "source_debug.h"
 #include "../common/fp_env.h"
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -64,6 +65,7 @@ Environment currentEnvironment() {
     }
 
     if (native_debug::enabled()) result.compilerOptions.push_back("native-debug-pinned-v1");
+    if (source_debug::enabled()) result.compilerOptions.push_back("source-debug-sites-v1");
     return result;
 }
 

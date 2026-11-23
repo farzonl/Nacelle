@@ -1,4 +1,5 @@
 #include "simt_to_simd_pass.h"
+#include "source_debug.h"
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -2819,6 +2820,71 @@ private:
             outError = "Indirect call inside DXIL shader is not supported";
             return false;
         }
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        if (*callee == "nacelle.source.site") {
+            if (!source_debug::enabled() || W_ > 16 || hooks_.threadId.size() != 3 ||
+                call.getNumOperands() > 65) {
+                outError = "Unsupported source debug packet width, stage mapping or local count";
+                return false;
+            }
+            auto module = mod_;
+            if (!module.lookupSymbol<mlir::LLVM::LLVMFuncOp>("nacelle_source_debug_observe")) {
+                mlir::OpBuilder declaration(module.getBodyRegion());
+                declaration.setInsertionPointToStart(module.getBody());
+                auto type = mlir::LLVM::LLVMFunctionType::get(
+                    mlir::LLVM::LLVMVoidType::get(b_.getContext()),
+                    {i32Ty(), i32Ty(), i32Ty(), i32Ty(), ptrTy(), ptrTy(), ptrTy()}, false);
+                mlir::LLVM::LLVMFuncOp::create(declaration, loc, "nacelle_source_debug_observe", type);
+            }
+            if (!sourceCoords_) sourceCoords_ = createEntryAlloca(loc, i32Ty(), 3 * W_);
+            if (!sourceValues_) sourceValues_ = createEntryAlloca(loc, i64Ty(), 65 * W_);
+            auto coords = sourceCoords_;
+            auto values = sourceValues_;
+            auto invocations = mlir::LLVM::GEPOp::create(b_, loc, ptrTy(), i64Ty(), values,
+                llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(64 * W_)});
+            const auto store = [&](mlir::Value pointer, mlir::Type type, uint32_t index, mlir::Value value) {
+                auto address = mlir::LLVM::GEPOp::create(b_, loc, ptrTy(), type, pointer,
+                    llvm::ArrayRef<mlir::LLVM::GEPArg>{static_cast<int32_t>(index)});
+                mlir::LLVM::StoreOp::create(b_, loc, value, address);
+            };
+            auto active = cInt(loc, i32Ty(), 0);
+            auto real = cInt(loc, i32Ty(), 0);
+            for (uint32_t lane = 0; lane < W_; ++lane) {
+                store(invocations, i64Ty(), lane, hooks_.sourceInvocation ?
+                    llvmExtract(b_, loc, hooks_.sourceInvocation, lane) : cInt(loc, i64Ty(), 0));
+                auto activeBit = mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), llvmExtract(b_, loc, execMask, lane));
+                auto realBit = mlir::LLVM::ZExtOp::create(b_, loc, i32Ty(), llvmExtract(b_, loc, realMask, lane));
+                active = mlir::LLVM::OrOp::create(b_, loc, active,
+                    mlir::LLVM::ShlOp::create(b_, loc, activeBit, cInt(loc, i32Ty(), lane)));
+                real = mlir::LLVM::OrOp::create(b_, loc, real,
+                    mlir::LLVM::ShlOp::create(b_, loc, realBit, cInt(loc, i32Ty(), lane)));
+                for (uint32_t dimension = 0; dimension < 3; ++dimension)
+                    store(coords, i32Ty(), lane * 3 + dimension,
+                        llvmExtract(b_, loc, hooks_.threadId[dimension], lane));
+            }
+            for (uint32_t index = 1; index < call.getNumOperands(); ++index) {
+                auto value = asVec(loc, getMapped(loc, call.getOperand(index)));
+                if (!value) {
+                    outError = "Source debug value packet mapping is unavailable";
+                    return false;
+                }
+                for (uint32_t lane = 0; lane < W_; ++lane) {
+                    auto bits = llvmExtract(b_, loc, value, lane);
+                    auto valid = llvmExtract(b_, loc, execMask, lane);
+                    store(values, i64Ty(), (index - 1) * W_ + lane,
+                        mlir::LLVM::SelectOp::create(b_, loc, valid, bits, cInt(loc, i64Ty(), 0)));
+                }
+            }
+            const auto site = getConstIntValue(call.getOperand(0));
+            if (!site) {
+                outError = "Source debug site identity is not constant";
+                return false;
+            }
+            mlir::LLVM::CallOp::create(b_, loc, mlir::TypeRange{}, "nacelle_source_debug_observe",
+                mlir::ValueRange{cInt(loc, i32Ty(), *site), cInt(loc, i32Ty(), W_), active, real, coords, values, invocations});
+            return true;
+        }
+#endif
         if (*callee == "nacelle.groupshared.ptr") {
             uint64_t byteOff = getConstIntValue(call.getOperand(0)).value_or(0);
             SimdVal sv;
@@ -8324,6 +8390,9 @@ private:
     mlir::Value rootCtxPtr_;
     StageHooks& hooks_;
     mlir::Value scratchAlloca_;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    mlir::Value sourceCoords_, sourceValues_;
+#endif
     bool strictFp_ = false;
     DescInfoCache ownedDescCache_;
     DescInfoCache* descCache_ = nullptr;
