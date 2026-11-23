@@ -49,6 +49,13 @@ void sanitizeModule(llvm::Module& module) {
         if (metadata->getName().starts_with("dx.source")) module.eraseNamedMetadata(metadata);
     }
 }
+
+std::string sourceReference(llvm::StringRef path) {
+    auto reference = path.str();
+    std::replace(reference.begin(), reference.end(), '\\', '/');
+    while (reference.starts_with("./")) reference.erase(0, 2);
+    return reference;
+}
 }
 
 void retainProfileShader(const D3D12_SHADER_BYTECODE& bytecode, const std::string& identity) {
@@ -105,7 +112,7 @@ void retainProfileShader(const D3D12_SHADER_BYTECODE& bytecode, const std::strin
                 text.label = "source-" + std::to_string(payloads.size() + 1) + ".hlsl";
                 text.text = content->getString().str();
                 const auto sourceId = identity + "-hlsl-" + profile::artifactDigest(text.text);
-                sourceIds.emplace(name->getString().str(), sourceId);
+                sourceIds.emplace(sourceReference(name->getString()), sourceId);
                 sourceLines.emplace(sourceId, 1 + std::count(text.text.begin(), text.text.end(), '\n'));
                 payloads.push_back(std::move(text));
             }
@@ -116,9 +123,9 @@ void retainProfileShader(const D3D12_SHADER_BYTECODE& bytecode, const std::strin
         for (auto& instruction : llvm::instructions(function)) {
             if (const auto location = instruction.getDebugLoc()) {
                 const auto* file = location->getFile();
-                auto found = sourceIds.find(file->getFilename().str());
+                auto found = sourceIds.find(sourceReference(file->getFilename()));
                 if (found == sourceIds.end())
-                    found = sourceIds.find((file->getDirectory() + "/" + file->getFilename()).str());
+                    found = sourceIds.find(sourceReference((file->getDirectory() + "/" + file->getFilename()).str()));
                 if (found != sourceIds.end() && location.getLine() > 0 &&
                     location.getLine() <= sourceLines.at(found->second))
                     locations.emplace(&instruction, std::make_pair(found->second, location.getLine()));

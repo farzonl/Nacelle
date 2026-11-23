@@ -156,6 +156,8 @@ invent missing artifacts. Text-only consent does not embed HLSL. Stripped input,
 late opt-in and unsupported mappings are explicitly unavailable. Filename
 references become capture-local `source-N.hlsl`; source **contents** can still
 contain private information. Treat the entire archive as private.
+Debug references are compared with normalized path separators, without reading
+those paths or guessing a match from a basename.
 
 Retained views include DXIL instruction text, lifted MLIR when that compilation
 path ran, optimized LLVM for emitted native objects, and disassembly of exact

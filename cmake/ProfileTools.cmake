@@ -51,7 +51,8 @@ function(nacelle_add_profile_support)
         NACELLE_PROFILE_OS="${CMAKE_SYSTEM_NAME}"
         NACELLE_PROFILE_ARCH="${CMAKE_SYSTEM_PROCESSOR}"
         NACELLE_PROFILE_REVISION="${revision}")
-    add_library(nacelle_profile_capture STATIC "${root}/src/instrumentation/capture.cpp")
+    add_library(nacelle_profile_capture STATIC "${root}/src/instrumentation/capture.cpp"
+        "${root}/src/instrumentation/artifact_store.cpp")
     find_package(Threads REQUIRED)
     target_link_libraries(nacelle_profile_capture PUBLIC Threads::Threads PRIVATE nacelle_profile_io)
     target_compile_features(nacelle_profile_capture PUBLIC cxx_std_20)
