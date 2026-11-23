@@ -1,4 +1,5 @@
 #include "jit_engine.h"
+#include "profile_artifacts.h"
 #include "../instrumentation/capture.h"
 #include "../rasterizer/raytracing_bvh.h"
 
@@ -737,6 +738,11 @@ bool emitObjectBytesO3(
         return false;
     }
     codegenPM.run(mod);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    const auto identity = profileContentIdentity(outObjBytes.data(), outObjBytes.size());
+    retainProfileObject(outObjBytes.data(), outObjBytes.size(), identity);
+    retainProfileLLVM(mod, identity);
+#endif
     return true;
 }
 
@@ -972,6 +978,7 @@ bool loadObjectIntoJitLocked(
     }
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     const auto identity = profileContentIdentity(objData, objSize);
+    retainProfileObject(objData, objSize, identity);
     std::lock_guard lock(rt.profileObjectMutex);
     for (const auto address : {outAddr0, outAddr1, outAddr2 ? *outAddr2 : 0,
                               outAddr3 ? *outAddr3 : 0, outAddr4 ? *outAddr4 : 0, outAddr5 ? *outAddr5 : 0}) {
@@ -2374,6 +2381,7 @@ bool compileComputePSO(
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     outPSO.profileShaderId = profileContentIdentity(desc.CS.pShaderBytecode, desc.CS.BytecodeLength);
+    retainProfileShader(desc.CS, outPSO.profileShaderId);
     profile::Scope compileProfile("Compile compute PSO");
     compileProfile.setAttributes({lo, hi, simdWidth, profile::Stage::Compute, 1});
     if (compileProfile.needsCompilerConfiguration()) recordProfileCompilerConfiguration();

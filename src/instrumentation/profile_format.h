@@ -19,6 +19,39 @@ struct Entry {
     std::string path;
     std::string encoding;
     uint64_t uncompressedSize = 0;
+    std::optional<std::string> digest;
+};
+
+struct ArtifactMapping {
+    uint32_t line = 0;
+    uint32_t sourceLine = 0;
+    std::string source;
+    std::optional<uint64_t> offset;
+    std::optional<uint32_t> size;
+};
+
+struct TextArtifact {
+    std::string id;
+    std::string owner;
+    std::string kind;
+    std::string label;
+    std::string text;
+    std::vector<ArtifactMapping> mappings;
+};
+
+struct ArtifactSelection {
+    uint64_t codeVersionId = 0;
+    std::vector<std::string> payloadIds;
+    std::string shaderAvailability;
+    std::string nativeAvailability;
+    std::string mappingAvailability = "partial";
+    std::string laneAvailability = "unavailable";
+};
+
+struct ArtifactMetadata {
+    uint32_t schemaVersion = 1;
+    std::vector<TextArtifact> payloads;
+    std::vector<ArtifactSelection> selections;
 };
 
 struct Build {
@@ -36,6 +69,8 @@ struct CaptureOptions {
     uint64_t eventBufferBytes = 0;
     bool embeddedSources = false;
     bool resourceSnapshots = false;
+    std::optional<uint64_t> artifactBytes;
+    std::optional<uint64_t> sourceBytes;
 };
 
 struct Manifest {
@@ -111,6 +146,7 @@ struct Profile {
     Manifest manifest;
     Trace trace;
     ShaderMetadata shaders;
+    std::optional<ArtifactMetadata> artifacts;
 };
 
 bool readProfile(const std::string& path, Profile& profile, std::string& error);

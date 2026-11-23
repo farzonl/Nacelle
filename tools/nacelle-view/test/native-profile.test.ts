@@ -44,3 +44,18 @@ it.runIf(Boolean(process.env.NACELLE_NATIVE_PROFILE))(
     expect(JSON.parse(new TextDecoder().decode(profile.traceBytes))).toEqual(profile.trace);
   },
 );
+
+it.runIf(Boolean(process.env.NACELLE_NATIVE_ARTIFACT_PROFILE))(
+  'loads real opt-in DXC source and cached native artifacts through the typed data-source boundary',
+  async () => {
+    const bytes = readFileSync(process.env.NACELLE_NATIVE_ARTIFACT_PROFILE!);
+    const profile = await loadProfile(FileProfileDataSource.fromBuffer(bytes.buffer.slice(
+      bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
+    )));
+    expect(profile.manifest.schemaVersion).toBe(2);
+    expect(profile.artifacts?.payloads.some(payload => payload.kind === 'hlsl')).toBe(true);
+    expect(profile.artifacts?.payloads.some(payload => payload.kind === 'dxil' && payload.mappings.length > 0)).toBe(true);
+    expect(profile.artifacts?.payloads.some(payload => payload.kind === 'assembly')).toBe(true);
+    expect(profile.artifacts?.selections.every(selection => selection.nativeAvailability === 'available')).toBe(true);
+  },
+);

@@ -1,4 +1,5 @@
 import { decodeProfileFile } from './worker-loader';
+import { createArtifactView } from './artifact-view';
 import {
   fetchPreloadedManifest,
   openPreloadedProfile,
@@ -91,6 +92,7 @@ export function mountViewer(
   options: ViewerOptions = {},
 ): void {
   setupThemeToggle(root);
+  const artifacts = createArtifactView(root);
 
   const input = root.querySelector<HTMLInputElement>('#profile-file')!;
   const dropzone = root.querySelector<HTMLElement>('#dropzone');
@@ -256,6 +258,7 @@ export function mountViewer(
     } catch (error) {
       filterStatus.textContent = `Invalid filters: ${error instanceof Error ? error.message : 'Unable to filter spans.'}`;
       timelineView?.clear();
+      artifacts.show();
     }
   }
 
@@ -395,6 +398,7 @@ export function mountViewer(
       const profile = await getProfile(controller.signal);
       if (request !== generation) return;
       current = profile;
+      artifacts.show(profile);
       allGroups = groupThreads(profile.trace);
       const stages = new Set<string>();
       for (const group of allGroups) {
