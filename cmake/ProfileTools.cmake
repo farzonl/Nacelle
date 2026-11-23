@@ -32,7 +32,8 @@ function(nacelle_add_profile_support)
     target_compile_definitions(nacelle_profile_miniz PUBLIC MINIZ_STATIC_DEFINE)
 
     add_library(nacelle_profile_io STATIC "${root}/src/instrumentation/profile_writer.cpp"
-        "${root}/src/instrumentation/artifacts.cpp" "${root}/src/instrumentation/spatial.cpp")
+        "${root}/src/instrumentation/artifacts.cpp" "${root}/src/instrumentation/spatial.cpp"
+        "${root}/src/instrumentation/replay_format.cpp")
     target_include_directories(nacelle_profile_io PRIVATE "${root}/third_party/xxHash")
     target_link_libraries(nacelle_profile_io PRIVATE glaze::glaze nacelle_profile_miniz libzstd_static)
     target_compile_definitions(nacelle_profile_io PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
@@ -69,6 +70,9 @@ function(nacelle_add_profile_support)
 endfunction()
 
 function(nacelle_add_profile_tests)
+    add_executable(replay_format_test "${NACELLE_PROFILE_ROOT}/tests/replay_format_test.cpp")
+    target_link_libraries(replay_format_test PRIVATE nacelle_profile_io)
+    add_test(NAME replay_format_test COMMAND replay_format_test)
     add_executable(instrumentation_test "${NACELLE_PROFILE_ROOT}/tests/instrumentation_test.cpp")
     target_link_libraries(instrumentation_test PRIVATE
         nacelle_profile_capture nacelle_profile_io nacelle_profile_miniz libzstd_static)

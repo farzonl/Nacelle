@@ -1,5 +1,9 @@
 if(NACELLE_BUILD_PROFILE_TOOLS)
     add_subdirectory(nacelle-dbg)
+    if(NACELLE_ENABLE_INSTRUMENTATION)
+        add_executable(nacelle-replay nacelle-replay/main.cpp)
+        target_link_libraries(nacelle-replay PRIVATE nacelle CLI11::CLI11)
+    endif()
 endif()
 
 add_subdirectory(nacelle-compile)

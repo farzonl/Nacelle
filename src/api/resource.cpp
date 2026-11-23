@@ -1,4 +1,7 @@
 #include "resource.h"
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include "../instrumentation/replay_capture.h"
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -364,11 +367,17 @@ HRESULT STDMETHODCALLTYPE NacelleResource::Map(UINT Subresource, const D3D12_RAN
     if (isReserved_) return E_INVALIDARG;
     if (!ppData) return E_INVALIDARG;
     if (Subresource >= subresources_.size()) return E_INVALIDARG;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMap(this, true);
+#endif
     *ppData = data_ + subresources_[Subresource].offset;
     return S_OK;
 }
 
 void STDMETHODCALLTYPE NacelleResource::Unmap(UINT, const D3D12_RANGE* pWrittenRange) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMap(this, false);
+#endif
     if (isReserved_) return;
     if (!pWrittenRange || pWrittenRange->End > pWrittenRange->Begin) {
         invalidateDecodedCache();
@@ -586,6 +595,9 @@ HRESULT STDMETHODCALLTYPE NacelleResource::WriteToSubresource(
     const void* pSrcData,
     UINT SrcRowPitch,
     UINT SrcDepthPitch) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("WriteToSubresource");
+#endif
     if (!pSrcData || DstSubresource >= subresources_.size()) return E_INVALIDARG;
     const NacelleMipLayout& dst = subresources_[DstSubresource];
     const FormatInfo fi = getFormatInfo(desc_.Format);

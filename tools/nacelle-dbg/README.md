@@ -49,6 +49,10 @@ ctest --test-dir build/profile-tools --output-on-failure
 
 This standalone build also needs the initialized DirectX-Headers submodule.
 
+Separately consented [compute/buffer replay](../nacelle-replay/README.md) uses a
+different `.nacelle-replay` format and runtime-linked CLI. The standalone reader,
+ordinary profile files, and browser viewer do not execute captured code.
+
 ## CI coverage
 
 The Linux, macOS, and Windows CI jobs retain their normal OFF build and test
