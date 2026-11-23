@@ -1,4 +1,7 @@
 #include "device.h"
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include "../instrumentation/replay_capture.h"
+#endif
 
 #include "../compiler/dxil_loader.h"
 #include "../compiler/jit_engine.h"
@@ -38,6 +41,9 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreateCommandQueue(
     if (!pDesc || !ppCommandQueue) return E_INVALIDARG;
     auto* obj = new NacelleCommandQueue(this, *pDesc);
     HRESULT hr = obj->QueryInterface(riid, ppCommandQueue);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (SUCCEEDED(hr)) replay::observeQueue(obj);
+#endif
     obj->Release();
     return hr;
 }
@@ -87,6 +93,9 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreateComputePipelineState(
 
     auto* pso = new NacellePipelineState(this, *pDesc, rs, std::move(compiled));
     HRESULT hr = pso->QueryInterface(riid, ppPipelineState);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (SUCCEEDED(hr)) replay::observePipeline(pso, *pDesc);
+#endif
     pso->Release();
     return hr;
 }
@@ -273,6 +282,9 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreateDescriptorHeap(
     if (!pDesc || !ppvHeap) return E_INVALIDARG;
     auto* obj = new NacelleDescriptorHeap(this, *pDesc);
     HRESULT hr = obj->QueryInterface(riid, ppvHeap);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (SUCCEEDED(hr)) replay::observeHeap(obj, *pDesc);
+#endif
     obj->Release();
     return hr;
 }
@@ -289,32 +301,53 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreateRootSignature(
     if (FAILED(hr)) return hr;
     auto* obj = new NacelleRootSignature(this, std::move(layout));
     hr = obj->QueryInterface(riid, ppvRootSignature);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (SUCCEEDED(hr)) replay::observeRoot(obj, pBlob, size);
+#endif
     obj->Release();
     return hr;
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createCBV(pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeCBV(pDesc, Dest);
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateShaderResourceView(ID3D12Resource* pRes, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createSRV(pRes, pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeSRV(pRes, pDesc, Dest);
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateUnorderedAccessView(ID3D12Resource* pRes, ID3D12Resource* pCounter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createUAV(pRes, pCounter, pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeUAV(pRes, pCounter, pDesc, Dest);
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateRenderTargetView(ID3D12Resource* pRes, const D3D12_RENDER_TARGET_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createRTV(pRes, pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("RTV creation");
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateDepthStencilView(ID3D12Resource* pRes, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createDSV(pRes, pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("DSV creation");
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CreateSampler(const D3D12_SAMPLER_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Dest) {
     DescriptorOps::createSampler(pDesc, Dest);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("sampler creation");
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CopyDescriptors(
@@ -322,11 +355,17 @@ void STDMETHODCALLTYPE NacelleDevice::CopyDescriptors(
     UINT NumSrc, const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcStarts, const UINT* pSrcSizes,
     D3D12_DESCRIPTOR_HEAP_TYPE) {
     DescriptorOps::copyDescriptors(NumDest, pDestStarts, pDestSizes, NumSrc, pSrcStarts, pSrcSizes);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeDescriptorCopy(NumDest, pDestStarts, pDestSizes, NumSrc, pSrcStarts, pSrcSizes);
+#endif
 }
 
 void STDMETHODCALLTYPE NacelleDevice::CopyDescriptorsSimple(
     UINT Num, D3D12_CPU_DESCRIPTOR_HANDLE DestStart, D3D12_CPU_DESCRIPTOR_HANDLE SrcStart, D3D12_DESCRIPTOR_HEAP_TYPE) {
     DescriptorOps::copyDescriptors(1, &DestStart, &Num, 1, &SrcStart, &Num);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeDescriptorCopy(1, &DestStart, &Num, 1, &SrcStart, &Num);
+#endif
 }
 
 #if defined(_MSC_VER) || !defined(_WIN32)
@@ -393,6 +432,9 @@ HRESULT STDMETHODCALLTYPE NacelleDevice::CreateCommittedResource(
     auto* res = new NacelleResource(this, *pHeapProperties, *pDesc, nullptr, 0);
     if (!ppvResource) { res->Release(); return S_OK; }
     HRESULT hr = res->QueryInterface(riidResource, ppvResource);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (SUCCEEDED(hr)) replay::observeResource(res, *pHeapProperties);
+#endif
     res->Release();
     return hr;
 }

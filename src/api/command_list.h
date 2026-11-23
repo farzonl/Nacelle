@@ -14,6 +14,11 @@
 #include "pipeline.h"
 #include "resource.h"
 #include "../rasterizer/rasterizer.h"
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#define NACELLE_REPLAY_UNSUPPORTED_LIST() replayUnsupported_ = true
+#else
+#define NACELLE_REPLAY_UNSUPPORTED_LIST() ((void)0)
+#endif
 
 namespace nacelle {
 
@@ -134,6 +139,9 @@ struct CmdCopyRaytracingAS {
 
 struct CmdSetStateObject { NacelleStateObject* stateObj = nullptr; };
 struct CmdDispatchRays { D3D12_DISPATCH_RAYS_DESC desc{}; };
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+struct CmdReplayBarrier { std::vector<D3D12_RESOURCE_BARRIER> barriers; };
+#endif
 
 using RecordedCommand = std::variant<
     CmdSetPipelineState, CmdSetRootSignature, CmdSetDescriptorHeaps,
@@ -145,7 +153,11 @@ using RecordedCommand = std::variant<
     CmdRSSetShadingRate,
     CmdOMSetRenderTargets, CmdClearRTV, CmdClearDSV, CmdClearUAV,
     CmdExecuteBundle, CmdEndQuery, CmdResolveQueryData, CmdExecuteIndirect,
-    CmdBuildRaytracingAS, CmdCopyRaytracingAS, CmdSetStateObject, CmdDispatchRays>;
+    CmdBuildRaytracingAS, CmdCopyRaytracingAS, CmdSetStateObject, CmdDispatchRays
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    , CmdReplayBarrier
+#endif
+    >;
 
 struct ExecutionState {
     NacellePipelineState* pso = nullptr;
@@ -203,46 +215,46 @@ public:
     void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) override;
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* pView) override;
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT StartSlot, UINT NumViews, const D3D12_VERTEX_BUFFER_VIEW* pViews) override;
-    void STDMETHODCALLTYPE SOSetTargets(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*) override {}
+    void STDMETHODCALLTYPE SOSetTargets(UINT, UINT, const D3D12_STREAM_OUTPUT_BUFFER_VIEW*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT NumRenderTargetDescriptors, const D3D12_CPU_DESCRIPTOR_HANDLE* pRenderTargetDescriptors, BOOL RTsSingleHandleToDescriptorRange, const D3D12_CPU_DESCRIPTOR_HANDLE* pDepthStencilDescriptor) override;
     void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView, D3D12_CLEAR_FLAGS ClearFlags, FLOAT Depth, UINT8 Stencil, UINT NumRects, const D3D12_RECT* pRects) override;
     void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE RenderTargetView, const FLOAT ColorRGBA[4], UINT NumRects, const D3D12_RECT* pRects) override;
     void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandleInCurrentHeap, D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource, const UINT Values[4], UINT NumRects, const D3D12_RECT* pRects) override;
     void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandleInCurrentHeap, D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource, const FLOAT Values[4], UINT NumRects, const D3D12_RECT* pRects) override;
-    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource*, const D3D12_DISCARD_REGION*) override {}
-    void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT) override {}
+    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource*, const D3D12_DISCARD_REGION*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap*, D3D12_QUERY_TYPE, UINT) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
     void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* pQueryHeap, D3D12_QUERY_TYPE Type, UINT Index) override;
     void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* pQueryHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT NumQueries, ID3D12Resource* pDestinationBuffer, UINT64 AlignedDestinationBufferOffset) override;
-    void STDMETHODCALLTYPE SetPredication(ID3D12Resource*, UINT64, D3D12_PREDICATION_OP) override {}
+    void STDMETHODCALLTYPE SetPredication(ID3D12Resource*, UINT64, D3D12_PREDICATION_OP) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
     void STDMETHODCALLTYPE SetMarker(UINT, const void*, UINT) override {}
     void STDMETHODCALLTYPE BeginEvent(UINT, const void*, UINT) override {}
     void STDMETHODCALLTYPE EndEvent() override {}
     void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* pCommandSignature, UINT MaxCommandCount, ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset, ID3D12Resource* pCountBuffer, UINT64 CountBufferOffset) override;
 
     // ID3D12GraphicsCommandList1
-    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override {}
-    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override {}
-    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT, FLOAT) override {}
-    void STDMETHODCALLTYPE SetSamplePositions(UINT, UINT, D3D12_SAMPLE_POSITION*) override {}
-    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource*, UINT, UINT, UINT, ID3D12Resource*, UINT, D3D12_RECT*, DXGI_FORMAT, D3D12_RESOLVE_MODE) override {}
-    void STDMETHODCALLTYPE SetViewInstanceMask(UINT) override {}
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT, ID3D12Resource* const*, const D3D12_SUBRESOURCE_RANGE_UINT64*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT, FLOAT) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE SetSamplePositions(UINT, UINT, D3D12_SAMPLE_POSITION*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource*, UINT, UINT, UINT, ID3D12Resource*, UINT, D3D12_RECT*, DXGI_FORMAT, D3D12_RESOLVE_MODE) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE SetViewInstanceMask(UINT) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
 
     // ID3D12GraphicsCommandList2
-    void STDMETHODCALLTYPE WriteBufferImmediate(UINT, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER*, const D3D12_WRITEBUFFERIMMEDIATE_MODE*) override {}
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER*, const D3D12_WRITEBUFFERIMMEDIATE_MODE*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
 
     // ID3D12GraphicsCommandList3
-    void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession*) override {}
+    void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
 
     // ID3D12GraphicsCommandList4
-    void STDMETHODCALLTYPE BeginRenderPass(UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS) override {}
-    void STDMETHODCALLTYPE EndRenderPass() override {}
-    void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
-    void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override {}
+    void STDMETHODCALLTYPE BeginRenderPass(UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE EndRenderPass() override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
+    void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand*, const void*, SIZE_T) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
         UINT NumPostbuildInfoDescs,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) override;
-    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*, UINT, const D3D12_GPU_VIRTUAL_ADDRESS*) override {}
+    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*, UINT, const D3D12_GPU_VIRTUAL_ADDRESS*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
     void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(
         D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
         D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
@@ -252,7 +264,7 @@ public:
 
     // ID3D12GraphicsCommandList5
     void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE baseShadingRate, const D3D12_SHADING_RATE_COMBINER* combiners) override;
-    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource*) override {}
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource*) override { NACELLE_REPLAY_UNSUPPORTED_LIST(); }
 
     // ID3D12GraphicsCommandList6
     void STDMETHODCALLTYPE DispatchMesh(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
@@ -266,10 +278,17 @@ private:
     bool closed_ = false;
     std::vector<RecordedCommand> commands_;
     std::vector<IUnknown*> heldRefs_;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    bool replayEligible_ = false, replayUnsupported_ = false;
+    uint32_t replayBarrierCount_ = 0;
+#endif
 };
 
 class NacelleCommandQueue : public D3D12PageableBase<ID3D12CommandQueue> {
 public:
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    std::mutex& replayMutex() { return execMutex_; }
+#endif
     NacelleCommandQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC& desc);
     ~NacelleCommandQueue() override;
 
@@ -304,3 +323,4 @@ private:
 };
 
 } // namespace nacelle
+#undef NACELLE_REPLAY_UNSUPPORTED_LIST

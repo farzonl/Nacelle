@@ -1,4 +1,7 @@
 #include "command_list.h"
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+#include "../instrumentation/replay_capture.h"
+#endif
 #include "../instrumentation/capture.h"
 
 #include <algorithm>
@@ -140,6 +143,9 @@ NacelleCommandList::NacelleCommandList(ID3D12Device* device,
                                        NacelleCommandAllocator*,
                                        ID3D12PipelineState* initialState)
     : D3D12DeviceChildBase(device), type_(type) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replayEligible_ = replay::provenanceEnabled();
+#endif
     if (initialState) {
         SetPipelineState(initialState);
     }
@@ -207,6 +213,11 @@ HRESULT STDMETHODCALLTYPE NacelleCommandList::Close() {
 }
 
 HRESULT STDMETHODCALLTYPE NacelleCommandList::Reset(ID3D12CommandAllocator*, ID3D12PipelineState* pInitialState) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replayEligible_ = replay::provenanceEnabled();
+    replayUnsupported_ = false;
+    replayBarrierCount_ = 0;
+#endif
     closed_ = false;
     commands_.clear();
     releaseRecordedRefs();
@@ -343,7 +354,22 @@ void STDMETHODCALLTYPE NacelleCommandList::SetPipelineState(ID3D12PipelineState*
     commands_.push_back(CmdSetPipelineState{static_cast<NacellePipelineState*>(pPSO)});
 }
 
-void STDMETHODCALLTYPE NacelleCommandList::ResourceBarrier(UINT, const D3D12_RESOURCE_BARRIER*) {
+void STDMETHODCALLTYPE NacelleCommandList::ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    if (replayEligible_ && (count > replay::maxCommands - replayBarrierCount_ || (count && !barriers)))
+        replayUnsupported_ = true;
+    else if (replayEligible_ && count) {
+        replayBarrierCount_ += count;
+        CmdReplayBarrier command;
+        command.barriers.assign(barriers, barriers + count);
+        for (const auto& barrier : command.barriers) {
+            ID3D12Resource* resource = barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? barrier.Transition.pResource :
+                barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV ? barrier.UAV.pResource : nullptr;
+            if (resource) { resource->AddRef(); heldRefs_.push_back(resource); }
+        }
+        commands_.push_back(std::move(command));
+    }
+#endif
     // Unified host memory: barriers are implicit between sequentially executed commands on the queue.
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
@@ -1022,6 +1048,7 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     if (!fn || gx == 0 || gy == 0 || gz == 0) return;
 
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeEntry(state.pso, entry->artifactId, entry->tier);
     profile::Scope dispatchProfile("Compute dispatch");
     dispatchProfile.setAttributes({cpso->cacheHashLo, cpso->cacheHashHi, cpso->simdWidth,
                                    profile::Stage::Compute});
@@ -1102,7 +1129,13 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
 } // namespace
 
 void NacelleCommandList::execute(BS::thread_pool<>& pool, ExecutionState& state) const {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeList(replayEligible_, replayUnsupported_, type_, parentDevice());
+#endif
     for (const auto& cmd : commands_) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+        replay::observeCommand(cmd, state);
+#endif
         std::visit([&](const auto& c) {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, CmdSetPipelineState>) {
@@ -1493,6 +1526,9 @@ void STDMETHODCALLTYPE NacelleCommandQueue::UpdateTileMappings(
     const UINT* pHeapRangeStartOffsets,
     const UINT* pRangeTileCounts,
     D3D12_TILE_MAPPING_FLAGS) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("queue tile mappings");
+#endif
     if (!pResource || NumResourceRegions == 0 || NumRanges == 0) return;
 
     std::lock_guard<std::mutex> lock(execMutex_);
@@ -1563,6 +1599,9 @@ void STDMETHODCALLTYPE NacelleCommandQueue::CopyTileMappings(
     const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate,
     const D3D12_TILE_REGION_SIZE* pRegionSize,
     D3D12_TILE_MAPPING_FLAGS) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("queue tile mapping copy");
+#endif
     if (!pDstResource || !pSrcResource) return;
 
     std::lock_guard<std::mutex> lock(execMutex_);
@@ -1601,6 +1640,9 @@ void STDMETHODCALLTYPE NacelleCommandQueue::CopyTileMappings(
 void STDMETHODCALLTYPE NacelleCommandQueue::ExecuteCommandLists(
     UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists) {
     std::lock_guard<std::mutex> lock(execMutex_);
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::Submission replaySubmission(this);
+#endif
     ExecutionState state{};
     for (UINT i = 0; i < NumCommandLists; ++i) {
         if (!ppCommandLists[i]) continue;
@@ -1610,12 +1652,18 @@ void STDMETHODCALLTYPE NacelleCommandQueue::ExecuteCommandLists(
 }
 
 HRESULT STDMETHODCALLTYPE NacelleCommandQueue::Signal(ID3D12Fence* pFence, UINT64 Value) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("queue Signal");
+#endif
     if (!pFence) return E_INVALIDARG;
     std::lock_guard<std::mutex> lock(execMutex_);
     return pFence->Signal(Value);
 }
 
 HRESULT STDMETHODCALLTYPE NacelleCommandQueue::Wait(ID3D12Fence* pFence, UINT64 Value) {
+#if defined(NACELLE_ENABLE_INSTRUMENTATION)
+    replay::observeMutation("queue Wait");
+#endif
     if (!pFence) return E_INVALIDARG;
     static_cast<NacelleFence*>(pFence)->waitForValue(Value);
     return S_OK;

@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "profile_format.h"
+#include "archive.h"
 
 #include <glaze/glaze.hpp>
 #include <miniz.h>
@@ -297,7 +298,8 @@ bool readProfile(const std::string& path, Profile& profile, std::string& error) 
     return readProfileBytes(archive, profile, error);
 }
 
-bool readProfileBytes(std::span<const char> archive, Profile& profile, std::string& error) {
+bool validateStoredArchive(std::span<const char> archive, unsigned minimumEntries,
+                           unsigned maximumEntries, std::string& error) {
     if (archive.size() < 22 || archive.size() > maxProfileBytes) {
         error = "Profile archive is truncated or exceeds 256 MiB";
         return false;
@@ -331,7 +333,7 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         return false;
     }
     const auto count = mz_zip_reader_get_num_files(&zip.archive);
-    if ((count < 3 || count > 5) || mz_zip_is_zip64(&zip.archive)) {
+    if ((count < minimumEntries || count > maximumEntries) || mz_zip_is_zip64(&zip.archive)) {
         error = "Profile v1 requires a non-ZIP64 archive with exactly manifest.json, trace.json.zst, and shaders.json";
         return false;
     }
@@ -387,6 +389,59 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         }
         ranges.emplace_back(local, rangeEnd);
     }
+    return true;
+}
+
+bool readStoredEntry(std::span<const char> archive, const char* name, size_t limit,
+                     std::string& result, std::string& error) {
+    Zip zip;
+    if (!mz_zip_reader_init_mem(&zip.archive, archive.data(), archive.size(), 0)) {
+        error = "Invalid stored ZIP archive";
+        return false;
+    }
+    return extract(zip, name, limit, result, error);
+}
+
+bool writeStoredArchive(const std::string& path,
+                        const std::vector<std::pair<std::string, std::string_view>>& entries,
+                        std::string& error) {
+    Zip zip;
+    zip.writing = true;
+    if (!mz_zip_writer_init_heap(&zip.archive, 0, 0)) {
+        error = "Cannot initialize stored ZIP writer";
+        return false;
+    }
+    uint64_t total = 0;
+    for (const auto& [name, data] : entries) {
+        if (!safePath(name) || data.size() > maxProfileBytes - total ||
+            !mz_zip_writer_add_mem(&zip.archive, name.c_str(), data.data(), data.size(), 0)) {
+            error = "Invalid or oversized stored ZIP entry";
+            return false;
+        }
+        total += data.size();
+    }
+    void* bytes = nullptr;
+    size_t size = 0;
+    if (!mz_zip_writer_finalize_heap_archive(&zip.archive, &bytes, &size)) {
+        error = "Cannot finalize stored ZIP archive";
+        return false;
+    }
+    std::unique_ptr<void, decltype(&mz_free)> storage(bytes, &mz_free);
+    if (size > maxProfileBytes) {
+        error = "Stored archive exceeds 256 MiB";
+        return false;
+    }
+    return writeExclusive(path, bytes, size, error);
+}
+
+bool readProfileBytes(std::span<const char> archive, Profile& profile, std::string& error) {
+    if (!validateStoredArchive(archive, 3, 5, error)) return false;
+    Zip zip;
+    if (!mz_zip_reader_init_mem(&zip.archive, archive.data(), archive.size(), 0)) {
+        error = "Invalid profile ZIP archive";
+        return false;
+    }
+    const auto count = mz_zip_reader_get_num_files(&zip.archive);
     std::string json;
     if (!extract(zip, "manifest.json", maxManifestBytes, json, error)) return false;
     Profile parsed;
