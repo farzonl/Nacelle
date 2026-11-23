@@ -1,4 +1,4 @@
-import { FileProfileDataSource } from './file-source';
+import { decodeProfileFile } from './worker-loader';
 import {
   fetchPreloadedManifest,
   openPreloadedProfile,
@@ -87,7 +87,7 @@ function categoryTone(cat: string): string {
 
 export function mountViewer(
   root: Document,
-  open: (file: File) => Promise<ProfileDataSource> = FileProfileDataSource.open,
+  open?: (file: File) => Promise<ProfileDataSource>,
   options: ViewerOptions = {},
 ): void {
   setupThemeToggle(root);
@@ -95,6 +95,7 @@ export function mountViewer(
   const input = root.querySelector<HTMLInputElement>('#profile-file')!;
   const dropzone = root.querySelector<HTMLElement>('#dropzone');
   const status = root.querySelector<HTMLElement>('#status')!;
+  const cancel = root.querySelector<HTMLButtonElement>('#cancel-load')!;
   const panel = root.querySelector<HTMLElement>('#profile')!;
   const summary = root.querySelector<HTMLElement>('#summary')!;
   const threads = root.querySelector<HTMLElement>('#threads')!;
@@ -139,6 +140,7 @@ export function mountViewer(
   let groups: ThreadGroup[] = [];
   let filtered = false;
   let generation = 0;
+  let decoding: AbortController | undefined;
   let shown = 0;
   let total = 0;
   let preloadedPlatforms: Record<string, PreloadedPlatformManifest> = {};
@@ -359,10 +361,14 @@ export function mountViewer(
   async function loadFromSource(
     title: string,
     loadingMessage: string,
-    getSource: () => Promise<ProfileDataSource>,
+    getProfile: (signal: AbortSignal) => Promise<Profile>,
     onFinally?: () => void,
   ): Promise<void> {
     const request = ++generation;
+    decoding?.abort();
+    const controller = new AbortController();
+    decoding = controller;
+    cancel.hidden = false;
     current = undefined;
     activeTitle = title;
     allGroups = [];
@@ -386,12 +392,7 @@ export function mountViewer(
     status.textContent = loadingMessage;
     status.dataset.state = 'loading';
     try {
-      const source = await getSource();
-      if (request !== generation) {
-        source.close();
-        return;
-      }
-      const profile = await loadProfile(source);
+      const profile = await getProfile(controller.signal);
       if (request !== generation) return;
       current = profile;
       allGroups = groupThreads(profile.trace);
@@ -416,17 +417,39 @@ export function mountViewer(
       status.textContent = `Invalid profile: ${error instanceof Error ? error.message : 'Unable to decode archive.'}`;
       status.dataset.state = 'invalid';
     } finally {
-      if (request === generation && onFinally) onFinally();
+      if (request === generation) {
+        decoding = undefined;
+        cancel.hidden = true;
+        onFinally?.();
+      }
     }
   }
 
   function loadLocalFile(file: File): void {
     if (benchmarkSelect) benchmarkSelect.value = '';
     updateBenchmarkNavButtons();
-    void loadFromSource(file.name || 'Local Profile', 'Reading local profile…', () => open(file), () => {
+    void loadFromSource(file.name || 'Local Profile', 'Reading local profile…', async signal => {
+      if (!open) return decodeProfileFile(file, signal);
+      const source = await open(file);
+      if (signal.aborted) {
+        source.close();
+        signal.throwIfAborted();
+      }
+      return loadProfile(source);
+    }, () => {
       input.value = '';
     });
   }
+
+  cancel.addEventListener('click', () => {
+    ++generation;
+    decoding?.abort();
+    decoding = undefined;
+    cancel.hidden = true;
+    input.value = '';
+    status.textContent = 'Profile loading cancelled.';
+    status.dataset.state = 'cancelled';
+  });
 
   input.addEventListener('change', () => {
     const file = input.files?.[0];
@@ -491,8 +514,18 @@ export function mountViewer(
     syncQueryParams(entry.id, activePlatformKey || undefined);
     const plat = activePlatformKey ? preloadedPlatforms[activePlatformKey] : undefined;
     const title = plat?.os ? `${entry.name} (${plat.os})` : entry.name;
-    const openPreloaded = options.openPreloadedProfile ?? openPreloadedProfile;
-    void loadFromSource(title, `Loading benchmark profile: ${title}…`, () => openPreloaded(entry.file));
+    const openPreloaded = options.openPreloadedProfile;
+    void loadFromSource(title, `Loading benchmark profile: ${title}…`, async signal => {
+      if (openPreloaded) {
+        const source = await openPreloaded(entry.file);
+        if (signal.aborted) {
+          source.close();
+          signal.throwIfAborted();
+        }
+        return loadProfile(source);
+      }
+      return openPreloadedProfile(entry.file, signal);
+    });
   }
 
   function selectBenchmarkPlatform(platformKey: string, preferredShaderId?: string | null): void {

@@ -1,5 +1,6 @@
 import { FileProfileDataSource } from './file-source';
-import { LIMITS, object, requireValid, type ProfileDataSource } from './profile';
+import { decodeProfileFile } from './worker-loader';
+import { LIMITS, object, requireValid, type Profile, type ProfileDataSource } from './profile';
 
 export interface PreloadedProfileEntry {
   id: string;
@@ -132,12 +133,30 @@ export async function fetchPreloadedManifest(url = './profiles/manifest.json'): 
   return validatePreloadedManifest(await response.json());
 }
 
-export async function openPreloadedProfile(file: string): Promise<ProfileDataSource> {
+export async function openPreloadedProfile(file: string): Promise<ProfileDataSource>;
+export async function openPreloadedProfile(file: string, signal: AbortSignal): Promise<Profile>;
+export async function openPreloadedProfile(file: string, signal?: AbortSignal): Promise<ProfileDataSource | Profile> {
   requireValid(isSafeProfileFile(file), 'Invalid preloaded profile filename.');
   const encodedPath = file.split('/').map(encodeURIComponent).join('/');
-  const response = await fetch(`./profiles/${encodedPath}`);
+  const response = await fetch(`./profiles/${encodedPath}`, { signal });
   requireValid(response.ok, `Unable to load benchmark profile ${file} (${response.status}).`);
-  const buffer = await response.arrayBuffer();
-  requireValid(buffer.byteLength <= LIMITS.archive, 'Benchmark profile exceeds 256 MiB limit.');
-  return FileProfileDataSource.fromBuffer(buffer);
+  requireValid(response.body, 'Benchmark profile has no response body.');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.length;
+      requireValid(size <= LIMITS.archive, 'Benchmark profile exceeds 256 MiB limit.');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel();
+    reader.releaseLock();
+  }
+  const blob = new Blob(chunks);
+  if (signal) return decodeProfileFile(blob, signal);
+  return FileProfileDataSource.fromBuffer(await blob.arrayBuffer());
 }

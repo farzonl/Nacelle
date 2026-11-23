@@ -1,5 +1,5 @@
-import { unzipSync } from 'fflate';
 import { Decompress } from 'fzstd';
+import xxhash from 'xxhash-wasm';
 import {
   LIMITS, parseJson, requireValid, safePath, validateManifest,
   type ProfileDataSource, type ProfileManifest,
@@ -9,7 +9,10 @@ interface ZipEntry {
   path: string;
   size: number;
   crc: number;
+  start: number;
 }
+
+let checksum: ReturnType<typeof xxhash> | undefined;
 
 const crcTable = Uint32Array.from({ length: 256 }, (_, value) => {
   for (let bit = 0; bit < 8; bit++) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
@@ -70,6 +73,9 @@ function inspectZip(bytes: Uint8Array): ZipEntry[] {
     const crc = u32(cursor + 16);
     let rangeEnd = dataEnd;
     if (flags & 8) {
+      requireValid((u32(local + 14) === 0 && u32(local + 18) === 0 && u32(local + 22) === 0)
+        || (u32(local + 14) === crc && u32(local + 18) === size && u32(local + 22) === size),
+      'ZIP local sizes or checksum conflict with data descriptor.');
       requireValid(dataEnd + 12 <= directory, 'Missing ZIP data descriptor.');
       const descriptor = u32(dataEnd) === 0x08074b50 ? dataEnd + 4 : dataEnd;
       requireValid(descriptor + 12 <= directory && u32(descriptor) === crc
@@ -83,7 +89,7 @@ function inspectZip(bytes: Uint8Array): ZipEntry[] {
     requireValid(ranges.every(([start, stop]) => rangeEnd <= start || local >= stop),
       'Overlapping ZIP entries.');
     ranges.push([local, rangeEnd]);
-    result.push({ path, size, crc });
+    result.push({ path, size, crc, start: local + 30 + nameSize + u16(local + 28) });
     cursor = next;
   }
   requireValid(cursor === end, 'Corrupt ZIP directory size.');
@@ -124,7 +130,7 @@ function inspectZstd(data: Uint8Array, expected: number): void {
     'Truncated or concatenated zstd frames are not supported.');
 }
 
-function decodeZstd(data: Uint8Array, expected: number): Uint8Array {
+async function decodeZstd(data: Uint8Array, expected: number): Promise<Uint8Array> {
   inspectZstd(data, expected);
   const result = new Uint8Array(expected);
   let written = 0;
@@ -135,6 +141,11 @@ function decodeZstd(data: Uint8Array, expected: number): Uint8Array {
   });
   decoder.push(data, true);
   requireValid(written === expected, 'Zstd decoded size disagrees with manifest.');
+  if (data[4] & 4) {
+    const hash = await (checksum ??= xxhash());
+    const expectedChecksum = new DataView(data.buffer, data.byteOffset + data.length - 4, 4).getUint32(0, true);
+    requireValid(Number(hash.h64Raw(result) & 0xffffffffn) === expectedChecksum, 'Corrupt zstd checksum.');
+  }
   return result;
 }
 
@@ -147,11 +158,12 @@ export class FileProfileDataSource implements ProfileDataSource {
     const directory = inspectZip(bytes);
     const metadata = directory.find(entry => entry.path === 'manifest.json');
     requireValid(metadata && metadata.size <= LIMITS.manifest, 'Missing or oversized manifest.json.');
-    this.entries = unzipSync(bytes);
+    this.entries = Object.create(null) as Record<string, Uint8Array>;
     for (const entry of directory) {
-      const data = this.entries[entry.path];
-      requireValid(data?.length === entry.size && crc32(data) === entry.crc,
+      const data = bytes.subarray(entry.start, entry.start + entry.size);
+      requireValid(crc32(data) === entry.crc,
         `Corrupt ZIP entry: ${entry.path}.`);
+      this.entries[entry.path] = data;
     }
     this.manifest = validateManifest(parseJson(this.entries['manifest.json']));
     const declared = new Set(this.manifest.entries.map(entry => entry.path));
@@ -184,8 +196,8 @@ export class FileProfileDataSource implements ProfileDataSource {
     const entry = this.manifest.entries.find(candidate => candidate.path === path);
     requireValid(entry, 'Entry is not declared in manifest.');
     const raw = this.entries[path];
-    const decoded = entry.encoding === 'zstd' ? decodeZstd(raw, entry.uncompressedSize) : raw;
-    return decoded.slice().buffer as ArrayBuffer;
+    if (entry.encoding === 'zstd') return (await decodeZstd(raw, entry.uncompressedSize)).buffer as ArrayBuffer;
+    return raw.slice().buffer as ArrayBuffer;
   }
 
   close(): void {

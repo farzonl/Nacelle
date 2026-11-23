@@ -4,10 +4,26 @@ import { FileProfileDataSource } from '../src/file-source';
 import { LIMITS, loadProfile, validateManifest, type ProfileDataSource } from '../src/profile';
 import { captureStatus, groupThreads, summaryText } from '../src/presentation';
 import { centralOffsets, fixture, span, trace } from './fixtures';
+import { openPreloadedProfile } from '../src/preloaded';
 
 const open = (buffer: ArrayBuffer) => FileProfileDataSource.fromBuffer(buffer);
 
 describe('file data source', () => {
+  it('bounds preloaded responses while streaming and cancels an oversized download', async () => {
+    const chunk = new Uint8Array(1024 * 1024);
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(chunk); },
+      cancel,
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(stream)));
+    try {
+      await expect(openPreloadedProfile('synthetic.nacelle-profile')).rejects.toThrow('256 MiB');
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
   it('loads a native-style stored ZIP with real zstd compression and exports exact decoded bytes', async () => {
     const source = open(fixture());
     const manifest = await source.readManifest();
@@ -252,11 +268,11 @@ describe('transport-independent loading and presentation', () => {
     await expect(loadProfile(open(codeFixture(undefined, args)))).rejects.toThrow(/code.version/);
   });
 
-  it('accepts empty captures and incomplete captures without assuming event-counter semantics', async () => {
+  it('accepts empty incomplete captures with consistent recorded-event counts', async () => {
     const profile = await loadProfile(open(fixture({ complete: false, droppedEvents: 7 }, trace([]))));
     expect(groupThreads(profile.trace)).toEqual([]);
     expect(captureStatus(profile)).toMatch(/Incomplete.*7 dropped/);
-    expect(summaryText(profile)).toContain('Recorded events: 1');
+    expect(summaryText(profile)).toContain('Recorded events: 0');
     expect(summaryText(profile)).toContain('Trace events: 0');
     expect(captureStatus({ ...profile, manifest: { ...profile.manifest, complete: true } })).toContain('data loss');
   });
