@@ -123,6 +123,46 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
                       NACELLE_PROFILE_ARCH, NACELLE_PROFILE_REVISION,
                       session.compilerHash, session.targetTriple, session.cpu, session.cpuFeatures};
     manifest.entries = {{"trace.json.zst", "zstd", 0}, {"shaders.json", "json", 2}};
+    std::string artifactsJson;
+    if (const auto& store = session.retainedArtifacts) {
+        ArtifactMetadata artifacts;
+        std::set<std::string> admitted;
+        {
+            std::lock_guard lock(store->mutex);
+            if (store->overflow) {
+                error = "Artifact retention budget exceeded; reconfigure retention and begin a new capture";
+                return false;
+            }
+            for (const auto& code : session.shaders.codeVersions) {
+                ArtifactSelection selection;
+                selection.codeVersionId = code.id;
+                selection.shaderAvailability = "not-retained";
+                selection.nativeAvailability = !code.artifactId && code.tier == 1 ? "tier1-unavailable" : "not-retained";
+                for (const auto* identity : {&code.shaderId, &code.artifactId}) {
+                    if (!*identity) continue;
+                    const auto found = store->groups.find(**identity);
+                    if (found == store->groups.end() || found->second.empty()) continue;
+                    for (const auto& payload : found->second) {
+                        selection.payloadIds.push_back(payload.id);
+                        if (admitted.insert(payload.id).second) artifacts.payloads.push_back(payload);
+                    }
+                    (identity == &code.shaderId ? selection.shaderAvailability : selection.nativeAvailability) = "available";
+                }
+                artifacts.selections.push_back(std::move(selection));
+            }
+        }
+        manifest.schemaVersion = 2;
+        manifest.captureOptions.embeddedSources = store->options.flags & NACELLE_PROFILE_EMBED_SHADER_SOURCES;
+        manifest.captureOptions.artifactBytes = store->options.artifact_bytes;
+        manifest.captureOptions.sourceBytes = store->options.source_bytes;
+        if (!validateArtifacts(artifacts, session.shaders, manifest.captureOptions, error) ||
+            !toJson(artifacts, artifactsJson, error)) return false;
+        if (artifactsJson.size() > maxProfileBytes) {
+            error = "Artifact metadata exceeds 256 MiB";
+            return false;
+        }
+        manifest.entries.push_back({"artifacts.json", "json", artifactsJson.size(), artifactDigest(artifactsJson)});
+    }
     std::string manifestJson;
     // Reject oversized metadata before allocating trace objects and compression buffers.
     if (!manifestToJson(manifest, manifestJson, error)) return false;
@@ -176,7 +216,8 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         if (!toJson(glz::obj{"traceEvents", events, "displayTimeUnit", defaults.displayTimeUnit},
                     traceJson, error)) return false;
     }
-    if (traceJson.size() > maxProfileBytes - shadersJson.size()) {
+    if (shadersJson.size() + artifactsJson.size() > maxProfileBytes ||
+        traceJson.size() > maxProfileBytes - shadersJson.size() - artifactsJson.size()) {
         error = "Profile trace exceeds the 256 MiB uncompressed format limit";
         return false;
     }
@@ -190,7 +231,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     compressed.resize(result);
 
     manifest.entries.front().uncompressedSize = traceJson.size();
-    manifest.entries.back().uncompressedSize = shadersJson.size();
+    manifest.entries[1].uncompressedSize = shadersJson.size();
     if (!manifestToJson(manifest, manifestJson, error)) return false;
 
     Zip zip;
@@ -203,6 +244,11 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         return false;
     }
     void* bytes = nullptr;
+    if (!artifactsJson.empty() && !mz_zip_writer_add_mem(&zip.archive, "artifacts.json",
+            artifactsJson.data(), artifactsJson.size(), 0)) {
+        error = "miniz could not add artifact metadata";
+        return false;
+    }
     size_t size = 0;
     if (!mz_zip_writer_finalize_heap_archive(&zip.archive, &bytes, &size)) {
         error = "miniz could not finalize the profile archive";
@@ -271,7 +317,7 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         return false;
     }
     const auto count = mz_zip_reader_get_num_files(&zip.archive);
-    if (count != 3 || mz_zip_is_zip64(&zip.archive)) {
+    if ((count != 3 && count != 4) || mz_zip_is_zip64(&zip.archive)) {
         error = "Profile v1 requires a non-ZIP64 archive with exactly manifest.json, trace.json.zst, and shaders.json";
         return false;
     }
@@ -335,18 +381,29 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         return false;
     }
     const auto& manifest = parsed.manifest;
-    if (manifest.schemaVersion != 1 || manifest.kind != "profile" || manifest.replayable ||
+    if ((manifest.schemaVersion != 1 && manifest.schemaVersion != 2) || manifest.kind != "profile" || manifest.replayable ||
         manifest.clock != "monotonic" || manifest.timestampUnit != "ns" ||
-        manifest.entries.size() != 2 || manifest.complete != (manifest.droppedEvents == 0) ||
+        manifest.entries.size() != (manifest.schemaVersion == 1 ? 2 : 3) ||
+        count != manifest.entries.size() + 1 ||
+        manifest.complete != (manifest.droppedEvents == 0) ||
         manifest.recordedEvents > 1'000'000) {
         error = "Unsupported or inconsistent profile manifest";
         return false;
     }
     const Entry* traceEntry = nullptr;
     const Entry* shadersEntry = nullptr;
+    const Entry* artifactsEntry = nullptr;
+    uint64_t decodedTotal = 0;
     for (const auto& entry : manifest.entries) {
+        if (entry.uncompressedSize > maxProfileBytes - decodedTotal) {
+            error = "Profile decoded payloads exceed 256 MiB";
+            return false;
+        }
+        decodedTotal += entry.uncompressedSize;
         if (entry.path == "trace.json.zst" && entry.encoding == "zstd" && !traceEntry) traceEntry = &entry;
         else if (entry.path == "shaders.json" && entry.encoding == "json" && !shadersEntry) shadersEntry = &entry;
+        else if (manifest.schemaVersion == 2 && entry.path == "artifacts.json" && entry.encoding == "json" && !artifactsEntry &&
+                 entry.digest && entry.digest->size() == 16) artifactsEntry = &entry;
         else {
             error = "Unsupported or duplicate manifest entry";
             return false;
@@ -500,6 +557,26 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
             error = "Trace does not match referenced code version";
             return false;
         }
+    }
+    if (manifest.schemaVersion == 2) {
+        if (!artifactsEntry || !manifest.captureOptions.artifactBytes || !manifest.captureOptions.sourceBytes ||
+            !*manifest.captureOptions.artifactBytes || !*manifest.captureOptions.sourceBytes ||
+            *manifest.captureOptions.artifactBytes > 64ull * 1024 * 1024 ||
+            *manifest.captureOptions.sourceBytes > 16ull * 1024 * 1024 ||
+            !extract(zip, "artifacts.json", artifactsEntry->uncompressedSize, json, error)) {
+            if (error.empty()) error = "Missing or invalid artifact budget/payload";
+            return false;
+        }
+        if (json.size() != artifactsEntry->uncompressedSize || artifactDigest(json) != artifactsEntry->digest) {
+            error = "Artifact size or digest mismatch";
+            return false;
+        }
+        parsed.artifacts.emplace();
+        if (const auto ec = glz::read<glz::opts{.error_on_missing_keys = true}>(*parsed.artifacts, json)) {
+            error = "Invalid artifact metadata: " + glz::format_error(ec, json);
+            return false;
+        }
+        if (!validateArtifacts(*parsed.artifacts, parsed.shaders, manifest.captureOptions, error)) return false;
     }
     profile = std::move(parsed);
     return true;

@@ -279,6 +279,7 @@ extern "C" HRESULT NacelleBeginProfileCapture(
     try {
         auto handle = std::make_unique<NacelleProfileCapture>();
         handle->session = std::make_shared<nacelle::profile::Session>(options->event_buffer_bytes);
+        handle->session->retainedArtifacts = nacelle::profile::artifactStore();
         activeSession = handle->session;
         *capture = handle.release();
         recording.store(true, std::memory_order_release);

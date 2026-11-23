@@ -11,6 +11,19 @@
 
 struct NacelleProfileCapture;
 
+enum NacelleProfileArtifactFlags : uint32_t {
+    NACELLE_PROFILE_RETAIN_SHADER_TEXT = 1,
+    NACELLE_PROFILE_EMBED_SHADER_SOURCES = 2,
+};
+
+struct NacelleProfileArtifactOptions {
+    uint32_t struct_size = sizeof(NacelleProfileArtifactOptions);
+    uint32_t version = 1;
+    uint32_t flags = 0;
+    uint64_t artifact_bytes = 32ull * 1024 * 1024;
+    uint64_t source_bytes = 8ull * 1024 * 1024;
+};
+
 struct NacelleProfileOptions {
     uint32_t struct_size = sizeof(NacelleProfileOptions);
     uint32_t version = 1;
@@ -28,6 +41,10 @@ struct NacelleProfileSummary {
 
 // End/Destroy must be called outside captured work, and serialized for each handle.
 extern "C" {
+// Configure before creating pipelines. Sources are private; both opt-ins default OFF.
+// Disabling/reconfiguring releases retained data; captured sessions retain their snapshot.
+NACELLE_PROFILE_API HRESULT NacelleConfigureProfileArtifacts(
+    const NacelleProfileArtifactOptions* options);
 NACELLE_PROFILE_API HRESULT NacelleBeginProfileCapture(
     const NacelleProfileOptions* options, NacelleProfileCapture** capture);
 NACELLE_PROFILE_API HRESULT NacelleEndProfileCapture(

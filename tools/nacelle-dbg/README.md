@@ -126,6 +126,68 @@ depth acquires independent ownership, so it may safely outlive the original root
 and continue recording while capture end waits for it. Worker coverage, event
 counts, and draining semantics are unchanged.
 
+### Opt-in shader text and source retention
+
+This is separate from event capture and defaults to **OFF** even in an
+instrumented runtime. Configure it **before creating pipelines** (and before
+beginning execution-only capture of pre-existing pipelines):
+
+```cpp
+NacelleProfileArtifactOptions artifacts;
+artifacts.flags = NACELLE_PROFILE_RETAIN_SHADER_TEXT;
+// Add NACELLE_PROFILE_EMBED_SHADER_SOURCES only with explicit source consent.
+HRESULT status = NacelleConfigureProfileArtifacts(&artifacts);
+```
+
+Check the HRESULT. Unknown flags, incompatible struct/version, or invalid budgets
+are rejected and logged. Retention defaults to 32 MiB artifact text and 8 MiB
+source data; caps are 64 MiB and 16 MiB respectively, configurable downward.
+Accounting includes IDs, labels and mapping storage as well as text. It is not
+a total-process RSS limit: compiler parsing/cloning, containers, serialization,
+CodeMirror and decoded objects use additional memory. Opted-in compilation
+does extra textual IR/disassembly work; ordinary ON-idle performance thresholds
+do **not** certify this separately enabled collection mode.
+
+Only debug data already present in the supplied DXC container is inspected.
+For embedded source and preserved HLSL-to-DXIL locations, compile with DXC
+`-Zi -Qembed_debug` (tests additionally use `-Od`). Nacelle never opens referenced
+source paths, invokes background DXC, or recompiles a pre-existing pipeline to
+invent missing artifacts. Text-only consent does not embed HLSL. Stripped input,
+late opt-in and unsupported mappings are explicitly unavailable. Filename
+references become capture-local `source-N.hlsl`; source **contents** can still
+contain private information. Treat the entire archive as private.
+Debug references are compared with normalized path separators, without reading
+those paths or guessing a match from a basename.
+
+Retained views include DXIL instruction text, lifted MLIR when that compilation
+path ran, optimized LLVM for emitted native objects, and disassembly of exact
+emitted or cached object bytes. Disk cache hits can have native text without
+retained LLVM/MLIR. Tier-1 entries without object identity do not invent assembly.
+Native offsets are relative to their labeled text section, never live JIT
+addresses. Lifetimes, promotion, cache selection and unloading remain unchanged.
+The panes resolve immutable shader/native owners for each captured code version,
+including older entries retained across asynchronous promotion. Optimizations
+can remove mappings: only supplied HLSL/DXIL mappings are currently preserved;
+MLIR/optimized LLVM/native source and lane mappings are unavailable, not inferred.
+
+Enabled sessions snapshot their retention store. Reconfiguring replaces the
+store for future compiler work/captures; existing sessions retain their snapshot.
+Quiesce compilation before reconfiguration for consistent coverage. Set `flags`
+to zero to release global retention after captures finish. Overflow fails saving
+with an explicit error and writes nothing; reconfigure and begin a **new**
+capture. Reconfiguring cannot repair a stopped handle's overflowed snapshot.
+
+Archives without retention keep manifest version 1. Enabled captures use
+manifest version 2 and a declared `artifacts.json` payload (artifact schema 1).
+The existing SHA-256 shader/native identities remain authoritative owners;
+payload IDs and the declared artifact checksum use XXH64 of the exact text/JSON
+bytes for corruption detection, **not cryptographic authenticity**. Native and
+browser readers reject owner/selection disagreement, duplicate or unused
+payloads, unsafe labels, checksum/size changes, absent source consent, mapping
+bounds and declared text-budget violations. Both archive/decoded aggregate
+limits remain 256 MiB. Updated readers accept versions 1 and 2; old readers
+reject version 2 rather than silently dropping artifacts.
+
 ### Memory validation
 
 The first [#212](https://github.com/farzonl/Nacelle/issues/212) diagnostic used

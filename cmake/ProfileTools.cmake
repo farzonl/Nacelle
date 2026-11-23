@@ -31,9 +31,15 @@ function(nacelle_add_profile_support)
         "${root}/third_party/miniz" "${CMAKE_CURRENT_BINARY_DIR}/profile-generated")
     target_compile_definitions(nacelle_profile_miniz PUBLIC MINIZ_STATIC_DEFINE)
 
-    add_library(nacelle_profile_io STATIC "${root}/src/instrumentation/profile_writer.cpp")
+    add_library(nacelle_profile_io STATIC "${root}/src/instrumentation/profile_writer.cpp"
+        "${root}/src/instrumentation/artifacts.cpp")
+    target_include_directories(nacelle_profile_io PRIVATE "${root}/third_party/xxHash")
     target_link_libraries(nacelle_profile_io PRIVATE glaze::glaze nacelle_profile_miniz libzstd_static)
     target_compile_definitions(nacelle_profile_io PRIVATE NACELLE_ENABLE_INSTRUMENTATION=1)
+    target_include_directories(nacelle_profile_io PRIVATE "${root}/include" "${root}/third_party/DirectX-Headers/include")
+    if(NOT WIN32)
+        target_include_directories(nacelle_profile_io PRIVATE "${root}/third_party/DirectX-Headers/include/wsl/stubs")
+    endif()
     execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${root}"
         OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE
         RESULT_VARIABLE revision_result)
@@ -45,7 +51,8 @@ function(nacelle_add_profile_support)
         NACELLE_PROFILE_OS="${CMAKE_SYSTEM_NAME}"
         NACELLE_PROFILE_ARCH="${CMAKE_SYSTEM_PROCESSOR}"
         NACELLE_PROFILE_REVISION="${revision}")
-    add_library(nacelle_profile_capture STATIC "${root}/src/instrumentation/capture.cpp")
+    add_library(nacelle_profile_capture STATIC "${root}/src/instrumentation/capture.cpp"
+        "${root}/src/instrumentation/artifact_store.cpp")
     find_package(Threads REQUIRED)
     target_link_libraries(nacelle_profile_capture PUBLIC Threads::Threads PRIVATE nacelle_profile_io)
     target_compile_features(nacelle_profile_capture PUBLIC cxx_std_20)
