@@ -152,6 +152,36 @@
           </details>
         </div>
 
+        <section id="spatial-view" class="panel rounded-xl p-4 shadow-sm" hidden aria-labelledby="spatial-heading">
+          <h2 id="spatial-heading" class="text-sm font-semibold">Spatial heatmaps and submitted-lane inspection</h2>
+          <p class="text-xs text-[var(--muted)]">Private, offline observations. Wall time belongs to whole entry calls, never individual pixels. Lane counts precede depth/discard; instruction activity and lane values are unavailable.</p>
+          <div class="mt-3 flex flex-wrap gap-3">
+            <label>Operation <select id="spatial-operation" class="profiler-select"></select></label>
+            <label>Metric <select id="spatial-metric" class="profiler-select">
+              <option value="wallNs">Host wall time (ns)</option><option value="calls">Entry calls</option>
+              <option value="invocations">Submitted invocations</option><option value="coveredLanes">Covered submissions</option>
+              <option value="companionLanes">Quad-companion submissions</option><option value="paddingLanes">Padding submissions</option>
+            </select></label>
+            <label>Lane <select id="spatial-lane" class="profiler-select"></select></label>
+            <label>Plane <select id="spatial-plane" class="profiler-select"><option value="xy">XY</option><option value="xz">XZ</option><option value="yz">YZ</option></select></label>
+            <label>Slice <input id="spatial-slice" class="profiler-input w-24" type="number" min="0" step="1" value="0"></label>
+            <label>Scale <select id="spatial-scale" class="profiler-select"><option value="linear">Linear</option><option value="log">Log1p</option></select></label>
+            <label>Minimum <input id="spatial-min" class="profiler-input w-24" type="number" min="0" step="any" value="0"></label>
+            <label>Maximum <input id="spatial-max" class="profiler-input w-24" type="number" min="0" step="any" placeholder="Auto"></label>
+          </div>
+          <p id="spatial-status" class="my-2 text-xs" role="status" aria-live="polite"></p>
+          <p id="spatial-legend" class="my-2 text-xs"></p>
+          <canvas id="spatial-canvas" class="block max-w-full border border-[var(--border)]" aria-label="Sparse spatial heatmap; click to inspect a coordinate. Exact XYZ controls are available below."></canvas>
+          <div class="my-3 flex flex-wrap gap-3">
+            <label>X <input id="spatial-x" class="profiler-input w-24" type="number" min="0" step="1" value="0"></label>
+            <label>Y <input id="spatial-y" class="profiler-input w-24" type="number" min="0" step="1" value="0"></label>
+            <label>Z <input id="spatial-z" class="profiler-input w-24" type="number" min="0" step="1" value="0"></label>
+            <button id="spatial-inspect" class="profiler-btn" type="button">Inspect exact coordinate</button>
+            <button id="spatial-correlate" class="profiler-btn" type="button">Show captured span / artifact version</button>
+          </div>
+          <pre id="spatial-details" class="text-xs whitespace-pre-wrap break-words" aria-live="polite"></pre>
+        </section>
+
         <!-- Embedded Interactive Flamegraph / Timeline (Renderer-agnostic host) -->
         <section id="timeline-section" class="panel overflow-hidden rounded-xl shadow-sm" hidden aria-labelledby="timeline-heading">
           <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border)] bg-[var(--surface-elevated)]/70 px-4 py-3">

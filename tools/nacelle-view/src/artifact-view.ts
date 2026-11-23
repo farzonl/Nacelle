@@ -3,7 +3,7 @@ import { EditorView, lineNumbers, highlightActiveLine } from '@codemirror/view';
 import type { Profile } from './profile';
 import type { ArtifactKind, TextArtifact } from './artifacts';
 
-export function createArtifactView(root: Document): { show(profile?: Profile): void } {
+export function createArtifactView(root: Document): { show(profile?: Profile): void; select(codeVersionId: number): void } {
   const section = root.querySelector<HTMLElement>('#shader-artifacts')!;
   const selector = root.querySelector<HTMLSelectElement>('#artifact-version')!;
   const status = root.querySelector<HTMLElement>('#artifact-status')!;
@@ -89,6 +89,12 @@ export function createArtifactView(root: Document): { show(profile?: Profile): v
   }
   selector.addEventListener('change', render);
   return {
+    select(codeVersionId) {
+      if (!current?.artifacts) return;
+      selector.value = String(codeVersionId - 1);
+      render();
+      section.scrollIntoView?.({ block: 'nearest' });
+    },
     show(profile) {
       current = profile;
       selector.replaceChildren();

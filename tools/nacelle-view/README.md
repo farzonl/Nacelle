@@ -85,8 +85,7 @@ skipped and dropped spatial observations separately from event drops. Either
 kind of loss makes capture status incomplete. Shader artifacts can coexist
 with spatial data; versions 1/2 remain supported.
 
-This is the #217 collection/data boundary, **not #218's heatmap renderer or lane
-inspector**. The payload describes host entry-call nanoseconds per raster tile
+The payload describes host entry-call nanoseconds per raster tile
 or threadgroup and submitted pixel coverage/quad-companion/padding counts,
 with exact operation/code-version identities. It does not contain per-pixel
 timings, instruction divergence, source-lane values or replay resources.
@@ -103,12 +102,62 @@ event references, per-slot counts and separate completeness without allocating
 a dense image from dimensions. Parsed/worker/UI objects consume memory beyond
 the record pool and archive limits.
 
+### Heatmaps and exact coordinate/lane inspection
+
+Choose an **operation** to keep stage/PSO/code-version attribution separate.
+Choose host wall-time **ns**, entry calls, submitted invocations, or pixel
+covered/quad-companion/padding submissions. Pixel lane selection chooses all
+slots or one captured SIMD slot (4/8/16); slot packing is quad-major with local
+XY `(slot % 2, floor(slot / 2) % 2)`. These are repeated entry submissions,
+not source-lane values, unique pixels or dynamic branch activity. Compute lane
+metrics are explicitly unavailable rather than empty numerical heatmaps.
+
+Choose **XY/XZ/YZ** and an integer slice for 3D groups. Displayed axes increase
+right/down; pixel XY preserves global top-left-Y-down orientation and actual
+render-target extent, including clipped edge tiles. The bounded canvas has
+at most 1024-by-1024 backing pixels, with CSS preserving the true extent aspect
+ratio. It draws sparse captured cells only, never allocates an image from
+untrusted dimensions. Subpixel cells can overlap: color is a projection, not
+an averaged or interpolated value. Use **exact XYZ inspection** for precise data
+in highly downscaled/extreme-aspect views. Click a visible cell or enter integer
+cell coordinates directly; pixel coordinates here identify 32-by-32 tiles,
+not individual framebuffer pixels.
+
+Linear and **log1p** scales share a documented blue-to-orange legend.
+Minimum/maximum controls clip colors only, not data; blank maximum uses the
+visible slice's maximum (at least minimum + 1). Invalid ranges/slices/coordinates
+produce explicit errors. Numeric zero is observed data and has a real metric
+value; gray means missing/unsampled/unavailable, never zero. Exact inspection
+distinguishes outside-ROI/stride **unsampled** from selected-but-**missing**
+submissions. A lost coordinate cannot be identified: **dropped-or-missing**
+stays ambiguous, all retained lossy-operation cells are **partial** with magenta
+outlines, and incomplete captures warn against reliable interpretation.
+
+Inspection includes exact pipeline/stage/PSO/code ID/version/Tier/cache/SIMD,
+extent and captured span ID/timing/thread when available. **Show captured span /
+artifact version** filters the span table/timeline to its PSO/stage/thread/time
+window and selects the exact immutable artifact version, not the newest tier.
+Intersecting spans may include parents or overlaps; the inspection's span ID
+is authoritative. Missing events/artifacts stay unavailable; source mappings
+and instruction-lane values are not invented.
+
+Preparation, indexing and painting yield to animation frames every 1,000 cells;
+replacement cancels stale scheduled work and releases the previous coordinate
+index. This adds one bounded sparse index for the selected operation and a
+canvas (up to 4 MiB pixel storage), beyond decoded objects and existing limits.
+Operation selectors are bounded by the 4,096-operation schema limit. No new
+libraries, runtime hooks, schema changes, uploads, telemetry or external assets
+are introduced. CSP and offline worker decoding are unchanged.
+
 The shared spatial corpus checks observed zeros, sampling, partial loss,
 empty/unsupported operations, malformed attribution/geometry/counts and native
 parser parity. Real static/shared captures exercise SIMD 4/8/16, odd edges,
 derivatives/discard, 3D groups, overflow, cache hits and promotion. The offline
-browser test checks native spatial decoding and separate loss warnings without
-uploads or external requests. Heatmap visualization remains separate work.
+browser tests check native spatial decoding, actual canvas colors/orientation,
+edge aspect ratio, lane selection, range errors, immutable artifact correlation,
+3D slices and separate loss warnings without uploads or external requests.
+A full-capacity 39,568-cell capture must render with main-thread heartbeats, bounded canvas
+storage, exact final-coordinate values and stale-render cancellation.
 
 ## Build and test
 
