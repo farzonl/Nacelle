@@ -1,5 +1,6 @@
 import { decodeProfileFile } from './worker-loader';
 import { createArtifactView } from './artifact-view';
+import { createSpatialView } from './spatial-view';
 import {
   fetchPreloadedManifest,
   openPreloadedProfile,
@@ -149,6 +150,15 @@ export function mountViewer(
   let activePlatformKey = '';
   let preloadedEntries: PreloadedProfileEntry[] = [];
   let tableCounter = 0;
+  const spatial = createSpatialView(root, selected => {
+    if (!current) return;
+    artifacts.select(selected.codeVersionId);
+    const span = current.trace.traceEvents.find(event => event.args.id === selected.eventId);
+    startFilter.value = '';
+    endFilter.value = '';
+    applySelectionFilter({ pso: selected.pso, stage: selected.stage, thread: span ? `${span.pid}:${span.tid}` : '',
+      start: span?.ts, end: span ? span.ts + span.dur : undefined });
+  });
 
   function applySelectionFilter(selection: TimelineSelectionEvent): void {
     if (selection.thread !== undefined) threadFilter.value = selection.thread;
@@ -373,6 +383,8 @@ export function mountViewer(
     decoding = controller;
     cancel.hidden = false;
     current = undefined;
+    spatial.show();
+    artifacts.show();
     activeTitle = title;
     allGroups = [];
     groups = [];
@@ -399,6 +411,7 @@ export function mountViewer(
       if (request !== generation) return;
       current = profile;
       artifacts.show(profile);
+      spatial.show(profile);
       allGroups = groupThreads(profile.trace);
       const stages = new Set<string>();
       for (const group of allGroups) {
