@@ -26,6 +26,7 @@ export interface ViewerOptions {
 export interface ViewerController {
   openSource(name: string, read: (signal: AbortSignal) => Promise<Blob>): Promise<void>;
   exportTrace(): Promise<void>;
+  exportSpeedscope(): Promise<void>;
   cancel(): void;
   dispose(): void;
 }
@@ -697,7 +698,7 @@ export function mountViewer(
     void exportTrace().catch(error => console.error('Trace export failed.', error));
   });
 
-  speedscopeButton.addEventListener('click', async () => {
+  async function exportSpeedscope(): Promise<void> {
     if (!current || !total) return;
     exportStatus.textContent = '';
     try {
@@ -709,7 +710,11 @@ export function mountViewer(
       exportStatus.textContent = 'Saved a local Speedscope profile. Open it in your locally installed Speedscope viewer; nothing was uploaded.';
     } catch (error) {
       exportStatus.textContent = `Speedscope export failed: ${error instanceof Error ? error.message : 'Unable to export spans.'}`;
+      throw error;
     }
+  }
+  speedscopeButton.addEventListener('click', () => {
+    void exportSpeedscope().catch(error => console.error('Speedscope export failed.', error));
   });
   return {
     openSource: (name, read) => loadFromSource(name, 'Reading selected profile...', async signal => {
@@ -718,6 +723,7 @@ export function mountViewer(
       return (options.decodeFile ?? decodeProfileFile)(blob, signal);
     }),
     exportTrace,
+    exportSpeedscope,
     cancel: cancelLoad,
     dispose: () => {
       cancelLoad();

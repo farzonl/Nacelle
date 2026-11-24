@@ -8,6 +8,12 @@ if (typeof window.acquireVsCodeApi === 'function') {
     status.dataset.state = 'invalid';
     status.textContent = `VS Code viewer failed: ${error instanceof Error ? error.message : String(error)}`;
   });
+} else if (window.__NACELLE_DESKTOP_HOST__) {
+  void import('./desktop-host').then(host => host.mountDesktopViewer()).catch(error => {
+    const status = document.querySelector<HTMLElement>('#status')!;
+    status.dataset.state = 'invalid';
+    status.textContent = `Desktop viewer failed: ${error instanceof Error ? error.message : String(error)}`;
+  });
 } else {
   mountViewer(document, undefined, {
     preloadedEnabled: import.meta.env.VITE_ENABLE_PRELOADED_PROFILES === '1',

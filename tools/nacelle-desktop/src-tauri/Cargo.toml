@@ -1,0 +1,30 @@
+[package]
+name = "nacelle-desktop"
+version = "0.1.0"
+description = "Thin local-only Tauri 2 profile viewer reusing Nacelle's offline frontend and native OS WebViews."
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "nacelle_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# Opt-in test-only harness for automated real-WebView smoke verification.
+# Never enabled in default or packaged production builds.
+smoke-harness = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.6", features = [] }
+
+[dependencies]
+getrandom = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "=2.12.7", features = [] }
+tauri-plugin-dialog = "=2.8.4"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
