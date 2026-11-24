@@ -1,7 +1,7 @@
 import { isRecord } from '../../nacelle-view/src/host-protocol.ts';
 
 export function nativeDebugSupported(platform: string, arch: string): boolean {
-  return platform === 'linux' && arch === 'x64';
+  return (platform === 'linux' || platform === 'win32') && arch === 'x64';
 }
 
 export function checkDebugResult(value: unknown): void {

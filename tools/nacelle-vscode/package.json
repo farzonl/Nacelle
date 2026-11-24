@@ -11,7 +11,12 @@
   "extensionKind": ["workspace"],
   "categories": ["Debuggers", "Visualization"],
   "main": "./dist/extension.js",
-  "activationEvents": ["onCustomEditor:nacelle.profile", "onDebug:nacelle-lldb"],
+  "activationEvents": [
+    "onCustomEditor:nacelle.profile",
+    "onDebugResolve:nacelle-lldb",
+    "onDebugInitialConfigurations",
+    "onDebugAdapterProtocolTracker:nacelle-lldb"
+  ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",

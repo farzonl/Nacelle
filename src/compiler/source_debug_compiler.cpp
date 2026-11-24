@@ -282,7 +282,7 @@ bool instrument(llvm::Module& module, const std::string& identity, uint32_t stag
         }
     }
     if (!unoptimized && !optimized()) return fail("Source debugging requires DXC -Od; optimized shaders are unsupported");
-    llvm::DIBuilder debugBuilder(module, true);
+    llvm::DIBuilder debugBuilder(module, /*AllowUnresolved=*/false);
     std::map<std::string, std::pair<std::string, uint32_t>> sources;
     for (const auto* operand : embedded->operands()) {
         if (operand->getNumOperands() != 2) return fail("Invalid embedded source record");

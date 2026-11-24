@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { exportMessage, readMessage, EXPORT_CHUNK_BYTES, MAX_EXPORT_BYTES } from '../../nacelle-view/src/host-protocol.ts';
 import { ExportBuffer } from '../src/transfer.ts';
 import { configurationJson, escapeAttribute, resourcePath, rewriteAssets } from '../src/html.ts';
-import { checkDebugResult, commandList, debugEnvironment, debugInteger } from '../src/debug-policy.ts';
+import { checkDebugResult, commandList, debugEnvironment, debugInteger, nativeDebugSupported } from '../src/debug-policy.ts';
 
 test('bounded ordered export preserves exact UTF-8 bytes across chunk boundaries', () => {
   const bytes = Buffer.from(JSON.stringify({ source: 'source \u{1f4a1} \u03bb'.repeat(12000) }));
@@ -69,4 +69,7 @@ test('debugger replies and launch command arrays fail explicitly on unsupported 
   }
   assert.throws(() => commandList('not an array', 'initCommands'));
   assert.throws(() => commandList([42], 'preRunCommands'));
+  assert.equal(nativeDebugSupported('linux', 'x64'), true);
+  assert.equal(nativeDebugSupported('win32', 'x64'), true);
+  assert.equal(nativeDebugSupported('darwin', 'arm64'), false);
 });

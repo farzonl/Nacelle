@@ -51,10 +51,15 @@ packaged script/styles/fonts are embedded to avoid cross-origin blob access.
 
 ## Native and HLSL debugging
 
-Genuine Nacelle shader debug support initially follows the runtime:
-**Linux x86_64**, with an instrumented runtime configured before compilation.
-Windows/macOS profile viewing is independent; their Nacelle runtime shader
-debugging is explicitly unsupported, not approximated with host stepping.
+Genuine Nacelle shader debug support follows the runtime: **Linux x86_64** and
+**Windows x64**, with an instrumented runtime configured before compilation.
+macOS profile viewing is independent; its Nacelle runtime shader debugging is
+explicitly unsupported, not approximated with host stepping. On Windows x64,
+enabled native/source debugging emits Win64-ABI ELF JIT objects registered
+through LLDB's GDB JIT loader, and host debug targets require PDB symbols
+(`/Z7` + `/DEBUG`). Ensure the Python runtime required by your `lldb-dap.exe`
+build (e.g., Python 3.10 for upstream LLVM 21.1.8 Windows binaries) is on
+`PATH`.
 
 Install upstream `lldb-dap` and set `nacelle.debug.lldbDapPath` if needed. The
 adapter runs on the workspace extension host, including an existing VS Code

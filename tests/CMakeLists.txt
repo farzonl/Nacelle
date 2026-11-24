@@ -359,32 +359,55 @@ endfunction()
 add_nacelle_test(d3d12_api_test d3d12_api_test.cpp)
 add_nacelle_test(compute_dispatch_test compute_dispatch_test.cpp)
 if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-        find_program(NACELLE_LLDB_EXECUTABLE NAMES lldb lldb-21 lldb-20 lldb-19 lldb-18)
-        if(NOT NACELLE_LLDB_EXECUTABLE)
+    if((CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+        find_program(NACELLE_LLDB_EXECUTABLE NAMES lldb lldb-21 lldb-20 lldb-19 lldb-18
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "C:/Program Files/LLVM/bin")
+        if(NOT NACELLE_LLDB_EXECUTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
             message(FATAL_ERROR "Native-debug acceptance requires LLDB; set NACELLE_LLDB_EXECUTABLE")
+        elseif(NACELLE_LLDB_EXECUTABLE AND WIN32)
+            execute_process(COMMAND "${NACELLE_LLDB_EXECUTABLE}" --version
+                RESULT_VARIABLE _nacelle_lldb_probe_rc
+                OUTPUT_QUIET ERROR_QUIET TIMEOUT 10)
+            if(NOT _nacelle_lldb_probe_rc EQUAL 0)
+                message(STATUS "Skipping Windows LLDB tests: ${NACELLE_LLDB_EXECUTABLE} --version failed (${_nacelle_lldb_probe_rc})")
+                set(NACELLE_LLDB_EXECUTABLE "")
+            endif()
         endif()
         add_nacelle_test(native_debug_test native_debug_test.cpp)
         add_nacelle_test(source_debug_test source_debug_test.cpp)
         add_test(NAME source_debug_optimized_policy_test COMMAND source_debug_test optimized)
         add_test(NAME source_debug_optimized_compiler_test COMMAND source_debug_test optimized-compiler)
         target_include_directories(source_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-        if(NOT MSVC)
-            target_compile_options(source_debug_test PRIVATE -fno-rtti)
+        if(NOT LLVM_ENABLE_RTTI)
+            if(MSVC)
+                target_compile_options(source_debug_test PRIVATE /GR-)
+            else()
+                target_compile_options(source_debug_test PRIVATE -fno-rtti)
+            endif()
         endif()
         add_test(NAME source_debug_source_budget_test COMMAND source_debug_test source-budget)
         add_test(NAME source_debug_metadata_budget_test COMMAND source_debug_test metadata-budget)
         target_include_directories(native_debug_test SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
         target_link_libraries(native_debug_test PRIVATE ${NACELLE_LLVM_LIBS})
         if(NOT LLVM_ENABLE_RTTI)
-            target_compile_options(native_debug_test PRIVATE -fno-rtti)
+            if(MSVC)
+                target_compile_options(native_debug_test PRIVATE /GR-)
+            else()
+                target_compile_options(native_debug_test PRIVATE -fno-rtti)
+            endif()
+        endif()
+        if(WIN32 AND MSVC)
+            target_compile_options(native_debug_test PRIVATE /Z7)
+            target_link_options(native_debug_test PRIVATE /DEBUG)
         endif()
         add_test(NAME native_debug_budget_test COMMAND native_debug_test budget)
-        add_test(NAME native_debug_lldb_unload_test
-            COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:native_debug_test>"
-                "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DSTAGE=lifetime -DLINKAGE=static
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/run_native_debug_test.cmake")
-        set_tests_properties(native_debug_lldb_unload_test PROPERTIES TIMEOUT 150 RESOURCE_LOCK native_debugger)
+        if(NACELLE_LLDB_EXECUTABLE)
+            add_test(NAME native_debug_lldb_unload_test
+                COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:native_debug_test>"
+                    "-DLLDB=${NACELLE_LLDB_EXECUTABLE}" -DSTAGE=lifetime -DLINKAGE=static
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/run_native_debug_test.cmake")
+            set_tests_properties(native_debug_lldb_unload_test PROPERTIES TIMEOUT 150 RESOURCE_LOCK native_debugger)
+        endif()
     endif()
     add_custom_command(OUTPUT "${NACELLE_SHADER_BIN_DIR}/vec_add_debug.dxil"
         COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Od -Zi -Qembed_debug
@@ -477,6 +500,9 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         target_include_directories(profile_runtime_${linkage}_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_compile_options(profile_runtime_${linkage}_test PRIVATE -g)
+        elseif(WIN32 AND MSVC)
+            target_compile_options(profile_runtime_${linkage}_test PRIVATE /Z7)
+            target_link_options(profile_runtime_${linkage}_test PRIVATE /DEBUG)
         endif()
         if(NACELLE_ENABLE_CPU_COUNTERS)
             foreach(mode IN ITEMS tier1 promoted cached disk graphics-tier1 graphics-promoted graphics-cached graphics-disk)
@@ -493,8 +519,21 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         else()
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle_d3d12 nacelle_profile_io)
             target_compile_definitions(profile_runtime_${linkage}_test PRIVATE NACELLE_PROFILE_SHARED_RUNTIME=1)
+            if(WIN32)
+                add_custom_command(TARGET profile_runtime_${linkage}_test POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "$<TARGET_FILE:nacelle_d3d12>"
+                        "$<TARGET_FILE_DIR:profile_runtime_${linkage}_test>")
+                if(MSVC)
+                    add_custom_command(TARGET profile_runtime_${linkage}_test POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "$<TARGET_PDB_FILE:nacelle_d3d12>"
+                            "$<TARGET_FILE_DIR:profile_runtime_${linkage}_test>")
+                endif()
+            endif()
         endif()
-        if(NACELLE_LLDB_EXECUTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+        if(NACELLE_LLDB_EXECUTABLE AND
+           (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR (WIN32 AND linkage STREQUAL "static")) AND
            CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
             foreach(stage IN ITEMS cs vs ps)
                 add_test(NAME native_debug_lldb_${linkage}_${stage}_test

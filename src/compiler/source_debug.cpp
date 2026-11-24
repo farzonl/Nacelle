@@ -394,8 +394,8 @@ HRESULT configureSource(const NacelleSourceDebugOptions* options, bool optimize)
             !options->source_bytes || options->source_bytes > 16ull * 1024 * 1024 ||
             !options->metadata_bytes || options->metadata_bytes > 32ull * 1024 * 1024)
             return diagnostic("Invalid configuration, privacy consent, or metadata budget");
-#if !defined(__linux__) || !defined(__x86_64__)
-        if (options->enabled) return diagnostic("Source debugging requires Linux x86_64");
+#if !(defined(__linux__) && defined(__x86_64__)) && !(defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)))
+        if (options->enabled) return diagnostic("Source debugging requires Linux x86_64 or Windows x64");
 #endif
         auto& data = state();
         std::lock_guard lock(data.mutex);
