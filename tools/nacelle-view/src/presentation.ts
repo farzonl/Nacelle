@@ -61,7 +61,8 @@ export function captureStatus(profile: Profile): string {
   const { manifest } = profile;
   if (!manifest.complete) {
     return `Incomplete capture: partial data only. ${manifest.droppedEvents} dropped events.` +
-      (profile.spatial && !profile.spatial.complete ? ` ${profile.spatial.dropped} dropped spatial observations.` : '');
+      (profile.spatial && !profile.spatial.complete ? ` ${profile.spatial.dropped} dropped spatial observations.` : '') +
+      (profile.counters && !profile.counters.complete ? ` CPU counters: ${profile.counters.availability}; wall-time data preserved.` : '');
   }
   if (manifest.droppedEvents) {
     return `Capture completed with data loss: ${manifest.droppedEvents} dropped events.`;
@@ -76,6 +77,12 @@ export function summaryText(profile: Profile): string {
     `Dropped events: ${manifest.droppedEvents}`,
     `Trace events: ${trace.traceEvents.length}`,
     `Timing spans: ${trace.traceEvents.filter(event => event.ph === 'X').length}`,
+    ...(profile.counters ? [
+      `CPU counters (${profile.counters.provider}): ${profile.counters.availability}; ${profile.counters.recorded} regions, ${profile.counters.unavailable} unavailable, ${profile.counters.dropped} dropped`,
+      'User-mode thread-region cycles/instructions, raw counts; enabled/running times expose multiplexing (not pure shader cycles).',
+      ...profile.counters.records.slice(0, 8).map(record =>
+        `Event ${record.eventId}, code ${record.codeVersionId}: ${record.status} (error ${record.nativeError}); cycles ${record.cycles}, instructions ${record.instructions}; enabled/running ${record.timeEnabledNs}/${record.timeRunningNs} ns`),
+    ] : []),
     ...(profile.spatial ? [
       `Spatial observations: ${profile.spatial.recorded}; skipped: ${profile.spatial.skipped}; dropped: ${profile.spatial.dropped}`,
       'Spatial wall time: host entry-call ns per tile/threadgroup; lane counts: entry submission only',

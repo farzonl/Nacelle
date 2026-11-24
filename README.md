@@ -46,6 +46,12 @@ context and serializer-stage scaling. Private file-backed streaming avoids
 whole-trace/compressed/archive heap copies; these are working-memory bounds,
 not a total application/compiler RSS cap.
 
+Separately opt-in [CPU hardware counters](tools/nacelle-dbg/README.md#optional-cpu-hardware-counters)
+use Linux's non-privileged per-thread performance API where permitted. Cycles
+and instructions identify selected compute/pixel code versions; permission
+denial preserves wall-time data with explicit incomplete counter status.
+Suitable-host hardware/performance acceptance is still pending.
+
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 
 Instead of interpreting bytecode or translating shaders through lossy intermediate APIs (SPIR-V, Metal, or OpenGL), Nacelle ingests native **Shader Model 6.x DXIL** directly, lifts unstructured LLVM 3.7 bitcode into structured **MLIR**, packetizes scalar SIMT threads into wide host SIMD lanes (`AVX-512`, `AVX2`, `ARM64 NEON`), fuses fixed-function graphics state into monolithic **Uber-PSOs**, and JIT-compiles machine code via **LLVM ORC `LLJIT`**.

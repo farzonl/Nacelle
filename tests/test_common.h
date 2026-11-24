@@ -4,9 +4,11 @@
 #include <directx/d3dx12.h>
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
 #include <nacelle/instrumentation.h>
+#include "../src/instrumentation/profile_format.h"
 #endif
 
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,8 +37,14 @@ struct SpatialTestCapture {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
     NacelleProfileCapture* capture = nullptr;
     const char* path = std::getenv("NACELLE_SPATIAL_TEST_OUTPUT");
+    bool counters = std::getenv("NACELLE_TEST_CPU_COUNTERS") != nullptr;
     explicit SpatialTestCapture(uint32_t stride = 1) {
         if (!path) return;
+        if (counters) {
+            NacelleProfileCounterOptions options;
+            options.flags = 1;
+            checkHR(NacelleConfigureProfileCounters(&options), "Configure execution-preserving CPU counters");
+        }
         NacelleProfileSpatialOptions spatial;
         spatial.flags = NACELLE_PROFILE_SPATIAL_COMPUTE | NACELLE_PROFILE_SPATIAL_PIXEL;
         spatial.sample_stride = stride;
@@ -50,6 +58,27 @@ struct SpatialTestCapture {
         NacelleProfileSummary summary;
         const auto result = NacelleEndProfileCapture(capture, path, &summary);
         checkHR(result, "Save spatial execution-preservation test");
+        if (counters) {
+            nacelle::profile::Profile profile;
+            std::string error;
+            if (!nacelle::profile::readProfile(path, profile, error) || !profile.counters ||
+                !profile.spatial || summary.dropped_events ||
+                !profile.counters->attempted || profile.counters->dropped ||
+                summary.complete != profile.manifest.complete) {
+                std::fprintf(stderr, "Counter execution-preservation capture invalid: %s\n", error.c_str());
+                std::abort();
+            }
+            if (std::getenv("NACELLE_TEST_CPU_COUNTER_DIRECT") &&
+                !std::any_of(profile.counters->records.begin(), profile.counters->records.end(),
+                    [](const auto& record) { return record.region == "compute-direct"; })) {
+                std::fprintf(stderr, "Single-group dispatch counter region was not exercised\n");
+                std::abort();
+            }
+            std::fprintf(stdout, "CPU counter real execution preserved: %s, %llu regions\n",
+                profile.counters->availability.c_str(),
+                static_cast<unsigned long long>(profile.counters->recorded));
+            return;
+        }
         if (result != S_OK || !summary.complete) {
             std::fprintf(stderr, "Spatial execution-preservation capture is incomplete\n");
             std::abort();

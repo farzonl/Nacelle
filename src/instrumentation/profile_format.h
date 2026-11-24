@@ -105,6 +105,29 @@ struct CaptureOptions {
     std::optional<uint64_t> artifactBytes;
     std::optional<uint64_t> sourceBytes;
     std::optional<uint64_t> spatialBytes;
+    std::optional<uint64_t> counterBytes;
+};
+
+struct CounterSample {
+    uint64_t eventId = 0, codeVersionId = 0;
+    std::string region, status;
+    int32_t nativeError = 0;
+    std::string cycles, instructions, timeEnabledNs, timeRunningNs;
+};
+
+struct CounterMetadata {
+    uint32_t schemaVersion = 1;
+    std::string provider;
+    bool providerImplemented = false;
+    uint32_t metricMask = 0;
+    std::string cycleUnit = "cycles", instructionUnit = "instructions", timeUnit = "ns";
+    std::string scope = "thread-user-region", sampling = "none";
+    std::string scaling = "raw-with-enabled-running";
+    std::string availability = "unsupported-scope";
+    bool kernelExcluded = true, hypervisorExcluded = true, inherited = false;
+    bool complete = false;
+    uint64_t recordBytes = 0, attempted = 0, recorded = 0, unavailable = 0, dropped = 0;
+    std::vector<CounterSample> records;
 };
 
 struct Manifest {
@@ -182,6 +205,7 @@ struct Profile {
     ShaderMetadata shaders;
     std::optional<ArtifactMetadata> artifacts;
     std::optional<SpatialMetadata> spatial;
+    std::optional<CounterMetadata> counters;
 };
 
 bool readProfile(const std::string& path, Profile& profile, std::string& error);

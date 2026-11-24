@@ -1,6 +1,7 @@
 #include "instrumentation/profile_format.h"
 #include <CLI/CLI.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <new>
@@ -25,6 +26,19 @@ int main(int argc, char** argv) {
         std::cout << (profile.manifest.complete ? "Complete" : "INCOMPLETE")
                   << " profile: " << profile.manifest.recordedEvents
                   << " events, " << profile.manifest.droppedEvents << " dropped\n";
+        if (profile.counters) {
+            const auto& counters = *profile.counters;
+            std::cout << "CPU counters (" << counters.provider << "): " << counters.availability
+                      << "; " << counters.recorded << " regions, " << counters.unavailable
+                      << " unavailable, " << counters.dropped << " dropped\n";
+            for (size_t index = 0; index < std::min<size_t>(8, counters.records.size()); ++index) {
+                const auto& record = counters.records[index];
+                std::cout << "  event " << record.eventId << ", code " << record.codeVersionId
+                          << ": " << record.status << " (native error " << record.nativeError
+                          << "), cycles " << record.cycles << ", instructions " << record.instructions
+                          << ", enabled/running " << record.timeEnabledNs << "/" << record.timeRunningNs << " ns\n";
+            }
+        }
         return profile.manifest.complete ? 0 : 2;
     } catch (const std::bad_alloc&) {
         std::cerr << "nacelle-dbg: insufficient memory to inspect profile\n";

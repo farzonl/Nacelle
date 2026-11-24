@@ -309,6 +309,164 @@ unchanged. Normal compiler-source build-hash invalidation still applies.
 
 ## Capture and inspect
 
+### Optional CPU hardware counters
+
+Build capability and capture opt-in are independent, both OFF by default:
+
+```sh
+cmake -S . -B build/counters -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DNACELLE_ENABLE_INSTRUMENTATION=ON -DNACELLE_ENABLE_CPU_COUNTERS=ON \
+  -DNACELLE_BUILD_PROFILE_TOOLS=ON -DNACELLE_BUILD_PROFILE_TESTS=ON
+cmake --build build/counters --target cpu_counter_provider_test cpu_counter_capture_test \
+  profile_runtime_static_test profile_runtime_shared_test compute_dispatch_test nacelle-dbg
+ctest --test-dir build/counters -R '^cpu_counter_.*test$' --output-on-failure
+```
+
+Before Begin, an instrumented application explicitly configures:
+
+```cpp
+NacelleProfileCounterOptions counters;
+counters.flags = 1;
+counters.record_bytes = 8ull * 1024 * 1024;
+HRESULT configured = NacelleConfigureProfileCounters(&counters);
+// Check configured, then use the ordinary Begin/End/Destroy capture lifecycle.
+```
+
+Without the build capability, enabling returns `E_NOTIMPL` with a diagnostic;
+disabling remains valid. Configuration validates version/size/flags/budget and
+is rejected during an active capture. Instrumentation OFF has no counter API,
+state, source targets, native provider, Linux headers or cache changes.
+
+The platform-independent provider supports begin/end/capabilities and explicit
+status. Metadata records `providerImplemented` and `metricMask` (1=cycles,
+2=instructions): these are compiled capabilities, not an access/PMU guarantee.
+The first real provider uses Linux `perf_event_open`: a fresh grouped
+cycles/instructions pair for the calling thread, `cpu=-1`, no inheritance,
+kernel/hypervisor excluded, close-on-exec handles. Windows/macOS currently
+report `unsupported-provider`; they do not approximate hardware metrics with
+wall time. The library never invokes sudo, changes capabilities/sysctls, or uses
+process-wide/system-wide observation, sampling interrupts, custom kernel
+instrumentation or network access.
+Opening fails explicitly on restricted/virtualized hosts. This shared Linux
+host denies unprivileged collection (`permission-denied`, native error13).
+An explicitly authorized administrative validation run collected real counters;
+no host-wide permission settings or persistent capabilities were changed.
+
+Coverage is outermost eligible compute-worker/pixel-raster-worker regions and
+the actual direct/single-group compute region, including the calling thread
+and single-worker raster shortcut. Results reference the recorded event and
+its immutable selected code-version ID; asynchronous promotion is unchanged.
+These are user-mode **host-region** CPU cycles/instructions, not GPU counters,
+pure shader cycles, per-HLSL-instruction/lane counts or whole-process totals.
+Scratch initialization, loop/raster bookkeeping, blending and explicitly
+enabled observations within the region can contribute. Compiler work on other
+threads and non-attributable composite geometry spans are not collected.
+Threaded BLAS/helper work invoked by a direct GEMM entry is outside the calling-
+thread scope, not silently counted as total shader CPU work.
+No eligible region yields explicit `unsupported-scope` availability.
+
+Group reads validate count, byte length, metric IDs and enabled/running times.
+Raw counts and nanosecond times are lossless uint64 decimal strings.
+`timeRunningNs < timeEnabledNs` exposes multiplexing; raw counts are **not**
+silently scaled or called complete time coverage. Estimated scaled totals,
+if computed by a consumer, must be labeled estimates. CPU cycles are frequency-
+and platform-dependent. Out-of-range/noncanonical integer encodings and
+inconsistent timings/references are rejected; no overflowing sums/products are
+used to construct metrics. Permission denial, unsupported provider/event,
+zero running time, read/I/O/resource failures and exhausted record budgets
+remain explicit, never successful zero-filled samples.
+
+Requested unavailable/dropped counters produce a saved ordinary wall-time
+capture with `summary.complete=0` and `S_FALSE`. The CLI/viewer exposes provider,
+availability, per-record status/native error, raw metrics and timing. Counter
+absence remains ordinary profiling; do not treat `S_FALSE` as certified
+hardware collection. End/Destroy drains workers before releasing records;
+groups close at the end of each region, including partial setup/failure.
+No descriptor cache can outlive a capture generation.
+
+The separate fixed record pool defaults8MiB, accepts64bytes through16MiB and
+uses64bytes/record. Admission allocates no C++ heap per observation. Two native
+descriptors per active measured region scale with live workers; OS resource
+exhaustion is reported, not silently skipped. The64MiB event limit is unchanged.
+Counter metadata object copies scale with admitted records and string
+representations. Their JSON joins the unchanged256MiB aggregate serializer/
+reader allowance alongside trace/shader/artifact/spatial data; this is not an
+application/OS RSS guarantee.
+
+Opted-in captures use manifest v4 and a declared checksummed `counters.json`
+payload (counter schema1), with `captureOptions.counterBytes`. Artifact and
+spatial payloads remain independently optional. Native/browser readers check
+matching completeness, counts, units, raw integers, exact event/code/region
+references and combined decoded limits. Existing v1/v2/v3 and counter-disabled
+captures remain unchanged; older readers explicitly reject v4.
+
+Focused mock tests cover available/multiplexed, denied, unsupported, not-running,
+I/O failure, concurrent workers and record exhaustion. Static/shared real
+compute/graphics tier1/promoted/cached/disk tests preserve shader outputs and
+exact worker coverage; a tiled-GEMM test exercises actual direct compute
+plus spatial/counter payload composition. `cpu_counter_real_provider_test`
+requires genuinely positive hardware metrics; exit77 is an explicit CTest skip
+on unavailable hosts, **not** acceptance. An explicitly authorized Linux run
+verified all16 static/shared compute/pixel tier1/promoted/cached/disk captures
+and the direct-GEMM/spatial capture:284 positive hardware readings, exact native
+event/code-version validation, zero drops/unavailable records and no reported
+multiplexing. This validates the administrative test context, not successful
+unprivileged access under this host's unchanged policy. See the
+[hardware acceptance evidence](https://github.com/farzonl/Nacelle/issues/224).
+
+Counter-specific diagnostic reproduction:
+
+```sh
+build/counters/cpu_counter_capture_test --measure > counter-cost.jsonl
+```
+
+This synthetic fixture uses24 alternating pairs,1024 regions/pair and matched
+output checksums. It reports counter-pool allocation, summed setup/body/finish
+(finish includes ordinary recorder work), whole-region execution and serialized
+save times; each archive is native-reader checked and removed. Diagnostic
+timers contribute cost. Shared-host denied-provider observations are not active
+PMU overhead, shader timing or #211 performance certification.
+
+Local shared-host observation (GNU13.3 Release,1MiB counter pool,24 pairs):
+
+| Median phase | Counter-disabled | Requested, denied provider |
+| --- | ---: | ---: |
+| Counter pool allocation |20ns|0.326ms|
+| Summed per-region setup |24.8us|387.0us|
+| Summed region body |7.866ms|7.867ms|
+| Summed finish/ordinary recording |59.2us|59.5us|
+| Overall region execution |8.010ms|8.373ms|
+| Serialized save |1.456ms|2.547ms|
+
+All48 captures had1025 events, zero event/record drops and equal checksums;
+requested captures had1024 explicitly unavailable counter records. Small
+negative phase differences are noise, not speedup claims. The observed~4.5%
+overall increase and larger save cost are **denied-provider** diagnostics only,
+not an available-provider budget or controlled-host acceptance.
+
+Available-provider observation using the same GNU13.3 Release synthetic fixture,
+an explicitly authorized administrative process,1MiB counter pool and24 pairs:
+
+| Median phase | Counter-disabled | Available provider |
+| --- | ---: | ---: |
+| Counter pool allocation |20ns|30.2us|
+| Summed per-region setup |22.1us|12.463ms|
+| Summed region body |7.503ms|7.501ms|
+| Summed finish/ordinary recording |57.3us|6.371ms|
+| Overall region execution |7.638ms|26.385ms|
+| Serialized save |1.270ms|2.366ms|
+
+All48 archives again had1025 events and equal checksums; all24 requested captures
+had complete counters and zero unavailable records. Paired geometric whole-region
+overhead was242.89%, with a seeded10000-resample paired-bootstrap95% interval
+of239.76% to245.58%. Raw observations are available in the
+[measurement evidence](https://github.com/farzonl/Nacelle/issues/224#issuecomment-7123128670).
+Fresh per-region counter groups are expensive for these roughly7us bodies;
+this optional mode is not a low-overhead choice for short regions. Setup/finish,
+not a demonstrated body speedup, account for the dominant increase. The result
+is **not** pure shader timing, whole-process coverage, or certification of #211's
+coarse-recorder <=5% budget, which remains a separate counter-disabled measurement.
+
 The benchmark worker offers an explicit capture path in instrumented builds:
 
 ```sh

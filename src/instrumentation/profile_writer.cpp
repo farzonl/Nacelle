@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "profile_format.h"
+#include "profile_counters.h"
 #include "archive.h"
 #include "profile_memory.h"
 
@@ -455,7 +456,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
                       NACELLE_PROFILE_ARCH, NACELLE_PROFILE_REVISION,
                       session.compilerHash, session.targetTriple, session.cpu, session.cpuFeatures};
     manifest.entries = {{"trace.json.zst", "zstd", 0}, {"shaders.json", "json", 2}};
-    std::string artifactsJson, spatialJson;
+    std::string artifactsJson, spatialJson, countersJson;
     if (const auto& store = session.retainedArtifacts) {
         ArtifactMetadata artifacts;
         std::set<std::string> admitted;
@@ -504,24 +505,36 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
             !toJson(spatial, spatialJson, error, maxProfileBytes - artifactsJson.size())) return false;
         manifest.entries.push_back({"spatial.json", "json", spatialJson.size(), artifactDigest(spatialJson)});
     }
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    if (session.counters) {
+        const auto counters = session.counters->metadata();
+        manifest.schemaVersion = 4;
+        manifest.complete = manifest.complete && counters.complete;
+        manifest.captureOptions.counterBytes = counters.recordBytes;
+        if (!validateCounters(counters, session.shaders, manifest.captureOptions, error) ||
+            !toJson(counters, countersJson, error, maxProfileBytes - artifactsJson.size() - spatialJson.size()))
+            return false;
+        manifest.entries.push_back({"counters.json", "json", countersJson.size(), artifactDigest(countersJson)});
+    }
+#endif
     std::string manifestJson;
     // Reject oversized metadata before allocating trace objects and compression buffers.
     if (!manifestToJson(manifest, manifestJson, error)) return false;
     std::string shadersJson = "[]";
     if ((!session.shaders.codeVersions.empty() || session.shaders.codeSelections) &&
-        !toJson(session.shaders, shadersJson, error, maxProfileBytes - artifactsJson.size() - spatialJson.size()))
+        !toJson(session.shaders, shadersJson, error, maxProfileBytes - artifactsJson.size() - spatialJson.size() - countersJson.size()))
         return false;
     if (shadersJson.size() > maxProfileBytes) {
         error = "Profile shader metadata exceeds the 256 MiB format limit";
         return false;
     }
-    const auto metadataBytes = shadersJson.size() + artifactsJson.size() + spatialJson.size();
+    const auto metadataBytes = shadersJson.size() + artifactsJson.size() + spatialJson.size() + countersJson.size();
     if (metadataBytes > maxProfileBytes) {
         error = "Profile metadata exceeds the 256 MiB uncompressed format limit";
         return false;
     }
     NACELLE_PROFILE_MEMORY("metadata-end", manifestJson.capacity() + shadersJson.capacity() +
-        artifactsJson.capacity() + spatialJson.capacity());
+        artifactsJson.capacity() + spatialJson.capacity() + countersJson.capacity());
     auto compressed = temporaryFile(error);
     if (!compressed) return false;
     size_t traceBytes = 0, compressedBytes = 0;
@@ -554,6 +567,11 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     if (!spatialJson.empty() && !mz_zip_writer_add_mem(&zip.archive, "spatial.json",
             spatialJson.data(), spatialJson.size(), 0)) {
         error = "miniz could not add spatial metadata";
+        return false;
+    }
+    if (!countersJson.empty() && !mz_zip_writer_add_mem(&zip.archive, "counters.json",
+            countersJson.data(), countersJson.size(), 0)) {
+        error = "miniz could not add CPU counter metadata";
         return false;
     }
     if (!mz_zip_writer_finalize_archive(&zip.archive) || std::fflush(archiveFile.get()) != 0) {
@@ -730,7 +748,7 @@ bool writeStoredArchive(const std::string& path,
 }
 
 bool readProfileBytes(std::span<const char> archive, Profile& profile, std::string& error) {
-    if (!validateStoredArchive(archive, 3, 5, error)) return false;
+    if (!validateStoredArchive(archive, 3, 6, error)) return false;
     Zip zip;
     if (!mz_zip_reader_init_mem(&zip.archive, archive.data(), archive.size(), 0)) {
         error = "Invalid profile ZIP archive";
@@ -745,10 +763,12 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         return false;
     }
     const auto& manifest = parsed.manifest;
-    if ((manifest.schemaVersion < 1 || manifest.schemaVersion > 3) || manifest.kind != "profile" || manifest.replayable ||
+    if ((manifest.schemaVersion < 1 || manifest.schemaVersion > 4) || manifest.kind != "profile" || manifest.replayable ||
         manifest.clock != "monotonic" || manifest.timestampUnit != "ns" ||
         (manifest.schemaVersion < 3 && manifest.entries.size() != (manifest.schemaVersion == 1 ? 2 : 3)) ||
         (manifest.schemaVersion == 3 && manifest.entries.size() != 3 && manifest.entries.size() != 4) ||
+        (manifest.schemaVersion == 4 && (manifest.entries.size() < 3 || manifest.entries.size() > 5)) ||
+        (manifest.schemaVersion < 4 && manifest.captureOptions.counterBytes) ||
         count != manifest.entries.size() + 1 ||
         (manifest.schemaVersion < 3 && manifest.complete != (manifest.droppedEvents == 0)) ||
         manifest.recordedEvents > 1'000'000) {
@@ -759,6 +779,7 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
     const Entry* shadersEntry = nullptr;
     const Entry* artifactsEntry = nullptr;
     const Entry* spatialEntry = nullptr;
+    const Entry* countersEntry = nullptr;
     uint64_t decodedTotal = 0;
     for (const auto& entry : manifest.entries) {
         if (entry.uncompressedSize > maxProfileBytes - decodedTotal) {
@@ -770,14 +791,16 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         else if (entry.path == "shaders.json" && entry.encoding == "json" && !shadersEntry) shadersEntry = &entry;
         else if (manifest.schemaVersion >= 2 && entry.path == "artifacts.json" && entry.encoding == "json" && !artifactsEntry &&
                  entry.digest && entry.digest->size() == 16) artifactsEntry = &entry;
-        else if (manifest.schemaVersion == 3 && entry.path == "spatial.json" && entry.encoding == "json" && !spatialEntry &&
+        else if (manifest.schemaVersion >= 3 && entry.path == "spatial.json" && entry.encoding == "json" && !spatialEntry &&
                  entry.digest && entry.digest->size() == 16) spatialEntry = &entry;
+        else if (manifest.schemaVersion == 4 && entry.path == "counters.json" && entry.encoding == "json" && !countersEntry &&
+                 entry.digest && entry.digest->size() == 16) countersEntry = &entry;
         else {
             error = "Unsupported or duplicate manifest entry";
             return false;
         }
     }
-    if (!traceEntry || !shadersEntry ||
+    if (!traceEntry || !shadersEntry || (manifest.schemaVersion == 4 && !countersEntry) ||
         traceEntry->uncompressedSize > maxProfileBytes ||
         shadersEntry->uncompressedSize > maxProfileBytes - traceEntry->uncompressedSize) {
         error = "Missing or oversized decoded profile entries";
@@ -946,7 +969,7 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         }
         if (!validateArtifacts(*parsed.artifacts, parsed.shaders, manifest.captureOptions, error)) return false;
     }
-    if (manifest.schemaVersion == 3) {
+    if (manifest.schemaVersion == 3 || spatialEntry) {
         if (!spatialEntry || !manifest.captureOptions.spatialBytes ||
             *manifest.captureOptions.spatialBytes < sizeof(SpatialRecord) ||
             *manifest.captureOptions.spatialBytes > 16ull * 1024 * 1024 ||
@@ -965,10 +988,26 @@ bool readProfileBytes(std::span<const char> archive, Profile& profile, std::stri
         }
         if (!validateSpatial(*parsed.spatial, parsed.shaders, manifest.captureOptions, error) ||
             !validateSpatialReferences(*parsed.spatial, parsed.trace, manifest.droppedEvents == 0, error)) return false;
-        if (manifest.complete != (manifest.droppedEvents == 0 && parsed.spatial->complete)) {
-            error = "Spatial/event completeness disagrees with manifest";
+    }
+    if (countersEntry) {
+        if (!extract(zip, "counters.json", countersEntry->uncompressedSize, json, error)) return false;
+        if (json.size() != countersEntry->uncompressedSize || artifactDigest(json) != countersEntry->digest) {
+            error = "Counter size or digest mismatch";
             return false;
         }
+        parsed.counters.emplace();
+        if (const auto ec = glz::read<glz::opts{.error_on_missing_keys = true}>(*parsed.counters, json)) {
+            error = "Invalid counter metadata: " + glz::format_error(ec, json);
+            return false;
+        }
+        if (!validateCounters(*parsed.counters, parsed.shaders, manifest.captureOptions, error) ||
+            !validateCounterReferences(*parsed.counters, parsed.trace, manifest.droppedEvents == 0, error))
+            return false;
+    }
+    if (manifest.schemaVersion >= 3 && manifest.complete != (manifest.droppedEvents == 0 &&
+        (!parsed.spatial || parsed.spatial->complete) && (!parsed.counters || parsed.counters->complete))) {
+        error = "Optional observations/event completeness disagrees with manifest";
+        return false;
     }
     profile = std::move(parsed);
     return true;

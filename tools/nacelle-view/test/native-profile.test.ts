@@ -5,6 +5,26 @@ import { expect, it } from 'vitest';
 import { FileProfileDataSource } from '../src/file-source';
 import { loadProfile } from '../src/profile';
 
+it.runIf(Boolean(process.env.NACELLE_NATIVE_COUNTER_PROFILE))(
+  'loads an actual counter-enabled runtime capture with exact code attribution and availability',
+  async () => {
+    const bytes = readFileSync(process.env.NACELLE_NATIVE_COUNTER_PROFILE!);
+    const profile = await loadProfile(FileProfileDataSource.fromBuffer(bytes.buffer.slice(
+      bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
+    )));
+    expect(profile.manifest.schemaVersion).toBe(4);
+    expect(profile.counters?.attempted).toBeGreaterThan(0);
+    expect(profile.counters?.records.length).toBe(profile.counters?.recorded);
+    expect(profile.manifest.complete).toBe(profile.counters?.complete);
+    expect(profile.trace.traceEvents.length).toBe(profile.manifest.recordedEvents);
+    for (const record of profile.counters!.records) {
+      expect(record.codeVersionId).toBeGreaterThan(0);
+      const event = profile.trace.traceEvents.find(event => event.args.id === record.eventId);
+      expect(event?.args.codeVersionId).toBe(record.codeVersionId);
+    }
+  },
+);
+
 it.runIf(Boolean(process.env.NACELLE_NATIVE_PROFILE))(
   'loads and exports an actual native runtime capture',
   async () => {

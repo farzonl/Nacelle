@@ -1074,6 +1074,13 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
 #endif
     const DriverRootContext ctxSnapshot = state.computeCtx;
     if (cpso->singleGroupDispatch) {
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+        std::optional<profile::Scope> directProfile;
+        if (profile::cpuCountersRequested(profile::CpuCounterRegion::ComputeDirect)) {
+            directProfile.emplace("Compute direct");
+            directProfile->startCounters(profile::CpuCounterRegion::ComputeDirect);
+        }
+#endif
         ScopedFlushDenormals flushDenorms;
         fn(&ctxSnapshot, nullptr, 0, 0, 0, gx, gy, gz);
         return;
@@ -1085,6 +1092,9 @@ void execDispatch(BS::thread_pool<>& pool, const ExecutionState& state, UINT gx,
     auto runRange = [&](uint64_t begin, uint64_t end) {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
         profile::Scope workerProfile(dispatchContext, "Compute worker");
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+        workerProfile.startCounters(profile::CpuCounterRegion::ComputeWorker);
+#endif
 #endif
         ScopedFlushDenormals flushDenorms;
         thread_local std::vector<uint8_t> tlScratch;

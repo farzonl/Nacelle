@@ -436,6 +436,16 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
                     "-DSIMD_WIDTH=${width}" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
         endforeach()
     endforeach()
+    if(NACELLE_ENABLE_CPU_COUNTERS)
+        add_test(NAME cpu_counter_direct_execution_test
+            COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_CPU_COUNTERS=1"
+                "NACELLE_TEST_CPU_COUNTER_DIRECT=1"
+                "NACELLE_DISABLE_GEMM_FASTPATH=0"
+                "NACELLE_SPATIAL_TEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/counters-direct.nacelle-profile"
+                "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:compute_dispatch_test>"
+                "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/counters-direct.nacelle-profile"
+                "-DSIMD_WIDTH=8" -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+    endif()
     foreach(linkage IN ITEMS static shared)
         add_executable(replay_runtime_${linkage}_test replay_runtime_test.cpp)
         add_dependencies(replay_runtime_${linkage}_test nacelle_test_shaders profile_debug_shaders)
@@ -467,6 +477,16 @@ if(NACELLE_ENABLE_INSTRUMENTATION AND NACELLE_BUILD_PROFILE_TESTS)
         target_include_directories(profile_runtime_${linkage}_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_compile_options(profile_runtime_${linkage}_test PRIVATE -g)
+        endif()
+        if(NACELLE_ENABLE_CPU_COUNTERS)
+            foreach(mode IN ITEMS tier1 promoted cached disk graphics-tier1 graphics-promoted graphics-cached graphics-disk)
+                add_test(NAME cpu_counter_runtime_${linkage}_${mode}_test
+                    COMMAND "${CMAKE_COMMAND}" -E env "NACELLE_TEST_CPU_COUNTERS=1"
+                        "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:profile_runtime_${linkage}_test>"
+                        "-DPROFILE=${CMAKE_CURRENT_BINARY_DIR}/counters-${linkage}-${mode}.nacelle-profile"
+                        "-DCAPTURE_MODE=${mode}" "-DSIMD_WIDTH=8"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/run_profile_test.cmake")
+            endforeach()
         endif()
         if(linkage STREQUAL "static")
             target_link_libraries(profile_runtime_${linkage}_test PRIVATE nacelle nacelle_profile_io)

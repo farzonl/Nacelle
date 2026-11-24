@@ -5,8 +5,71 @@ import { LIMITS, loadProfile, validateManifest, type ProfileDataSource } from '.
 import { captureStatus, groupThreads, summaryText } from '../src/presentation';
 import { centralOffsets, fixture, span, trace } from './fixtures';
 import { openPreloadedProfile } from '../src/preloaded';
+import { artifactDigest } from '../src/artifacts';
+import type { CounterMetadata } from '../src/counters';
 
 const open = (buffer: ArrayBuffer) => FileProfileDataSource.fromBuffer(buffer);
+
+async function counterFixture(modify?: (counters: CounterMetadata) => void): Promise<ArrayBuffer> {
+  const counters: CounterMetadata = {
+    schemaVersion: 1, provider: 'linux-perf-event', providerImplemented: true, metricMask: 3,
+    cycleUnit: 'cycles', instructionUnit: 'instructions',
+    timeUnit: 'ns', scope: 'thread-user-region', sampling: 'none', scaling: 'raw-with-enabled-running',
+    availability: 'available', kernelExcluded: true, hypervisorExcluded: true, inherited: false,
+    complete: true, recordBytes: 64, attempted: 1, recorded: 1, unavailable: 0, dropped: 0,
+    records: [{ eventId: 1, codeVersionId: 1, region: 'compute-worker', status: 'available', nativeError: 0,
+      cycles: '9007199254740993', instructions: '456', timeEnabledNs: '120', timeRunningNs: '60' }],
+  };
+  modify?.(counters);
+  const bytes = strToU8(JSON.stringify(counters));
+  const digest = await artifactDigest(bytes);
+  const pso = '1'.repeat(32);
+  const code = { id: 1, pipelineId: 1, pso, stage: 'compute', simdWidth: 8, version: 1, tier: 1, cache: 'miss' };
+  return fixture({ schemaVersion: 4, complete: counters.complete, captureOptions: { counterBytes: 64 } },
+    trace([span({ name: 'Compute worker',
+      args: { id: 1, parent: 0, pipelineId: 1, codeVersionId: 1, pso, stage: 'compute', simdWidth: 8, tier: 1, cache: 'miss' } })]),
+    (entries, manifest) => {
+      entries['shaders.json'] = strToU8(JSON.stringify({ schemaVersion: 1, codeVersions: [code] }));
+      manifest.entries[1].uncompressedSize = entries['shaders.json'].length;
+      entries['counters.json'] = bytes;
+      manifest.entries.push({ path: 'counters.json', encoding: 'json', uncompressedSize: bytes.length, digest });
+    });
+}
+
+describe('CPU counters', () => {
+  it('preserves raw uint64 counts and multiplexing times without claiming scaled exactness', async () => {
+    const profile = await loadProfile(open(await counterFixture()));
+    expect(profile.counters?.records[0].cycles).toBe('9007199254740993');
+    expect(profile.counters?.records[0].timeRunningNs).toBe('60');
+    expect(summaryText(profile)).toContain('9007199254740993');
+  });
+  it('preserves wall-time spans and reports permission denial as incomplete, not zero-valued success', async () => {
+    const profile = await loadProfile(open(await counterFixture(counters => {
+      counters.complete = false;
+      counters.availability = 'unavailable';
+      counters.unavailable = 1;
+      Object.assign(counters.records[0], { status: 'permission-denied', nativeError: 13,
+        cycles: '0', instructions: '0', timeEnabledNs: '0', timeRunningNs: '0' });
+    })));
+    expect(profile.trace.traceEvents).toHaveLength(1);
+    expect(captureStatus(profile)).toContain('CPU counters: unavailable');
+    expect(summaryText(profile)).toContain('permission-denied');
+  });
+  it.each(['timing', 'integer', 'version', 'region', 'count', 'success-shaped'])(
+    'rejects corrupt counter %s while validating actual payload digests', async corruption => {
+      const bytes = await counterFixture(counters => {
+        const record = counters.records[0];
+        if (corruption === 'timing') record.timeRunningNs = '121';
+        if (corruption === 'integer') record.cycles = '18446744073709551616';
+        if (corruption === 'version') record.codeVersionId = 999;
+        if (corruption === 'region') record.region = 'pixel-worker';
+        if (corruption === 'count') counters.attempted = 2;
+        if (corruption === 'success-shaped') record.status = 'permission-denied';
+      });
+      await expect(loadProfile(open(bytes))).rejects.toThrow(/counter/i);
+    },
+  );
+});
 
 describe('file data source', () => {
   it('bounds preloaded responses while streaming and cancels an oversized download', async () => {

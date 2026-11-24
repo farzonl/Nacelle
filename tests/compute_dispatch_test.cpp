@@ -90,7 +90,9 @@ int main() {
         rp[3].Descriptor.ShaderRegister = 0;
 
         auto rs = createComputeRS(rt.device.Get(), 4, rp);
-        auto pso = createComputePSO(rt.device.Get(), rs.Get(), "matmul.dxil");
+        const bool directCounters = std::getenv("NACELLE_TEST_CPU_COUNTER_DIRECT") != nullptr;
+        auto pso = createComputePSO(rt.device.Get(), rs.Get(),
+            directCounters ? "tiled_matmul.dxil" : "matmul.dxil");
 
         constexpr UINT M = 16, N = 16, K = 16;
         uint32_t dims[4] = {M, N, K, 0};
@@ -117,13 +119,17 @@ int main() {
         rt.cmdList->SetComputeRootShaderResourceView(1, bA->GetGPUVirtualAddress());
         rt.cmdList->SetComputeRootShaderResourceView(2, bB->GetGPUVirtualAddress());
         rt.cmdList->SetComputeRootUnorderedAccessView(3, bC->GetGPUVirtualAddress());
-        rt.cmdList->Dispatch(2, 2, 1);
+        rt.cmdList->Dispatch(directCounters ? 1 : 2, directCounters ? 1 : 2, 1);
         rt.executeAndWait();
 
         auto outRaw = rt.readbackBuffer(bC.Get(), M * N * 4);
         std::vector<float> matC(M * N);
         std::memcpy(matC.data(), outRaw.data(), M * N * 4);
         for (UINT i = 0; i < M * N; ++i) {
+            if (directCounters && !(std::fabs(matC[i] - matA[i] * 2.0f) < 1e-4f)) {
+                std::fprintf(stderr, "Counter-enabled direct GEMM output mismatch at %u\n", i);
+                return 1;
+            }
             assert(std::fabs(matC[i] - matA[i] * 2.0f) < 1e-4f);
         }
     }

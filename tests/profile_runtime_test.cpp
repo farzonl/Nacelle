@@ -647,7 +647,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     NacelleProfileCapture* capture = nullptr;
+    const bool counterMode = std::getenv("NACELLE_TEST_CPU_COUNTERS") != nullptr;
     try {
+        if (counterMode) {
+            NacelleProfileCounterOptions options;
+            options.flags = 1;
+            testutil::checkHR(NacelleConfigureProfileCounters(&options), "Configure CPU counters");
+        }
         if (mode.starts_with("source-")) {
             NacelleSourceDebugOptions options;
             options.enabled = 1;
@@ -895,7 +901,28 @@ int main(int argc, char** argv) {
                 "Compiler and CPU metadata available without requiring pipeline creation");
         require(std::is_sorted(build.cpuFeatures.begin(), build.cpuFeatures.end()),
                 "CPU features have stable ordering");
-        const bool expectedComplete = !spatialMode || std::string_view(spatialMode) != "overflow";
+        if (counterMode) {
+            const auto eligibleRegions = std::count_if(profile.trace.traceEvents.begin(), profile.trace.traceEvents.end(),
+                [](const auto& event) {
+                    return event.ph == "X" && event.args.codeVersionId &&
+                        ((event.name == "Compute worker" || event.name == "Compute direct") && event.args.stage == "compute" ||
+                         event.name == "Raster worker" && event.args.stage == "pixel");
+                });
+            require(profile.counters && profile.counters->attempted > 0 &&
+                profile.counters->attempted == static_cast<uint64_t>(eligibleRegions) &&
+                profile.counters->recorded == profile.counters->attempted && !profile.counters->dropped,
+                "CPU counter scopes missing or dropped");
+            std::cout << "CPU COUNTERS provider=" << profile.counters->provider
+                      << " availability=" << profile.counters->availability
+                      << " records=" << profile.counters->recorded;
+            for (const auto& record : profile.counters->records)
+                require(record.codeVersionId && record.eventId, "Counters lack exact native version attribution");
+            if (!profile.counters->records.empty())
+                std::cout << " first-status=" << profile.counters->records.front().status;
+            std::cout << '\n';
+        } else require(!profile.counters && profile.manifest.schemaVersion < 4, "Counters enabled without consent");
+        const bool expectedComplete = (!spatialMode || std::string_view(spatialMode) != "overflow") &&
+            (!counterMode || profile.counters->complete);
         require(profile.manifest.complete == expectedComplete && bool(summary.complete) == expectedComplete &&
                 summary.recorded_events > (mode == "all" ? 10u : 0u),
                 "Complete runtime capture");

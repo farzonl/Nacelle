@@ -1,5 +1,6 @@
 #include "capture.h"
 #include "profile_format.h"
+#include "profile_counters.h"
 #include <nacelle/instrumentation.h>
 
 #include <algorithm>
@@ -15,6 +16,7 @@ std::atomic<bool> recording{false};
 std::atomic<uint64_t> generation{1};
 thread_local nacelle::profile::Scope* currentScope = nullptr;
 NacelleProfileSpatialOptions spatialOptions;
+NacelleProfileCounterOptions counterOptions;
 
 HRESULT fail(HRESULT code, const char* message) {
     std::fprintf(stderr, "[NacelleProfile] %s\n", message);
@@ -142,6 +144,10 @@ void Scope::begin(const char* name) {
 
 Scope::~Scope() {
     if (!session_) return;
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    if (counterRecord_ && counterRecord_->result.status == CpuCounterStatus::Available)
+        counterRecord_->result = session_->counters->provider.end(counterGroup_);
+#endif
     const auto now = std::chrono::steady_clock::now() - session_->origin;
     event_.durationNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()) - event_.startNs;
@@ -149,6 +155,24 @@ Scope::~Scope() {
     currentScope = previous_;
     if (ownsWork_) session_->releaseWork();
 }
+
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+bool cpuCountersRequested(CpuCounterRegion region) {
+    const auto stage = region == CpuCounterRegion::PixelWorker ? Stage::Pixel : Stage::Compute;
+    return currentScope && currentScope->countersEnabled() &&
+        currentScope->attributes().stage == stage && currentScope->attributes().codeVersionId != 0;
+}
+
+void Scope::startCounters(CpuCounterRegion region) {
+    if (!session_ || !session_->counters || counterRecord_ || !event_.attributes.codeVersionId) return;
+    const auto stage = region == CpuCounterRegion::PixelWorker ? Stage::Pixel : Stage::Compute;
+    if (event_.attributes.stage != stage) return;
+    for (auto* parent = previous_; parent; parent = parent->previous_)
+        if (parent->counterRecord_) return;
+    counterRecord_ = session_->counters->reserve(event_.id, event_.attributes.codeVersionId, region);
+    if (counterRecord_) counterRecord_->result = session_->counters->provider.begin(counterGroup_);
+}
+#endif
 
 Context Scope::context() const {
     if (!session_) return {};
@@ -343,6 +367,23 @@ void setCompilerConfiguration(const std::string &hash, const std::string &triple
 
 } // namespace nacelle::profile
 
+extern "C" HRESULT NacelleConfigureProfileCounters(const NacelleProfileCounterOptions* options) {
+    if (!options || options->struct_size != sizeof(*options) || options->version != 1 ||
+        (options->flags & ~1u) || options->record_bytes < sizeof(nacelle::profile::CounterRecord) ||
+        options->record_bytes > nacelle::profile::maxCounterBytes)
+        return fail(E_INVALIDARG, "Invalid CPU counter options (record budget must be 64 bytes to 16 MiB)");
+    std::lock_guard lock(activeMutex);
+    if (activeSession) return fail(E_UNEXPECTED, "Configure CPU counters before Begin");
+#if !defined(NACELLE_ENABLE_CPU_COUNTERS)
+    if (options->flags) return fail(E_NOTIMPL, "CPU counter capability was not enabled in this build");
+#else
+    if (options->flags && !nacelle::profile::cpuCounterProvider().capabilities().implemented)
+        std::fprintf(stderr, "[NacelleProfile] CPU counter provider unsupported on this platform; requested captures will preserve wall-time data with unavailable counters\n");
+#endif
+    counterOptions = *options;
+    return S_OK;
+}
+
 extern "C" HRESULT NacelleConfigureProfileSpatial(const NacelleProfileSpatialOptions *options) {
     if (!options || options->struct_size != sizeof(*options) || options->version != 1 ||
         (options->flags & ~3u) || options->record_bytes < sizeof(nacelle::profile::SpatialRecord) ||
@@ -374,6 +415,10 @@ extern "C" HRESULT NacelleBeginProfileCapture(
         handle->session->retainedArtifacts = nacelle::profile::artifactStore();
         if (spatialOptions.flags)
             handle->session->spatial = std::make_unique<nacelle::profile::SpatialState>(spatialOptions);
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+        if (counterOptions.flags)
+            handle->session->counters = std::make_unique<nacelle::profile::CounterState>(counterOptions.record_bytes);
+#endif
         activeSession = handle->session;
         *capture = handle.release();
         recording.store(true, std::memory_order_release);
@@ -406,6 +451,13 @@ extern "C" HRESULT NacelleEndProfileCapture(
     summary->complete = summary->dropped_events == 0 &&
         !capture->session->shaderMetadataOverflow &&
         (!capture->session->spatial || capture->session->spatial->complete());
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    if (capture->session->counters && !capture->session->counters->complete()) {
+        summary->complete = 0;
+        std::fprintf(stderr, "[NacelleProfile] CPU counters %s (%s); wall-time data preserved; inspect counters.json\n",
+            capture->session->counters->failureReason(), capture->session->counters->provider.name());
+    }
+#endif
     if (capture->session->spatial && !capture->session->spatial->complete())
         std::fprintf(stderr, "[NacelleProfile] Spatial observations incomplete; inspect spatial drop counters\n");
     std::string error;

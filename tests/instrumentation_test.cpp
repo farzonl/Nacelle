@@ -97,6 +97,14 @@ int main(int argc, char** argv) {
         ("nacelle-profile-test-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
+#if !defined(NACELLE_ENABLE_CPU_COUNTERS)
+        NacelleProfileCounterOptions counters;
+        counters.flags = 1;
+        require(NacelleConfigureProfileCounters(&counters) == E_NOTIMPL,
+            "Counter capability OFF did not reject opt-in explicitly");
+        counters.flags = 0;
+        require(NacelleConfigureProfileCounters(&counters) == S_OK, "Counter disable was rejected");
+#endif
         require(std::filesystem::create_directory(directory), "Create test directory");
         {
             nacelle::GraphicsEntryVersions<nacelle::CompiledPixelQuadFn> entries;
