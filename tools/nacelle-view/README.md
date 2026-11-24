@@ -7,6 +7,9 @@ trace JSON (timestamps/durations in **microseconds**, despite manifest clock
 timestamps being specified in nanoseconds). No replay or custom flamegraph.
 Empty shader metadata and empty traces are supported.
 
+The optional [VS Code integration](../nacelle-vscode/README.md) embeds this same
+frontend in a read-only profile editor with explicit export permissions.
+
 ## Local filters and Speedscope export
 
 Apply process/thread, case-insensitive PSO-substring, stage and optional
@@ -205,7 +208,8 @@ Exported traces may contain sensitive application data; keep them private.
 
 All three existing Pages publishers build/test and stage this viewer before
 their existing Pages artifact upload. Staging copies only `dist/index.html` and
-bundled JS/CSS assets, not captures, examples, source, or arbitrary build output.
+allowlisted hashed viewer, worker and optional editor-host JS/CSS assets, plus
+bundled Speedscope files; not captures, examples, source, or arbitrary build output.
 Do not put production profiles in `pages/` or any published artifact directory.
 There is no additional deployment workflow.
 

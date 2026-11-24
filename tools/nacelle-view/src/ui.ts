@@ -19,8 +19,16 @@ export interface ViewerOptions {
   loadPreloadedManifest?: () => Promise<PreloadedManifestInput>;
   openPreloadedProfile?: (file: string) => Promise<ProfileDataSource>;
   timelineView?: TimelineView;
+  decodeFile?: typeof decodeProfileFile;
+  saveFile?: (blob: Blob, name: string) => Promise<void>;
 }
 
+export interface ViewerController {
+  openSource(name: string, read: (signal: AbortSignal) => Promise<Blob>): Promise<void>;
+  exportTrace(): Promise<void>;
+  cancel(): void;
+  dispose(): void;
+}
 const THEME_STORAGE_KEY = 'nacelle-viewer-theme';
 
 function systemPrefersDark(win: Window | null): boolean {
@@ -91,7 +99,7 @@ export function mountViewer(
   root: Document,
   open?: (file: File) => Promise<ProfileDataSource>,
   options: ViewerOptions = {},
-): void {
+): ViewerController {
   setupThemeToggle(root);
   const artifacts = createArtifactView(root);
 
@@ -446,7 +454,7 @@ export function mountViewer(
     if (benchmarkSelect) benchmarkSelect.value = '';
     updateBenchmarkNavButtons();
     void loadFromSource(file.name || 'Local Profile', 'Reading local profile…', async signal => {
-      if (!open) return decodeProfileFile(file, signal);
+      if (!open) return (options.decodeFile ?? decodeProfileFile)(file, signal);
       const source = await open(file);
       if (signal.aborted) {
         source.close();
@@ -458,7 +466,7 @@ export function mountViewer(
     });
   }
 
-  cancel.addEventListener('click', () => {
+  function cancelLoad(): void {
     ++generation;
     decoding?.abort();
     decoding = undefined;
@@ -466,7 +474,8 @@ export function mountViewer(
     input.value = '';
     status.textContent = 'Profile loading cancelled.';
     status.dataset.state = 'cancelled';
-  });
+  }
+  cancel.addEventListener('click', cancelLoad);
 
   input.addEventListener('change', () => {
     const file = input.files?.[0];
@@ -673,22 +682,49 @@ export function mountViewer(
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  exportButton.addEventListener('click', () => {
+  async function exportTrace(): Promise<void> {
     if (!current) return;
-    download(new Blob([current.traceBytes], { type: 'application/json' }), 'nacelle-trace.json');
+    const blob = new Blob([current.traceBytes], { type: 'application/json' });
+    try {
+      if (options.saveFile) await options.saveFile(blob, 'nacelle-trace.json');
+      else download(blob, 'nacelle-trace.json');
+    } catch (error) {
+      exportStatus.textContent = `Trace export failed: ${error instanceof Error ? error.message : 'Unable to export trace.'}`;
+      throw error;
+    }
+  }
+  exportButton.addEventListener('click', () => {
+    void exportTrace().catch(error => console.error('Trace export failed.', error));
   });
 
-  speedscopeButton.addEventListener('click', () => {
+  speedscopeButton.addEventListener('click', async () => {
     if (!current || !total) return;
     exportStatus.textContent = '';
     try {
       const json = JSON.stringify(speedscopeProfile(current, groups, filtered));
       const blob = new Blob([json], { type: 'application/json' });
       requireValid(blob.size <= LIMITS.entry, 'Speedscope export exceeds the 256 MiB size limit.');
-      download(blob, 'nacelle-speedscope.json');
+      if (options.saveFile) await options.saveFile(blob, 'nacelle-speedscope.json');
+      else download(blob, 'nacelle-speedscope.json');
       exportStatus.textContent = 'Saved a local Speedscope profile. Open it in your locally installed Speedscope viewer; nothing was uploaded.';
     } catch (error) {
       exportStatus.textContent = `Speedscope export failed: ${error instanceof Error ? error.message : 'Unable to export spans.'}`;
     }
   });
+  return {
+    openSource: (name, read) => loadFromSource(name, 'Reading selected profile...', async signal => {
+      const blob = await read(signal);
+      signal.throwIfAborted();
+      return (options.decodeFile ?? decodeProfileFile)(blob, signal);
+    }),
+    exportTrace,
+    cancel: cancelLoad,
+    dispose: () => {
+      cancelLoad();
+      current = undefined;
+      artifacts.show();
+      spatial.show();
+      timelineView?.dispose();
+    },
+  };
 }

@@ -71,6 +71,27 @@ describe('SpeedscopeTimelineView', () => {
     expect(host.querySelector('iframe')!.hidden).toBe(true);
     expect(host.textContent).toContain('crossing overlaps');
   });
+
+  it('imports into a nonce-controlled embedded viewer and clears its source on invalid selection', async () => {
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:embedded') });
+    const revoke = vi.fn();
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revoke });
+    const host = document.querySelector<HTMLElement>('#host')!;
+    const view = new SpeedscopeTimelineView({ frameHtml: '<html><head></head><body></body></html>', frameNonce: 'test-nonce' });
+    view.mount(host);
+    const loaded = await makeProfile();
+    const groups = [{ pid: 1, tid: 2, name: 'thread', spans: loaded.trace.traceEvents.filter(e => e.ph === 'X') }];
+    view.render({ profile: loaded, groups, filtered: false, title: '<capture>' });
+    const iframe = host.querySelector('iframe')!;
+    expect(iframe.srcdoc).toContain('nonce="test-nonce"');
+    expect(iframe.srcdoc).not.toContain('profileURL=');
+    expect(iframe.onload).toBeTypeOf('function');
+    view.render({ profile: loaded, groups: [], filtered: true, title: 'empty' });
+    expect(iframe.hasAttribute('srcdoc')).toBe(false);
+    expect(iframe.onload).toBeNull();
+    expect(revoke).toHaveBeenCalledWith('blob:embedded');
+    view.dispose();
+  });
 });
 
 describe('TimelineView integration in mountViewer', () => {
