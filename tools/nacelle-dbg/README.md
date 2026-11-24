@@ -801,13 +801,145 @@ Synthetic metadata and one retained context added approximately 12 KiB, below
 reliable RSS attribution granularity. Metadata and 512 retained contexts used
 about 56 KiB in the short-lived-thread case, excluding thread execution effects.
 Workers were joined before drain, so drain latency does not characterize waiting
-for live application work. Serialization remains non-streaming and its peak
-memory is not separately bounded; per-serialization-stage attribution and further bookkeeping bounds remain open
-under #212. Deterministic recorder tests now fail the actual event-pool allocation
+for live application work. These historical measurements predate the bounded
+streaming implementation and current stage measurements below. Deterministic recorder tests fail the actual event-pool allocation
 and a serialization allocation using a test-only thread-local allocator probe.
 They require `E_OUTOFMEMORY`, no partial output or stale active session, and a
 successful retry of the stopped capture with identical event/drop counts. No
 allocation-failure hooks or global allocator replacement enter the runtime.
+
+#### Bounded serialization and current metadata scaling
+
+The approved [#212 design](https://github.com/farzonl/Nacelle/issues/212#issuecomment-7115020880)
+replaces simultaneous full trace JSON, `compressBound` storage and heap ZIP with:
+
+- A sorted pointer index for completed event slots.
+- Exact JSON-size preflight over the same Glaze-reflected values, then Glaze
+  serialization into pre-sized storage. No output-buffer growth/allocation occurs
+  inside Glaze's `noexcept` writer. JSON exceeding a format limit is rejected
+  before allocating its output. Unsupported control bytes that the pinned Glaze
+  writer does not escape are explicitly rejected; supported escapes and UTF-8
+  round-trip. No custom JSON parser/encoder or source-content transformation is added.
+- Two bounded event passes: count the exact decoded trace length, then encode
+  one event at a time (at most 4 KiB plus library padding) into zstd streaming
+  compression. The frame pledges the decoded size, remains dictionary-free,
+  and uses level 1 with window log 19. Existing reader requirements and exact
+  typed Chrome Trace bytes remain unchanged.
+- A 128 KiB compression output buffer, private compressed spool, and miniz's
+  stored-file archive APIs. The archive is staged privately, then copied in
+  64 KiB chunks to an exclusively created destination. Neither a compressed
+  payload nor the ZIP is held in a whole-archive heap buffer.
+
+POSIX staging is owner-only, unlinked `tmpfile` storage. Windows uses native
+cryptographic random names, exclusive creation, an owner-rights-only protected
+ACL and delete-on-close handles, preserving UTF-16 paths. Every exit releases
+both staging handles. A failed final copy/close removes only the destination
+this attempt created; pre-existing destinations are never overwritten.
+Transient serialization/allocation/write failures remain retryable with exact
+counts. Actual metadata allocation failure is sticky: execution continues,
+End returns `E_OUTOFMEMORY`, summary completeness is false, and a new capture is
+required rather than saving missing identities. Code/version/selection limits
+and invalid SHA-256 owners are also explicitly diagnosed. Synchronous compiler
+configuration records through its existing counted root, without allocating an
+unnecessary escaping Work context.
+
+**Working-memory model (not total process RSS):** let `E <= 64 MiB` be the
+event pool, `N <= floor(E / sizeof(Event))` its completed events, `C + S <= 65536`
+the code-version/selection counts, and `P <= C + S` the capture-local pipeline
+count. Recorder metadata scales as `O(C + S + P)`, with one bounded key/map node
+per version/pipeline, at most eight IDs per selection, bounded vector capacity,
+32-character PSO and optional 64-character shader/native owners, and fixed
+stage/role/cache labels. CPU/compiler strings and feature-array serialization
+are constrained by the 1 MiB manifest; raw contents and the minimum encoded
+feature-array length are checked before copying them into a session. In-flight
+roots/escaping contexts and thread stacks are owned by application work:
+their memory is proportional to live ownership units, **not a fixed event-budget
+entitlement**. TLS keeps fixed ID/slot cursors per thread, not additional event pools.
+
+After drain, the serializer retains the admitted session metadata plus its
+bounded metadata JSON `M <= 256 MiB` in aggregate, up to two 1 MiB manifest
+buffers while updating descriptors, `N * sizeof(Event*)` for sorting,
+one bounded event JSON buffer, the 128 KiB output buffer and zstd's level-1
+512 KiB-window workspace. Archive construction and final writing run after
+the sorting/compression workspace is released. Miniz keeps only its small
+3..5-entry directory and bounded file-I/O scratch. Allocator/container capacity
+and library workspace are reported separately; these formulas do not limit
+compiler RSS, application work, OS page cache or browser decoded objects.
+Both compressed spool and staged archive are individually limited to 256 MiB,
+so staging disk can require up to 512 MiB, excluding the explicit final export.
+The unchanged native/browser decoded aggregate and final archive cap is
+256 MiB; the manifest cap is 1 MiB and event cap is 64 MiB.
+
+The test-only [stage diagnostic](../../tests/profile_memory_test.cpp) recompiles
+the production writer with private phase observations. No callbacks, timers,
+allocator probe or diagnostic targets enter shipping libraries or OFF builds.
+It reports current RSS, process lifetime high-water marks, 2 ms sampled stage
+peaks, retained/requested storage and elapsed time. Short stages may be missed
+by sampling; cumulative high-water marks are **never subtracted and mislabeled
+as stage allocations**. Test-only allocation counts are cumulative requests,
+including reallocation, not live bytes or allocator overhead.
+
+Five fresh GNU 13.3 Release Linux x86_64 processes per matched baseline/new
+synthetic case used the same 136-byte Event and version-tracked output. Every
+bundle passed the native reader with exact event/drop/completeness counts:
+
+| Budget / workload | Recorded / dropped | Baseline / streaming save peak RSS | Baseline / streaming save time |
+| --- | ---: | ---: | ---: |
+| 1 MiB nearly full | 7,697 / 0 | 8.89 / 6.00 MiB | 6.48 / 9.13 ms |
+| 16 MiB nearly full | 123,348 / 0 | 82.83 / 22.00 MiB | 98.38 / 129.91 ms |
+| 64 MiB nearly full | 493,434 / 0 | 320.83 / 72.50 MiB | 399.53 / 518.06 ms |
+| 64 MiB overflow | 493,447 / 4,096 | 320.83 / 72.50 MiB | 396.95 / 523.76 ms |
+
+This trades approximately 30% additional synthetic End time for about 77%
+lower peak RSS at 64 MiB. It is not kernel overhead or a universal latency
+guarantee. Final writing remains I/O-dependent; End still waits for real live
+work, while these synthetic workers are drained before saving.
+
+Five separate phase-observed processes per case measured current RSS, including
+the diagnostic sampler, rather than isolated allocation deltas:
+
+| 64 MiB case | After event allocation | After bookkeeping | After metadata JSON | During compression | After archive | After save |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nearly full | 68.27 | 68.28 | 68.36 | 73.43 | 68.90 | 68.96 |
+| 32,768 versions + 32,768 selections | 68.28 | 89.04 | 100.71 | 105.81 | 105.87 | 94.33 |
+| 65,536 versions | 68.29 | 104.81 | 124.59 | 129.69 | 129.75 | 110.08 |
+
+Units are MiB. On this STL, Session/Context/Work/CodeVersion/CodeSelection are
+832/72/16/248/40 bytes; shared control blocks, map nodes, strings and allocator
+overhead are additional. Maximum mixed/all-version bookkeeping requested
+28,409,312/50,003,472 bytes cumulatively during construction; this includes
+released vector growth and is not resident memory.
+At 64 MiB, ordering retains 3,947,472 bytes; measured ordering + live zstd +
+output/event buffers retained about 5,448,679 bytes. In the sampler run,
+trace encoding and zstd/spool totals were separately approximately 284/63 ms.
+Metadata-heavy archive copying increased End time and is not hidden in shader
+timings. With 512 short-lived threads and retained contexts, a 1 MiB pool
+recorded 121 events and explicitly dropped 391 from stranded blocks; context
+creation cumulatively requested 90,040 bytes. Every output's counts were checked.
+
+Reproduce the current stage matrix after enabling profile tests:
+
+```sh
+cmake --build build/runtime-check --target profile_memory_test
+build/runtime-check/profile_memory_test 1 near-full
+build/runtime-check/profile_memory_test 16 near-full
+build/runtime-check/profile_memory_test 64 near-full
+build/runtime-check/profile_memory_test 64 overflow
+build/runtime-check/profile_memory_test 1 threads
+build/runtime-check/profile_memory_test 64 metadata
+build/runtime-check/profile_memory_test 64 versions
+ctest --test-dir build/runtime-check \
+  -R '^(instrumentation_test|profile_memory_.*test)$' --output-on-failure
+```
+
+Run each measurement in a fresh process; retain stdout JSON lines. Output
+captures are private temporary files and removed after native validation.
+Focused tests cover phase failures, including failure after the first final
+write chunk, cleanup/retry, metadata allocator faults, output exclusivity,
+manifest boundaries, Unicode and typed-trace byte identity. The existing
+static/shared artifact/spatial and native/browser suites remain authoritative
+format/execution checks. Raw comparative/stage samples and reproduction
+evidence are published under [#212](https://github.com/farzonl/Nacelle/issues/212).
 
 ### Reproducible coarse-capture performance acceptance
 
@@ -1118,9 +1250,8 @@ validation with exact completeness and counts. Raw samples, diagnostic source,
 and reproduction instructions are published under
 [#212](https://github.com/farzonl/Nacelle/issues/212).
 These code-version workloads are not comparable to the earlier smaller-event
-measurements. Metadata admission bounds, separate serialization-stage memory
-attribution, allocation-failure stress, and a total serialization-memory bound
-remain open; the event limit is still not a process RSS guarantee.
+measurements. These historical results predate the bounded streaming/stage work above.
+The event limit is still not a process RSS guarantee.
 
 Keep application captures private. Only viewer assets, never captures, are
 staged by the Pages publishers. The accepted measurement targets are no OFF

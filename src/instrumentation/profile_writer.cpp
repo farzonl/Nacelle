@@ -1,6 +1,7 @@
 #include "capture.h"
 #include "profile_format.h"
 #include "archive.h"
+#include "profile_memory.h"
 
 #include <glaze/glaze.hpp>
 #include <miniz.h>
@@ -18,6 +19,14 @@
 #include <ranges>
 #include <set>
 #include <sstream>
+#include <cstring>
+#if defined(_WIN32)
+#include <windows.h>
+#include <sddl.h>
+#include <io.h>
+#include <fcntl.h>
+#include <bcrypt.h>
+#endif
 
 namespace nacelle::profile {
 std::string formatProfileHash(uint64_t lo, uint64_t hi) {
@@ -50,17 +59,80 @@ bool safePath(const std::string& path) {
     return path.back() != '/';
 }
 
+size_t quotedSize(std::string_view value) {
+    size_t bytes = 2;
+    for (const unsigned char c : value) {
+        if (c < 0x20 && c != '\b' && c != '\f' && c != '\n' && c != '\r' && c != '\t')
+            return maxProfileBytes + 1;
+        bytes += glz::detail::char_escape_table[c] ? 2 : 1;
+    }
+    return bytes;
+}
+
+template <typename T> size_t jsonSize(const T &value) {
+    using V = std::remove_cvref_t<T>;
+    if constexpr (std::is_same_v<V, std::string> || std::is_same_v<V, std::string_view>) {
+        return quotedSize(value);
+    } else if constexpr (std::is_arithmetic_v<V>) {
+        char buffer[128];
+        char *output = buffer;
+        const auto result = glz::write_json(value, output);
+        return result ? *result : maxProfileBytes + 1;
+    } else if constexpr (requires { value.has_value(); }) {
+        return value ? jsonSize(*value) : 4;
+    } else if constexpr (std::ranges::range<V>) {
+        size_t bytes = 2;
+        bool first = true;
+        for (const auto &item : value) {
+            bytes += jsonSize(item) + (first ? 0 : 1);
+            first = false;
+            if (bytes > maxProfileBytes)
+                break;
+        }
+        return bytes;
+    } else {
+        size_t bytes = 2;
+        bool first = true;
+        const auto members = glz::detail::to_tuple(value);
+        glz::for_each<glz::reflect<V>::size>([&](auto index) {
+            constexpr size_t I = decltype(index)::value;
+            const auto &member = glz::get<I>(members);
+            if constexpr (requires { member.has_value(); }) {
+                if (!member)
+                    return;
+            }
+            bytes += quotedSize(glz::reflect<V>::keys[I]) + 1 + jsonSize(member) + (first ? 0 : 1);
+            first = false;
+        });
+        return bytes;
+    }
+}
+
 template <typename T>
-bool toJson(const T& value, std::string& json, std::string& error) {
-    if (const auto ec = glz::write_json(value, json)) {
-        error = "Glaze serialization failed: " + glz::format_error(ec, json);
+bool toJson(const T &value, std::string &json, std::string &error, size_t limit = maxProfileBytes) {
+    const size_t size = jsonSize(value);
+    if (size > limit) {
+        error = "Profile JSON exceeds its format limit or contains unsupported control characters";
         return false;
     }
+    // Raw-buffer Glaze serialization cannot grow or allocate inside its noexcept writer.
+    std::string serialized(size + glz::write_padding_bytes, '\0');
+    char* output = serialized.data();
+    const auto result = glz::write_json(value, output);
+    if (!result || *result != size) {
+        error = "Glaze serialization size or encoding mismatch";
+        return false;
+    }
+    serialized.resize(size);
+    json.swap(serialized);
     return true;
 }
 
-bool manifestToJson(const Manifest& manifest, std::string& json, std::string& error) {
-    if (!toJson(manifest, json, error)) return false;
+bool manifestToJson(const Manifest &manifest, std::string &json, std::string &error) {
+    if (!toJson(manifest, json, error, maxManifestBytes)) {
+        error = "Profile manifest exceeds the 1 MiB format limit or could not be serialized";
+        return false;
+    }
     if (json.size() > maxManifestBytes) {
         error = "Profile manifest exceeds the 1 MiB format limit";
         return false;
@@ -68,11 +140,12 @@ bool manifestToJson(const Manifest& manifest, std::string& json, std::string& er
     return true;
 }
 
-bool writeExclusive(const std::string& path, const void* bytes, size_t size, std::string& error) {
+bool writeExclusive(const std::string &path, const void *bytes, size_t size, std::string &error) {
     const auto nativePath = std::filesystem::path(std::u8string(path.begin(), path.end()));
-    FILE* file = nullptr;
+    FILE *file = nullptr;
 #if defined(_WIN32)
-    if (_wfopen_s(&file, nativePath.c_str(), L"wbx") != 0) file = nullptr;
+    if (_wfopen_s(&file, nativePath.c_str(), L"wbx") != 0)
+        file = nullptr;
 #else
     file = std::fopen(nativePath.c_str(), "wbx");
 #endif
@@ -86,12 +159,269 @@ bool writeExclusive(const std::string& path, const void* bytes, size_t size, std
         std::error_code ec;
         std::filesystem::remove(nativePath, ec);
         error = "Failed writing profile: " + path;
-        if (ec) error += "; could not remove partial file: " + ec.message();
+        if (ec)
+            error += "; could not remove partial file: " + ec.message();
         return false;
     }
     return true;
 }
+using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
 
+File temporaryFile(std::string &error) {
+#if defined(_WIN32)
+    wchar_t directory[MAX_PATH + 1];
+    const DWORD directoryLength = GetTempPathW(MAX_PATH + 1, directory);
+    if (!directoryLength || directoryLength >= MAX_PATH + 1) {
+        error = "Cannot locate private profile staging directory";
+        return {nullptr, &std::fclose};
+    }
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;OW)", SDDL_REVISION_1,
+                                                              &descriptor, nullptr)) {
+        error = "Cannot configure private profile staging permissions";
+        return {nullptr, &std::fclose};
+    }
+    std::unique_ptr<void, decltype(&LocalFree)> security(descriptor, &LocalFree);
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE};
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        std::wstring name(directory);
+        name += L"nacelle-profile-";
+        std::array<ULONG, 4> random{};
+        if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(random.data()), sizeof(random),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+            error = "Cannot generate a private profile staging identity";
+            return {nullptr, &std::fclose};
+        }
+        for (const auto value : random) name += std::to_wstring(value) + L"-";
+        const HANDLE handle =
+            CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, &attributes, CREATE_NEW,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_FILE_EXISTS)
+                continue;
+            break;
+        }
+        const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_RDWR);
+        if (fd == -1) {
+            CloseHandle(handle);
+            break;
+        }
+        FILE *file = _fdopen(fd, "w+b");
+        if (!file) {
+            _close(fd);
+            break;
+        }
+        File result(file, &std::fclose);
+        NACELLE_PROFILE_PRIVATE_FILE(file);
+        return result;
+    }
+#else
+    if (FILE *file = std::tmpfile()) {
+        File result(file, &std::fclose);
+        NACELLE_PROFILE_PRIVATE_FILE(file);
+        return result;
+    }
+#endif
+    error = "Cannot create private profile staging file";
+    return {nullptr, &std::fclose};
+}
+
+bool seekFile(FILE *file, uint64_t offset) {
+#if defined(_WIN32)
+    return _fseeki64(file, static_cast<__int64>(offset), SEEK_SET) == 0;
+#else
+    return fseeko(file, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
+}
+
+bool writeExclusiveFile(const std::string &path, FILE *source, size_t size, std::string &error) {
+    const auto nativePath = std::filesystem::path(std::u8string(path.begin(), path.end()));
+    FILE *raw = nullptr;
+#if defined(_WIN32)
+    if (_wfopen_s(&raw, nativePath.c_str(), L"wbx") != 0)
+        raw = nullptr;
+#else
+    raw = std::fopen(nativePath.c_str(), "wbx");
+#endif
+    if (!raw) {
+        error = "Cannot create profile (destination must not already exist): " + path;
+        return false;
+    }
+    File output(raw, &std::fclose);
+    bool committed = false;
+    struct Rollback {
+        File &output;
+        const std::filesystem::path &path;
+        bool &committed;
+        ~Rollback() {
+            if (committed)
+                return;
+            output.reset();
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            if (ec)
+                std::fprintf(stderr, "[NacelleProfile] Could not remove partial profile: %s\n",
+                             ec.message().c_str());
+        }
+    } rollback{output, nativePath, committed};
+    std::array<char, 64 * 1024> buffer;
+    bool written = seekFile(source, 0);
+    for (size_t remaining = size; written && remaining;) {
+        const auto amount = std::min(remaining, buffer.size());
+        written = std::fread(buffer.data(), 1, amount, source) == amount &&
+                  std::fwrite(buffer.data(), 1, amount, output.get()) == amount;
+        if (remaining == size)
+            NACELLE_PROFILE_MEMORY("write-progress", size);
+        remaining -= amount;
+    }
+    const bool closed = std::fclose(output.release()) == 0;
+    if (!written || !closed) {
+        std::error_code ec;
+        std::filesystem::remove(nativePath, ec);
+        error = "Failed writing profile: " + path;
+        if (ec)
+            error += "; could not remove partial file: " + ec.message();
+        return false;
+    }
+    committed = true;
+    return true;
+}
+
+TraceEvent traceEvent(const Event &event) {
+    constexpr const char *stages[] = {"unknown",    "compute",  "graphics", "vertex", "pixel",        "mesh",
+                                      "raytracing", "geometry", "hull",     "domain", "amplification"};
+    constexpr const char *caches[] = {"unknown", "hit", "miss"};
+    TraceEvent item;
+    item.name = event.name;
+    item.cat = event.attributes.tier && !event.attributes.codeVersionId ? "jit" : "runtime";
+    item.ts = static_cast<double>(event.startNs) / 1000.0;
+    item.dur = static_cast<double>(event.durationNs) / 1000.0;
+    item.tid = event.thread;
+    item.args = {event.id,
+                 event.parent,
+                 formatProfileHash(event.attributes.hashLo, event.attributes.hashHi),
+                 stages[static_cast<unsigned>(event.attributes.stage)],
+                 event.attributes.simdWidth,
+                 event.attributes.tier,
+                 caches[static_cast<unsigned>(event.attributes.cache)]};
+    if (event.attributes.codeVersionId || event.attributes.codeSelectionId)
+        item.args.pipelineId = event.attributes.pipelineId;
+    if (event.attributes.codeVersionId)
+        item.args.codeVersionId = event.attributes.codeVersionId;
+    if (event.attributes.codeSelectionId)
+        item.args.codeSelectionId = event.attributes.codeSelectionId;
+    return item;
+}
+
+bool compressTrace(const Session &session, FILE *file, size_t limit, size_t &decodedBytes,
+                   size_t &compressedBytes, std::string &error) {
+    NACELLE_PROFILE_MEMORY("ordering-begin", 0);
+    std::vector<const Event *> ordered;
+    ordered.reserve(static_cast<size_t>(session.eventCount));
+    for (size_t i = 0; i < std::min(session.capacity, session.nextBlock.load()); ++i)
+        if (session.events[i].id)
+            ordered.push_back(&session.events[i]);
+    std::sort(ordered.begin(), ordered.end(), [](const Event *a, const Event *b) {
+        return static_cast<double>(a->startNs) / 1000.0 < static_cast<double>(b->startNs) / 1000.0;
+    });
+    NACELLE_PROFILE_MEMORY("ordering-end", ordered.capacity() * sizeof(const Event *));
+    constexpr std::string_view prefix = R"({"traceEvents":[)";
+    constexpr std::string_view suffix = R"(],"displayTimeUnit":"ms"})";
+    decodedBytes = prefix.size() + suffix.size();
+    NACELLE_PROFILE_MEMORY("trace-count-begin", ordered.capacity() * sizeof(const Event *));
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        const auto bytes = jsonSize(traceEvent(*ordered[i])) + (i ? 1 : 0);
+        if (decodedBytes > limit || bytes > limit - decodedBytes) {
+            error = "Profile trace exceeds the 256 MiB uncompressed format limit";
+            return false;
+        }
+        decodedBytes += bytes;
+    }
+    if (decodedBytes > limit) {
+        error = "Profile trace exceeds the 256 MiB uncompressed format limit";
+        return false;
+    }
+    NACELLE_PROFILE_MEMORY("trace-count-end", ordered.capacity() * sizeof(const Event *));
+    auto context = std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)>(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+    if (!context)
+        throw std::bad_alloc();
+    for (const auto result : {ZSTD_CCtx_setParameter(context.get(), ZSTD_c_compressionLevel, 1),
+                              ZSTD_CCtx_setParameter(context.get(), ZSTD_c_windowLog, 19),
+                              ZSTD_CCtx_setPledgedSrcSize(context.get(), decodedBytes)}) {
+        if (ZSTD_isError(result)) {
+            error = std::string("zstd setup failed: ") + ZSTD_getErrorName(result);
+            return false;
+        }
+    }
+    auto buffer = std::make_unique<char[]>(128 * 1024);
+    std::string eventJson;
+    compressedBytes = 0;
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+    uint64_t encodingNs = 0, compressionNs = 0;
+#endif
+    const auto emit = [&](std::string_view bytes, ZSTD_EndDirective directive) {
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+        const auto started = std::chrono::steady_clock::now();
+#endif
+        ZSTD_inBuffer input{bytes.data(), bytes.size(), 0};
+        size_t remaining = 1;
+        do {
+            ZSTD_outBuffer output{buffer.get(), 128 * 1024, 0};
+            remaining = ZSTD_compressStream2(context.get(), &output, &input, directive);
+            if (ZSTD_isError(remaining)) {
+                error = std::string("zstd compression failed: ") + ZSTD_getErrorName(remaining);
+                return false;
+            }
+            if (output.pos > maxProfileBytes - compressedBytes ||
+                std::fwrite(buffer.get(), 1, output.pos, file) != output.pos) {
+                error = "Could not write bounded compressed profile staging data";
+                return false;
+            }
+            compressedBytes += output.pos;
+        } while (input.pos < input.size || (directive == ZSTD_e_end && remaining));
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+        compressionNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+#endif
+        return true;
+    };
+    NACELLE_PROFILE_MEMORY("compression-begin", ordered.capacity() * sizeof(const Event *) + 128 * 1024 +
+                                                    ZSTD_sizeof_CCtx(context.get()));
+    if (!emit(prefix, ZSTD_e_continue))
+        return false;
+    for (size_t i = 0; i < ordered.size(); ++i) {
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+        const auto started = std::chrono::steady_clock::now();
+#endif
+        if (!toJson(traceEvent(*ordered[i]), eventJson, error, 4096))
+            return false;
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+        encodingNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+#endif
+        if ((i && !emit(",", ZSTD_e_continue)) || !emit(eventJson, ZSTD_e_continue)) return false;
+    }
+    if (!emit(suffix, ZSTD_e_end) || std::fflush(file) != 0 || !seekFile(file, 0)) {
+        if (error.empty())
+            error = "Could not finalize compressed profile staging data";
+        return false;
+    }
+    NACELLE_PROFILE_MEMORY("compression-end", ordered.capacity() * sizeof(const Event *) +
+                                                  eventJson.capacity() + 128 * 1024 +
+                                                  ZSTD_sizeof_CCtx(context.get()));
+#if defined(NACELLE_PROFILE_MEMORY_DIAGNOSTICS)
+    observeProfileTiming("trace-encoding", encodingNs);
+    observeProfileTiming("zstd-and-spool", compressionNs);
+#endif
+    return true;
+}
+
+    size_t writeArchiveFile(void* opaque, mz_uint64 offset, const void* bytes, size_t size) {
+        auto* file = static_cast<FILE*>(opaque);
+        if (offset > maxProfileBytes || size > maxProfileBytes - offset || !seekFile(file, offset))
+            return 0;
+        return std::fwrite(bytes, 1, size, file);
+    }
 bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::string& error) {
     mz_zip_archive_file_stat stat{};
     const int index = mz_zip_reader_locate_file(&zip.archive, name, nullptr, 0);
@@ -112,9 +442,10 @@ bool extract(Zip& zip, const char* name, size_t limit, std::string& data, std::s
 
 bool writeProfile(const std::string& path, const Session& session, std::string& error) {
     if (session.shaderMetadataOverflow) {
-        error = "Profile exceeds the 65536 code-version/selection metadata limit or 8-entry selection limit";
+        error = "Profile metadata admission failed or exceeded its format limits; begin a new capture";
         return false;
     }
+    NACELLE_PROFILE_MEMORY("metadata-begin", 0);
     Manifest manifest;
     manifest.complete = session.dropped.load() == 0 && (!session.spatial || session.spatial->complete());
     manifest.recordedEvents = session.eventCount;
@@ -170,7 +501,7 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         manifest.captureOptions.spatialBytes = session.spatial->options.record_bytes;
         if (!session.spatial->aggregate(spatial, error) ||
             !validateSpatial(spatial, session.shaders, manifest.captureOptions, error) ||
-            !toJson(spatial, spatialJson, error)) return false;
+            !toJson(spatial, spatialJson, error, maxProfileBytes - artifactsJson.size())) return false;
         manifest.entries.push_back({"spatial.json", "json", spatialJson.size(), artifactDigest(spatialJson)});
     }
     std::string manifestJson;
@@ -178,82 +509,43 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
     if (!manifestToJson(manifest, manifestJson, error)) return false;
     std::string shadersJson = "[]";
     if ((!session.shaders.codeVersions.empty() || session.shaders.codeSelections) &&
-        !toJson(session.shaders, shadersJson, error))
+        !toJson(session.shaders, shadersJson, error, maxProfileBytes - artifactsJson.size() - spatialJson.size()))
         return false;
     if (shadersJson.size() > maxProfileBytes) {
         error = "Profile shader metadata exceeds the 256 MiB format limit";
         return false;
     }
-
-    std::string traceJson;
-    {
-        std::vector<const Event*> ordered;
-        ordered.reserve(static_cast<size_t>(session.eventCount));
-        for (size_t i = 0; i < std::min(session.capacity, session.nextBlock.load()); ++i) {
-            if (session.events[i].id != 0) ordered.push_back(&session.events[i]);
-        }
-        std::sort(ordered.begin(), ordered.end(), [](const Event* a, const Event* b) {
-            return static_cast<double>(a->startNs) / 1000.0 <
-                   static_cast<double>(b->startNs) / 1000.0;
-        });
-        // Glaze consumes one temporary event at a time instead of a second full object graph.
-        const auto events = ordered | std::views::transform([](const Event* event) {
-            constexpr const char* stages[] = {
-                "unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing",
-                "geometry", "hull", "domain", "amplification"};
-            constexpr const char* caches[] = {"unknown", "hit", "miss"};
-            TraceEvent item;
-            item.name = event->name;
-            item.cat = event->attributes.tier && !event->attributes.codeVersionId ? "jit" : "runtime";
-            item.ts = static_cast<double>(event->startNs) / 1000.0;
-            item.dur = static_cast<double>(event->durationNs) / 1000.0;
-            item.tid = event->thread;
-            item.args = {event->id, event->parent,
-                         formatProfileHash(event->attributes.hashLo, event->attributes.hashHi),
-                         stages[static_cast<unsigned>(event->attributes.stage)],
-                         event->attributes.simdWidth, event->attributes.tier,
-                         caches[static_cast<unsigned>(event->attributes.cache)]};
-            if (event->attributes.codeVersionId || event->attributes.codeSelectionId) {
-                item.args.pipelineId = event->attributes.pipelineId;
-            }
-            if (event->attributes.codeVersionId) {
-                item.args.codeVersionId = event->attributes.codeVersionId;
-            }
-            if (event->attributes.codeSelectionId) item.args.codeSelectionId = event->attributes.codeSelectionId;
-            return item;
-        });
-        const Trace defaults;
-        if (!toJson(glz::obj{"traceEvents", events, "displayTimeUnit", defaults.displayTimeUnit},
-                    traceJson, error)) return false;
-    }
-    if (shadersJson.size() + artifactsJson.size() + spatialJson.size() > maxProfileBytes ||
-        traceJson.size() > maxProfileBytes - shadersJson.size() - artifactsJson.size() - spatialJson.size()) {
-        error = "Profile trace exceeds the 256 MiB uncompressed format limit";
+    const auto metadataBytes = shadersJson.size() + artifactsJson.size() + spatialJson.size();
+    if (metadataBytes > maxProfileBytes) {
+        error = "Profile metadata exceeds the 256 MiB uncompressed format limit";
         return false;
     }
-    std::string compressed(ZSTD_compressBound(traceJson.size()), '\0');
-    const size_t result = ZSTD_compress(compressed.data(), compressed.size(),
-                                      traceJson.data(), traceJson.size(), 1);
-    if (ZSTD_isError(result)) {
-        error = std::string("zstd compression failed: ") + ZSTD_getErrorName(result);
-        return false;
-    }
-    compressed.resize(result);
-
-    manifest.entries.front().uncompressedSize = traceJson.size();
+    NACELLE_PROFILE_MEMORY("metadata-end", manifestJson.capacity() + shadersJson.capacity() +
+        artifactsJson.capacity() + spatialJson.capacity());
+    auto compressed = temporaryFile(error);
+    if (!compressed) return false;
+    size_t traceBytes = 0, compressedBytes = 0;
+    if (!compressTrace(session, compressed.get(), maxProfileBytes - metadataBytes,
+                       traceBytes, compressedBytes, error)) return false;
+    manifest.entries.front().uncompressedSize = traceBytes;
     manifest.entries[1].uncompressedSize = shadersJson.size();
     if (!manifestToJson(manifest, manifestJson, error)) return false;
 
+    auto archiveFile = temporaryFile(error);
+    if (!archiveFile) return false;
     Zip zip;
     zip.writing = true;
-    if (!mz_zip_writer_init_heap(&zip.archive, 0, 0) ||
+    zip.archive.m_pWrite = &writeArchiveFile;
+    zip.archive.m_pIO_opaque = archiveFile.get();
+    NACELLE_PROFILE_MEMORY("archive-begin", metadataBytes);
+    if (!mz_zip_writer_init(&zip.archive, 0) ||
         !mz_zip_writer_add_mem(&zip.archive, "manifest.json", manifestJson.data(), manifestJson.size(), 0) ||
-        !mz_zip_writer_add_mem(&zip.archive, "trace.json.zst", compressed.data(), compressed.size(), 0) ||
+        !mz_zip_writer_add_cfile(&zip.archive, "trace.json.zst", compressed.get(), compressedBytes,
+            nullptr, nullptr, 0, 0, nullptr, 0, nullptr, 0) ||
         !mz_zip_writer_add_mem(&zip.archive, "shaders.json", shadersJson.data(), shadersJson.size(), 0)) {
         error = "miniz could not construct the profile archive";
         return false;
     }
-    void* bytes = nullptr;
     if (!artifactsJson.empty() && !mz_zip_writer_add_mem(&zip.archive, "artifacts.json",
             artifactsJson.data(), artifactsJson.size(), 0)) {
         error = "miniz could not add artifact metadata";
@@ -264,17 +556,20 @@ bool writeProfile(const std::string& path, const Session& session, std::string& 
         error = "miniz could not add spatial metadata";
         return false;
     }
-    size_t size = 0;
-    if (!mz_zip_writer_finalize_heap_archive(&zip.archive, &bytes, &size)) {
+    if (!mz_zip_writer_finalize_archive(&zip.archive) || std::fflush(archiveFile.get()) != 0) {
         error = "miniz could not finalize the profile archive";
         return false;
     }
-    std::unique_ptr<void, decltype(&mz_free)> storage(bytes, &mz_free);
+    const auto size = zip.archive.m_archive_size;
     if (size > maxProfileBytes) {
         error = "Profile archive exceeds the 256 MiB format limit";
         return false;
     }
-    return writeExclusive(path, bytes, size, error);
+    NACELLE_PROFILE_MEMORY("archive-end", metadataBytes);
+    NACELLE_PROFILE_MEMORY("write-begin", metadataBytes);
+    const bool written = writeExclusiveFile(path, archiveFile.get(), static_cast<size_t>(size), error);
+    NACELLE_PROFILE_MEMORY("write-end", metadataBytes);
+    return written;
 }
 
 bool exportTrace(const std::string& path, const Trace& trace, std::string& error) {
