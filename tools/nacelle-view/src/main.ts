@@ -1,5 +1,5 @@
 import './style.css';
-import { createSpeedscopeTimelineView } from './speedscope-timeline';
+import { createSwimlaneTimelineView } from './swimlane-timeline';
 import { mountViewer } from './ui';
 
 if (typeof window.acquireVsCodeApi === 'function') {
@@ -17,6 +17,6 @@ if (typeof window.acquireVsCodeApi === 'function') {
 } else {
   mountViewer(document, undefined, {
     preloadedEnabled: import.meta.env.VITE_ENABLE_PRELOADED_PROFILES === '1',
-    timelineView: createSpeedscopeTimelineView(),
+    timelineView: createSwimlaneTimelineView(),
   });
 }

@@ -14,6 +14,7 @@ export interface TimelineSelectionEvent {
   stage?: string;
   start?: number;
   end?: number;
+  reset?: boolean;
 }
 
 export interface TimelineViewCapabilities {
