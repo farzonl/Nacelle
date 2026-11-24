@@ -39,7 +39,12 @@ not yet included.
 passed controlled Linux x86_64 compute/graphics measurements: idle and active
 intervals are below the 1% and 5% budgets, with an unchanged instrumentation-OFF
 binary. This is not an all-host guarantee or acceptance of separately opted-in
-debugging/spatial modes; additional-memory acceptance remains open.
+debugging/spatial modes.
+[Bounded profile serialization](tools/nacelle-dbg/README.md#bounded-serialization-and-current-metadata-scaling)
+preserves the 64 MiB event and 256 MiB format limits, with measured metadata,
+context and serializer-stage scaling. Private file-backed streaming avoids
+whole-trace/compressed/archive heap copies; these are working-memory bounds,
+not a total application/compiler RSS cap.
 
 **Nacelle** is a ground-up, zero-compromise Direct3D 12 (`ID3D12Device`) and DXCore (`IDXCoreAdapterFactory`) software rasterizer and compute runtime for **Linux, macOS, and Windows**.
 

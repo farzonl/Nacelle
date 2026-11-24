@@ -579,7 +579,7 @@ jobs:
       - name: Build instrumented capture tests
         run: |
           cmake --build build-profile --target \
-            instrumentation_test replay_format_test replay_runtime_static_test replay_runtime_shared_test \
+            instrumentation_test profile_memory_test replay_format_test replay_runtime_static_test replay_runtime_shared_test \
             profile_runtime_static_test profile_runtime_shared_test nacelle-dbg nacelle-replay \
             compute_dispatch_test interlocked_barrier_test \
             rasterizer_pipeline_test graphics_features_test \
@@ -597,7 +597,7 @@ jobs:
             export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
           fi
           ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|profile_overhead_harness_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
+            -R '^(instrumentation_test|profile_memory_.*test|profile_overhead_harness_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
 
       - name: Set up Node for native profile interoperability
         uses: actions/setup-node@v4

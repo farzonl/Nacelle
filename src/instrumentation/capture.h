@@ -77,6 +77,7 @@ struct Session {
     std::vector<uint64_t> codeSelectionParents;
     ShaderMetadata shaders;
     bool shaderMetadataOverflow = false;
+    bool metadataAllocationFailure = false;
     std::shared_ptr<ArtifactStore> retainedArtifacts;
     std::unique_ptr<SpatialState> spatial;
 };
@@ -125,6 +126,8 @@ public:
     uint64_t addSpatialOperation(SpatialOperation operation) const;
 
 private:
+    friend void setCompilerConfiguration(const std::string&, const std::string&,
+                                        const std::string&, const std::vector<std::string>&);
     void begin(const char* name);
     Session* session_ = nullptr;
     std::shared_ptr<Session> rootSession_;

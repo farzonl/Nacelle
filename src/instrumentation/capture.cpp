@@ -178,81 +178,125 @@ void Scope::setComputeVersion(uint64_t pipeline, uint32_t version, uint8_t tier,
 void Scope::setGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
                                uint8_t tier, Cache cache, const std::string& shaderId, EntryRole role,
                                const std::string& artifactId) {
-    if (!session_) return;
-    auto& session = *session_;
+    if (!session_)
+        return;
+    auto &session = *session_;
     std::lock_guard lock(session.metadataMutex);
-    auto& attributes = event_.attributes;
-    const auto key = std::make_tuple(pipeline, stage, role, version);
-    auto found = session.codeVersionIds.find(key);
-    if (found == session.codeVersionIds.end()) {
-        if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() == maxCodeVersions) {
-            session.shaderMetadataOverflow = true;
-            return;
-        }
-        const auto pipelineIt =
-            session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first;
-        const uint64_t id = session.shaders.codeVersions.size() + 1;
-        constexpr const char* caches[] = {"unknown", "hit", "miss"};
-        constexpr const char* stages[] = {
-            "unknown", "compute", "graphics", "vertex", "pixel", "mesh", "raytracing",
-            "geometry", "hull", "domain", "amplification"};
-        const char* stageName = stages[static_cast<unsigned>(stage)];
-        CodeVersion code{
-            id, pipelineIt->second, formatProfileHash(attributes.hashLo, attributes.hashHi),
-            stageName, attributes.simdWidth, version, tier, caches[static_cast<unsigned>(cache)]};
-        if (stage != Stage::Compute) {
-            code.entryRole = role == EntryRole::HullControlPoint ? "hull-control-point" :
-                             role == EntryRole::HullPatchConstant ? "hull-patch-constant" : stageName;
-            session.shaders.schemaVersion = 2;
-        }
-        if (!shaderId.empty()) code.shaderId = shaderId;
-        if (!artifactId.empty()) code.artifactId = artifactId;
-        if (code.shaderId || code.artifactId) session.shaders.schemaVersion = 2;
-        session.shaders.codeVersions.push_back(std::move(code));
-        found = session.codeVersionIds.emplace(key, id).first;
+    if (session.shaderMetadataOverflow)
+        return;
+    if ((!shaderId.empty() &&
+         (shaderId.size() != 64 || shaderId.find_first_not_of("0123456789abcdef") != std::string::npos)) ||
+        (!artifactId.empty() && (artifactId.size() != 64 ||
+                                 artifactId.find_first_not_of("0123456789abcdef") != std::string::npos))) {
+        session.shaderMetadataOverflow = true;
+        fail(E_INVALIDARG, "Profile shader/native identity is not a 64-character SHA-256 identity");
+        return;
     }
-    attributes.pipelineId = session.shaders.codeVersions[found->second - 1].pipelineId;
-    attributes.codeVersionId = found->second;
-    attributes.stage = stage;
-    attributes.tier = tier;
-    attributes.cache = cache;
-    for (auto selection = attributes.codeSelectionId; selection;
-         selection = session.codeSelectionParents[selection - 1]) {
-        auto& ids = session.shaders.codeSelections->at(selection - 1).codeVersionIds;
-        if (std::find(ids.begin(), ids.end(), found->second) == ids.end()) {
-            if (ids.size() == maxSelectionEntries) session.shaderMetadataOverflow = true;
-            else ids.push_back(found->second);
+    try {
+        auto &attributes = event_.attributes;
+        const auto key = std::make_tuple(pipeline, stage, role, version);
+        auto found = session.codeVersionIds.find(key);
+        if (found == session.codeVersionIds.end()) {
+            if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() ==
+                maxCodeVersions) {
+                session.shaderMetadataOverflow = true;
+                fail(E_FAIL, "Profile code-version/selection metadata limit exceeded");
+                return;
+            }
+            const auto pipelineIt =
+                session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first;
+            const uint64_t id = session.shaders.codeVersions.size() + 1;
+            constexpr const char *caches[] = {"unknown", "hit", "miss"};
+            constexpr const char *stages[] = {"unknown", "compute", "graphics",     "vertex",
+                                              "pixel",   "mesh",    "raytracing",   "geometry",
+                                              "hull",    "domain",  "amplification"};
+            const char *stageName = stages[static_cast<unsigned>(stage)];
+            CodeVersion code{id,
+                             pipelineIt->second,
+                             formatProfileHash(attributes.hashLo, attributes.hashHi),
+                             stageName,
+                             attributes.simdWidth,
+                             version,
+                             tier,
+                             caches[static_cast<unsigned>(cache)]};
+            if (stage != Stage::Compute) {
+                code.entryRole = role == EntryRole::HullControlPoint    ? "hull-control-point"
+                                 : role == EntryRole::HullPatchConstant ? "hull-patch-constant"
+                                                                        : stageName;
+                session.shaders.schemaVersion = 2;
+            }
+            if (!shaderId.empty())
+                code.shaderId = shaderId;
+            if (!artifactId.empty())
+                code.artifactId = artifactId;
+            if (code.shaderId || code.artifactId)
+                session.shaders.schemaVersion = 2;
+            session.shaders.codeVersions.push_back(std::move(code));
+            found = session.codeVersionIds.emplace(key, id).first;
         }
+        attributes.pipelineId = session.shaders.codeVersions[found->second - 1].pipelineId;
+        attributes.codeVersionId = found->second;
+        attributes.stage = stage;
+        attributes.tier = tier;
+        attributes.cache = cache;
+        for (auto selection = attributes.codeSelectionId; selection;
+             selection = session.codeSelectionParents[selection - 1]) {
+            auto &ids = session.shaders.codeSelections->at(selection - 1).codeVersionIds;
+            if (std::find(ids.begin(), ids.end(), found->second) == ids.end()) {
+                if (ids.size() == maxSelectionEntries) {
+                    session.shaderMetadataOverflow = true;
+                    fail(E_FAIL, "Profile graphics selection exceeds eight entries");
+                } else
+                    ids.push_back(found->second);
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        session.shaderMetadataOverflow = true;
+        session.metadataAllocationFailure = true;
+        fail(E_OUTOFMEMORY, "Could not retain profile code-version metadata; capture cannot be saved");
     }
 }
 
 void Scope::beginGraphicsSelection(uint64_t pipeline) {
-    if (!session_) return;
-    auto& session = *session_;
-    std::lock_guard lock(session.metadataMutex);
-    if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() == maxCodeVersions) {
-        session.shaderMetadataOverflow = true;
+    if (!session_)
         return;
+    auto &session = *session_;
+    std::lock_guard lock(session.metadataMutex);
+    if (session.shaderMetadataOverflow)
+        return;
+    try {
+        if (session.shaders.codeVersions.size() + session.codeSelectionParents.size() == maxCodeVersions) {
+            session.shaderMetadataOverflow = true;
+            fail(E_FAIL, "Profile code-version/selection metadata limit exceeded");
+            return;
+        }
+        const auto pipelineId =
+            session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first->second;
+        if (!session.shaders.codeSelections)
+            session.shaders.codeSelections.emplace();
+        const auto id = session.codeSelectionParents.size() + 1;
+        session.shaders.codeSelections->push_back({id, pipelineId, {}});
+        const auto parent = event_.attributes.codeSelectionId;
+        session.codeSelectionParents.push_back(
+            parent && session.shaders.codeSelections->at(parent - 1).pipelineId == pipelineId ? parent : 0);
+        session.shaders.schemaVersion = 2;
+        event_.attributes.pipelineId = pipelineId;
+        event_.attributes.codeVersionId = 0;
+        event_.attributes.codeSelectionId = id;
+    } catch (const std::bad_alloc &) {
+        session.shaderMetadataOverflow = true;
+        session.metadataAllocationFailure = true;
+        fail(E_OUTOFMEMORY, "Could not retain profile graphics selection; capture cannot be saved");
     }
-    const auto pipelineId = session.pipelineIds.try_emplace(pipeline, session.pipelineIds.size() + 1).first->second;
-    if (!session.shaders.codeSelections) session.shaders.codeSelections.emplace();
-    const auto id = session.codeSelectionParents.size() + 1;
-    session.shaders.codeSelections->push_back({id, pipelineId, {}});
-    const auto parent = event_.attributes.codeSelectionId;
-    session.codeSelectionParents.push_back(parent &&
-        session.shaders.codeSelections->at(parent - 1).pipelineId == pipelineId ? parent : 0);
-    session.shaders.schemaVersion = 2;
-    event_.attributes.pipelineId = pipelineId;
-    event_.attributes.codeVersionId = 0;
-    event_.attributes.codeSelectionId = id;
 }
 
-void Scope::observeGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version,
-                                   uint8_t tier, Cache cache, const std::string& shaderId, EntryRole role,
-                                   const std::string& artifactId) {
+void Scope::observeGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t version, uint8_t tier,
+                                   Cache cache, const std::string &shaderId, EntryRole role,
+                                   const std::string &artifactId) {
     const auto originalStage = attributes().stage;
     setGraphicsVersion(pipeline, stage, version, tier, cache, shaderId, role, artifactId);
-    if (!session_) return;
+    if (!session_)
+        return;
     event_.attributes.stage = originalStage;
     event_.attributes.codeVersionId = 0;
     event_.attributes.tier = 0;
@@ -260,23 +304,46 @@ void Scope::observeGraphicsVersion(uint64_t pipeline, Stage stage, uint32_t vers
 }
 Context captureContext() { return currentScope ? currentScope->context() : Context{}; }
 
-void setCompilerConfiguration(const std::string& hash, const std::string& triple,
-                              const std::string& cpu, const std::vector<std::string>& features) {
-    auto context = captureContext();
-    if (!context.work) return;
-    auto& session = *context.work->session;
+void setCompilerConfiguration(const std::string &hash, const std::string &triple, const std::string &cpu,
+                              const std::vector<std::string> &features) {
+    if (!currentScope)
+        return;
+    auto &session = *currentScope->session_;
     std::lock_guard lock(session.metadataMutex);
-    if (session.compilerConfigurationRecorded.load(std::memory_order_relaxed)) return;
-    session.compilerHash = hash;
-    session.targetTriple = triple;
-    session.cpu = cpu;
-    session.cpuFeatures = features;
-    session.compilerConfigurationRecorded.store(true, std::memory_order_release);
+    if (session.compilerConfigurationRecorded.load(std::memory_order_relaxed))
+        return;
+    if (session.shaderMetadataOverflow)
+        return;
+    size_t bytes = hash.size() + triple.size() + cpu.size();
+    for (const auto &feature : features) {
+        if (bytes > maxManifestBytes || feature.size() + 3 > maxManifestBytes - bytes) {
+            session.shaderMetadataOverflow = true;
+            fail(E_FAIL, "Profile compiler configuration exceeds the manifest format limit");
+            return;
+        }
+        bytes += feature.size() + 3;
+    }
+    if (bytes > maxManifestBytes) {
+        session.shaderMetadataOverflow = true;
+        fail(E_FAIL, "Profile compiler configuration exceeds the manifest format limit");
+        return;
+    }
+    try {
+        session.compilerHash = hash;
+        session.targetTriple = triple;
+        session.cpu = cpu;
+        session.cpuFeatures = features;
+        session.compilerConfigurationRecorded.store(true, std::memory_order_release);
+    } catch (const std::bad_alloc &) {
+        session.shaderMetadataOverflow = true;
+        session.metadataAllocationFailure = true;
+        fail(E_OUTOFMEMORY, "Could not retain profile compiler configuration; capture cannot be saved");
+    }
 }
 
 } // namespace nacelle::profile
 
-extern "C" HRESULT NacelleConfigureProfileSpatial(const NacelleProfileSpatialOptions* options) {
+extern "C" HRESULT NacelleConfigureProfileSpatial(const NacelleProfileSpatialOptions *options) {
     if (!options || options->struct_size != sizeof(*options) || options->version != 1 ||
         (options->flags & ~3u) || options->record_bytes < sizeof(nacelle::profile::SpatialRecord) ||
         options->record_bytes > 16ull * 1024 * 1024 || !options->sample_stride)
@@ -337,10 +404,13 @@ extern "C" HRESULT NacelleEndProfileCapture(
     summary->recorded_events = capture->session->eventCount;
     summary->dropped_events = capture->session->dropped.load();
     summary->complete = summary->dropped_events == 0 &&
+        !capture->session->shaderMetadataOverflow &&
         (!capture->session->spatial || capture->session->spatial->complete());
     if (capture->session->spatial && !capture->session->spatial->complete())
         std::fprintf(stderr, "[NacelleProfile] Spatial observations incomplete; inspect spatial drop counters\n");
     std::string error;
+    if (capture->session->metadataAllocationFailure)
+        return fail(E_OUTOFMEMORY, "Profile metadata allocation failed; begin a new capture");
     try {
         if (!nacelle::profile::writeProfile(path, *capture->session, error))
             return fail(E_FAIL, error.c_str());

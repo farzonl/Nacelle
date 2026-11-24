@@ -644,6 +644,32 @@ int main(int argc, char** argv) {
                     "Concurrent callers publish one consistent compiler configuration");
         }
         {
+            for (unsigned mode = 0; mode < 3; ++mode) {
+                Capture capture;
+                capture.begin();
+                {
+                    nacelle::profile::Scope root("Metadata allocation failure");
+                    const auto pipeline = nacelle::profile::allocatePipelineIdentity();
+                    const std::string compiler(128, 'c');
+                    allocationFailureMinimum = 1;
+                    if (mode == 0)
+                        root.setComputeVersion(pipeline, 1, 1, nacelle::profile::Cache::Miss);
+                    else if (mode == 1)
+                        root.beginGraphicsSelection(pipeline);
+                    else
+                        nacelle::profile::setCompilerConfiguration(compiler, "triple", "cpu", {});
+                    allocationFailureMinimum = 0;
+                    nacelle::profile::Scope child("Work continues after metadata failure");
+                }
+                NacelleProfileSummary summary;
+                const auto path = directory / ("metadata-allocation-" + std::to_string(mode) + ".nacelle-profile");
+                require(NacelleEndProfileCapture(capture.value, path.string().c_str(), &summary) == E_OUTOFMEMORY &&
+                        !summary.complete && summary.recorded_events == 2 && summary.dropped_events == 0 &&
+                        !std::filesystem::exists(path),
+                        "Metadata allocation loss preserves execution/counts but cannot save a successful capture");
+            }
+        }
+        {
             Capture cancelled;
             cancelled.begin();
             NACELLE_PROFILE_SCOPE("Cancelled event");
@@ -719,6 +745,27 @@ int main(int argc, char** argv) {
             std::ifstream input(exported, std::ios::binary);
             require(decoded == std::string(std::istreambuf_iterator<char>(input), {}),
                     "Lazy trace bytes match ordinary typed Trace serialization exactly");
+        }
+        {
+            nacelle::profile::Session session(sizeof(nacelle::profile::Event));
+            const std::string controls = "\b\f\n\r\t";
+            session.cpuFeatures = {controls + "\"\\", "utf8-\xc3\xa9"};
+            session.wait();
+            const auto path = directory / std::filesystem::path(u8"capture-\u03bb.nacelle-profile");
+            const auto text = path.u8string();
+            const std::string utf8(text.begin(), text.end());
+            std::string error;
+            const bool written = nacelle::profile::writeProfile(utf8, session, error);
+            require(written, error.c_str());
+            nacelle::profile::Profile profile;
+            require(nacelle::profile::readProfile(utf8, profile, error) &&
+                    profile.manifest.build.cpuFeatures == session.cpuFeatures,
+                    "Bounded JSON counts supported escapes and preserves Unicode output paths");
+            session.cpuFeatures.emplace_back(1, '\x01');
+            const auto invalid = directory / "invalid-controls.nacelle-profile";
+            require(!nacelle::profile::writeProfile(invalid.string(), session, error) &&
+                    !std::filesystem::exists(invalid),
+                    "Unsupported Glaze control characters are rejected before allocation or output");
         }
         {
             constexpr uint64_t manifestLimit = 1024 * 1024;

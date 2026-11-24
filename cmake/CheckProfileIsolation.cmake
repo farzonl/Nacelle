@@ -27,7 +27,7 @@ execute_process(COMMAND "${CMAKE_COMMAND}" --build "${BUILD_DIR}" --target help
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "Cannot inspect OFF build targets: ${error}")
 endif()
-if(targets MATCHES "nacelle_profile_|nacelle-replay|replay_runtime|replay_format|profile-zstd|profile-glaze|CLI11")
+if(targets MATCHES "nacelle_profile_|nacelle-replay|replay_runtime|replay_format|profile_memory_test|profile_writer_diagnostics|profile-zstd|profile-glaze|CLI11")
     message(FATAL_ERROR "Profiling support targets leaked into the OFF build")
 endif()
 
