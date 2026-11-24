@@ -210,6 +210,29 @@ describe('offline viewer DOM', () => {
     expect(document.querySelector('#mode-badge')!.textContent).toBe('Offline');
   });
 
+  it('uses host decode/save hooks and surfaces rejected exports without a browser download', async () => {
+    const loaded = await profile();
+    const decode = vi.fn(async () => loaded);
+    const save = vi.fn().mockRejectedValueOnce(new Error('Write permission denied')).mockResolvedValueOnce(undefined);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const viewer = mountViewer(document, undefined, { decodeFile: decode, saveFile: save });
+    try {
+      await viewer.openSource('selected.nacelle-profile', async () => new Blob(['selected bytes']));
+      expect(decode).toHaveBeenCalledOnce();
+      await expect(viewer.exportTrace()).rejects.toThrow('Write permission denied');
+      expect(document.querySelector('#export-status')!.textContent).toContain('Write permission denied');
+      await viewer.exportTrace();
+      expect(save.mock.calls[1][0].size).toBe(loaded.traceBytes.byteLength);
+      expect(save.mock.calls[1][1]).toBe('nacelle-trace.json');
+      expect(click).not.toHaveBeenCalled();
+    } finally {
+      viewer.dispose();
+      click.mockRestore();
+      consoleError.mockRestore();
+    }
+  });
+
   it('preloads benchmark shader profiles and switches between shaders when enabled', async () => {
     const raymarch = await profile([span({ name: 'Raymarch dispatch', ts: 10, dur: 50 })]);
     const matmul = await profile([span({ name: 'MatMul dispatch', ts: 20, dur: 80 })]);

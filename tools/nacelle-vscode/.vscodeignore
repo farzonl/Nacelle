@@ -1,0 +1,10 @@
+src/**
+test/**
+scripts/**
+node_modules/**
+package-lock.json
+tsconfig.json
+*.vsix
+.vscode-test/**
+dist/policy-test.cjs
+dist/smoke-suite.cjs

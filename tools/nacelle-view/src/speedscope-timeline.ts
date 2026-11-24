@@ -10,6 +10,8 @@ import type {
 export interface SpeedscopeTimelineOptions {
   /** Relative URL to the locally bundled Speedscope entry page. */
   baseUrl?: string;
+  frameHtml?: string;
+  frameNonce?: string;
 }
 
 export class SpeedscopeTimelineView implements TimelineView {
@@ -20,6 +22,8 @@ export class SpeedscopeTimelineView implements TimelineView {
   };
 
   private readonly baseUrl: string;
+  private readonly frameHtml: string | undefined;
+  private readonly frameNonce: string | undefined;
   private container: HTMLElement | null = null;
   private iframe: HTMLIFrameElement | null = null;
   private messageEl: HTMLElement | null = null;
@@ -27,6 +31,8 @@ export class SpeedscopeTimelineView implements TimelineView {
 
   constructor(options: SpeedscopeTimelineOptions = {}) {
     this.baseUrl = options.baseUrl ?? './speedscope/index.html';
+    this.frameHtml = options.frameHtml;
+    this.frameNonce = options.frameNonce;
   }
 
   mount(container: HTMLElement, _callbacks?: TimelineViewCallbacks): void {
@@ -70,7 +76,25 @@ export class SpeedscopeTimelineView implements TimelineView {
       this.messageEl.hidden = true;
       this.iframe.hidden = false;
       // Assign via src with unique blob URL so Speedscope reloads cleanly on every profile/filter update.
-      this.iframe.src = `${this.baseUrl}#${hash}`;
+      if (this.frameHtml && this.frameNonce) {
+        // srcdoc keeps the host's blob origin; VS Code asset iframes cannot read it.
+        const initialize = `<script nonce="${this.frameNonce}">location.hash=${JSON.stringify(`title=${encodeURIComponent(input.title)}`)};</script>`;
+        this.iframe.onload = () => {
+          try {
+            const file = this.iframe?.contentDocument?.querySelector<HTMLInputElement>('input[type="file"]');
+            requireValid(file, 'Embedded Speedscope file import is unavailable.');
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], `${input.title}.speedscope.json`, { type: 'application/json' }));
+            file.files = transfer.files;
+            file.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch (error) {
+            this.showMessage(`Embedded flamegraph import failed: ${String(error)}. The span tables and Chrome export remain available.`);
+          }
+        };
+        this.iframe.srcdoc = this.frameHtml.replace('<head>', `<head>${initialize}`);
+      } else {
+        this.iframe.src = `${this.baseUrl}#${hash}`;
+      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'Unable to render flamegraph.';
       this.showMessage(`Flamegraph unavailable for this selection: ${reason} The span tables and Chrome trace export remain available below.`);
@@ -80,8 +104,10 @@ export class SpeedscopeTimelineView implements TimelineView {
   clear(): void {
     this.revokeBlob();
     if (this.iframe) {
+      this.iframe.onload = null;
       this.iframe.hidden = true;
       this.iframe.removeAttribute('src');
+      this.iframe.removeAttribute('srcdoc');
     }
     if (this.messageEl) {
       this.messageEl.hidden = true;
@@ -99,8 +125,10 @@ export class SpeedscopeTimelineView implements TimelineView {
 
   private showMessage(text: string): void {
     if (this.iframe) {
+      this.iframe.onload = null;
       this.iframe.hidden = true;
       this.iframe.removeAttribute('src');
+      this.iframe.removeAttribute('srcdoc');
     }
     if (this.messageEl) {
       this.messageEl.textContent = text;

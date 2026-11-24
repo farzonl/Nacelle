@@ -1,0 +1,89 @@
+{
+  "name": "nacelle-vscode",
+  "displayName": "Nacelle Profiles and Shader Debugging",
+  "description": "Local profile viewing and established LLDB shader debugging for Nacelle.",
+  "version": "0.1.0",
+  "publisher": "nacelle",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/farzonl/Nacelle" },
+  "engines": { "vscode": "^1.106.0" },
+  "extensionKind": ["workspace"],
+  "categories": ["Debuggers", "Visualization"],
+  "main": "./dist/extension.js",
+  "activationEvents": ["onCustomEditor:nacelle.profile", "onDebug:nacelle-lldb"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Read-only profile viewing is supported; debugger execution and exports require trust."
+    },
+    "virtualWorkspaces": { "supported": false }
+  },
+  "contributes": {
+    "customEditors": [{
+      "viewType": "nacelle.profile",
+      "displayName": "Nacelle Profile",
+      "selector": [{ "filenamePattern": "*.nacelle-profile" }],
+      "priority": "default"
+    }],
+    "commands": [
+      { "command": "nacelle.exportTrace", "title": "Nacelle: Export Viewed Chrome Trace" },
+      { "command": "nacelle.debugCapabilities", "title": "Nacelle: Show Debugger Capabilities" },
+      { "command": "nacelle.hlslLocation", "title": "Nacelle: Inspect HLSL Source Location" },
+      { "command": "nacelle.hlslLane", "title": "Nacelle: Inspect HLSL Lane" },
+      { "command": "nacelle.hlslValues", "title": "Nacelle: Inspect HLSL Values and Code Version" },
+      { "command": "nacelle.hlslStep", "title": "Nacelle: Step Selected HLSL Invocation" },
+      { "command": "nacelle.hlslContinue", "title": "Nacelle: Continue HLSL Observation" },
+      { "command": "nacelle.hlslCancel", "title": "Nacelle: Cancel HLSL Observation and Resume" }
+    ],
+    "configuration": {
+      "title": "Nacelle",
+      "properties": {
+        "nacelle.debug.lldbDapPath": {
+          "type": "string", "default": "lldb-dap", "scope": "machine",
+          "description": "Standard lldb-dap executable on the extension host. Debugging requires workspace trust."
+        }
+      }
+    },
+    "debuggers": [{
+      "type": "nacelle-lldb",
+      "label": "Nacelle (standard lldb-dap)",
+      "languages": ["cpp", "hlsl"],
+      "configurationAttributes": {
+        "launch": {
+          "required": ["program"],
+          "properties": {
+            "program": { "type": "string", "description": "Application explicitly configured for Nacelle native/HLSL debugging." },
+            "args": { "type": "array", "items": { "type": "string" }, "default": [] },
+            "cwd": { "type": "string" },
+            "disableASLR": { "type": "boolean", "default": false, "description": "Explicitly request disabling target-process ASLR. By default the adapter preserves ASLR." },
+            "env": { "type": "object", "additionalProperties": { "type": "string" } },
+            "mode": { "type": "string", "enum": ["native", "hlsl", "optimized-hlsl"], "default": "native" },
+            "initCommands": { "type": "array", "items": { "type": "string" }, "default": [] },
+            "preRunCommands": { "type": "array", "items": { "type": "string" }, "default": [] }
+          }
+        }
+      },
+      "configurationSnippets": [{
+        "label": "Nacelle native shader launch",
+        "body": { "type": "nacelle-lldb", "request": "launch", "name": "Nacelle shader", "program": "^\"${workspaceFolder}/path/to/application\"", "mode": "native", "args": [] }
+      }]
+    }]
+  },
+  "scripts": {
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "test": "node --test dist/policy-test.cjs",
+    "test:smoke": "node test/smoke.mjs",
+    "package": "vsce package --no-dependencies --skip-license",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "@types/node": "22.15.30",
+    "@types/vscode": "1.106.0",
+    "@vscode/test-electron": "2.5.2",
+    "@vscode/vsce": "3.6.2",
+    "esbuild": "0.25.5",
+    "typescript": "5.9.3"
+  }
+}

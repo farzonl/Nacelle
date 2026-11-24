@@ -7,6 +7,9 @@ trace JSON (timestamps/durations in **microseconds**, despite manifest clock
 timestamps being specified in nanoseconds). No replay or custom flamegraph.
 Empty shader metadata and empty traces are supported.
 
+The optional [VS Code integration](../nacelle-vscode/README.md) embeds this same
+frontend in a read-only profile editor with explicit export permissions.
+
 ## Local filters and Speedscope export
 
 Apply process/thread, case-insensitive PSO-substring, stage and optional

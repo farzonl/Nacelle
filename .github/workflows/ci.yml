@@ -546,7 +546,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y lldb
+          sudo apt-get install -y lldb xvfb
           lldb --version
 
       - name: Configure instrumented capture tests
@@ -624,6 +624,23 @@ jobs:
       - name: Build profile viewer
         working-directory: tools/nacelle-view
         run: npm run build
+
+      - name: Build, test and package optional VS Code integration
+        run: |
+          npm ci --prefix tools/nacelle-vscode
+          npm run build --prefix tools/nacelle-vscode
+          npm test --prefix tools/nacelle-vscode
+          npm run package --prefix tools/nacelle-vscode
+
+      - name: Test real VS Code editor and shader DAP integration
+        if: runner.os == 'Linux'
+        env:
+          NACELLE_EXTENSION_DEBUG_PROGRAM: "${{ github.workspace }}/build-profile/tests/profile_runtime_static_test"
+          NACELLE_EXTENSION_PROFILE_READER: "${{ github.workspace }}/build-profile/tools/nacelle-dbg/nacelle-dbg"
+          LD_LIBRARY_PATH: "${{ github.workspace }}/build-profile:${{ github.workspace }}/.sdk/lib:${{ github.workspace }}/.toolchains/llvm/lib"
+        run: |
+          xvfb-run -a npm run test:smoke --prefix tools/nacelle-vscode
+          NACELLE_EXTENSION_SMOKE_UNTRUSTED=1 xvfb-run -a npm run test:smoke --prefix tools/nacelle-vscode
 
       - name: Verify profile viewer staging
         working-directory: tools/nacelle-view

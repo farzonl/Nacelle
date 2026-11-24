@@ -1,5 +1,9 @@
 # Offline profiling and local shader debugging
 
+The optional [VS Code integration](../nacelle-vscode/README.md) reuses standard
+`lldb-dap` and the source-debug aliases below; it does not add a runtime or network
+debugger service.
+
 ## HLSL source and lane inspection (Linux x86_64, LLDB)
 
 Source debugging is separately opt-in, requires the native-debug build described
