@@ -43,6 +43,13 @@ inline void parallelForDynamic(BS::thread_pool<>& pool, IndexT count, Fn&& fn) {
     if (count == 0) return;
     const size_t poolThreads = pool.get_thread_count();
     if (count == 1 || poolThreads <= 1) {
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+        std::optional<profile::Scope> workerProfile;
+        if (profile::cpuCountersRequested(profile::CpuCounterRegion::PixelWorker)) {
+            workerProfile.emplace("Raster worker");
+            workerProfile->startCounters(profile::CpuCounterRegion::PixelWorker);
+        }
+#endif
         for (IndexT i = 0; i < count; ++i) {
             fn(i);
         }
@@ -57,6 +64,9 @@ inline void parallelForDynamic(BS::thread_pool<>& pool, IndexT count, Fn&& fn) {
     auto workerLoop = [&]() {
 #if defined(NACELLE_ENABLE_INSTRUMENTATION)
         profile::Scope workerProfile(workerContext, "Raster worker");
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+        workerProfile.startCounters(profile::CpuCounterRegion::PixelWorker);
+#endif
 #endif
         while (true) {
             IndexT begin = nextIdx.fetch_add(grain, std::memory_order_relaxed);

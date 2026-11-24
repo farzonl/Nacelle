@@ -566,6 +566,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNACELLE_FETCH_SDL3=OFF \
             -DNACELLE_ENABLE_INSTRUMENTATION=ON \
+            -DNACELLE_ENABLE_CPU_COUNTERS=ON \
             -DNACELLE_BUILD_PROFILE_TOOLS=ON \
             -DNACELLE_BUILD_PROFILE_TESTS=ON \
             -DNACELLE_CLANGXX="${{ github.workspace }}/.toolchains/llvm/bin/clang++${{ matrix.exe }}" \
@@ -579,7 +580,7 @@ jobs:
       - name: Build instrumented capture tests
         run: |
           cmake --build build-profile --target \
-            instrumentation_test profile_memory_test replay_format_test replay_runtime_static_test replay_runtime_shared_test \
+            instrumentation_test profile_memory_test cpu_counter_provider_test cpu_counter_capture_test replay_format_test replay_runtime_static_test replay_runtime_shared_test \
             profile_runtime_static_test profile_runtime_shared_test nacelle-dbg nacelle-replay \
             compute_dispatch_test interlocked_barrier_test \
             rasterizer_pipeline_test graphics_features_test \
@@ -597,7 +598,23 @@ jobs:
             export PATH="$PWD/build-profile:$PWD/.sdk/bin/x64:$PWD/.sdk/openblas/bin:$PWD/.toolchains/llvm/bin:$PATH"
           fi
           ctest --test-dir build-profile --no-tests=error \
-            -R '^(instrumentation_test|profile_memory_.*test|profile_overhead_harness_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
+            -R '^(instrumentation_test|cpu_counter_.*test|profile_memory_.*test|profile_overhead_harness_test|native_debug_.*test|source_debug_.*test|replay_format_test|replay_cli_test|replay_runtime_.*_test|profile_runtime_.*_test|spatial_.*_test)$' --output-on-failure
+
+      - name: Verify counter capability OFF preserves ordinary profiling
+        run: |
+          args=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            args+=(
+              "-DCMAKE_C_COMPILER=$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe"
+              "-DCMAKE_CXX_COMPILER=$GITHUB_WORKSPACE/.toolchains/llvm/bin/clang-cl.exe"
+            )
+          fi
+          cmake -S tools/nacelle-dbg -B build-counter-disabled -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DNACELLE_BUILD_PROFILE_TESTS=ON \
+            -DNACELLE_ENABLE_CPU_COUNTERS=OFF "${args[@]}"
+          cmake --build build-counter-disabled --target instrumentation_test cpu_counter_provider_test --parallel
+          ctest --test-dir build-counter-disabled --no-tests=error \
+            -R '^(instrumentation_test|cpu_counter_provider_test)$' --output-on-failure
 
       - name: Set up Node for native profile interoperability
         uses: actions/setup-node@v4
@@ -619,6 +636,7 @@ jobs:
           NACELLE_NATIVE_READER: "${{ github.workspace }}/build-profile/tools/nacelle-dbg/nacelle-dbg${{ matrix.exe }}"
           NACELLE_NATIVE_ARTIFACT_PROFILE: "${{ github.workspace }}/build-profile/tests/static-artifacts-source.nacelle-profile"
           NACELLE_NATIVE_SPATIAL_PROFILE: "${{ github.workspace }}/build-profile/tests/static-spatial-dense-simd8.nacelle-profile"
+          NACELLE_NATIVE_COUNTER_PROFILE: "${{ github.workspace }}/build-profile/tests/counters-static-tier1.nacelle-profile"
         run: npm test
 
       - name: Build profile viewer

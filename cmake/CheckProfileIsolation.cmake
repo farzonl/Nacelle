@@ -7,8 +7,8 @@ foreach(input BUILD_DIR LIBRARY_FILE NM_TOOL)
 endforeach()
 
 file(STRINGS "${BUILD_DIR}/CMakeCache.txt" profile_options
-    REGEX "^NACELLE_(ENABLE_INSTRUMENTATION|BUILD_PROFILE_(TOOLS|TESTS)):BOOL=")
-foreach(option NACELLE_ENABLE_INSTRUMENTATION NACELLE_BUILD_PROFILE_TOOLS NACELLE_BUILD_PROFILE_TESTS)
+    REGEX "^NACELLE_(ENABLE_(INSTRUMENTATION|CPU_COUNTERS)|BUILD_PROFILE_(TOOLS|TESTS)):BOOL=")
+foreach(option NACELLE_ENABLE_INSTRUMENTATION NACELLE_ENABLE_CPU_COUNTERS NACELLE_BUILD_PROFILE_TOOLS NACELLE_BUILD_PROFILE_TESTS)
     if(NOT "${option}:BOOL=OFF" IN_LIST profile_options)
         message(FATAL_ERROR "Profile isolation check requires ${option}=OFF")
     endif()
@@ -18,7 +18,7 @@ if(NOT EXISTS "${BUILD_DIR}/compile_commands.json")
     message(FATAL_ERROR "Profile isolation check requires CMAKE_EXPORT_COMPILE_COMMANDS=ON")
 endif()
 file(READ "${BUILD_DIR}/compile_commands.json" compile_commands)
-if(compile_commands MATCHES "NACELLE_ENABLE_INSTRUMENTATION|nacelle_profile_|native_debug|source_debug|replay_(capture|execute|shader|format)|profile-zstd|profile-glaze")
+if(compile_commands MATCHES "NACELLE_ENABLE_(INSTRUMENTATION|CPU_COUNTERS)|cpu_counter|profile_counters|nacelle_profile_|native_debug|source_debug|replay_(capture|execute|shader|format)|profile-zstd|profile-glaze")
     message(FATAL_ERROR "Instrumentation definitions or support sources leaked into the OFF build")
 endif()
 
@@ -27,7 +27,7 @@ execute_process(COMMAND "${CMAKE_COMMAND}" --build "${BUILD_DIR}" --target help
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "Cannot inspect OFF build targets: ${error}")
 endif()
-if(targets MATCHES "nacelle_profile_|nacelle-replay|replay_runtime|replay_format|profile_memory_test|profile_writer_diagnostics|profile-zstd|profile-glaze|CLI11")
+if(targets MATCHES "cpu_counter|nacelle_profile_|nacelle-replay|replay_runtime|replay_format|profile_memory_test|profile_writer_diagnostics|profile-zstd|profile-glaze|CLI11")
     message(FATAL_ERROR "Profiling support targets leaked into the OFF build")
 endif()
 

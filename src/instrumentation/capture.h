@@ -14,6 +14,9 @@
 #include "profile_format.h"
 #include "artifacts.h"
 #include "spatial.h"
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+#include "profile_counters.h"
+#endif
 
 namespace nacelle::profile {
 
@@ -80,6 +83,9 @@ struct Session {
     bool metadataAllocationFailure = false;
     std::shared_ptr<ArtifactStore> retainedArtifacts;
     std::unique_ptr<SpatialState> spatial;
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    std::unique_ptr<CounterState> counters;
+#endif
 };
 
 struct Work {
@@ -124,6 +130,10 @@ public:
     Context context() const;
     SpatialState* spatial() const { return session_ ? session_->spatial.get() : nullptr; }
     uint64_t addSpatialOperation(SpatialOperation operation) const;
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    void startCounters(CpuCounterRegion region);
+    bool countersEnabled() const { return session_ && session_->counters != nullptr; }
+#endif
 
 private:
     friend void setCompilerConfiguration(const std::string&, const std::string&,
@@ -135,9 +145,16 @@ private:
     bool ownsWork_ = false;
     Event event_;
     Scope* previous_ = nullptr;
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+    CpuCounterGroup counterGroup_;
+    CounterRecord* counterRecord_ = nullptr;
+#endif
 };
 
 Context captureContext();
+#if defined(NACELLE_ENABLE_CPU_COUNTERS)
+bool cpuCountersRequested(CpuCounterRegion region);
+#endif
 void setCompilerConfiguration(const std::string& hash, const std::string& triple,
                               const std::string& cpu, const std::vector<std::string>& features);
 

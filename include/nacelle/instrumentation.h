@@ -11,6 +11,13 @@
 
 struct NacelleProfileCapture;
 
+struct NacelleProfileCounterOptions {
+    uint32_t struct_size = sizeof(NacelleProfileCounterOptions);
+    uint32_t version = 1;
+    uint32_t flags = 0; // Bit 0 enables user-mode cycles/instructions for supported regions.
+    uint64_t record_bytes = 8ull * 1024 * 1024;
+};
+
 enum NacelleProfileSpatialFlags : uint32_t {
     NACELLE_PROFILE_SPATIAL_COMPUTE = 1,
     NACELLE_PROFILE_SPATIAL_PIXEL = 2,
@@ -57,6 +64,9 @@ struct NacelleProfileSummary {
 
 // End/Destroy must be called outside captured work, and serialized for each handle.
 extern "C" {
+// Configure before Begin; requested unavailable counters preserve wall-time data and make End incomplete.
+NACELLE_PROFILE_API HRESULT NacelleConfigureProfileCounters(
+    const NacelleProfileCounterOptions* options);
 // Configure before Begin. Selection limits observation only, never shader execution.
 NACELLE_PROFILE_API HRESULT NacelleConfigureProfileSpatial(
     const NacelleProfileSpatialOptions* options);

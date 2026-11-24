@@ -315,6 +315,17 @@ through the data-source boundary; shader/code-view panes are not implemented.
 See the [native format guide](../nacelle-dbg/README.md#compute-entry-metadata) for
 identity, promotion, privacy and old-reader compatibility rules.
 
+Opt-in CPU-counter captures use manifest v4 and checksummed `counters.json`,
+with optional artifact/spatial payloads alongside the ordinary trace. The typed
+`Profile.counters` boundary validates provider, units, scope, sampling/scaling,
+availability, budgets/counts, exact event/code/region references and combined
+completeness. Raw uint64 counts/times are decimal strings, not lossy JS numbers;
+enabled/running times expose multiplexing without silently estimated metrics.
+The existing summary shows status/native errors and the first eight records.
+Unavailable counters keep wall-time spans visible with an incomplete warning.
+Linux provider access is optional; other platforms explicitly report unsupported.
+See [counter limitations and acceptance](../nacelle-dbg/README.md#optional-cpu-hardware-counters).
+
 Limits (reject rather than silently truncate): 256 MiB archive, 16 ZIP entries,
 1 MiB manifest, 256 MiB decoded per entry / zstd window, 256 MiB decoded total,
 1,000,000 trace events, 65,536 code-version/selection records combined, and eight
