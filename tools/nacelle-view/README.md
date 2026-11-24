@@ -208,7 +208,8 @@ Exported traces may contain sensitive application data; keep them private.
 
 All three existing Pages publishers build/test and stage this viewer before
 their existing Pages artifact upload. Staging copies only `dist/index.html` and
-bundled JS/CSS assets, not captures, examples, source, or arbitrary build output.
+allowlisted hashed viewer, worker and optional editor-host JS/CSS assets, plus
+bundled Speedscope files; not captures, examples, source, or arbitrary build output.
 Do not put production profiles in `pages/` or any published artifact directory.
 There is no additional deployment workflow.
 
