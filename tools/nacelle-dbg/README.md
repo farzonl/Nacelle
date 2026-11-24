@@ -344,11 +344,13 @@ The first real provider uses Linux `perf_event_open`: a fresh grouped
 cycles/instructions pair for the calling thread, `cpu=-1`, no inheritance,
 kernel/hypervisor excluded, close-on-exec handles. Windows/macOS currently
 report `unsupported-provider`; they do not approximate hardware metrics with
-wall time. No sudo, capabilities, sysctls, process-wide/system-wide observation,
-sampling interrupts, custom kernel instrumentation or network access is used.
+wall time. The library never invokes sudo, changes capabilities/sysctls, or uses
+process-wide/system-wide observation, sampling interrupts, custom kernel
+instrumentation or network access.
 Opening fails explicitly on restricted/virtualized hosts. This shared Linux
-host denies collection (`permission-denied`, native error13); no permissions
-were changed.
+host denies unprivileged collection (`permission-denied`, native error13).
+An explicitly authorized administrative validation run collected real counters;
+no host-wide permission settings or persistent capabilities were changed.
 
 Coverage is outermost eligible compute-worker/pixel-raster-worker regions and
 the actual direct/single-group compute region, including the calling thread
@@ -404,8 +406,13 @@ compute/graphics tier1/promoted/cached/disk tests preserve shader outputs and
 exact worker coverage; a tiled-GEMM test exercises actual direct compute
 plus spatial/counter payload composition. `cpu_counter_real_provider_test`
 requires genuinely positive hardware metrics; exit77 is an explicit CTest skip
-on unavailable hosts, **not** acceptance. A suitable-host run and available-
-provider overhead evidence remain required before #224 can close.
+on unavailable hosts, **not** acceptance. An explicitly authorized Linux run
+verified all16 static/shared compute/pixel tier1/promoted/cached/disk captures
+and the direct-GEMM/spatial capture:284 positive hardware readings, exact native
+event/code-version validation, zero drops/unavailable records and no reported
+multiplexing. This validates the administrative test context, not successful
+unprivileged access under this host's unchanged policy. See the
+[hardware acceptance evidence](https://github.com/farzonl/Nacelle/issues/224).
 
 Counter-specific diagnostic reproduction:
 
@@ -436,6 +443,29 @@ requested captures had1024 explicitly unavailable counter records. Small
 negative phase differences are noise, not speedup claims. The observed~4.5%
 overall increase and larger save cost are **denied-provider** diagnostics only,
 not an available-provider budget or controlled-host acceptance.
+
+Available-provider observation using the same GNU13.3 Release synthetic fixture,
+an explicitly authorized administrative process,1MiB counter pool and24 pairs:
+
+| Median phase | Counter-disabled | Available provider |
+| --- | ---: | ---: |
+| Counter pool allocation |20ns|30.2us|
+| Summed per-region setup |22.1us|12.463ms|
+| Summed region body |7.503ms|7.501ms|
+| Summed finish/ordinary recording |57.3us|6.371ms|
+| Overall region execution |7.638ms|26.385ms|
+| Serialized save |1.270ms|2.366ms|
+
+All48 archives again had1025 events and equal checksums; all24 requested captures
+had complete counters and zero unavailable records. Paired geometric whole-region
+overhead was242.89%, with a seeded10000-resample paired-bootstrap95% interval
+of239.76% to245.58%. Raw observations are available in the
+[measurement evidence](https://github.com/farzonl/Nacelle/issues/224#issuecomment-7123128670).
+Fresh per-region counter groups are expensive for these roughly7us bodies;
+this optional mode is not a low-overhead choice for short regions. Setup/finish,
+not a demonstrated body speedup, account for the dominant increase. The result
+is **not** pure shader timing, whole-process coverage, or certification of #211's
+coarse-recorder <=5% budget, which remains a separate counter-disabled measurement.
 
 The benchmark worker offers an explicit capture path in instrumented builds:
 
