@@ -100,7 +100,7 @@ export async function run(): Promise<void> {
     await session.customRequest('stepIn', { threadId: stopped.thread, granularity: 'instruction' });
     await until(() => Boolean(stopped && stopped.sequence > first), 'real shader instruction step');
     assert.ok(stopped);
-    await session.customRequest('evaluate', { expression: 'breakpoint disable', context: 'repl' });
+    await session.customRequest('evaluate', { expression: 'breakpoint modify --auto-continue true 1', context: 'repl' });
     await session.customRequest('continue', { threadId: stopped.thread, singleThread: false });
     await until(() => exited, 'native workload completion');
     assert.match(output, /NATIVE DEBUG OUTPUT PASS/);
@@ -119,7 +119,10 @@ export async function run(): Promise<void> {
       await vscode.commands.executeCommand('nacelle.hlslValues');
       await writeFile(join(work, 'stage.json'), JSON.stringify({ stage: 'source', mode }));
       await vscode.commands.executeCommand('nacelle.hlslLocation');
-      assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, process.env.NACELLE_EXTENSION_SOURCE_FILE);
+      assert.equal(
+        vscode.window.activeTextEditor?.document.uri.fsPath,
+        vscode.Uri.file(process.env.NACELLE_EXTENSION_SOURCE_FILE ?? '').fsPath,
+      );
       await writeFile(join(work, 'stage.json'), JSON.stringify({ stage: 'lane', mode }));
       await vscode.commands.executeCommand('nacelle.hlslLane');
       await writeFile(join(work, 'stage.json'), JSON.stringify({ stage: 'debug', mode }));

@@ -495,6 +495,11 @@ llvm::Expected<llvm::orc::JITTargetMachineBuilder> createHostJTMB(llvm::CodeGenO
     const CachedHostTargetInfo& info = getCachedHostTargetInfo();
     auto jtmbOrErr = llvm::orc::JITTargetMachineBuilder::detectHost();
     if (!jtmbOrErr) return jtmbOrErr;
+#if defined(NACELLE_ENABLE_INSTRUMENTATION) && defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    if (native_debug::enabled()) {
+        jtmbOrErr->getTargetTriple().setObjectFormat(llvm::Triple::ELF);
+    }
+#endif
     jtmbOrErr->setCodeGenOptLevel(optLevel);
     if (!info.cpu.empty()) {
         jtmbOrErr->setCPU(info.cpu);
@@ -1942,6 +1947,8 @@ bool jitCompileComputeTier1AndScheduleTier2(
             return false;
         }
         llvm::orc::JITDylib& jd = *jdOrErr;
+        llvmMod->setTargetTriple(rt.jit->getTargetTriple());
+        llvmMod->setDataLayout(rt.jit->getDataLayout());
         if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
             outError = llvm::toString(std::move(err));
             return false;
@@ -2084,6 +2091,8 @@ bool jitCompileGraphicsTier1AndScheduleTier2(
             return false;
         }
         llvm::orc::JITDylib& jd = *jdOrErr;
+        llvmMod->setTargetTriple(rt.jit->getTargetTriple());
+        llvmMod->setDataLayout(rt.jit->getDataLayout());
         if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
             outError = llvm::toString(std::move(err));
             return false;
@@ -2278,6 +2287,8 @@ bool jitCompileVertexStageTier1AndScheduleTier2(
                 return false;
             }
             llvm::orc::JITDylib& jd = *jdOrErr;
+            llvmMod->setTargetTriple(rt.jit->getTargetTriple());
+            llvmMod->setDataLayout(rt.jit->getDataLayout());
             if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
                 outError = llvm::toString(std::move(err));
                 return false;
@@ -2433,6 +2444,8 @@ bool jitCompilePixelStageTier1AndScheduleTier2(
             return false;
         }
         llvm::orc::JITDylib& jd = *jdOrErr;
+        llvmMod->setTargetTriple(rt.jit->getTargetTriple());
+        llvmMod->setDataLayout(rt.jit->getDataLayout());
         if (auto err = rt.jit->addIRModule(jd, llvm::orc::ThreadSafeModule(std::move(llvmMod), std::move(llvmCtx)))) {
             outError = llvm::toString(std::move(err));
             return false;

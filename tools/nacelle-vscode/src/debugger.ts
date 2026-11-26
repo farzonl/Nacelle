@@ -41,9 +41,15 @@ export class ShaderDebugger {
               'settings set target.disable-aslr false',
               'settings set plugin.jit-loader.gdb.enable on',
             ];
-            const commands = mode === 'native' ? ['breakpoint set --func-regex ^nacelle_(cs|vs|ps)_'] :
-              [`command source "${vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'debug',
-                mode === 'hlsl' ? 'source-debug.lldb' : 'optimized-source-debug.lldb').fsPath.replace(/["\\]/g, '\\$&')}"`];
+            let commands: string[];
+            if (mode === 'native') {
+              commands = ['breakpoint set --func-regex ^nacelle_(cs|vs|ps)_'];
+            } else {
+              const scriptUri = vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'debug',
+                mode === 'hlsl' ? 'source-debug.lldb' : 'optimized-source-debug.lldb');
+              const script = new TextDecoder().decode(await vscode.workspace.fs.readFile(scriptUri));
+              commands = script.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0 && !line.startsWith('#'));
+            }
             return { ...config, mode, disableASLR: config.disableASLR ?? false, env: debugEnvironment(config.env),
               initCommands: [...settings, ...commandList(config.initCommands, 'initCommands')],
               preRunCommands: [...commands, ...commandList(config.preRunCommands, 'preRunCommands')] };
@@ -202,7 +208,7 @@ export class ShaderDebugger {
 
   private authorize(): void {
     if (!vscode.workspace.isTrusted) throw new Error('Shader debugger execution requires workspace trust.');
-    if (!nativeDebugSupported(process.platform, process.arch)) throw new Error('Nacelle runtime shader debugging currently requires Linux x86_64; offline profile viewing remains available.');
+    if (!nativeDebugSupported(process.platform, process.arch)) throw new Error('Nacelle runtime shader debugging currently requires Linux x86_64 or Windows x64; offline profile viewing remains available.');
   }
 
   private async adapter(): Promise<string> {

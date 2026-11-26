@@ -140,6 +140,17 @@ bool configureBuilder(llvm::orc::LLJITBuilder& builder,
         return false;
     }
     listener = std::make_shared<Listener>(*debugger);
+#if defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    if (!builder.getJITTargetMachineBuilder()) {
+        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+        if (!jtmb) {
+            error = llvm::toString(jtmb.takeError());
+            return false;
+        }
+        builder.setJITTargetMachineBuilder(std::move(*jtmb));
+    }
+    builder.getJITTargetMachineBuilder()->getTargetTriple().setObjectFormat(llvm::Triple::ELF);
+#endif
     builder.setNumCompileThreads(0);
     builder.setObjectLinkingLayerCreator([listener](llvm::orc::ExecutionSession& session,
 #if LLVM_VERSION_MAJOR >= 24
@@ -211,8 +222,8 @@ extern "C" HRESULT NacelleConfigureNativeDebug(const NacelleNativeDebugOptions* 
         return fail("Invalid configuration or object budget");
     if (nacelle::source_debug::optimized())
         return fail("Optimized source policy must not be changed through pinned native configuration");
-#if !defined(__linux__) || !defined(__x86_64__)
-    if (options->enabled) return fail("Native debugging currently supports Linux x86_64 with LLDB only");
+#if !(defined(__linux__) && defined(__x86_64__)) && !(defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__)))
+    if (options->enabled) return fail("Native debugging currently supports Linux x86_64 and Windows x64 with LLDB only");
 #endif
     const auto data = nacelle::native_debug::state();
     std::lock_guard lock(data->mutex);

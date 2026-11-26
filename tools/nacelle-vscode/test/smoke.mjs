@@ -6,14 +6,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
+const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const repository = resolve(root, '../..');
 const untrusted = process.env.NACELLE_EXTENSION_SMOKE_UNTRUSTED === '1';
+const exe = process.platform === 'win32' ? '.exe' : '';
 const sourceFile = process.env.NACELLE_EXTENSION_SOURCE_FILE ?? join(repository, 'tests/shaders/source_debug.hlsl');
 const program = process.env.NACELLE_EXTENSION_DEBUG_PROGRAM ??
-  join(repository, 'build/runtime-check/tests/profile_runtime_static_test');
+  join(repository, `build/runtime-check/tests/profile_runtime_static_test${exe}`);
 const cli = process.env.NACELLE_EXTENSION_PROFILE_READER ??
-  join(repository, 'build/runtime-check/tools/nacelle-dbg/nacelle-dbg');
+  join(repository, `build/runtime-check/tools/nacelle-dbg/nacelle-dbg${exe}`);
 const executablePath = await downloadAndUnzipVSCode({
   version: '1.106.3', cachePath: join(root, '.vscode-test'),
 });
