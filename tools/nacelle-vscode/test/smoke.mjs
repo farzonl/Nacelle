@@ -65,18 +65,30 @@ try {
     });
     if (phase?.stage === 'complete') {
       console.log(untrusted ?
-        'Real restricted-mode render/Speedscope/denied export and HLSL controls/teardown: PASS' :
-        'Real Extension Host render/Speedscope/export/teardown and native/pinned/optimized shader DAP steps, source and lanes: PASS');
+        'Real restricted-mode render/swimlane timeline/denied export and HLSL controls/teardown: PASS' :
+        'Real Extension Host render/swimlane timeline/export/teardown and native/pinned/optimized shader DAP steps, source and lanes: PASS');
       break;
     }
     if (closed) throw new Error('VS Code exited before completing the extension smoke.');
     if (phase?.stage === 'render') {
       for (const frame of page.frames()) {
-        if (!frame.url().startsWith('about:srcdoc')) continue;
-        const text = await frame.locator('body').innerText();
-        if (/Time Order/.test(text) && /Left Heavy/.test(text) &&
-            /capture\.nacelle-profile/.test(text) && await frame.locator('canvas').count() > 0) {
-          await writeFile(join(work, 'render-verified'), 'Real Speedscope profile and canvas loaded.');
+        try {
+          const renderer = frame.locator('#timeline-renderer');
+          if (await renderer.count() === 0) continue;
+          const rendererText = (await renderer.textContent())?.trim();
+          const statusState = await frame.locator('#status').getAttribute('data-state');
+          const canvas = frame.locator('#timeline-host canvas').first();
+          if (rendererText === 'Nacelle Swimlanes' &&
+              (statusState === 'complete' || statusState === 'incomplete') &&
+              await canvas.isVisible()) {
+            const box = await canvas.boundingBox();
+            if (box && box.width > 0 && box.height > 0) {
+              await writeFile(join(work, 'render-verified'), 'Real swimlane timeline and canvas loaded.');
+              break;
+            }
+          }
+        } catch {
+          // Ignore frames that detach or navigate while VS Code settles.
         }
       }
     }
