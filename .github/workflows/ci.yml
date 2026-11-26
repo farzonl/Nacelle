@@ -585,7 +585,7 @@ jobs:
             compute_dispatch_test interlocked_barrier_test \
             rasterizer_pipeline_test graphics_features_test \
             --parallel
-          if [ "$RUNNER_OS" = Linux ]; then
+          if [ "$RUNNER_OS" = Linux ] || [ "$RUNNER_OS" = Windows ]; then
             cmake --build build-profile --target native_debug_test source_debug_test --parallel
           fi
 
