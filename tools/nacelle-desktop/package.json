@@ -1,0 +1,25 @@
+{
+  "name": "nacelle-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin local-only Tauri 2 profile viewer reusing Nacelle's offline frontend and native OS WebViews.",
+  "scripts": {
+    "build:frontend": "tsc --noEmit && node scripts/build-frontend.mjs",
+    "build": "npm run build:frontend && tauri build --no-bundle",
+    "package": "npm run build:frontend && node scripts/package.mjs",
+    "test:policy": "node --test test/policy.test.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "npm run test:policy && npm run test:rust",
+    "test:smoke": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.6",
+    "@types/node": "22.15.30",
+    "esbuild": "0.25.5",
+    "typescript": "5.9.3"
+  }
+}

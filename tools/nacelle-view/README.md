@@ -8,7 +8,9 @@ timestamps being specified in nanoseconds). No replay or custom flamegraph.
 Empty shader metadata and empty traces are supported.
 
 The optional [VS Code integration](../nacelle-vscode/README.md) embeds this same
-frontend in a read-only profile editor with explicit export permissions.
+frontend in a read-only profile editor with explicit export permissions, and the
+optional [Tauri 2 desktop wrapper](../nacelle-desktop/README.md) packages this
+same frontend using native OS WebViews (WebView2, WKWebView, and WebKitGTK).
 
 ## Local filters and Speedscope export
 

@@ -20,12 +20,16 @@ it('stages the hashed editor host chunk but refuses captures and unrecognized as
     await writeFile(join(assets, 'index-abc.js'), 'viewer');
     await writeFile(join(assets, 'profile-worker-def.js'), 'worker');
     await writeFile(join(assets, 'vscode-host-ghi.js'), 'editor host');
+    await writeFile(join(assets, 'desktop-host-jkl.js'), 'desktop host');
+    await writeFile(join(assets, 'host-protocol-mno.js'), 'shared host protocol');
     await run();
     const staged = join(output, 'viewer', 'assets', 'vscode-host-ghi.js');
     expect(await readFile(staged, 'utf8')).toBe('editor host');
+    expect(await readFile(join(output, 'viewer', 'assets', 'desktop-host-jkl.js'), 'utf8')).toBe('desktop host');
+    expect(await readFile(join(output, 'viewer', 'assets', 'host-protocol-mno.js'), 'utf8')).toBe('shared host protocol');
 
     await writeFile(join(assets, 'vscode-host-ghi.js'), 'replacement');
-    for (const name of ['private.nacelle-profile', 'vscode-host.js']) {
+    for (const name of ['private.nacelle-profile', 'vscode-host.js', 'desktop-host.js', 'desktop-bridge.js']) {
       const unexpected = join(assets, name);
       await writeFile(unexpected, 'not publishable');
       await expect(run()).rejects.toThrow(`Unexpected viewer asset: ${name}`);

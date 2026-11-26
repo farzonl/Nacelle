@@ -12,6 +12,8 @@ export interface SpeedscopeTimelineOptions {
   baseUrl?: string;
   frameHtml?: string;
   frameNonce?: string;
+  /** Load bundled same-origin page and pass profile via input[type="file"] without blob: fetch. */
+  useFileImport?: boolean;
 }
 
 export class SpeedscopeTimelineView implements TimelineView {
@@ -24,15 +26,18 @@ export class SpeedscopeTimelineView implements TimelineView {
   private readonly baseUrl: string;
   private readonly frameHtml: string | undefined;
   private readonly frameNonce: string | undefined;
+  private readonly useFileImport: boolean;
   private container: HTMLElement | null = null;
   private iframe: HTMLIFrameElement | null = null;
   private messageEl: HTMLElement | null = null;
   private activeBlobUrl: string | null = null;
+  private loadCounter = 0;
 
   constructor(options: SpeedscopeTimelineOptions = {}) {
     this.baseUrl = options.baseUrl ?? './speedscope/index.html';
     this.frameHtml = options.frameHtml;
     this.frameNonce = options.frameNonce;
+    this.useFileImport = Boolean(options.useFileImport);
   }
 
   mount(container: HTMLElement, _callbacks?: TimelineViewCallbacks): void {
@@ -76,13 +81,19 @@ export class SpeedscopeTimelineView implements TimelineView {
       this.messageEl.hidden = true;
       this.iframe.hidden = false;
       // Assign via src with unique blob URL so Speedscope reloads cleanly on every profile/filter update.
-      if (this.frameHtml && this.frameNonce) {
-        // srcdoc keeps the host's blob origin; VS Code asset iframes cannot read it.
-        const initialize = `<script nonce="${this.frameNonce}">location.hash=${JSON.stringify(`title=${encodeURIComponent(input.title)}`)};</script>`;
-        this.iframe.onload = () => {
+      const importViaFileInput = (targetFrame: HTMLIFrameElement, expectedLoad: number) => {
+        const started = Date.now();
+        const attempt = () => {
+          if (this.iframe !== targetFrame || this.loadCounter !== expectedLoad) return;
           try {
-            const file = this.iframe?.contentDocument?.querySelector<HTMLInputElement>('input[type="file"]');
-            requireValid(file, 'Embedded Speedscope file import is unavailable.');
+            const file = targetFrame.contentDocument?.querySelector<HTMLInputElement>('input[type="file"]');
+            if (!file) {
+              if (Date.now() - started < 2000) {
+                setTimeout(attempt, 25);
+                return;
+              }
+              throw new Error('Embedded Speedscope file import is unavailable.');
+            }
             const transfer = new DataTransfer();
             transfer.items.add(new File([blob], `${input.title}.speedscope.json`, { type: 'application/json' }));
             file.files = transfer.files;
@@ -91,7 +102,20 @@ export class SpeedscopeTimelineView implements TimelineView {
             this.showMessage(`Embedded flamegraph import failed: ${String(error)}. The span tables and Chrome export remain available.`);
           }
         };
-        this.iframe.srcdoc = this.frameHtml.replace('<head>', `<head>${initialize}`);
+        attempt();
+      };
+      if (this.frameHtml && this.frameNonce) {
+        // srcdoc keeps the host's blob origin; VS Code asset iframes cannot read it.
+        const currentLoad = ++this.loadCounter;
+        const initialize = `<script nonce="${this.frameNonce}">location.hash=${JSON.stringify(`title=${encodeURIComponent(input.title)}`)};</script>`;
+        const targetFrame = this.iframe;
+        targetFrame.onload = () => importViaFileInput(targetFrame, currentLoad);
+        targetFrame.srcdoc = this.frameHtml.replace('<head>', `<head>${initialize}`);
+      } else if (this.useFileImport) {
+        const currentLoad = ++this.loadCounter;
+        const targetFrame = this.iframe;
+        targetFrame.onload = () => importViaFileInput(targetFrame, currentLoad);
+        targetFrame.src = `${this.baseUrl}?load=${currentLoad}#title=${encodeURIComponent(input.title)}`;
       } else {
         this.iframe.src = `${this.baseUrl}#${hash}`;
       }

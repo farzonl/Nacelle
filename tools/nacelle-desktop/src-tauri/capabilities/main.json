@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Minimal offline capability for the Nacelle Profile Viewer main window.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "core:event:default",
+    "allow-desktop-get-initial-capture",
+    "allow-desktop-open-dialog",
+    "allow-desktop-reload-capture",
+    "allow-desktop-read-chunk",
+    "allow-desktop-cancel-read",
+    "allow-desktop-export-start",
+    "allow-desktop-export-chunk",
+    "allow-desktop-export-finish",
+    "allow-desktop-export-cancel"
+  ]
+}

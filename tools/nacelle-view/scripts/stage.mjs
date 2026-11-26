@@ -2,7 +2,7 @@ import { cp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, join } from 'node:path';
 
-const VIEWER_ALLOWED_ASSET = /^(index-[A-Za-z0-9_-]+\.(js|css)|(profile-worker|vscode-host)-[A-Za-z0-9_-]+\.js)$/;
+const VIEWER_ALLOWED_ASSET = /^(index-[A-Za-z0-9_-]+\.(js|css)|(profile-worker|vscode-host|desktop-host|host-protocol)-[A-Za-z0-9_-]+\.js)$/;
 const SPEEDSCOPE_ALLOWED_FILE = /^(index\.html|release\.txt|source-code-pro\.LICENSE\.md|speedscope-[A-Za-z0-9_-]+\.(js|css)|SourceCodePro-[A-Za-z0-9_.-]+\.woff2|jfrview_bg-[A-Za-z0-9_-]+\.wasm|favicon-[A-Za-z0-9_-]+\.(ico|png|js))$/;
 
 const args = process.argv.slice(2);
