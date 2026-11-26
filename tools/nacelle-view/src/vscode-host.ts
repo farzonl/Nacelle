@@ -1,7 +1,7 @@
 import InlineDecoder from './profile-worker?worker&inline';
 import { EXPORT_CHUNK_BYTES, HOST_VERSION, MAX_EXPORT_BYTES, isRecord, type ExportMessage } from './host-protocol';
 import { LIMITS, requireValid } from './profile';
-import { createSpeedscopeTimelineView } from './speedscope-timeline';
+import { createSwimlaneTimelineView } from './swimlane-timeline';
 import { mountViewer } from './ui';
 import { decodeProfileFile } from './worker-loader';
 
@@ -91,7 +91,7 @@ export function mountVSCodeViewer(): void {
   const viewer = mountViewer(document, undefined, {
     decodeFile: (file, signal) => decodeProfileFile(file, signal, () => new InlineDecoder()),
     saveFile,
-    timelineView: createSpeedscopeTimelineView({ frameHtml: config.frameHtml, frameNonce: config.nonce }),
+    timelineView: createSwimlaneTimelineView(),
   });
   document.querySelector<HTMLInputElement>('#profile-file')!.disabled = true;
   document.querySelector<HTMLElement>('#dropzone')!.hidden = true;

@@ -9,7 +9,7 @@ import {
   type DesktopMenuAction,
 } from './host-protocol';
 import { LIMITS, requireValid } from './profile';
-import { createSpeedscopeTimelineView } from './speedscope-timeline';
+import { createSwimlaneTimelineView } from './swimlane-timeline';
 import type { TimelineView } from './timeline';
 import { mountViewer, type ViewerOptions } from './ui';
 import { decodeProfileFile } from './worker-loader';
@@ -143,7 +143,7 @@ export function mountDesktopViewer(
   const viewer = mountViewer(root, undefined, {
     decodeFile: options.decodeFile ?? ((file, signal) => decodeProfileFile(file, signal, () => new InlineDecoder())),
     saveFile,
-    timelineView: options.timelineView ?? createSpeedscopeTimelineView({ useFileImport: true }),
+    timelineView: options.timelineView ?? createSwimlaneTimelineView(),
   });
 
   async function reportSmokeState(generation: number): Promise<void> {
@@ -152,26 +152,22 @@ export function mountDesktopViewer(
     const message = status.textContent ?? '';
     const spans = root.querySelectorAll('tbody tr').length;
     if (state !== 'complete' && state !== 'incomplete') {
-      await bridge.reportSmokeEvent({ stage: 'loaded', state, message, spans, speedscopeReady: false });
+      await bridge.reportSmokeEvent({ stage: 'loaded', state, message, spans, timelineReady: false });
       return;
     }
     const deadline = Date.now() + 15000;
-    let speedscopeReady = false;
+    let timelineReady = false;
     while (!disposed && generation === loadGeneration && Date.now() < deadline) {
-      const iframe = root.querySelector<HTMLIFrameElement>('#timeline-host iframe');
-      const frameDoc = iframe?.contentDocument;
-      if (frameDoc) {
-        const text = frameDoc.body?.innerText ?? frameDoc.body?.textContent ?? '';
-        const canvases = frameDoc.querySelectorAll('canvas').length;
-        if (/Time Order/.test(text) && /Left Heavy/.test(text) && canvases > 0) {
-          speedscopeReady = true;
-          break;
-        }
+      const renderer = root.querySelector<HTMLElement>('#timeline-renderer')?.textContent?.trim();
+      const canvas = root.querySelector<HTMLCanvasElement>('#timeline-host canvas');
+      if (renderer === 'Nacelle Swimlanes' && canvas && !canvas.hidden && canvas.width > 0 && canvas.height > 0) {
+        timelineReady = true;
+        break;
       }
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     if (!disposed && generation === loadGeneration) {
-      await bridge.reportSmokeEvent({ stage: 'loaded', state, message, spans, speedscopeReady });
+      await bridge.reportSmokeEvent({ stage: 'loaded', state, message, spans, timelineReady });
     }
   }
 

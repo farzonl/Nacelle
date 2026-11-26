@@ -76,7 +76,8 @@ test('uploads a native capture offline, renders spans, and exports exact native 
   await page.locator('#filters').evaluate((form: HTMLFormElement) => form.requestSubmit());
   await expect(page.locator('#threads')).toContainText('Compute dispatch');
   await expect(page.locator('#threads')).not.toContainText('Graphics draw');
-  await expect(page.frameLocator('#timeline-host iframe').getByText(/Time Order/)).toBeVisible();
+  await expect(page.locator('#timeline-renderer')).toHaveText('Nacelle Swimlanes');
+  await expect(page.locator('#timeline-host canvas')).toBeVisible();
   expect(await downloadBytes(page, '#export')).toEqual(expectedBytes);
 
   const speedscope = JSON.parse((await downloadBytes(page, '#export-speedscope')).toString('utf8'));

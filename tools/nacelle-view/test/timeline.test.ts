@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { FileProfileDataSource } from '../src/file-source';
 import { loadProfile, type Profile, type ProfileDataSource } from '../src/profile';
 import { SpeedscopeTimelineView } from '../src/speedscope-timeline';
+import { computeSwimlaneLayout, createSwimlaneTimelineView, hitTestSwimlane } from '../src/swimlane-timeline';
 import type { TimelineRenderInput, TimelineView, TimelineViewCallbacks } from '../src/timeline';
 import { mountViewer } from '../src/ui';
 import { fixture, span, trace } from './fixtures';
@@ -133,5 +134,64 @@ describe('TimelineView integration in mountViewer', () => {
     expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
     expect(renders.length).toBe(2);
     expect(renders[1].filtered).toBe(true);
+  });
+
+  it('lays out simultaneous multi-thread swimlanes including crossing overlaps and hit-tests spans', async () => {
+    const loaded = await makeProfile([
+      span({ pid: 1, tid: 1, name: 'Outer', ts: 100, dur: 100 }),
+      span({ pid: 1, tid: 1, name: 'Inner', ts: 120, dur: 40 }),
+      span({ pid: 1, tid: 1, name: 'Crossing', ts: 150, dur: 80 }),
+      span({ pid: 1, tid: 2, name: 'Worker', ts: 110, dur: 90 }),
+    ]);
+    const g1 = { pid: 1, tid: 1, name: 'main', spans: loaded.trace.traceEvents.filter(e => e.ph === 'X' && e.tid === 1) };
+    const g2 = { pid: 1, tid: 2, name: 'worker-0', spans: loaded.trace.traceEvents.filter(e => e.ph === 'X' && e.tid === 2) };
+
+    const layout = computeSwimlaneLayout([g1, g2]);
+    expect(layout.lanes).toHaveLength(2);
+    expect(layout.minTs).toBe(100);
+    expect(layout.maxEnd).toBe(230);
+    // Outer=depth 0, Inner=depth 1, Crossing overlaps both Outer and Inner => depth 2
+    expect(layout.lanes[0].spans.map(s => s.depth)).toEqual([0, 1, 2]);
+    expect(layout.lanes[0].rowCount).toBe(3);
+    expect(layout.lanes[1].rowCount).toBe(1);
+
+    const workerItem = layout.lanes[1].spans[0];
+    const hit = hitTestSwimlane(layout, 200, workerItem.y + 4, 650, layout.minTs, layout.maxEnd, 0);
+    expect(hit?.span.name).toBe('Worker');
+  });
+
+  it('mounts SwimlaneTimelineView in viewer, filters on span click, and resets via toolbar button', async () => {
+    const loaded = await makeProfile([
+      span({ pid: 1, tid: 1, name: 'Compile', ts: 10, dur: 40, args: { stage: 'compute' } }),
+      span({ pid: 2, tid: 2, name: 'Raster', ts: 60, dur: 50, args: { stage: 'pixel' } }),
+    ]);
+
+    mountViewer(document, async () => source(loaded), { timelineView: createSwimlaneTimelineView() });
+    chooseFile();
+    await vi.waitFor(() => expect(document.querySelectorAll('tbody tr')).toHaveLength(2));
+
+    expect(document.querySelector('#timeline-renderer')!.textContent).toBe('Nacelle Swimlanes');
+    const canvas = document.querySelector<HTMLCanvasElement>('#timeline-host canvas')!;
+    vi.spyOn(canvas, 'getContext').mockReturnValue(null);
+    expect(canvas.hidden).toBe(false);
+
+    // Mock bounding rect for deterministic click hit-testing on the first lane's span
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0, top: 0, right: 500, bottom: 400, width: 500, height: 400, x: 0, y: 0, toJSON: () => ({}),
+    });
+    // Ruler=28, lane0 header=24 => first span y=[52..72]; ts=10..50 in [10..110] => x=[0..200]
+    canvas.dispatchEvent(new MouseEvent('pointerdown', { button: 0, clientX: 80, clientY: 60 }));
+    canvas.dispatchEvent(new MouseEvent('pointerup', { button: 0, clientX: 80, clientY: 60 }));
+
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(1);
+    expect(document.querySelector('#threads')!.textContent).toContain('Compile');
+    expect(document.querySelector('#threads')!.textContent).not.toContain('Raster');
+
+    // Click "Show all threads" button in swimlane toolbar to clear filters
+    const resetBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('#timeline-host button'))
+      .find(b => b.textContent === 'Show all threads')!;
+    expect(resetBtn.hidden).toBe(false);
+    resetBtn.click();
+    expect(document.querySelectorAll('tbody tr')).toHaveLength(2);
   });
 });

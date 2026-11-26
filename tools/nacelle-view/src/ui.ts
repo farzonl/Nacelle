@@ -170,6 +170,11 @@ export function mountViewer(
   });
 
   function applySelectionFilter(selection: TimelineSelectionEvent): void {
+    if (selection.reset) {
+      filterForm.reset();
+      applyFilters();
+      return;
+    }
     if (selection.thread !== undefined) threadFilter.value = selection.thread;
     if (selection.pso !== undefined) psoFilter.value = selection.pso;
     if (selection.stage !== undefined) stageFilter.value = selection.stage;

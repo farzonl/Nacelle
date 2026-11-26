@@ -74,12 +74,12 @@ try {
 
   assert.equal(exitCode, 0, `Desktop viewer exited with unexpected code ${exitCode}`);
 
-  // 4. Verify real WebView rendering, Speedscope canvas, blocked external navigation, and exports.
+  // 4. Verify real WebView rendering, swimlane timeline canvas, blocked external navigation, and exports.
   const summary = JSON.parse(await readFile(join(work, 'smoke-result.json'), 'utf8'));
   assert.ok(['complete', 'incomplete'].includes(summary.loaded?.state),
     `Expected complete/incomplete capture state, got: ${JSON.stringify(summary.loaded)}`);
   assert.ok(summary.loaded.spans > 0, `Expected rendered timing spans, got ${summary.loaded.spans}`);
-  assert.equal(summary.loaded.speedscopeReady, true, 'Embedded Speedscope canvas did not become ready');
+  assert.equal(summary.loaded.timelineReady, true, 'Swimlane timeline canvas did not become ready');
   assert.ok(summary.blockedNavigationCount >= 1, 'Expected on_navigation to block external https:// navigation');
   assert.match(summary.currentUrl, /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)(\/|$)/,
     `Unexpected WebView URL after blocked navigation: ${summary.currentUrl}`);
@@ -102,7 +102,7 @@ try {
   const stagingLeftovers = files.filter(name => name.startsWith('.nacelle-export-'));
   assert.deepEqual(stagingLeftovers, [], 'Export staging temporary files were left behind');
 
-  console.log(`Real native WebView smoke passed (${process.platform}): open, decode, Speedscope canvas, blocked navigation (${summary.blockedNavigationCount}), exact trace export, and Speedscope export verified.`);
+  console.log(`Real native WebView smoke passed (${process.platform}): open, decode, swimlane timeline canvas, blocked navigation (${summary.blockedNavigationCount}), exact trace export, and Speedscope export verified.`);
 } finally {
   // Restore clean non-smoke frontend staging so subsequent policy/package runs stay clean.
   try {

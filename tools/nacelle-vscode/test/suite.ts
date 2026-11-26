@@ -31,7 +31,7 @@ export async function run(): Promise<void> {
     return status?.state === 'complete';
   }, 'actual shared viewer render');
   await writeFile(join(work, 'stage.json'), JSON.stringify({ stage: 'render' }));
-  await until(() => existsSync(join(work, 'render-verified')), 'real embedded Speedscope rendering');
+  await until(() => existsSync(join(work, 'render-verified')), 'real swimlane timeline rendering');
   await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(join(work, 'expected-trace.json')));
   await vscode.commands.executeCommand('vscode.openWith', uri, 'nacelle.profile');
   if (process.env.NACELLE_EXTENSION_SMOKE_UNTRUSTED === '1') {
