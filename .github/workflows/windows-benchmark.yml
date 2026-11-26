@@ -413,6 +413,7 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\.toolchains\warp\*.dll" "$env:GITHUB_WORKSPACE\build\" -Force
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\build\D3D12" | Out-Null
           Copy-Item "$env:GITHUB_WORKSPACE\.toolchains\agility-sdk\*.dll" "$env:GITHUB_WORKSPACE\build\D3D12\" -Force
+          $env:OPENBLAS_NUM_THREADS = "1"
           $env:PATH = "$env:GITHUB_WORKSPACE\.toolchains\warp;$env:GITHUB_WORKSPACE\.sdk\bin\x64;$env:GITHUB_WORKSPACE\.sdk\openblas\bin;$env:GITHUB_WORKSPACE\.toolchains\llvm\bin;$env:PATH;$env:GITHUB_WORKSPACE\.toolchains\llvmpipe\x64;$env:GITHUB_WORKSPACE\.toolchains\swiftshader"
           & "$env:GITHUB_WORKSPACE\build\nacelle-bench.exe" --iters 7 --allow-partial --json "$env:GITHUB_WORKSPACE\bench-results.json"
           if ($LASTEXITCODE -ne 0) { throw "nacelle-bench failed with exit code $LASTEXITCODE" }
