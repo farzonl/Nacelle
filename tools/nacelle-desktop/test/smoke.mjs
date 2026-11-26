@@ -81,7 +81,7 @@ try {
   assert.ok(summary.loaded.spans > 0, `Expected rendered timing spans, got ${summary.loaded.spans}`);
   assert.equal(summary.loaded.speedscopeReady, true, 'Embedded Speedscope canvas did not become ready');
   assert.ok(summary.blockedNavigationCount >= 1, 'Expected on_navigation to block external https:// navigation');
-  assert.match(summary.currentUrl, /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)\//,
+  assert.match(summary.currentUrl, /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)(\/|$)/,
     `Unexpected WebView URL after blocked navigation: ${summary.currentUrl}`);
   assert.equal(summary.traceExported, true, 'Chrome trace export did not commit');
   assert.equal(summary.speedscopeExported, true, 'Filtered Speedscope export did not commit');

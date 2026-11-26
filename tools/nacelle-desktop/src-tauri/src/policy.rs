@@ -85,6 +85,7 @@ mod tests {
     #[test]
     fn allows_only_bundled_app_origins() {
         let allowed = [
+            "tauri://localhost",
             "tauri://localhost/index.html",
             "tauri://localhost/speedscope/index.html?load=1#title=test",
             "http://tauri.localhost/index.html",
